@@ -5,6 +5,28 @@ export type LabSettings = {
   defaultModel: string;
   backends: Record<BackendKind, { url: string; enabled: boolean; label: string }>;
   hfToken?: string;
+  contextBudgetChars?: number;
+  contextMaxFileChars?: number;
+  contextMaxSearchHits?: number;
+};
+
+export type ContextMention =
+  | { type: "file"; path: string }
+  | { type: "folder"; path: string }
+  | { type: "search"; query: string };
+
+export type EditorSelection = {
+  path: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+};
+
+export type EditorSnapshot = {
+  openFiles: Array<{ path: string; content?: string }>;
+  activePath?: string | null;
+  selection?: EditorSelection | null;
+  mentions: ContextMention[];
 };
 
 export type Workspace = {
@@ -69,7 +91,8 @@ export type AgentEvent =
   | { type: "assistant"; runId: string; text: string; delta?: boolean }
   | { type: "done"; runId: string; usage?: { prompt: number; completion: number } }
   | { type: "cancelled"; runId: string }
-  | { type: "error"; runId: string; message: string };
+  | { type: "error"; runId: string; message: string }
+  | { type: "context_truncated"; runId: string; dropped: string[] };
 
 export type DownloadEvent =
   | { type: "download_progress"; jobId: string; progress: number; message: string }

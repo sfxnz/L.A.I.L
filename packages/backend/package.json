@@ -7,8 +7,10 @@
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
+
   "dependencies": {
     "@lail/shared": "workspace:*",
     "hono": "^4.7.0",

@@ -62,5 +62,37 @@ function migrate(database: Database) {
 
     CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      message TEXT NOT NULL,
+      error TEXT,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS patches (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      old_string TEXT NOT NULL,
+      new_string TEXT NOT NULL,
+      op TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_patches_session_status ON patches(session_id, status);
+    CREATE INDEX IF NOT EXISTS idx_patches_run ON patches(run_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON agent_runs(session_id);
   `);
 }

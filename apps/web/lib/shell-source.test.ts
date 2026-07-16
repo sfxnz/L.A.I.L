@@ -76,6 +76,11 @@ describe("shipped Workbench source chrome", () => {
     expect(endBlock).toContain("setCmdCount");
     expect(endBlock).toContain('kind: "ran"');
   });
+
+  test("workbench has mode toggle and patch review", () => {
+    expect(wb).toMatch(/ModeToggle|agentMode|Plan/);
+    expect(wb).toMatch(/PatchReview|pendingPatches|patches\.accept/);
+  });
 });
 
 describe("default entry", () => {

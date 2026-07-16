@@ -145,6 +145,7 @@ export function createApp() {
         message: body.message,
         workspaceId: body.workspaceId,
         mode: body.mode, // plan|ask|agent, optional
+        editorSnapshot: body.editorSnapshot,
       });
       return c.json(result);
     } catch (e) {

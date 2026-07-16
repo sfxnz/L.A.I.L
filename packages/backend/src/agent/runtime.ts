@@ -1,13 +1,13 @@
 import { randomUUID } from "crypto";
-import type { AgentMode } from "@lail/shared";
+import type { AgentMode, EditorSnapshot } from "@lail/shared";
 import { getDb } from "../db/schema";
 import { wsHub } from "../ws/hub";
 import { addMessage } from "../controller/sessions";
 import { getWorkspace } from "../controller/workspaces";
-import { openAiBase, resolveModelId } from "../controller/settings";
+import { getSettings, openAiBase, resolveModelId } from "../controller/settings";
 import { recordUsage } from "../controller/usage";
 import { runTool, toolDefinitions } from "../tools";
-import { buildContext } from "./context";
+import { buildContextPack, loadHistory } from "./context";
 import { systemPrompt } from "./prompts";
 import { isToolAllowed, classifyShell } from "./tool-policy";
 import { approvalHub } from "./approvals";
@@ -20,6 +20,7 @@ export type StartRunOpts = {
   message: string;
   workspaceId: string;
   mode: AgentMode;
+  editorSnapshot?: EditorSnapshot;
   /** test seam */
   fetchImpl?: typeof fetch;
   maxSteps?: number;
@@ -274,11 +275,38 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
   });
   publish(runId, { type: "status", text: "Working on your request…" });
 
-  const history = await buildContext(sessionId);
+  const settings = getSettings();
+  const pack = await buildContextPack({
+    rootPath: ws.rootPath,
+    snapshot: opts.editorSnapshot ?? { openFiles: [], mentions: [] },
+    budgetChars: settings.contextBudgetChars ?? 32_000,
+    maxFileChars: settings.contextMaxFileChars,
+    maxSearchHits: settings.contextMaxSearchHits,
+    message: opts.message,
+  });
+
+  if (pack.truncated) {
+    publish(runId, {
+      type: "status",
+      text: `Context truncated to budget (${pack.droppedLabels.length} lower-priority chunks dropped)`,
+    });
+    publish(runId, {
+      type: "context_truncated",
+      dropped: pack.droppedLabels,
+    });
+  }
+
+  const history = await loadHistory(sessionId);
   const messages: ChatMsg[] = [
-    { role: "system", content: systemPrompt(mode, ws.rootPath) },
-    ...history,
+    {
+      role: "system",
+      content: systemPrompt(mode, ws.rootPath) + "\n\n" + pack.systemExtra,
+    },
   ];
+  if (pack.contextMessage) {
+    messages.push(pack.contextMessage);
+  }
+  messages.push(...history);
 
   // Ensure latest user message is present (facade should have addMessage'd it)
   if (!messages.some((m) => m.role === "user" && m.content === message)) {

@@ -204,4 +204,51 @@ describe("AgentRuntime", () => {
     // Cancel during LLM must not become done after a late successful response
     expect(finished.status).toBe("cancelled");
   });
+
+  test("editorSnapshot packs file content into LLM messages", async () => {
+    writeFileSync(join(rootPath, "ctx-pack.txt"), "PACKED_CTX_MARKER_99\n");
+    const session = createSession("runtime context pack", workspaceId);
+    const userMsg = "What is in ctx-pack.txt?";
+    addMessage(session.id, "user", userMsg);
+
+    let capturedMessages: Array<{ role?: string; content?: string | null }> = [];
+    const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      try {
+        const body = JSON.parse(String(init?.body || "{}")) as {
+          messages?: Array<{ role?: string; content?: string | null }>;
+        };
+        if (body.messages?.length) capturedMessages = body.messages;
+      } catch {
+        /* ignore */
+      }
+      return Response.json({
+        choices: [{ message: { content: "Saw the context." } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      });
+    }) as unknown as typeof fetch;
+
+    const { runId } = startAgentRun({
+      sessionId: session.id,
+      message: userMsg,
+      workspaceId,
+      mode: "ask",
+      fetchImpl,
+      maxSteps: 4,
+      editorSnapshot: {
+        openFiles: [{ path: "ctx-pack.txt" }],
+        activePath: "ctx-pack.txt",
+        mentions: [{ type: "file", path: "ctx-pack.txt" }],
+      },
+    });
+
+    const finished = await waitForRun(runId);
+    expect(finished.status).toBe("done");
+
+    const blob = capturedMessages
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n");
+    expect(blob).toContain("PACKED_CTX_MARKER_99");
+    expect(blob).toMatch(/Attached \d+ context chunk/);
+  });
 });
+

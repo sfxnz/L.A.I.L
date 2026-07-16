@@ -1,4 +1,4 @@
-import type { AgentMode } from "@lail/shared";
+import type { AgentMode, EditorSnapshot } from "@lail/shared";
 import { startAgentRun, cancelAgentRun, getAgentRun } from "../agent/runtime";
 import { addMessage, getSession, updateSession } from "./sessions";
 import { getWorkspace } from "./workspaces";
@@ -8,6 +8,7 @@ export async function runAgent(opts: {
   message: string;
   workspaceId?: string | null;
   mode?: AgentMode;
+  editorSnapshot?: EditorSnapshot;
 }): Promise<{ runId: string }> {
   const session = getSession(opts.sessionId);
   if (!session) throw new Error("Session not found");
@@ -40,6 +41,7 @@ export async function runAgent(opts: {
     message: opts.message,
     workspaceId,
     mode: opts.mode ?? "agent",
+    editorSnapshot: opts.editorSnapshot,
   });
 }
 

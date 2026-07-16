@@ -5,7 +5,7 @@ import type { AgentMode, Patch, Session, Workspace } from "./api";
 
 export type TimelineItem = {
   id: string;
-  kind: "thought" | "status" | "tool" | "file" | "assistant" | "error" | "ran";
+  kind: "thought" | "status" | "tool" | "file" | "assistant" | "error" | "ran" | "patch";
   text: string;
   meta?: Record<string, unknown>;
   ts: number;

@@ -6,15 +6,20 @@ import {
   Brain,
   ChevronRight,
   Columns2,
+  FileDiff,
   FilePenLine,
   Loader2,
   PanelRight,
   Plus,
   Save,
+  Square,
   Terminal,
   X,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { ModeToggle } from "@/components/workbench/ModeToggle";
+import { PatchReviewPanel } from "@/components/workbench/PatchReviewPanel";
+import { ShellApprovalBanner } from "@/components/workbench/ShellApprovalBanner";
+import { api, type Patch } from "@/lib/api";
 import { useLabStore } from "@/lib/store";
 import {
   COMPOSER_PLACEHOLDER,
@@ -49,6 +54,15 @@ export default function WorkbenchPage() {
     statusPanelOpen,
     setStatusPanelOpen,
     modelLabel,
+    agentMode,
+    setAgentMode,
+    pendingPatches,
+    upsertPatch,
+    shellApproval,
+    setShellApproval,
+    streamingText,
+    appendStreamingText,
+    clearStreamingText,
   } = useLabStore();
 
   const [input, setInput] = useState("");
@@ -79,7 +93,7 @@ export default function WorkbenchPage() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [timeline, messages, busy]);
+  }, [timeline, messages, busy, streamingText]);
 
   useEffect(() => {
     return onWsEvent((event, channel) => {
@@ -88,7 +102,9 @@ export default function WorkbenchPage() {
       const runId = String(event.runId || "");
       if (activeRunId && runId && runId !== activeRunId) return;
 
-      if (type === "thought") {
+      if (type === "token") {
+        appendStreamingText(String(event.text || ""));
+      } else if (type === "thought") {
         pushTimeline({ kind: "thought", text: String(event.text || "") });
       } else if (type === "status") {
         pushTimeline({ kind: "status", text: String(event.text || "") });
@@ -119,16 +135,42 @@ export default function WorkbenchPage() {
             .then((f) => openFile({ path: f.path, content: f.content }))
             .catch(() => {});
         }
+      } else if (type === "patch_proposed" || type === "patch_updated") {
+        const patch = event.patch as Patch | undefined;
+        if (patch && typeof patch === "object" && patch.id) {
+          upsertPatch(patch);
+          if (type === "patch_proposed") {
+            pushTimeline({
+              kind: "patch",
+              text: String(patch.path || ""),
+              meta: { patchId: patch.id, op: patch.op },
+            });
+          }
+        }
+      } else if (type === "shell_approval_required") {
+        setShellApproval({
+          runId: runId || String(event.runId || ""),
+          approvalId: String(event.approvalId || ""),
+          command: String(event.command || ""),
+        });
       } else if (type === "assistant") {
         // Messages pane only — do not also push timeline (avoids duplicate bubbles).
         const text = String(event.text || "");
         setMessages((m) => [...m, { role: "assistant", content: text }]);
+        clearStreamingText();
       } else if (type === "error") {
         pushTimeline({ kind: "error", text: String(event.message || "error") });
         setBusy(false);
+        clearStreamingText();
+      } else if (type === "cancelled") {
+        setBusy(false);
+        setActiveRunId(null);
+        clearStreamingText();
+        pushTimeline({ kind: "status", text: "Run cancelled" });
       } else if (type === "done") {
         setBusy(false);
         setActiveRunId(null);
+        clearStreamingText();
         if (session) {
           api.sessions.get(session.id).then((full) => {
             setMessages(full.messages.map((m) => ({ role: m.role, content: m.content })));
@@ -136,7 +178,18 @@ export default function WorkbenchPage() {
         }
       }
     });
-  }, [activeRunId, pushTimeline, session, setActiveRunId, workspace, openFile]);
+  }, [
+    activeRunId,
+    pushTimeline,
+    session,
+    setActiveRunId,
+    workspace,
+    openFile,
+    appendStreamingText,
+    clearStreamingText,
+    upsertPatch,
+    setShellApproval,
+  ]);
 
   async function send(text?: string) {
     const message = (text ?? input).trim();
@@ -146,9 +199,15 @@ export default function WorkbenchPage() {
     setBusy(true);
     setCmdCount(0);
     clearTimeline();
+    clearStreamingText();
     setMessages((m) => [...m, { role: "user", content: message }]);
     try {
-      const { runId } = await api.agentRun(session.id, message, workspace?.id);
+      const { runId } = await api.agentRun(
+        session.id,
+        message,
+        workspace?.id,
+        agentMode,
+      );
       setActiveRunId(runId);
       wsSubscribe(`agent:${runId}`);
       wsSubscribe("agent");
@@ -161,12 +220,22 @@ export default function WorkbenchPage() {
     }
   }
 
+  async function cancelRun() {
+    if (!activeRunId) return;
+    try {
+      await api.cancelAgentRun(activeRunId);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
   async function newChat() {
     const s = await api.sessions.create("Composer", workspace?.id);
     setSession(s);
     setSessions(await api.sessions.list());
     setMessages([]);
     clearTimeline();
+    clearStreamingText();
   }
 
   async function saveActive() {
@@ -224,7 +293,7 @@ export default function WorkbenchPage() {
           )}
         >
           <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
-            {messages.length === 0 && timeline.length === 0 && (
+            {messages.length === 0 && timeline.length === 0 && !streamingText && (
               <div className="mx-auto max-w-lg pt-20 text-center">
                 <p className="text-[13px] font-medium text-[#ddd]">Workbench</p>
                 <p className="mt-2 text-[12px] leading-relaxed text-[#666]">
@@ -252,16 +321,28 @@ export default function WorkbenchPage() {
                 ),
               )}
 
-              {(busy || streamBlocks.length > 0) && (
+              {(busy || streamBlocks.length > 0 || streamingText) && (
                 <div className="space-y-2">
                   {streamBlocks.map((b, i) => (
                     <StreamBlockView key={i} block={b} />
                   ))}
+                  {streamingText ? (
+                    <div
+                      className="text-[13px] leading-relaxed text-[#cfcfcf] whitespace-pre-wrap"
+                      data-testid="streaming-draft"
+                    >
+                      {streamingText}
+                      {busy && (
+                        <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-[#888] align-middle" />
+                      )}
+                    </div>
+                  ) : null}
                   {busy && (
                     <div className="flex items-center gap-2 text-[12px] text-[#777]">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       {STREAM_MARKERS.working}
                       {cmdCount > 0 ? ` · ${cmdCount} tools` : ""}
+                      {shellApproval ? " · waiting for shell approval" : ""}
                     </div>
                   )}
                 </div>
@@ -272,6 +353,7 @@ export default function WorkbenchPage() {
 
           <div className="shrink-0 border-t border-[#1f1f1f] bg-[#0e0e0e] px-3 py-3">
             <div className="mx-auto max-w-2xl">
+              <ShellApprovalBanner />
               <div className="rounded-2xl border border-[#2a2a2a] bg-[#181818] focus-within:border-[#3d3d3d]">
                 <textarea
                   ref={taRef}
@@ -294,14 +376,17 @@ export default function WorkbenchPage() {
                   }}
                 />
                 <div className="flex items-center justify-between px-2.5 pb-2">
-                  <button
-                    type="button"
-                    onClick={() => void newChat()}
-                    className="rounded-md p-1.5 text-[#666] hover:bg-[#222] hover:text-[#ccc]"
-                    title="New chat"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void newChat()}
+                      className="rounded-md p-1.5 text-[#666] hover:bg-[#222] hover:text-[#ccc]"
+                      title="New chat"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                    </button>
+                    <ModeToggle value={agentMode} onChange={setAgentMode} />
+                  </div>
                   <div className="flex items-center gap-2">
                     <span
                       className="max-w-[160px] truncate font-mono text-[11px] text-[#666]"
@@ -309,24 +394,33 @@ export default function WorkbenchPage() {
                     >
                       {modelLabel?.split("/").pop() || "model"}
                     </span>
-                    <button
-                      type="button"
-                      disabled={busy || !input.trim()}
-                      onClick={() => void send()}
-                      aria-label="Send"
-                      className={cn(
-                        "flex h-7 w-7 items-center justify-center rounded-full transition",
-                        busy || !input.trim()
-                          ? "bg-[#2a2a2a] text-[#555]"
-                          : "bg-white text-black hover:opacity-90",
-                      )}
-                    >
-                      {busy ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
+                    {busy ? (
+                      <button
+                        type="button"
+                        onClick={() => void cancelRun()}
+                        aria-label="Cancel"
+                        title="Cancel run"
+                        className="flex h-7 items-center gap-1 rounded-full border border-[#3a3a3a] bg-[#2a2a2a] px-2.5 text-[11px] text-[#ccc] hover:bg-[#333]"
+                      >
+                        <Square className="h-2.5 w-2.5 fill-current" />
+                        Cancel
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!input.trim()}
+                        onClick={() => void send()}
+                        aria-label="Send"
+                        className={cn(
+                          "flex h-7 w-7 items-center justify-center rounded-full transition",
+                          !input.trim()
+                            ? "bg-[#2a2a2a] text-[#555]"
+                            : "bg-white text-black hover:opacity-90",
+                        )}
+                      >
                         <ArrowUp className="h-3.5 w-3.5" strokeWidth={2.2} />
-                      )}
-                    </button>
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -362,6 +456,8 @@ export default function WorkbenchPage() {
           </div>
         )}
 
+        {pendingPatches.length > 0 && <PatchReviewPanel />}
+
         {statusPanelOpen && (
           <aside
             className="flex w-[240px] shrink-0 flex-col border-l border-[#1f1f1f] bg-[#111111]"
@@ -380,8 +476,10 @@ export default function WorkbenchPage() {
                 </div>
                 <div className="space-y-1">
                   <KV k="State" v={busy ? "running" : "idle"} />
+                  <KV k="Mode" v={agentMode} />
                   <KV k="Model" v={modelLabel?.split("/").pop() || "—"} />
                   <KV k="Tools this run" v={String(cmdCount)} />
+                  <KV k="Pending patches" v={String(pendingPatches.length)} />
                   <KV k="Open files" v={String(openFiles.length)} />
                 </div>
               </div>
@@ -498,6 +596,16 @@ function StreamBlockView({ block }: { block: StreamBlock }) {
         <div className="flex items-center gap-1.5 text-[11px] text-[#8fbcbb]">
           <FilePenLine className="h-3 w-3" strokeWidth={1.5} />
           {fileWriteLabel(block.path, block.creating)}
+        </div>
+      </div>
+    );
+  }
+  if (block.type === "patch") {
+    return (
+      <div className="rounded-md border border-[#222] bg-[#141414] px-2.5 py-2">
+        <div className="flex items-center gap-1.5 text-[11px] text-[#c9a86c]">
+          <FileDiff className="h-3 w-3" strokeWidth={1.5} />
+          {STREAM_MARKERS.proposed} {block.path}
         </div>
       </div>
     );

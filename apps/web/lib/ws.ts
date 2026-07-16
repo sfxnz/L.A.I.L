@@ -45,7 +45,9 @@ export function connectWs() {
 export function onWsEvent(handler: Handler) {
   handlers.add(handler);
   connectWs();
-  return () => handlers.delete(handler);
+  return () => {
+    handlers.delete(handler);
+  };
 }
 
 export function wsSubscribe(channel: string) {

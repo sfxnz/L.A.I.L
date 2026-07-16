@@ -17,7 +17,14 @@ import {
   updateSession,
   listMessages,
 } from "./controller/sessions";
-import { runAgent } from "./controller/agent";
+import { runAgent, cancelAgentRun } from "./controller/agent";
+import {
+  listPatches,
+  acceptPatch,
+  rejectPatch,
+  acceptAllPatches,
+} from "./controller/patches";
+import { approvalHub } from "./agent/approvals";
 import { getUsageSummary } from "./controller/usage";
 import { searchHuggingFace, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
@@ -137,11 +144,64 @@ export function createApp() {
         sessionId: body.sessionId,
         message: body.message,
         workspaceId: body.workspaceId,
+        mode: body.mode, // plan|ask|agent, optional
       });
       return c.json(result);
     } catch (e) {
       const err = e as Error & { code?: string; recovery?: string };
       return c.json({ error: err.code || "error", message: err.message, recovery: err.recovery }, 400);
+    }
+  });
+
+  app.post("/api/agent/runs/:runId/cancel", (c) => {
+    const ok = cancelAgentRun(c.req.param("runId"));
+    return c.json({ ok });
+  });
+
+  app.post("/api/agent/runs/:runId/shell-approvals/:approvalId", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const decision = body.decision === "allow" ? "allow" : "deny";
+    const ok = approvalHub.decide(c.req.param("approvalId"), decision);
+    return c.json({ ok });
+  });
+
+  app.get("/api/patches", (c) => {
+    return c.json(
+      listPatches({
+        sessionId: c.req.query("sessionId") || undefined,
+        runId: c.req.query("runId") || undefined,
+        status: c.req.query("status") || undefined,
+      }),
+    );
+  });
+
+  app.post("/api/patches/:id/accept", (c) => {
+    try {
+      return c.json(acceptPatch(c.req.param("id")));
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const status = err.code === "NOT_FOUND" ? 404 : 400;
+      return c.json({ error: err.code || "error", message: err.message }, status);
+    }
+  });
+
+  app.post("/api/patches/:id/reject", (c) => {
+    try {
+      return c.json(rejectPatch(c.req.param("id")));
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const status = err.code === "NOT_FOUND" ? 404 : 400;
+      return c.json({ error: err.code || "error", message: err.message }, status);
+    }
+  });
+
+  app.post("/api/patches/accept-all", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      return c.json(acceptAllPatches(body));
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      return c.json({ error: err.code || "error", message: err.message }, 400);
     }
   });
 

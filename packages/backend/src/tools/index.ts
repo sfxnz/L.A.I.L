@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
-import { dirname, join, relative } from "path";
+import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { join, relative } from "path";
 import { resolveInWorkspace, getWorkspace } from "../controller/workspaces";
+import { assertWorkspaceRelativePath } from "../agent/tool-policy";
 
 export const toolDefinitions = [
   {
@@ -33,8 +34,26 @@ export const toolDefinitions = [
   {
     type: "function" as const,
     function: {
-      name: "write_file",
-      description: "Create or overwrite a text file in the workspace",
+      name: "search_replace",
+      description:
+        "Propose a search-and-replace edit in a workspace file (pending review; does not write disk)",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" },
+        },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "create_file",
+      description:
+        "Propose creating a new text file in the workspace (pending review; does not write disk)",
       parameters: {
         type: "object",
         properties: {
@@ -42,6 +61,21 @@ export const toolDefinitions = [
           content: { type: "string" },
         },
         required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "delete_file",
+      description:
+        "Propose deleting a file in the workspace (pending review; does not write disk)",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+        },
+        required: ["path"],
       },
     },
   },
@@ -95,6 +129,15 @@ export type ToolResult = {
   output: string;
   summary: string;
   fileWrite?: { path: string; bytes: number };
+  /** When set, runtime should create a pending patch instead of treating as disk write */
+  patchProposal?: {
+    path: string;
+    oldString: string;
+    newString: string;
+    op: "replace" | "create" | "delete";
+  };
+  needsShellApproval?: boolean;
+  command?: string;
 };
 
 export async function runTool(
@@ -133,17 +176,44 @@ export async function runTool(
         }
         return { ok: true, output: buf.toString("utf8"), summary: `Read ${args.path}` };
       }
-      case "write_file": {
-        const rel = String(args.path);
-        const content = String(args.content ?? "");
-        const abs = resolveInWorkspace(workspaceId, rel);
-        mkdirSync(dirname(abs), { recursive: true });
-        writeFileSync(abs, content, "utf8");
+      case "search_replace": {
+        const path = assertWorkspaceRelativePath(String(args.path));
+        const oldString = String(args.old_string ?? "");
+        const newString = String(args.new_string ?? "");
         return {
           ok: true,
-          output: `Wrote ${content.length} bytes to ${rel}`,
-          summary: `Wrote ${rel}`,
-          fileWrite: { path: rel, bytes: Buffer.byteLength(content) },
+          output: `Proposed replace in ${path} (${oldString.length} → ${newString.length} chars)`,
+          summary: `Proposed replace in ${path}`,
+          patchProposal: { path, oldString, newString, op: "replace" },
+        };
+      }
+      case "create_file": {
+        const path = assertWorkspaceRelativePath(String(args.path));
+        const content = String(args.content ?? "");
+        return {
+          ok: true,
+          output: `Proposed create ${path} (${content.length} bytes)`,
+          summary: `Proposed create ${path}`,
+          patchProposal: {
+            path,
+            oldString: "",
+            newString: content,
+            op: "create",
+          },
+        };
+      }
+      case "delete_file": {
+        const path = assertWorkspaceRelativePath(String(args.path));
+        return {
+          ok: true,
+          output: `Proposed delete ${path}`,
+          summary: `Proposed delete ${path}`,
+          patchProposal: {
+            path,
+            oldString: "",
+            newString: "",
+            op: "delete",
+          },
         };
       }
       case "grep": {
@@ -171,7 +241,7 @@ export async function runTool(
       case "run_shell": {
         const command = String(args.command || "");
         if (!command.trim()) return { ok: false, output: "Empty command", summary: "Failed" };
-        // Soft guardrails
+        // Soft guardrails (hard-blocked patterns); runtime owns classifyShell/approval
         if (/\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?\/\b/.test(command) || command.includes("mkfs")) {
           return { ok: false, output: "Command blocked by safety policy", summary: "Blocked" };
         }

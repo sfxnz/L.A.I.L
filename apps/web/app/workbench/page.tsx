@@ -203,6 +203,15 @@ export default function WorkbenchPage() {
         setBusy(false);
         setActiveRunId(null);
         clearStreamingText();
+        // Drop transient status lines ("Working…", "Thinking…") so they don't sit under the answer
+        // Keep thought / tools / patches / errors for the run trail
+        useLabStore.setState((s) => ({
+          timeline: s.timeline.filter(
+            (it) =>
+              it.kind !== "status" ||
+              (typeof it.meta?.phase === "string" && it.meta.phase === "start"),
+          ),
+        }));
         if (session) {
           api.sessions.get(session.id).then((full) => {
             setMessages(full.messages.map((m) => ({ role: m.role, content: m.content })));
@@ -379,49 +388,74 @@ export default function WorkbenchPage() {
             )}
 
             <div className="mx-auto max-w-2xl space-y-4">
-              {messages.map((m, i) =>
-                m.role === "user" ? (
-                  <div key={i} className="flex justify-end">
-                    <div className="max-w-[90%] rounded-2xl bg-[#2a2a2a] px-3.5 py-2 text-[13px] leading-relaxed text-[#e8e8e8]">
+              {(() => {
+                // Cursor-like order: history → last user → stream (thought/tools) → streaming draft → answer
+                let lastUser = -1;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (messages[i].role === "user") {
+                    lastUser = i;
+                    break;
+                  }
+                }
+                const before =
+                  lastUser >= 0 ? messages.slice(0, lastUser + 1) : messages;
+                const after = lastUser >= 0 ? messages.slice(lastUser + 1) : [];
+                const showStream =
+                  busy || streamBlocks.length > 0 || Boolean(streamingText);
+
+                const renderMsg = (
+                  m: { role: string; content: string },
+                  i: number,
+                  keyPrefix: string,
+                ) =>
+                  m.role === "user" ? (
+                    <div key={`${keyPrefix}-${i}`} className="flex justify-end">
+                      <div className="max-w-[90%] rounded-2xl bg-[#2a2a2a] px-3.5 py-2 text-[13px] leading-relaxed text-[#e8e8e8]">
+                        {m.content}
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      key={`${keyPrefix}-${i}`}
+                      className="text-[13px] leading-relaxed text-[#cfcfcf] whitespace-pre-wrap"
+                    >
                       {m.content}
                     </div>
-                  </div>
-                ) : (
-                  <div
-                    key={i}
-                    className="text-[13px] leading-relaxed text-[#cfcfcf] whitespace-pre-wrap"
-                  >
-                    {m.content}
-                  </div>
-                ),
-              )}
+                  );
 
-              {(busy || streamBlocks.length > 0 || streamingText) && (
-                <div className="space-y-2">
-                  {streamBlocks.map((b, i) => (
-                    <StreamBlockView key={i} block={b} />
-                  ))}
-                  {streamingText ? (
-                    <div
-                      className="text-[13px] leading-relaxed text-[#cfcfcf] whitespace-pre-wrap"
-                      data-testid="streaming-draft"
-                    >
-                      {streamingText}
-                      {busy && (
-                        <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-[#888] align-middle" />
-                      )}
-                    </div>
-                  ) : null}
-                  {busy && (
-                    <div className="flex items-center gap-2 text-[12px] text-[#777]">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      {STREAM_MARKERS.working}
-                      {cmdCount > 0 ? ` · ${cmdCount} tools` : ""}
-                      {shellApproval ? " · waiting for shell approval" : ""}
-                    </div>
-                  )}
-                </div>
-              )}
+                return (
+                  <>
+                    {before.map((m, i) => renderMsg(m, i, "b"))}
+                    {showStream && (
+                      <div className="space-y-2">
+                        {streamBlocks.map((b, i) => (
+                          <StreamBlockView key={i} block={b} />
+                        ))}
+                        {streamingText ? (
+                          <div
+                            className="text-[13px] leading-relaxed text-[#cfcfcf] whitespace-pre-wrap"
+                            data-testid="streaming-draft"
+                          >
+                            {streamingText}
+                            {busy && (
+                              <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-[#888] align-middle" />
+                            )}
+                          </div>
+                        ) : null}
+                        {busy && (
+                          <div className="flex items-center gap-2 text-[12px] text-[#777]">
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            {STREAM_MARKERS.working}
+                            {cmdCount > 0 ? ` · ${cmdCount} tools` : ""}
+                            {shellApproval ? " · waiting for shell approval" : ""}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {after.map((m, i) => renderMsg(m, i, "a"))}
+                  </>
+                );
+              })()}
               <div ref={bottomRef} />
             </div>
           </div>

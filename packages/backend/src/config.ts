@@ -10,7 +10,10 @@ export const config = {
   root,
   dataDir: resolve(process.env.LAIL_DATA_DIR || join(root, "data")),
   workspacesDir: resolve(process.env.LAIL_WORKSPACES_DIR || join(root, "workspaces")),
-  dbPath: resolve(process.env.LAIL_DATA_DIR || join(root, "data"), "lail.sqlite"),
+  dbPath: resolve(
+    process.env.LAIL_DB_PATH ||
+      join(process.env.LAIL_DATA_DIR || join(root, "data"), "lail.sqlite"),
+  ),
   defaultBackend: (process.env.LAIL_DEFAULT_BACKEND || "vllm") as "vllm" | "llamacpp",
   defaultModel: process.env.LAIL_DEFAULT_MODEL || "auto",
   backends: {

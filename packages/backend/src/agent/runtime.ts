@@ -65,8 +65,8 @@ function now() {
 }
 
 function publish(runId: string, event: Record<string, unknown>) {
+  // Single channel only — clients default to "*" and dual-publish was doubling the UI stream
   wsHub.publish(`agent:${runId}`, { runId, ...event });
-  wsHub.publish("agent", { runId, ...event });
 }
 
 function extractText(msg: LlmMessage | null | undefined): string {

@@ -122,7 +122,8 @@ export default function WorkbenchPage() {
 
   useEffect(() => {
     return onWsEvent((event, channel) => {
-      if (!channel.startsWith("agent")) return;
+      // Only agent run channels (agent:<uuid>). Ignore broadcast "agent" if any old publishers remain.
+      if (!channel.startsWith("agent:")) return;
       const type = String(event.type || "");
       const runId = String(event.runId || "");
       if (activeRunId && runId && runId !== activeRunId) return;
@@ -279,7 +280,6 @@ export default function WorkbenchPage() {
       );
       setActiveRunId(runId);
       wsSubscribe(`agent:${runId}`);
-      wsSubscribe("agent");
     } catch (e) {
       pushTimeline({
         kind: "error",
@@ -674,11 +674,8 @@ function StreamBlockView({ block }: { block: StreamBlock }) {
     );
   }
   if (block.type === "status") {
-    return (
-      <p className="text-[12px] text-[#777]">
-        <span className="font-medium text-[#888]">{STREAM_MARKERS.working}</span> {block.text}
-      </p>
-    );
+    // Status text is already human-readable ("Working on…", "Running read_file…") — no extra "Working" prefix
+    return <p className="text-[12px] text-[#777]">{block.text}</p>;
   }
   if (block.type === "file") {
     return (

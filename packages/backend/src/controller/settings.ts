@@ -10,7 +10,20 @@ function defaults(): LabSettings {
     defaultModel: config.defaultModel,
     backends: { ...config.backends },
     hfToken: config.hfToken || undefined,
+    contextBudgetChars: 32_000,
+    contextMaxFileChars: 200_000,
+    contextMaxSearchHits: 30,
   };
+}
+
+function clampBudget(n: number): number {
+  return Math.min(500_000, Math.max(2_000, n));
+}
+
+function coercePositiveInt(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
 }
 
 /** Strip legacy backends (ollama, lmstudio, custom) from stored settings. */
@@ -42,6 +55,17 @@ function sanitize(raw: Partial<LabSettings> & { backends?: Record<string, unknow
     defaultModel: raw.defaultModel || base.defaultModel,
     backends,
     hfToken: raw.hfToken ?? base.hfToken,
+    contextBudgetChars: clampBudget(
+      coercePositiveInt(raw.contextBudgetChars, base.contextBudgetChars!),
+    ),
+    contextMaxFileChars: coercePositiveInt(
+      raw.contextMaxFileChars,
+      base.contextMaxFileChars!,
+    ),
+    contextMaxSearchHits: coercePositiveInt(
+      raw.contextMaxSearchHits,
+      base.contextMaxSearchHits!,
+    ),
   };
 }
 

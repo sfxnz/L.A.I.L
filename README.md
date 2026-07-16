@@ -128,7 +128,7 @@ Then open http://127.0.0.1:3000 on the Mac.
 
 ## Workbench (agentic IDE)
 
-Phase A delivers a **Cursor-style agent platform** (modes, review-first patches, cancel, shell approval). Spec: [docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md). Later phases (Monaco, context index, terminal panel, etc.) are still planned.
+**Phase A** delivers a Cursor-style agent platform (modes, review-first patches, cancel, shell approval). **Phase B** adds a **context engine**: open tabs + `@` mentions packed into each agent run under a configurable character budget. Specs: [Phase A design](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B design](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md). Later phases (Monaco, terminal panel, etc.) are still planned.
 
 1. Open **Workbench** (or `/`).  
 2. Ensure vLLM or llama.cpp is healthy (**Status** / **Server**).  
@@ -144,6 +144,7 @@ Phase A delivers a **Cursor-style agent platform** (modes, review-first patches,
 5. **Patches**: Accept / Reject per change (or Accept all). Disk and editor tabs update only after Accept.  
 6. **Cancel** stops an in-flight run; **risky shell** commands pause for Allow / Deny.  
 7. Use **Save** after manual edits in editor tabs.  
+8. **Context (Phase B)**: open editor tabs are auto-included; type `@` in Composer for a path popup (`@file path`), or use `@folder`, `@search "query"`, `@code`. Context chips show mentions + open tab count. Adjust **Configure → Context budget (chars)** (default 32000).
 
 **Composer stream labels** (inspo-style):
 

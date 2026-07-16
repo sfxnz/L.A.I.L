@@ -81,6 +81,12 @@ describe("shipped Workbench source chrome", () => {
     expect(wb).toMatch(/ModeToggle|agentMode|Plan/);
     expect(wb).toMatch(/PatchReview|pendingPatches|patches\.accept/);
   });
+
+  test("Phase B context: MentionPopup / parseMentions / editorSnapshot", () => {
+    expect(wb).toMatch(/MentionPopup|parseMentions/);
+    expect(wb).toContain("editorSnapshot");
+    expect(wb).toMatch(/ContextChips|parseMentions/);
+  });
 });
 
 describe("default entry", () => {

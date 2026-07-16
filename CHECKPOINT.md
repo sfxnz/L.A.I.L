@@ -4,18 +4,18 @@ Session handoff. Read this before continuing lab work.
 
 ## What this product is
 
-**Cursor-style local agentic IDE** + lab tooling. **Phase A** (agent platform) is in: modes, review-first patches, streaming/cancel, risky shell approval.
+**Cursor-style local agentic IDE** + lab tooling. **Phase A** (agent platform) is in: modes, review-first patches, streaming/cancel, risky shell approval. **Phase B** (context engine) is in: `EditorSnapshot`, `@file`/`@folder`/`@search` mentions, open-tab packing, Configure context budget.
 
 | Surface | Role |
 |---------|------|
-| **Workbench** | Primary — Composer (Plan / Ask / Agent), patch review Accept/Reject, shell approval, cancel, file tabs, Status rail |
+| **Workbench** | Primary — Composer (Plan / Ask / Agent), @mentions + context chips, patch review Accept/Reject, shell approval, cancel, file tabs, Status rail |
 | **Server** | vLLM Lab Safe / Workflow Max, smoke, perf, agentic, history |
 | **Models** | HF search + download for vLLM/llama.cpp |
-| **Usage / Configure / Status** | Metering, backends, health |
+| **Usage / Configure / Status** | Metering, backends, context budget, health |
 
 Path: `~/projects/ai-lab/local-ai-lab`  
 Legacy GUI: `~/projects/ai-lab/local-ai-lab-legacy`  
-Design: [docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md)
+Design: [Phase A](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md)
 
 ## Start
 
@@ -50,30 +50,37 @@ Same as legacy lab:
 - **0.4** Lab Safe · **0.7–0.85** Workflow Max with free RAM buffer  
 - One large model at a time; trust `free -h` available more than `docker stats` on UMA  
 
-## Phase A Workbench (handoff)
+## Phase A + B Workbench (handoff)
 
 - **Modes**: Plan (no edits) · Ask (read-only) · Agent (tools + pending patches)  
 - **Patches**: review-first; Accept / Reject / Accept all before disk write  
 - **Streaming** + mid-run **Cancel**  
 - **Risky shell**: approval banner Allow / Deny  
-- UI: `ModeToggle`, `PatchReviewPanel`, `ShellApprovalBanner` under `apps/web/components/workbench/`  
-- Backend agent modules: `packages/backend/src/agent/` (runtime, patch-store, tool-policy, approvals)  
-- Phases B–E (Monaco, context index, terminal, …) still planned — see design spec  
+- **Context (Phase B)**: client builds `EditorSnapshot` (open tabs, active path, selection, mentions); server `ContextPacker` re-reads disk, runs rg for `@search`, applies ignore + budget  
+- Composer UI: type `@` → `MentionPopup` inserts `@file path`; `ContextChips` show mentions + open tab count  
+- **Configure → Context budget (chars)** (`contextBudgetChars`, default 32000)  
+- UI: `ModeToggle`, `PatchReviewPanel`, `ShellApprovalBanner`, `MentionPopup`, `ContextChips` under `apps/web/components/workbench/`  
+- Backend: `packages/backend/src/agent/` + `agent/context/` (mentions, packer, budget, ignore, search)  
+- Phases C–E (Monaco, terminal, …) still planned — see design specs  
 
 ## Code map
 
 ```text
 apps/web/components/layout/AppShell.tsx          # Sidebar inspo shell
-apps/web/app/workbench/page.tsx                  # IDE composer + editor + status + Phase A UI
+apps/web/app/workbench/page.tsx                  # IDE composer + editor + status + Phase A/B UI
 apps/web/components/workbench/ModeToggle.tsx     # Plan | Ask | Agent
+apps/web/components/workbench/MentionPopup.tsx   # @ path popup
+apps/web/components/workbench/ContextChips.tsx   # mention + open-tab chips
 apps/web/components/workbench/PatchReviewPanel.tsx
 apps/web/components/workbench/ShellApprovalBanner.tsx
+apps/web/lib/mentions.ts                         # client parseMentions
 apps/web/lib/ide-chrome.ts                       # Labels + groupTimeline (tested)
 apps/web/lib/store.ts                            # agentMode, pendingPatches
 packages/backend/src/agent/                      # Runtime, PatchStore, ToolPolicy, approvals
-packages/backend/src/controller/agent.ts         # Composer agent HTTP/WS
+packages/backend/src/agent/context/              # ContextPacker, mentions, budget, rg search
+packages/backend/src/controller/agent.ts         # Composer agent HTTP/WS (+ editorSnapshot)
 packages/backend/src/controller/patches.ts       # Accept / reject patches
-packages/backend/src/controller/settings.ts      # resolveModelId
+packages/backend/src/controller/settings.ts      # resolveModelId + contextBudgetChars
 packages/serve-engine/                           # vLLM serve/bench
 ```
 
@@ -88,6 +95,6 @@ cd packages/backend && bun test
 ## Related
 
 - Full setup: [README.md](./README.md)  
-- Design: [docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md)  
-- Phase A plan: [docs/superpowers/plans/2026-07-16-lail-phase-a-agent-platform.md](./docs/superpowers/plans/2026-07-16-lail-phase-a-agent-platform.md)  
+- Design: [Phase A](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md)  
+- Plans: [Phase A](./docs/superpowers/plans/2026-07-16-lail-phase-a-agent-platform.md) · [Phase B](./docs/superpowers/plans/2026-07-16-lail-phase-b-context-engine.md)  
 - Env template: [.env.example](./.env.example)  

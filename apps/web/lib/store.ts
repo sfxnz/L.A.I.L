@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import type { Session, Workspace } from "./api";
+import type { AgentMode, Patch, Session, Workspace } from "./api";
 
 export type TimelineItem = {
   id: string;
@@ -17,6 +17,12 @@ export type OpenFile = {
   dirty?: boolean;
 };
 
+type ShellApproval = {
+  runId: string;
+  approvalId: string;
+  command: string;
+};
+
 type LabStore = {
   workspace: Workspace | null;
   session: Session | null;
@@ -28,6 +34,10 @@ type LabStore = {
   editorOpen: boolean;
   statusPanelOpen: boolean;
   modelLabel: string | null;
+  agentMode: AgentMode;
+  pendingPatches: Patch[];
+  shellApproval: ShellApproval | null;
+  streamingText: string;
   setWorkspace: (w: Workspace | null) => void;
   setSession: (s: Session | null) => void;
   setSessions: (s: Session[]) => void;
@@ -41,6 +51,12 @@ type LabStore = {
   setEditorOpen: (v: boolean) => void;
   setStatusPanelOpen: (v: boolean) => void;
   setModelLabel: (m: string | null) => void;
+  setAgentMode: (m: AgentMode) => void;
+  setPendingPatches: (p: Patch[]) => void;
+  upsertPatch: (p: Patch) => void;
+  setShellApproval: (v: ShellApproval | null) => void;
+  appendStreamingText: (t: string) => void;
+  clearStreamingText: () => void;
 };
 
 export const useLabStore = create<LabStore>((set) => ({
@@ -54,6 +70,10 @@ export const useLabStore = create<LabStore>((set) => ({
   editorOpen: true,
   statusPanelOpen: true,
   modelLabel: null,
+  agentMode: "agent",
+  pendingPatches: [],
+  shellApproval: null,
+  streamingText: "",
   setWorkspace: (workspace) => set({ workspace }),
   setSession: (session) => set({ session }),
   setSessions: (sessions) => set({ sessions }),
@@ -101,4 +121,26 @@ export const useLabStore = create<LabStore>((set) => ({
   setEditorOpen: (editorOpen) => set({ editorOpen }),
   setStatusPanelOpen: (statusPanelOpen) => set({ statusPanelOpen }),
   setModelLabel: (modelLabel) => set({ modelLabel }),
+  setAgentMode: (agentMode) => set({ agentMode }),
+  setPendingPatches: (pendingPatches) => set({ pendingPatches }),
+  upsertPatch: (p) =>
+    set((s) => {
+      // Keep only pending patches in the list; remove when status changes away from pending
+      if (p.status !== "pending") {
+        return {
+          pendingPatches: s.pendingPatches.filter((x) => x.id !== p.id),
+        };
+      }
+      const idx = s.pendingPatches.findIndex((x) => x.id === p.id);
+      if (idx >= 0) {
+        const pendingPatches = s.pendingPatches.slice();
+        pendingPatches[idx] = p;
+        return { pendingPatches };
+      }
+      return { pendingPatches: [...s.pendingPatches, p] };
+    }),
+  setShellApproval: (shellApproval) => set({ shellApproval }),
+  appendStreamingText: (t) =>
+    set((s) => ({ streamingText: s.streamingText + t })),
+  clearStreamingText: () => set({ streamingText: "" }),
 }));

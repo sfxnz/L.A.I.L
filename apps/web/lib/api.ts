@@ -129,11 +129,41 @@ export const api = {
     patch: (id: string, body: Partial<Session>) =>
       req<Session>(`/api/sessions/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   },
-  agentRun: (sessionId: string, message: string, workspaceId?: string) =>
+  agentRun: (
+    sessionId: string,
+    message: string,
+    workspaceId?: string,
+    mode: AgentMode = "agent",
+  ) =>
     req<{ runId: string }>("/api/agent/run", {
       method: "POST",
-      body: JSON.stringify({ sessionId, message, workspaceId }),
+      body: JSON.stringify({ sessionId, message, workspaceId, mode }),
     }),
+  cancelAgentRun: (runId: string) =>
+    req<{ ok: boolean }>(`/api/agent/runs/${runId}/cancel`, { method: "POST" }),
+  shellApproval: (runId: string, approvalId: string, decision: "allow" | "deny") =>
+    req<{ ok: boolean }>(`/api/agent/runs/${runId}/shell-approvals/${approvalId}`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    }),
+  patches: {
+    list: (q: { sessionId?: string; runId?: string; status?: string } = {}) => {
+      const sp = new URLSearchParams();
+      if (q.sessionId) sp.set("sessionId", q.sessionId);
+      if (q.runId) sp.set("runId", q.runId);
+      if (q.status) sp.set("status", q.status);
+      return req<Patch[]>(`/api/patches?${sp}`);
+    },
+    accept: (id: string) =>
+      req<Patch>(`/api/patches/${id}/accept`, { method: "POST" }),
+    reject: (id: string) =>
+      req<Patch>(`/api/patches/${id}/reject`, { method: "POST" }),
+    acceptAll: (body: { sessionId?: string; runId?: string }) =>
+      req<Patch[]>("/api/patches/accept-all", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+  },
   usage: () => req<UsageSummary>("/api/usage"),
   models: {
     local: () => req<{ local: ModelCard[] }>("/api/models"),
@@ -252,4 +282,20 @@ export type ModelCard = {
   local?: boolean;
   backends?: string[];
   pipeline_tag?: string;
+};
+
+export type AgentMode = "plan" | "ask" | "agent";
+
+export type Patch = {
+  id: string;
+  runId: string;
+  sessionId: string;
+  path: string;
+  oldString: string;
+  newString: string;
+  op: "replace" | "create" | "delete";
+  status: "pending" | "accepted" | "rejected" | "failed";
+  reason?: string;
+  createdAt: string;
+  resolvedAt?: string;
 };

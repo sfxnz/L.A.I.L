@@ -5,7 +5,7 @@ import { startAgentRun, getAgentRun, cancelAgentRun } from "./runtime";
 import { patchStore } from "./patch-store";
 import { createWorkspace } from "../controller/workspaces";
 import { createSession, addMessage } from "../controller/sessions";
-import { putSettings } from "../controller/settings";
+import { getSettings, putSettings } from "../controller/settings";
 
 const TMP = `/tmp/lail-runtime-test-${process.pid}`;
 
@@ -72,6 +72,7 @@ function mockFetchTwoStep(): typeof fetch {
 describe("AgentRuntime", () => {
   let workspaceId: string;
   let rootPath: string;
+  let savedModel: string | undefined;
 
   beforeAll(() => {
     rmSync(TMP, { recursive: true, force: true });
@@ -80,11 +81,16 @@ describe("AgentRuntime", () => {
     const ws = createWorkspace(`runtime-test-${process.pid}`, TMP);
     workspaceId = ws.id;
     rootPath = ws.rootPath;
-    // Avoid resolveModelId probing a real backend
-    putSettings({ defaultModel: "mock-model" });
+    // Snapshot production settings — tests must not leave mock-model stuck in lab DB
+    savedModel = getSettings().defaultModel;
+    // Prefer a real served id when available; mock-model is treated as auto-resolve
+    putSettings({ defaultModel: "auto" });
   });
 
   afterAll(() => {
+    if (savedModel !== undefined) {
+      putSettings({ defaultModel: savedModel });
+    }
     rmSync(TMP, { recursive: true, force: true });
   });
 

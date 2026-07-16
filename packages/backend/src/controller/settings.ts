@@ -112,7 +112,8 @@ export function openAiBase(kind?: BackendKind): string {
 /** Placeholders that mean "use whatever the backend is serving". */
 function isPlaceholderModel(model: string | undefined | null): boolean {
   const m = (model || "").trim().toLowerCase();
-  return !m || m === "default" || m === "auto" || m === "none";
+  // mock-model is used only in unit tests — never treat as a real served id
+  return !m || m === "default" || m === "auto" || m === "none" || m === "mock-model";
 }
 
 /**

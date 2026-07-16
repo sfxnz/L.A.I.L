@@ -101,6 +101,12 @@ export default function WorkbenchPage() {
       if (s) {
         const full = await api.sessions.get(s.id);
         setMessages(full.messages.map((m) => ({ role: m.role, content: m.content })));
+        // Session switch (sidebar New / Tasks) — reset stream UI for this session
+        clearTimeline();
+        clearStreamingText();
+        setCmdCount(0);
+        setBusy(false);
+        setActiveRunId(null);
       }
     })().catch(console.error);
   }, [session?.id, workspace?.id]);

@@ -469,10 +469,12 @@ export default function WorkbenchPage() {
                     <button
                       type="button"
                       onClick={() => void newChat()}
-                      className="rounded-md p-1.5 text-[#666] hover:bg-[#222] hover:text-[#ccc]"
-                      title="New chat"
+                      className="flex items-center gap-1 rounded-md border border-[#2a2a2a] bg-[#1a1a1a] px-2 py-1 text-[11px] text-[#bbb] hover:border-[#3a3a3a] hover:bg-[#222] hover:text-white"
+                      title="Start a new Composer chat (clears the current stream)"
+                      aria-label="New chat"
                     >
-                      <Plus className="h-3.5 w-3.5" />
+                      <Plus className="h-3.5 w-3.5" strokeWidth={2} />
+                      New chat
                     </button>
                     <ModeToggle value={agentMode} onChange={setAgentMode} />
                   </div>

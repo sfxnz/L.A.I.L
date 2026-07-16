@@ -12,6 +12,7 @@ import {
   FolderOpen,
   Gauge,
   LayoutDashboard,
+  Plus,
   Plug,
   Search,
   Server,
@@ -174,8 +175,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             )}
           </div>
 
-          <div className="mb-1 px-2 text-[10px] font-medium uppercase tracking-wider text-[#555]">
-            Tasks
+          <div className="mb-1 flex items-center justify-between px-2">
+            <span className="text-[10px] font-medium uppercase tracking-wider text-[#555]">
+              Tasks
+            </span>
+            <button
+              type="button"
+              className="flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px] text-[#888] hover:bg-[#1c1c1c] hover:text-white"
+              title="New chat"
+              aria-label="New chat"
+              onClick={async () => {
+                const s = await api.sessions.create("Composer", workspace?.id);
+                setSession(s);
+                setSessions(await api.sessions.list());
+                router.push("/workbench");
+              }}
+            >
+              <Plus className="h-3 w-3" strokeWidth={2} />
+              New
+            </button>
           </div>
           <div className="mb-3 space-y-0.5" aria-label="Tasks">
             {filteredSessions.slice(0, 10).map((s) => (

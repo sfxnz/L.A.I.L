@@ -34,14 +34,41 @@ export type ChatMessage = {
   meta?: Record<string, unknown>;
 };
 
+export type AgentMode = "plan" | "ask" | "agent";
+
+export type PatchOp = "replace" | "create" | "delete";
+
+export type PatchStatus = "pending" | "accepted" | "rejected" | "failed";
+
+export type Patch = {
+  id: string;
+  runId: string;
+  sessionId: string;
+  path: string;
+  oldString: string;
+  newString: string;
+  op: PatchOp;
+  status: PatchStatus;
+  reason?: string;
+  createdAt: string;
+  resolvedAt?: string;
+};
+
+export type AgentRunStatus = "running" | "done" | "error" | "cancelled";
+
 export type AgentEvent =
   | { type: "thought"; runId: string; text: string }
+  | { type: "token"; runId: string; text: string; channel?: "assistant" | "thought" }
   | { type: "status"; runId: string; text: string }
   | { type: "tool_start"; runId: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_end"; runId: string; tool: string; summary: string; output?: string }
-  | { type: "file_write"; runId: string; path: string; bytes: number }
+  | { type: "patch_proposed"; runId: string; patch: Patch }
+  | { type: "patch_updated"; runId: string; patch: Patch }
+  | { type: "shell_approval_required"; runId: string; approvalId: string; command: string }
+  | { type: "file_write"; runId: string; path: string; bytes: number } // after accept only
   | { type: "assistant"; runId: string; text: string; delta?: boolean }
   | { type: "done"; runId: string; usage?: { prompt: number; completion: number } }
+  | { type: "cancelled"; runId: string }
   | { type: "error"; runId: string; message: string };
 
 export type DownloadEvent =

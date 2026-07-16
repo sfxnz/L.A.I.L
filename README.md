@@ -25,10 +25,14 @@ Left sidebar:
 
 **Workbench** (default home):
 
+- **Modes**: **Plan** · **Ask** · **Agent** (toggle in Composer)  
 - Composer stream: user bubble → **Thought** → **Ran N command(s)** → **Creating** / file write → final answer  
-- Bottom bar: **Ask for follow-up changes** · model label · send  
+- **Review-first patches**: Accept / Reject (or Accept all) before disk writes  
+- Streaming replies with **Cancel** mid-run  
+- **Risky shell** approval banner (Allow / Deny) for destructive commands  
+- Bottom bar: **Ask for follow-up changes** · mode · model label · send / stop  
 - Optional **editor** tabs when the agent writes (or you open) a project file  
-- Right **Status** rail: session state, model, workspace  
+- Right **Status** rail: session state, model, workspace, pending patches  
 
 Lab pages (same dark chrome): **Models** (HF search / download), **Server** (full vLLM serve + perf/agentic/history), **Usage**, **Configure**, **Status**, **Integrations**.
 
@@ -124,11 +128,22 @@ Then open http://127.0.0.1:3000 on the Mac.
 
 ## Workbench (agentic IDE)
 
+Phase A delivers a **Cursor-style agent platform** (modes, review-first patches, cancel, shell approval). Spec: [docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md). Later phases (Monaco, context index, terminal panel, etc.) are still planned.
+
 1. Open **Workbench** (or `/`).  
 2. Ensure vLLM or llama.cpp is healthy (**Status** / **Server**).  
 3. Set **Configure → Default model** to the served model id (or leave auto).  
-4. Ask the agent to explore files, run shell (cwd = workspace), edit/create docs.  
-5. Written files open in **editor tabs**; use **Save** after manual edits.  
+4. Pick a mode, then prompt the agent:
+
+| Mode | Behavior |
+|------|----------|
+| **Plan** | Design / outline only — no file edits or patches |
+| **Ask** | Read-only tools (explore, answer) — no writes |
+| **Agent** | Full tools; edits land as **pending patches** until you Accept |
+
+5. **Patches**: Accept / Reject per change (or Accept all). Disk and editor tabs update only after Accept.  
+6. **Cancel** stops an in-flight run; **risky shell** commands pause for Allow / Deny.  
+7. Use **Save** after manual edits in editor tabs.  
 
 **Composer stream labels** (inspo-style):
 
@@ -136,12 +151,10 @@ Then open http://127.0.0.1:3000 on the Mac.
 |----|---------|
 | **Thought** | Model reasoning step |
 | **Ran N command(s)** | Completed tool calls (counts **tool_end** only) |
-| **Creating path** | File write; opens editor tab |
+| **Creating path** | File write / patch proposal; may open editor tab |
 | **Working** | In-progress turn |
 
 Bottom placeholder: **Ask for follow-up changes**.
-
-Offline fallback: if the LLM is down, tools can still run for simple file work (e.g. survival guide path).
 
 ## Server (vLLM serve & evals)
 

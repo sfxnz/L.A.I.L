@@ -134,10 +134,11 @@ export const api = {
     message: string,
     workspaceId?: string,
     mode: AgentMode = "agent",
+    editorSnapshot?: EditorSnapshot,
   ) =>
     req<{ runId: string }>("/api/agent/run", {
       method: "POST",
-      body: JSON.stringify({ sessionId, message, workspaceId, mode }),
+      body: JSON.stringify({ sessionId, message, workspaceId, mode, editorSnapshot }),
     }),
   cancelAgentRun: (runId: string) =>
     req<{ ok: boolean }>(`/api/agent/runs/${runId}/cancel`, { method: "POST" }),
@@ -256,6 +257,30 @@ export type Settings = {
   defaultModel: string;
   backends: Record<string, { url: string; enabled: boolean; label: string }>;
   hfToken?: string;
+  contextBudgetChars?: number;
+  contextMaxFileChars?: number;
+  contextMaxSearchHits?: number;
+};
+
+/** Mirrors @lail/shared ContextMention */
+export type ContextMention =
+  | { type: "file"; path: string }
+  | { type: "folder"; path: string }
+  | { type: "search"; query: string };
+
+export type EditorSelection = {
+  path: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+};
+
+/** Mirrors @lail/shared EditorSnapshot — client → server context pack */
+export type EditorSnapshot = {
+  openFiles: Array<{ path: string; content?: string }>;
+  activePath?: string | null;
+  selection?: EditorSelection | null;
+  mentions: ContextMention[];
 };
 
 export type UsageSummary = {

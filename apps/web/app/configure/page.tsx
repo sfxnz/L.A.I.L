@@ -28,7 +28,7 @@ export default function ConfigurePage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Settings</h1>
-          <p className="page-sub">vLLM / llama.cpp · default model · HF token</p>
+          <p className="page-sub">vLLM / llama.cpp · default model · HF token · context budget</p>
         </div>
       </div>
 
@@ -61,6 +61,25 @@ export default function ConfigurePage() {
             onChange={(e) => setSettings({ ...settings, hfToken: e.target.value })}
             placeholder="hf_…"
           />
+        </Field>
+        <Field label="Context budget (chars)">
+          <Input
+            type="number"
+            min={2000}
+            step={1000}
+            value={settings.contextBudgetChars ?? 32_000}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              setSettings({
+                ...settings,
+                contextBudgetChars: Number.isFinite(n) ? n : 32_000,
+              });
+            }}
+          />
+          <p className="mt-1 text-[11px] text-lab-muted">
+            Max characters packed from open tabs, @mentions, and search hits per agent run
+            (default 32000, min 2000).
+          </p>
         </Field>
       </Panel>
 

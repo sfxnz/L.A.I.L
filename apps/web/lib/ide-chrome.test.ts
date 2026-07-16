@@ -4,6 +4,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  AGENT_MODES,
+  AGENT_MODE_LABELS,
   COMPOSER_PLACEHOLDER,
   SIDEBAR_SECTION_LABELS,
   STREAM_MARKERS,
@@ -52,13 +54,29 @@ describe("ide-chrome composer / stream", () => {
     expect(COMPOSER_PLACEHOLDER).toBe("Ask for follow-up changes");
   });
 
-  test("stream markers include Thought, Working, Ran, Creating, Status", () => {
+  test("stream markers include Thought, Working, Ran, Creating, Status, Proposed", () => {
     expect(STREAM_MARKERS.thought).toBe("Thought");
     expect(STREAM_MARKERS.working).toBe("Working");
     expect(STREAM_MARKERS.ran).toBe("Ran");
     expect(STREAM_MARKERS.creating).toBe("Creating");
     expect(STREAM_MARKERS.status).toBe("Status");
+    expect(STREAM_MARKERS.proposed).toBe("Proposed");
   });
+
+  test("agent modes expose Cursor-style Plan / Ask / Agent labels", () => {
+    expect([...AGENT_MODES]).toEqual(["plan", "ask", "agent"]);
+    expect(AGENT_MODE_LABELS.plan).toBe("Plan");
+    expect(AGENT_MODE_LABELS.ask).toBe("Ask");
+    expect(AGENT_MODE_LABELS.agent).toBe("Agent");
+  });
+
+  test("groupTimeline maps patch kind to patch stream block", () => {
+    const blocks = groupTimeline([
+      { kind: "patch", text: "apps/web/lib/ide-chrome.ts" },
+    ]);
+    expect(blocks).toEqual([{ type: "patch", path: "apps/web/lib/ide-chrome.ts" }]);
+  });
+
 
   test("one tool_start + tool_end pair counts as Ran 1 command (not 2)", () => {
     // Real WS pairing: tool_start → kind tool (ignored for count), tool_end → kind ran

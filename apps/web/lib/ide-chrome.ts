@@ -33,12 +33,16 @@ export const WORKSPACE_NAV = [
 
 export const COMPOSER_PLACEHOLDER = "Ask for follow-up changes";
 
+export const AGENT_MODES = ["plan", "ask", "agent"] as const;
+export const AGENT_MODE_LABELS = { plan: "Plan", ask: "Ask", agent: "Agent" } as const;
+
 export const STREAM_MARKERS = {
   thought: "Thought",
   working: "Working",
   ran: "Ran",
   creating: "Creating",
   status: "Status",
+  proposed: "Proposed",
 } as const;
 
 export type TimelineKind =
@@ -48,7 +52,8 @@ export type TimelineKind =
   | "file"
   | "assistant"
   | "error"
-  | "ran";
+  | "ran"
+  | "patch";
 
 export type TimelineInput = {
   kind: TimelineKind | string;
@@ -61,6 +66,7 @@ export type StreamBlock =
   | { type: "thought"; text: string }
   | { type: "status"; text: string }
   | { type: "file"; path: string; creating?: boolean }
+  | { type: "patch"; path: string }
   | { type: "error"; text: string }
   | { type: "assistant"; text: string };
 
@@ -99,6 +105,7 @@ export function groupTimeline(items: TimelineInput[]): StreamBlock[] {
     else if (it.kind === "status") out.push({ type: "status", text: it.text });
     else if (it.kind === "file")
       out.push({ type: "file", path: it.text, creating: !!it.meta?.creating });
+    else if (it.kind === "patch") out.push({ type: "patch", path: it.text });
     else if (it.kind === "error") out.push({ type: "error", text: it.text });
     // assistant is rendered from messages[], not the stream (avoids duplicate bubbles)
   }

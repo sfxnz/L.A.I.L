@@ -1,0 +1,22 @@
+{
+  "name": "lail",
+  "private": true,
+  "version": "0.1.0",
+  "description": "L.A.I.L — Local AI Lab",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run scripts/dev.ts",
+    "dev:web": "bun run --filter @lail/web dev",
+    "dev:api": "bun run --filter @lail/backend dev",
+    "build": "bun run --filter @lail/web build && bun run --filter @lail/backend build",
+    "start": "bun run --filter @lail/backend start",
+    "typecheck": "bun run --filter @lail/backend typecheck && bun run --filter @lail/web typecheck"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

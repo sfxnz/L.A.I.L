@@ -1,0 +1,59 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    ports:
+      - "8787:8787"
+    environment:
+      LAIL_HOST: 0.0.0.0
+      LAIL_API_PORT: 8787
+      LAIL_SERVE_ENGINE_URL: http://serve-engine:8765
+      LAIL_DEFAULT_BACKEND: vllm
+      LAIL_VLLM_URL: http://host.docker.internal:8000
+      LAIL_LLAMACPP_URL: http://host.docker.internal:8080
+      LAIL_DATA_DIR: /data
+      LAIL_WORKSPACES_DIR: /workspaces
+    volumes:
+      - lail-data:/data
+      - ./workspaces:/workspaces
+    depends_on:
+      - serve-engine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  serve-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: serve-engine
+    ports:
+      - "8765:8765"
+    environment:
+      LOCAL_AI_LAB_ROOT: /app
+      LAIL_DATA_DIR: /data
+      LAB_API_PORT: 8765
+      LAB_BASE_URL: http://host.docker.internal:8000
+    volumes:
+      - lail-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    ports:
+      - "3000:3000"
+    environment:
+      LAIL_API_URL: http://api:8787
+      NEXT_PUBLIC_LAIL_API: http://localhost:8787
+      NEXT_PUBLIC_LAIL_WS: ws://localhost:8787/ws
+    depends_on:
+      - api
+
+volumes:
+  lail-data:

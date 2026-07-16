@@ -201,7 +201,7 @@ describe("AgentRuntime", () => {
     expect(ok).toBe(true);
 
     const finished = await waitForRun(runId, 3000);
-    // cancelled or done (if LLM finished before cancel took effect) — prefer cancelled
-    expect(["cancelled", "done", "error"]).toContain(finished.status);
+    // Cancel during LLM must not become done after a late successful response
+    expect(finished.status).toBe("cancelled");
   });
 });

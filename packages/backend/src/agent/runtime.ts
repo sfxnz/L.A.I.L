@@ -186,6 +186,60 @@ function isCancelled(runId: string): boolean {
   return runs.get(runId)?.cancelled === true;
 }
 
+/** Exit the run as cancelled (caller should return immediately after). */
+function finishCancelled(
+  runId: string,
+  promptTokens: number,
+  completionTokens: number,
+) {
+  publish(runId, { type: "cancelled" });
+  updateRun(runId, {
+    status: "cancelled",
+    promptTokens,
+    completionTokens,
+  });
+  runs.delete(runId);
+}
+
+/**
+ * Wait for shell approval, but exit early if the run is cancelled mid-wait.
+ * Resolves "cancelled" when cancel wins; otherwise "allow" | "deny".
+ */
+function waitApprovalOrCancel(
+  runId: string,
+  approvalId: string,
+): Promise<"allow" | "deny" | "cancelled"> {
+  if (isCancelled(runId)) return Promise.resolve("cancelled");
+  const handle = runs.get(runId);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: "allow" | "deny" | "cancelled") => {
+      if (settled) return;
+      settled = true;
+      handle?.abort.signal.removeEventListener("abort", onAbort);
+      resolve(v);
+    };
+    const onAbort = () => {
+      // Unblock approvalHub so the entry does not sit until timeout
+      try {
+        approvalHub.decide(approvalId, "deny");
+      } catch {
+        /* ignore */
+      }
+      finish("cancelled");
+    };
+    if (handle?.abort.signal.aborted) {
+      onAbort();
+      return;
+    }
+    handle?.abort.signal.addEventListener("abort", onAbort);
+    approvalHub.wait(approvalId).then((d) => {
+      if (isCancelled(runId)) finish("cancelled");
+      else finish(d);
+    });
+  });
+}
+
 async function agentLoop(runId: string, opts: StartRunOpts) {
   const { sessionId, workspaceId, mode, message } = opts;
   const maxSteps = opts.maxSteps ?? DEFAULT_MAX_STEPS;
@@ -240,13 +294,7 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
   try {
     for (let step = 0; step < maxSteps; step++) {
       if (isCancelled(runId)) {
-        publish(runId, { type: "cancelled" });
-        updateRun(runId, {
-          status: "cancelled",
-          promptTokens,
-          completionTokens,
-        });
-        runs.delete(runId);
+        finishCancelled(runId, promptTokens, completionTokens);
         return;
       }
 
@@ -264,13 +312,7 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
         });
       } catch (e) {
         if (isCancelled(runId) || (e instanceof Error && e.name === "AbortError")) {
-          publish(runId, { type: "cancelled" });
-          updateRun(runId, {
-            status: "cancelled",
-            promptTokens,
-            completionTokens,
-          });
-          runs.delete(runId);
+          finishCancelled(runId, promptTokens, completionTokens);
           return;
         }
         throw e;
@@ -278,6 +320,13 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
 
       promptTokens += result.usage.prompt_tokens || 0;
       completionTokens += result.usage.completion_tokens || 0;
+
+      // Honor cancel that arrived during LLM call (e.g. fetch mock ignores AbortSignal)
+      // before treating response as final done or continuing with tools.
+      if (isCancelled(runId)) {
+        finishCancelled(runId, promptTokens, completionTokens);
+        return;
+      }
 
       const msg = result.message;
       if (!msg) break;
@@ -295,13 +344,7 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
 
         for (const tc of msg.tool_calls) {
           if (isCancelled(runId)) {
-            publish(runId, { type: "cancelled" });
-            updateRun(runId, {
-              status: "cancelled",
-              promptTokens,
-              completionTokens,
-            });
-            runs.delete(runId);
+            finishCancelled(runId, promptTokens, completionTokens);
             return;
           }
 
@@ -365,7 +408,11 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
                 approvalId,
                 command,
               });
-              const decision = await approvalHub.wait(approvalId);
+              const decision = await waitApprovalOrCancel(runId, approvalId);
+              if (decision === "cancelled" || isCancelled(runId)) {
+                finishCancelled(runId, promptTokens, completionTokens);
+                return;
+              }
               if (decision === "deny") {
                 output = "Shell command denied by user";
                 summary = "Denied";
@@ -440,6 +487,12 @@ async function agentLoop(runId: string, opts: StartRunOpts) {
         }
       }
       break;
+    }
+
+    // Final guard: do not publish done if cancel won the race after last step
+    if (isCancelled(runId)) {
+      finishCancelled(runId, promptTokens, completionTokens);
+      return;
     }
 
     if (!finalText) finalText = "Done.";

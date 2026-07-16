@@ -16,10 +16,17 @@ import {
   Terminal,
   X,
 } from "lucide-react";
+import { ContextChips } from "@/components/workbench/ContextChips";
+import {
+  MentionPopup,
+  flattenTreePaths,
+  mentionQueryAtCursor,
+} from "@/components/workbench/MentionPopup";
 import { ModeToggle } from "@/components/workbench/ModeToggle";
 import { PatchReviewPanel } from "@/components/workbench/PatchReviewPanel";
 import { ShellApprovalBanner } from "@/components/workbench/ShellApprovalBanner";
-import { api, type Patch } from "@/lib/api";
+import { api, type EditorSnapshot, type Patch, type TreeNode } from "@/lib/api";
+import { parseMentions } from "@/lib/mentions";
 import { useLabStore } from "@/lib/store";
 import {
   COMPOSER_PLACEHOLDER,
@@ -69,10 +76,17 @@ export default function WorkbenchPage() {
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([]);
   const [cmdCount, setCmdCount] = useState(0);
+  const [treePaths, setTreePaths] = useState<string[]>([]);
+  const [cursor, setCursor] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const editorTaRef = useRef<HTMLTextAreaElement>(null);
 
   const active = openFiles.find((f) => f.path === activeFile) || null;
+  const liveMentions = useMemo(() => parseMentions(input), [input]);
+  const mentionAt = useMemo(() => mentionQueryAtCursor(input, cursor), [input, cursor]);
+  const mentionOpen = Boolean(mentionAt) && !busy && !mentionDismissed;
 
   useEffect(() => {
     (async () => {
@@ -90,6 +104,17 @@ export default function WorkbenchPage() {
       }
     })().catch(console.error);
   }, [session?.id, workspace?.id]);
+
+  useEffect(() => {
+    if (!workspace?.id) {
+      setTreePaths([]);
+      return;
+    }
+    api.workspaces
+      .tree(workspace.id)
+      .then((nodes: TreeNode[]) => setTreePaths(flattenTreePaths(nodes)))
+      .catch(() => setTreePaths([]));
+  }, [workspace?.id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -191,10 +216,46 @@ export default function WorkbenchPage() {
     setShellApproval,
   ]);
 
+  function readEditorSelection(): EditorSnapshot["selection"] {
+    const el = editorTaRef.current;
+    const file = active;
+    if (!el || !file) return null;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    if (end <= start) return null;
+    const text = file.content.slice(start, end);
+    if (!text) return null;
+    const before = file.content.slice(0, start);
+    const startLine = before.split("\n").length;
+    const endLine = startLine + text.split("\n").length - 1;
+    return { path: file.path, startLine, endLine, text };
+  }
+
+  function insertMentionFile(path: string) {
+    if (!mentionAt) return;
+    const before = input.slice(0, mentionAt.start);
+    const after = input.slice(cursor);
+    const insert = `@file ${path} `;
+    const next = before + insert + after;
+    setInput(next);
+    setMentionDismissed(false);
+    const nextCursor = before.length + insert.length;
+    setCursor(nextCursor);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(nextCursor, nextCursor);
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+    });
+  }
+
   async function send(text?: string) {
     const message = (text ?? input).trim();
     if (!message || !session) return;
     setInput("");
+    setCursor(0);
     if (taRef.current) taRef.current.style.height = "auto";
     setBusy(true);
     setCmdCount(0);
@@ -202,11 +263,19 @@ export default function WorkbenchPage() {
     clearStreamingText();
     setMessages((m) => [...m, { role: "user", content: message }]);
     try {
+      const mentions = parseMentions(message);
+      const editorSnapshot: EditorSnapshot = {
+        openFiles: openFiles.map((f) => ({ path: f.path, content: f.content })),
+        activePath: activeFile,
+        selection: readEditorSelection(),
+        mentions,
+      };
       const { runId } = await api.agentRun(
         session.id,
         message,
         workspace?.id,
         agentMode,
+        editorSnapshot,
       );
       setActiveRunId(runId);
       wsSubscribe(`agent:${runId}`);
@@ -354,7 +423,15 @@ export default function WorkbenchPage() {
           <div className="shrink-0 border-t border-[#1f1f1f] bg-[#0e0e0e] px-3 py-3">
             <div className="mx-auto max-w-2xl">
               <ShellApprovalBanner />
-              <div className="rounded-2xl border border-[#2a2a2a] bg-[#181818] focus-within:border-[#3d3d3d]">
+              <ContextChips mentions={liveMentions} openTabCount={openFiles.length} />
+              <div className="relative rounded-2xl border border-[#2a2a2a] bg-[#181818] focus-within:border-[#3d3d3d]">
+                <MentionPopup
+                  open={mentionOpen}
+                  query={mentionAt?.query ?? ""}
+                  paths={treePaths}
+                  onSelect={insertMentionFile}
+                  onClose={() => setMentionDismissed(true)}
+                />
                 <textarea
                   ref={taRef}
                   rows={2}
@@ -365,10 +442,22 @@ export default function WorkbenchPage() {
                   className="w-full resize-none bg-transparent px-3.5 py-2.5 text-[13px] text-[#e4e4e4] outline-none placeholder:text-[#555]"
                   onChange={(e) => {
                     setInput(e.target.value);
+                    setCursor(e.target.selectionStart ?? e.target.value.length);
+                    setMentionDismissed(false);
                     e.target.style.height = "auto";
                     e.target.style.height = `${Math.min(e.target.scrollHeight, 140)}px`;
                   }}
+                  onSelect={(e) => {
+                    setCursor(e.currentTarget.selectionStart ?? 0);
+                  }}
+                  onKeyUp={(e) => {
+                    setCursor(e.currentTarget.selectionStart ?? 0);
+                  }}
+                  onClick={(e) => {
+                    setCursor(e.currentTarget.selectionStart ?? 0);
+                  }}
                   onKeyDown={(e) => {
+                    // MentionPopup captures Arrow/Enter/Escape when open
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       void send();
@@ -446,6 +535,7 @@ export default function WorkbenchPage() {
               </button>
             </div>
             <textarea
+              ref={editorTaRef}
               className="min-h-0 flex-1 resize-none bg-transparent p-3 font-mono text-[12px] leading-relaxed text-[#d4d4d4] outline-none"
               spellCheck={false}
               value={active?.content ?? ""}

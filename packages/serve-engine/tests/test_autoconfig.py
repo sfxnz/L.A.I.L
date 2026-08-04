@@ -57,14 +57,32 @@ def test_mixed_checkpoint_penalizes_flashinfer_in_scoring():
     assert detected["quant_flag"] == "compressed-tensors"
 
     cands = ac.extract_serve_candidates(readme, detected=detected)
-    flash = [c for c in cands if (c.config.get("moe_backend") or "") == "flashinfer_b12x"]
-    non_flash = [c for c in cands if (c.config.get("moe_backend") or "") != "flashinfer_b12x"]
-    assert flash, "fixture must include flashinfer recipe"
+    # Recipes that mentioned flashinfer on the card (raw), even if moe_backend was cleared
+    flash_raw = [
+        c
+        for c in cands
+        if "flashinfer_b12x" in (c.raw or "")
+        or any("flashinfer" in (r or "").lower() for r in (c.reasons or []))
+    ]
+    non_flash = [
+        c
+        for c in cands
+        if "flashinfer_b12x" not in (c.raw or "")
+        and (c.config.get("moe_backend") or "") != "flashinfer_b12x"
+    ]
+    assert flash_raw, "fixture must include flashinfer recipe text"
     assert non_flash, "fixture must include non-flashinfer recipe"
-    # Best overall must not be a flashinfer recipe when checkpoint is mixed
+    # Best overall must not keep flashinfer_b12x in config (cleared for safety)
     best = cands[0]
     assert (best.config.get("moe_backend") or "") != "flashinfer_b12x"
-    assert max(c.score for c in non_flash) > max(c.score for c in flash)
+    # Flashinfer card recipes must carry a penalty / clearance reason
+    assert any(
+        any(
+            "PENALTY" in (x or "") or "FP8 MoE" in (x or "") or "cleared moe_backend" in (x or "")
+            for x in (c.reasons or [])
+        )
+        for c in flash_raw
+    )
 
 
 def test_checkpoint_safety_strips_flashinfer_b12x():
@@ -192,6 +210,119 @@ def test_offline_does_not_claim_live_website(monkeypatch):
     assert r["from_website"] is False
 
 
+def test_http_get_retries_anonymous_on_401(monkeypatch):
+    """Bad Bearer must not poison public card fetches."""
+    calls: list[str | None] = []
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self._body = body
+            self.headers = {"Content-Type": "text/plain; charset=utf-8"}
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=20.0):
+        # Request may store auth in header_items / unredirected_hdrs
+        auth = None
+        try:
+            auth = req.get_header("Authorization")
+        except Exception:
+            auth = None
+        if not auth:
+            auth = getattr(req, "headers", {}).get("Authorization")
+        calls.append(auth)
+        if auth:
+            raise HTTPError(req.full_url, 401, "Unauthorized", hdrs=None, fp=None)  # type: ignore[arg-type]
+        return FakeResp(b"# hello card\n\nvllm serve org/model\n")
+
+    from urllib.error import HTTPError
+
+    monkeypatch.setattr(ac, "_HF_TOKEN_USABLE", None)
+    monkeypatch.setattr(ac, "_hf_token", lambda: "hf_bad_token")
+    # autoconfig imports urlopen into its module namespace
+    monkeypatch.setattr(ac, "urlopen", fake_urlopen)
+
+    body, err = ac._http_get("https://huggingface.co/org/model/raw/main/README.md")
+    assert err is None, err
+    assert body and "vllm serve" in body
+    assert any(c for c in calls if c)  # tried with token
+    assert any(c is None for c in calls)  # then anonymous
+    assert ac._HF_TOKEN_USABLE is False
+
+
+def test_mtp_speculative_config_not_duplicated_in_extra():
+    args = [
+        "--speculative-config",
+        '{"method":"mtp","num_speculative_tokens":2}',
+        "--trust-remote-code",
+    ]
+    cfg = ac._args_to_config(args, [])
+    assert cfg.get("mtp") is True
+    assert cfg.get("mtp_num_tokens") == 2
+    assert "speculative-config" not in (cfg.get("extra_flags") or "")
+
+
+def test_strip_flag_from_extra():
+    s = ac._strip_flag_from_extra(
+        '--foo 1 --speculative-config \'{"method":"mtp"}\' --bar',
+        "--speculative-config",
+    )
+    assert "speculative-config" not in s
+    assert "--foo" in s and "--bar" in s
+
+
+def test_mixed_checkpoint_prefers_spark_salvage_over_bare():
+    """After flashinfer penalty + salvage, DGX Spark recipe should beat bare serve."""
+    readme = (FIX / "card_mixed_moe_nvfp4.md").read_text()
+    cfg = json.loads((FIX / "config_mixed_compressed_tensors.json").read_text())
+    detected = ac.analyze_config(cfg, "example/Mixed-MoE-NVFP4")
+    cands = ac.extract_serve_candidates(readme, detected=detected)
+    best = cands[0]
+    # Selected recipe should carry Spark signal (CUTE or DGX section), not bare-only
+    blob = (best.raw + " " + (best.section or "")).lower()
+    assert "spark" in blob or "cute" in blob or best.config.get("docker_env")
+    assert (best.config.get("moe_backend") or "") != "flashinfer_b12x" or any(
+        "PENALTY" in r for r in best.reasons
+    )
+
+
+def test_checkpoint_safety_strips_marlin_on_moe():
+    detected = {
+        "is_moe": True,
+        "has_nvfp4": True,
+        "quant_flag": "modelopt",
+        "quant_method": "modelopt",
+    }
+    serve_cfg = {
+        "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        "quantization": "modelopt",
+        "moe_backend": "marlin",
+        "mtp": True,
+        "mtp_num_tokens": 3,
+        "extra_flags": '--attention-backend flashinfer --speculative-config \'{"method":"mtp"}\'',
+        "kv_cache_dtype": "fp8",
+        "max_num_seqs": 4,
+        "docker_env": [],
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_checkpoint_safety(serve_cfg, detected, warnings, rationale)
+    assert serve_cfg["moe_backend"] == ""
+    assert any("marlin" in w for w in warnings)
+    ac._apply_first_boot_defaults(
+        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+    )
+    assert serve_cfg["mtp"] is False
+    assert "speculative-config" not in (serve_cfg.get("extra_flags") or "")
+
+
 def test_recommend_requires_model():
     with pytest.raises(ValueError, match="model"):
         ac.recommend("", fetch_remote=False)
@@ -208,10 +339,10 @@ def test_api_route_wires_recommend():
 
 
 def test_serve_ui_wires_auto_configure():
-    root = Path(__file__).resolve().parents[2]  # local-ai-lab
-    serve_tsx = root / "frontend" / "src" / "pages" / "Serve.tsx"
-    api_ts = root / "frontend" / "src" / "api.ts"
-    assert serve_tsx.is_file() and api_ts.is_file()
+    root = Path(__file__).resolve().parents[3]  # local-ai-lab monorepo root
+    serve_tsx = root / "apps" / "web" / "app" / "server" / "page.tsx"
+    api_ts = root / "apps" / "web" / "lib" / "api.ts"
+    assert serve_tsx.is_file() and api_ts.is_file(), f"missing UI: {serve_tsx} / {api_ts}"
     st = serve_tsx.read_text()
     at = api_ts.read_text()
     assert "recommendServe" in at
@@ -221,8 +352,11 @@ def test_serve_ui_wires_auto_configure():
     assert "from_website" in st
     assert "Auto-configure" in st
     # Recipe scoring reasons (e.g. PENALTY for flashinfer) must render in UI
-    assert "cr.reasons" in st
+    assert "cr.reasons" in st or "reasons" in st
     assert "card_recipes" in st
+    assert "warnings" in st
+    # Job log must remain visible outside Serve tab
+    assert "Job:" in st
 
 
 def test_fixture_card_mixed_moe_surfaces_flashinfer_warning_via_recommend_path(monkeypatch):

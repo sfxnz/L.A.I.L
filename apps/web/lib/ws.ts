@@ -7,12 +7,32 @@ const handlers = new Set<Handler>();
 
 function wsUrl() {
   if (typeof window === "undefined") return "";
-  const env = process.env.NEXT_PUBLIC_LAIL_WS;
-  if (env) return env;
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  // Dev: Next on 3000, API on 8787
+  const pageHost = window.location.hostname;
+  const env = process.env.NEXT_PUBLIC_LAIL_WS?.trim();
+
+  // Prefer same host as the page (Tailscale / LAN / hostname). Only honor
+  // NEXT_PUBLIC_LAIL_WS when it targets the host the user is actually browsing,
+  // otherwise Mac→Spark via 100.x breaks: env was baked as ws://127.0.0.1:8787
+  // and the browser connects to the *laptop* loopback, not the lab.
+  if (env) {
+    try {
+      const u = new URL(env);
+      const local =
+        pageHost === "localhost" ||
+        pageHost === "127.0.0.1" ||
+        pageHost === "::1";
+      if (u.hostname === pageHost || (local && (u.hostname === "127.0.0.1" || u.hostname === "localhost"))) {
+        return env;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // Dev: Next on 3000, controller WS on 8787
   if (window.location.port === "3000") {
-    return `${proto}//${window.location.hostname}:8787/ws`;
+    return `${proto}//${pageHost}:8787/ws`;
   }
   return `${proto}//${window.location.host}/ws`;
 }

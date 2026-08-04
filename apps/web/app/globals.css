@@ -1,27 +1,50 @@
 @import "tailwindcss";
 
-/* Cursor-inspired IDE palette */
+/*
+  L.A.I.L — Apple-calm × Linear-precision dark lab console
+  Surface: Monitor (status / ops). Density + glanceability over marketing chrome.
+*/
+
 @theme {
-  --color-lab-bg: #0d0d0d;
-  --color-lab-editor: #141414;
-  --color-lab-panel: #181818;
-  --color-lab-panel2: #1e1e1e;
-  --color-lab-hover: #2a2a2a;
-  --color-lab-active: #2c2c2c;
-  --color-lab-border: #2b2b2b;
-  --color-lab-border-subtle: #222222;
-  --color-lab-muted: #858585;
-  --color-lab-text: #e4e4e4;
-  --color-lab-text-dim: #b4b4b4;
-  --color-lab-accent: #81a1c1;
-  --color-lab-accent-bright: #88c0d0;
-  --color-lab-accent2: #b48ead;
-  --color-lab-warn: #ebcb8b;
-  --color-lab-danger: #bf616a;
-  --color-lab-ok: #a3be8c;
-  --color-lab-input: #1f1f1f;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  /* Canvas & surfaces (luminance stack) */
+  --color-lab-bg: #0a0a0b;
+  --color-lab-editor: #0f0f11;
+  --color-lab-panel: #141416;
+  --color-lab-panel2: #1a1a1d;
+  --color-lab-hover: #1c1c1f;
+  --color-lab-active: #222226;
+  --color-lab-input: #121214;
+
+  /* Borders — whisper white on dark */
+  --color-lab-border: rgba(255, 255, 255, 0.09);
+  --color-lab-border-subtle: rgba(255, 255, 255, 0.05);
+  --color-lab-border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Text */
+  --color-lab-text: #f5f5f7;
+  --color-lab-text-dim: #d2d2d7;
+  --color-lab-muted: #86868b;
+
+  /* Accent — single interactive blue (Apple system blue on dark) */
+  --color-lab-accent: #0a84ff;
+  --color-lab-accent-bright: #409cff;
+
+  /* Status — SF system colors */
+  --color-lab-warn: #ffd60a;
+  --color-lab-danger: #ff453a;
+  --color-lab-ok: #30d158;
+
+  /* Type */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo,
+    Consolas, monospace;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
 }
 
 html,
@@ -31,93 +54,219 @@ body {
   background: var(--color-lab-bg);
   color: var(--color-lab-text);
   font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 14px;
+  line-height: 1.47;
+  letter-spacing: -0.01em;
   color-scheme: dark;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  letter-spacing: 0.01em;
+  text-rendering: optimizeLegibility;
 }
 
 * {
   box-sizing: border-box;
 }
 
-/* Thin Cursor-like scrollbars */
+/* Quiet scrollbars */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #333;
+  background: rgba(255, 255, 255, 0.1);
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 8px;
+  border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #444;
+  background: rgba(255, 255, 255, 0.18);
   background-clip: padding-box;
   border: 2px solid transparent;
 }
 
-/* Selection */
 ::selection {
-  background: rgba(129, 161, 193, 0.35);
+  background: rgba(10, 132, 255, 0.35);
+  color: #fff;
 }
 
-/* Focus rings */
 :focus-visible {
-  outline: 1px solid var(--color-lab-accent);
-  outline-offset: 1px;
+  outline: 2px solid var(--color-lab-accent);
+  outline-offset: 2px;
 }
 
-/* Page title row used across routes */
+/* Page chrome */
 .page-header {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 1rem;
-  padding-bottom: 0.75rem;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  padding-bottom: 1.25rem;
   border-bottom: 1px solid var(--color-lab-border-subtle);
 }
 
 .page-title {
-  font-size: 0.9375rem;
+  font-size: 1.5rem;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
   color: var(--color-lab-text);
   margin: 0;
 }
 
 .page-sub {
-  margin: 0.15rem 0 0;
-  font-size: 0.75rem;
+  margin: 0.35rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
   color: var(--color-lab-muted);
+  letter-spacing: -0.01em;
+  max-width: 42rem;
 }
 
-/* Compact tables */
+/* Tables */
 .lab-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
 }
 .lab-table th {
   text-align: left;
   font-weight: 500;
   color: var(--color-lab-muted);
-  padding: 0.4rem 0.5rem;
-  border-bottom: 1px solid var(--color-lab-border);
+  padding: 0.65rem 0.85rem;
+  border-bottom: 1px solid var(--color-lab-border-subtle);
+  background: transparent;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 .lab-table td {
-  padding: 0.45rem 0.5rem;
+  padding: 0.7rem 0.85rem;
   border-bottom: 1px solid var(--color-lab-border-subtle);
   color: var(--color-lab-text-dim);
+  vertical-align: middle;
 }
-.lab-table tr:hover td {
-  background: rgba(255, 255, 255, 0.02);
+.lab-table tr:last-child td {
+  border-bottom: none;
+}
+.lab-table tbody tr {
+  transition: background 0.15s ease;
+}
+.lab-table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+/* Card surface */
+.lab-card {
+  border: 1px solid var(--color-lab-border);
+  background: var(--color-lab-panel);
+  border-radius: var(--radius-lg);
+  box-shadow:
+    0 0 0 0.5px rgba(255, 255, 255, 0.03) inset,
+    0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+/* Glass — used sparingly (nav / floating) */
+.lab-glass {
+  background: rgba(20, 20, 22, 0.72);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--color-lab-border-subtle);
+}
+
+/* Bento grid helpers */
+.bento {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+.bento-span-3 {
+  grid-column: span 12;
+}
+.bento-span-4 {
+  grid-column: span 12;
+}
+.bento-span-6 {
+  grid-column: span 12;
+}
+.bento-span-8 {
+  grid-column: span 12;
+}
+.bento-span-12 {
+  grid-column: span 12;
+}
+@media (min-width: 640px) {
+  .bento-span-3 {
+    grid-column: span 6;
+  }
+  .bento-span-4 {
+    grid-column: span 6;
+  }
+  .bento-span-6 {
+    grid-column: span 6;
+  }
+}
+@media (min-width: 1024px) {
+  .bento-span-3 {
+    grid-column: span 3;
+  }
+  .bento-span-4 {
+    grid-column: span 4;
+  }
+  .bento-span-6 {
+    grid-column: span 6;
+  }
+  .bento-span-8 {
+    grid-column: span 8;
+  }
+}
+
+/* Status pulse */
+@keyframes lab-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.lab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.lab-dot-live {
+  background: var(--color-lab-ok);
+  box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.18);
+  animation: lab-pulse 2.4s ease-in-out infinite;
+}
+.lab-dot-down {
+  background: var(--color-lab-danger);
+  box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.15);
+}
+.lab-dot-idle {
+  background: var(--color-lab-muted);
+}
+
+/* Subtle hairline separator */
+.lab-sep {
+  height: 1px;
+  background: var(--color-lab-border-subtle);
+  border: 0;
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .lab-dot-live {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+  }
 }

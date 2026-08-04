@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config import DEFAULT_BASE_URL, GOLDEN_TOOLS, RUNS_DIR
+from ..config import DEFAULT_BASE_URL, RUNS_DIR
 from .. import db
 from .metadata import build_envelope, make_run_id, probe_endpoint
 import asyncio
@@ -84,6 +85,36 @@ GOLDEN_CASES: list[tuple[str, set[str] | None]] = [
     ("Thanks, that's all for now.", None),
 ]
 
+INSTALL_HINT = (
+    "uv tool install git+https://github.com/SeraphimSerapis/tool-eval-bench.git"
+)
+
+# Prefer uv-tool install location; serve-engine may not inherit interactive shell PATH.
+_EXTRA_PATHS = [
+    Path.home() / ".local" / "bin",
+    Path("/usr/local/bin"),
+]
+
+
+def _augmented_env() -> dict[str, str]:
+    env = dict(os.environ)
+    parts = [str(p) for p in _EXTRA_PATHS if p.is_dir()]
+    if parts:
+        env["PATH"] = os.pathsep.join(parts + [env.get("PATH", "")])
+    return env
+
+
+def _resolve_tool_eval_bin() -> str | None:
+    env = _augmented_env()
+    which = shutil.which("tool-eval-bench", path=env.get("PATH"))
+    if which:
+        return which
+    for p in _EXTRA_PATHS:
+        cand = p / "tool-eval-bench"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
 
 def _chat_tools(base: str, model: str, prompt: str) -> dict[str, Any]:
     body = {
@@ -113,7 +144,6 @@ def _probe_tools_enabled(base: str, model_id: str) -> str | None:
     except Exception as e:
         msg = str(e)
         try:
-            # urllib HTTPError often has body in .read already consumed; best-effort
             import urllib.error
 
             if isinstance(e, urllib.error.HTTPError):
@@ -224,18 +254,35 @@ def run_golden_tools(
 
 
 def tool_eval_available() -> dict[str, Any]:
-    which = subprocess.run(["which", "tool-eval-bench"], capture_output=True, text=True)
-    if which.returncode == 0:
-        return {"available": True, "path": which.stdout.strip(), "via": "cli"}
-    try:
-        import tool_eval_bench  # noqa: F401
-
-        return {"available": True, "path": None, "via": "python"}
-    except ImportError:
+    bin_path = _resolve_tool_eval_bin()
+    if not bin_path:
         return {
             "available": False,
-            "install": "uv tool install git+https://github.com/SeraphimSerapis/tool-eval-bench.git",
+            "install": INSTALL_HINT,
+            "repo": "https://github.com/SeraphimSerapis/tool-eval-bench",
         }
+
+    version: str | None = None
+    try:
+        out = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_augmented_env(),
+        )
+        # e.g. "tool-eval-bench 2.3.2.dev1+g910777110"
+        version = (out.stdout or out.stderr or "").strip().split()[-1] or None
+    except Exception:
+        pass
+
+    return {
+        "available": True,
+        "path": bin_path,
+        "via": "cli",
+        "version": version,
+        "repo": "https://github.com/SeraphimSerapis/tool-eval-bench",
+    }
 
 
 def run_tool_eval_bench(
@@ -246,30 +293,40 @@ def run_tool_eval_bench(
     intent: str = "attach",
     seed: int = 42,
     context_pressure: float | None = None,
+    no_think: bool = True,
     log: Any = None,
     progress: Callable | None = None,
 ) -> dict[str, Any]:
     info = tool_eval_available()
     if not info.get("available"):
         raise RuntimeError(
-            "tool-eval-bench not installed. "
-            + info.get("install", "pip install git+https://github.com/SeraphimSerapis/tool-eval-bench.git")
+            "tool-eval-bench not installed. " + info.get("install", INSTALL_HINT)
         )
+
+    bin_path = info.get("path") or _resolve_tool_eval_bin()
+    if not bin_path:
+        raise RuntimeError("tool-eval-bench binary not found on PATH")
 
     run_id = make_run_id()
     json_out = RUNS_DIR / f"{run_id}_tool_eval.json"
     base = base_url.rstrip("/")
 
+    # v2.x CLI: `run` subcommand; --no-think for Qwen/Laguna reasoning models.
     cmd = [
-        "tool-eval-bench",
+        bin_path,
+        "run",
         "--base-url",
         base,
+        "--backend",
+        "vllm",
         "--seed",
         str(seed),
         "--json-file",
         str(json_out),
         "--no-live",
     ]
+    if no_think:
+        cmd.append("--no-think")
     if model:
         cmd += ["--model", model]
     if preset == "short":
@@ -278,28 +335,54 @@ def run_tool_eval_bench(
         cmd.append("--hardmode")
     elif preset == "coding":
         cmd += ["--categories", "J", "G", "M", "O"]
-    # full = no extra flags
+    # full = no extra scenario flags (full 69)
     if context_pressure is not None:
         cmd += ["--context-pressure", str(context_pressure)]
 
     if log:
         log.write(f"$ {' '.join(cmd)}")
     if progress:
-        progress(0.05, "starting tool-eval-bench")
+        progress(0.02, "starting tool-eval-bench")
+
+    env = _augmented_env()
+    env["TOOL_EVAL_BASE_URL"] = base
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env={**os.environ, "TOOL_EVAL_BASE_URL": base},
+        env=env,
     )
     assert proc.stdout
+    n_lines = 0
+    done_hint = 0
     for line in proc.stdout:
+        line = line.rstrip()
+        n_lines += 1
         if log:
-            log.write(line.rstrip())
-        if progress and "scenario" in line.lower():
-            progress(0.5, line[:80])
+            log.write(line)
+        # Progress from JSON event stream (--no-live emits events as JSON lines)
+        try:
+            if line.startswith("{") and "scenario" in line.lower():
+                ev = json.loads(line)
+                idx = ev.get("index")
+                total = ev.get("total")
+                if isinstance(idx, int) and isinstance(total, int) and total > 0:
+                    done_hint = max(done_hint, (idx + 1) / total)
+                    if progress:
+                        progress(
+                            0.05 + 0.9 * done_hint,
+                            f"{ev.get('scenario_id', 'scenario')} {ev.get('status', '')}".strip()[
+                                :80
+                            ],
+                        )
+                elif ev.get("event") == "benchmark_complete" and progress:
+                    progress(0.98, f"score={ev.get('final_score')}")
+        except Exception:
+            if progress and n_lines % 5 == 0:
+                progress(min(0.9, 0.1 + n_lines * 0.01), line[:80])
+
     code = proc.wait()
     if code != 0 and not json_out.exists():
         raise RuntimeError(f"tool-eval-bench exited {code}")
@@ -307,6 +390,15 @@ def run_tool_eval_bench(
     raw: dict[str, Any] = {}
     if json_out.exists():
         raw = json.loads(json_out.read_text())
+
+    cfg = raw.get("config") if isinstance(raw.get("config"), dict) else {}
+    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    model_id = (
+        model
+        or (cfg or {}).get("model")
+        or (meta or {}).get("model")
+        or raw.get("model")
+    )
 
     agentic = {
         "suite": "tool-eval-bench",
@@ -316,10 +408,14 @@ def run_tool_eval_bench(
         "total_scenarios": raw.get("total_scenarios"),
         "safety_warnings": raw.get("safety_warnings"),
         "deployability": raw.get("deployability"),
-        "tool_eval_bench_version": raw.get("tool_eval_bench_version"),
+        "responsiveness": raw.get("responsiveness"),
+        "safety_gate": raw.get("safety_gate"),
+        "scores": raw.get("scores"),
+        "tool_eval_bench_version": raw.get("tool_eval_bench_version") or info.get("version"),
+        "report_path": raw.get("report_path"),
         "raw_path": str(json_out),
+        "exit_code": code,
     }
-    model_id = model or raw.get("model")
     probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
@@ -331,13 +427,24 @@ def run_tool_eval_bench(
             "preset": preset,
             "seed": seed,
             "context_pressure": context_pressure,
+            "no_think": no_think,
         },
         metrics={},
         agentic=agentic,
         probe=probe,
     )
+    # Prefer probed / envelope model id (probe may fill when CLI omitted --model)
+    model_id = (
+        model_id
+        or ((envelope.get("model") or {}).get("id") if isinstance(envelope.get("model"), dict) else None)
+        or ((raw.get("config") or {}).get("model") if isinstance(raw.get("config"), dict) else None)
+    )
+    if model_id and isinstance(envelope.get("model"), dict):
+        envelope["model"]["id"] = model_id
     path = RUNS_DIR / f"{run_id}.json"
     path.write_text(json.dumps(envelope, indent=2))
+    scores = agentic.get("scores") if isinstance(agentic.get("scores"), dict) else {}
+    cat = scores.get("category_scores") if isinstance(scores, dict) else None
     db.insert_run(
         run_id=run_id,
         created_at=envelope["created_at"],
@@ -348,9 +455,30 @@ def run_tool_eval_bench(
             "final_score": agentic.get("final_score"),
             "rating": agentic.get("rating"),
             "preset": preset,
+            "total_scenarios": agentic.get("total_scenarios"),
+            "deployability": agentic.get("deployability"),
+            "responsiveness": agentic.get("responsiveness"),
+            "safety_passed": (agentic.get("safety_gate") or {}).get("passed")
+            if isinstance(agentic.get("safety_gate"), dict)
+            else None,
+            "pass_rate": scores.get("total_points") and scores.get("max_points")
+            and round(100 * float(scores["total_points"]) / float(scores["max_points"]), 1)
+            if isinstance(scores, dict) and scores.get("max_points")
+            else None,
+            "categories": [
+                {"id": c.get("category"), "label": c.get("label"), "percent": c.get("percent")}
+                for c in (cat or [])
+                if isinstance(c, dict)
+            ][:16],
+            "engine": ((envelope.get("engine") or {}).get("image") if isinstance(envelope.get("engine"), dict) else None),
         },
         path=str(path),
     )
     if progress:
         progress(1.0, f"score={agentic.get('final_score')}")
+    if log and agentic.get("final_score") is not None:
+        log.write(
+            f"=== tool-eval-bench done: score={agentic.get('final_score')} "
+            f"rating={agentic.get('rating')} scenarios={agentic.get('total_scenarios')} ==="
+        )
     return envelope

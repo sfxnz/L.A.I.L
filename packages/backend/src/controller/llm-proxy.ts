@@ -18,13 +18,20 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
   let bodyText: string | undefined;
   if (req.method !== "GET" && req.method !== "HEAD") {
     bodyText = await req.text();
-    // Rewrite placeholder model names so vLLM doesn't 404 on "default"
+    // Always bind chat/completions to the live served model (Server is source of truth)
     if (path.includes("chat/completions") || path.includes("completions")) {
       try {
         const body = JSON.parse(bodyText) as { model?: string; [k: string]: unknown };
-        const m = (body.model || "").trim().toLowerCase();
-        if (!m || m === "default" || m === "auto") {
-          body.model = await resolveModelId();
+        const live = await resolveModelId();
+        const requested = (body.model || "").trim();
+        const reqL = requested.toLowerCase();
+        if (
+          !requested ||
+          reqL === "default" ||
+          reqL === "auto" ||
+          requested !== live
+        ) {
+          body.model = live;
           bodyText = JSON.stringify(body);
         }
       } catch {

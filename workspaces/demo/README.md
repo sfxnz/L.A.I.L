@@ -18,4 +18,8 @@ The agent should:
 
 - Shell tools run with **cwd = this workspace**.  
 - Paths cannot escape the workspace root.  
-- Point **Configure → Default model** at your live vLLM (or llama.cpp) model id.  
+- Point **Configure → Default model** at your live vLLM (or llama.cpp) model id.
+
+## Quick Start
+
+Run `ls` to list files, `cat <file>` to read them, or ask me to create new ones.  

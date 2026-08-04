@@ -487,8 +487,152 @@ async def tool_eval_status() -> dict[str, Any]:
 
 
 @router.get("/runs")
-async def list_runs(limit: int = 50) -> list[dict[str, Any]]:
-    return db.list_runs(limit)
+async def list_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[str, Any]]:
+    rows = db.list_runs(limit if not kind else max(limit, 100))
+    if kind:
+        rows = [r for r in rows if r.get("kind") == kind][:limit]
+    return rows
+
+
+@router.get("/runs/tool-eval/board")
+async def tool_eval_board(limit: int = 40) -> dict[str, Any]:
+    """Normalized tool-eval scorecards for leaderboard + compare UI."""
+    rows = [r for r in db.list_runs(80) if r.get("kind") == "agentic_tool_eval"][:limit]
+    board: list[dict[str, Any]] = []
+    for row in rows:
+        env = db.load_envelope(row["path"]) or {}
+        ag = env.get("agentic") if isinstance(env.get("agentic"), dict) else {}
+        scores = ag.get("scores") if isinstance(ag.get("scores"), dict) else {}
+        model = env.get("model") if isinstance(env.get("model"), dict) else {}
+        engine = env.get("engine") if isinstance(env.get("engine"), dict) else {}
+        workload = env.get("workload") if isinstance(env.get("workload"), dict) else {}
+        model_id = row.get("model_id") or model.get("id") or "unknown"
+        final = ag.get("final_score")
+        if final is None:
+            final = (row.get("summary") or {}).get("final_score")
+        cats = scores.get("category_scores") or []
+        board.append(
+            {
+                "run_id": row["run_id"],
+                "created_at": row.get("created_at"),
+                "model_id": model_id,
+                "model_short": str(model_id).split("/")[-1],
+                "final_score": final,
+                "rating": ag.get("rating") or (row.get("summary") or {}).get("rating"),
+                "preset": workload.get("preset") or (row.get("summary") or {}).get("preset"),
+                "total_scenarios": ag.get("total_scenarios")
+                or scores.get("total_scenarios")
+                or (row.get("summary") or {}).get("total_scenarios"),
+                "total_points": scores.get("total_points"),
+                "max_points": scores.get("max_points"),
+                "deployability": ag.get("deployability"),
+                "responsiveness": ag.get("responsiveness"),
+                "safety_passed": (ag.get("safety_gate") or {}).get("passed")
+                if isinstance(ag.get("safety_gate"), dict)
+                else True,
+                "safety_warnings": ag.get("safety_warnings") or [],
+                "categories": [
+                    {
+                        "id": c.get("category"),
+                        "label": c.get("label"),
+                        "percent": c.get("percent"),
+                        "earned": c.get("earned"),
+                        "max": c.get("max"),
+                        "pass": c.get("pass_count"),
+                        "partial": c.get("partial_count"),
+                        "fail": c.get("fail_count"),
+                    }
+                    for c in cats
+                    if isinstance(c, dict)
+                ],
+                "engine_image": engine.get("image"),
+                "engine_version": engine.get("version"),
+                "quant": (env.get("weights") or {}).get("dtype")
+                if isinstance(env.get("weights"), dict)
+                else None,
+                "href": f"/evals/tool/{row['run_id']}",
+            }
+        )
+    # Sort by score desc then recency
+    board.sort(
+        key=lambda x: (
+            float(x["final_score"]) if x.get("final_score") is not None else -1,
+            x.get("created_at") or "",
+        ),
+        reverse=True,
+    )
+    return {"runs": board, "count": len(board)}
+
+
+@router.get("/runs/tool-eval/compare")
+async def tool_eval_compare(ids: str) -> dict[str, Any]:
+    """Compare 2–4 tool-eval runs by id (comma-separated)."""
+    run_ids = [x.strip() for x in ids.split(",") if x.strip()]
+    if len(run_ids) < 2 or len(run_ids) > 4:
+        raise HTTPException(400, "pass 2–4 run ids via ?ids=a,b")
+    board = (await tool_eval_board(limit=80))["runs"]
+    by_id = {r["run_id"]: r for r in board}
+    selected = []
+    for rid in run_ids:
+        if rid not in by_id:
+            # try load fresh
+            row = db.get_run(rid)
+            if not row:
+                raise HTTPException(404, f"run not found: {rid}")
+            # rebuild one entry via board filter
+            full = await tool_eval_board(limit=80)
+            by_id = {r["run_id"]: r for r in full["runs"]}
+        if rid not in by_id:
+            raise HTTPException(404, f"run not found: {rid}")
+        selected.append(by_id[rid])
+
+    # winner by final_score
+    ranked = sorted(
+        selected,
+        key=lambda x: float(x["final_score"]) if x.get("final_score") is not None else -1,
+        reverse=True,
+    )
+    winner = ranked[0]
+    metrics = [
+        "final_score",
+        "deployability",
+        "responsiveness",
+        "total_points",
+        "max_points",
+    ]
+    table = []
+    for m in metrics:
+        row = {"metric": m, "values": {s["run_id"]: s.get(m) for s in selected}}
+        nums = [s.get(m) for s in selected if isinstance(s.get(m), (int, float))]
+        if len(nums) >= 2:
+            row["delta_best_vs_rest"] = round(max(nums) - sorted(nums)[-2], 1) if len(nums) > 1 else 0
+        table.append(row)
+
+    # category union
+    cat_ids: list[str] = []
+    for s in selected:
+        for c in s.get("categories") or []:
+            cid = c.get("id")
+            if cid and cid not in cat_ids:
+                cat_ids.append(cid)
+    categories = []
+    for cid in cat_ids:
+        labels = {}
+        vals = {}
+        for s in selected:
+            hit = next((c for c in (s.get("categories") or []) if c.get("id") == cid), None)
+            vals[s["run_id"]] = hit.get("percent") if hit else None
+            if hit and hit.get("label"):
+                labels[cid] = hit["label"]
+        categories.append({"id": cid, "label": labels.get(cid, cid), "values": vals})
+
+    return {
+        "runs": selected,
+        "winner_run_id": winner["run_id"],
+        "winner_model": winner.get("model_short"),
+        "metrics": table,
+        "categories": categories,
+    }
 
 
 @router.get("/runs/compare/{a}/{b}")
@@ -517,7 +661,16 @@ async def get_run(run_id: str) -> dict[str, Any]:
     if not row:
         raise HTTPException(404, "run not found")
     env = db.load_envelope(row["path"])
-    return {"index": row, "envelope": env}
+    # Attach raw TEB scenario list when present (for rich UI)
+    raw = None
+    if env and isinstance(env.get("agentic"), dict):
+        raw_path = (env["agentic"] or {}).get("raw_path")
+        if raw_path and Path(raw_path).exists():
+            try:
+                raw = json.loads(Path(raw_path).read_text())
+            except Exception:
+                raw = None
+    return {"index": row, "envelope": env, "tool_eval_raw": raw}
 
 
 @router.delete("/runs/{run_id}")

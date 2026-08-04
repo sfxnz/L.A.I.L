@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { api, type Settings } from "@/lib/api";
-import { Btn, Field, Input, Panel } from "@/components/ui";
+import { Btn, Field, Input, Panel, inputCls } from "@/components/ui";
+import { cn } from "@/lib/utils";
 
 export default function ConfigurePage() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -24,7 +25,7 @@ export default function ConfigurePage() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-4 p-4 md:p-5">
+    <div className="space-y-5">
       <div className="page-header">
         <div>
           <h1 className="page-title">Settings</h1>
@@ -35,7 +36,7 @@ export default function ConfigurePage() {
       <Panel className="space-y-4 p-4">
         <Field label="Default backend">
           <select
-            className="w-full rounded-lg border border-lab-border bg-zinc-900 px-3 py-2 text-sm"
+            className={cn(inputCls)}
             value={settings.defaultBackend}
             onChange={(e) =>
               setSettings({ ...settings, defaultBackend: e.target.value })
@@ -48,11 +49,17 @@ export default function ConfigurePage() {
             ))}
           </select>
         </Field>
-        <Field label="Default model">
+        <Field label="Default model (fallback only)">
           <Input
             value={settings.defaultModel}
             onChange={(e) => setSettings({ ...settings, defaultModel: e.target.value })}
+            placeholder="auto — or leave and Workbench follows Server"
           />
+          <p className="mt-1 text-[11px] text-lab-muted">
+            Workbench always talks to whatever is live on the Server endpoint (
+            <code className="text-lab-text">/v1/models</code>). This field is updated to match
+            automatically; you only need it if nothing is served yet.
+          </p>
         </Field>
         <Field label="Hugging Face token (optional)">
           <Input

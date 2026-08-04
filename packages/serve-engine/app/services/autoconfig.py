@@ -65,7 +65,7 @@ _FORM_FLAGS = {
 def _hf_token() -> str:
     tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
     if tok:
-        return tok
+        return tok.strip()
     token_file = Path.home() / ".cache" / "huggingface" / "token"
     if token_file.is_file():
         try:
@@ -75,26 +75,85 @@ def _hf_token() -> str:
     return ""
 
 
-def _http_get(url: str, timeout: float = 20.0) -> tuple[Optional[str], Optional[str]]:
+# Cached probe: stale/expired hf_oauth tokens 401 public card fetches; anonymous often works.
+_HF_TOKEN_USABLE: Optional[bool] = None
+
+
+def hf_token_usable(force: bool = False) -> bool:
+    """True when a stored/env HF token authenticates against the Hub API.
+
+    Invalid tokens must not be sent on public GETs — huggingface.co returns 401
+    for bad Bearer tokens even on public models (anonymous 200).
+    """
+    global _HF_TOKEN_USABLE
+    if not force and _HF_TOKEN_USABLE is not None:
+        return _HF_TOKEN_USABLE
+    tok = _hf_token()
+    if not tok:
+        _HF_TOKEN_USABLE = False
+        return False
+    body, err = _http_get_raw(
+        "https://huggingface.co/api/whoami-v2",
+        timeout=8.0,
+        token=tok,
+        allow_retry_without_auth=False,
+    )
+    ok = bool(body) and not err and not body.lstrip().startswith("<")
+    _HF_TOKEN_USABLE = ok
+    return ok
+
+
+def _http_get_raw(
+    url: str,
+    *,
+    timeout: float = 20.0,
+    token: Optional[str] = None,
+    allow_retry_without_auth: bool = True,
+) -> tuple[Optional[str], Optional[str]]:
     """GET text body. Follows redirects. Returns (body, error)."""
     headers = {"User-Agent": HF_UA, "Accept": "*/*"}
-    tok = _hf_token()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         req = Request(url, headers=headers)
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-            # charset
             ctype = resp.headers.get("Content-Type", "")
             charset = "utf-8"
             if "charset=" in ctype:
                 charset = ctype.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
             return raw.decode(charset, errors="replace"), None
     except HTTPError as e:
+        # Bad/expired token → 401/403 on public repos; retry anonymous once.
+        if (
+            allow_retry_without_auth
+            and token
+            and e.code in (401, 403)
+            and "Authorization" in headers
+        ):
+            global _HF_TOKEN_USABLE
+            _HF_TOKEN_USABLE = False
+            return _http_get_raw(
+                url,
+                timeout=timeout,
+                token=None,
+                allow_retry_without_auth=False,
+            )
         return None, f"HTTP {e.code} for {url}"
     except (URLError, TimeoutError, OSError) as e:
         return None, f"{type(e).__name__}: {e}"
+
+
+def _http_get(url: str, timeout: float = 20.0) -> tuple[Optional[str], Optional[str]]:
+    """GET with optional HF token; auto-falls back to anonymous on 401/403."""
+    tok = _hf_token()
+    # Skip known-bad tokens entirely (faster + fewer 401 log lines).
+    if tok and _HF_TOKEN_USABLE is False:
+        tok = ""
+    elif tok and _HF_TOKEN_USABLE is None:
+        # Lightweight: try with token first; 401 path marks unusable.
+        pass
+    return _http_get_raw(url, timeout=timeout, token=tok or None, allow_retry_without_auth=True)
 
 
 def fetch_hf_card(model_id: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -333,7 +392,7 @@ def _parse_one_serve_command(text: str) -> Optional[ServeCandidate]:
 
 
 def _args_to_config(args: list[str], env: list[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {"docker_env": list(env)}
+    out: dict[str, Any] = {"docker_env": _dedupe_env(list(env))}
     extras: list[str] = []
     i = 0
     while i < len(args):
@@ -383,11 +442,15 @@ def _args_to_config(args: list[str], env: list[str]) -> dict[str, Any]:
             out["enable_prefix_caching"] = True
         elif a == "--speculative-config":
             cfg = take_val()
+            # Map into structured MTP fields only — do NOT also dump into
+            # extra_flags (serve.py would emit --speculative-config twice).
             out["mtp"] = "mtp" in cfg.lower()
             mm = re.search(r"num_speculative_tokens[\"']?\s*:\s*(\d+)", cfg)
             if mm:
                 out["mtp_num_tokens"] = int(mm.group(1))
-            extras += ["--speculative-config", cfg]
+            if not out.get("mtp"):
+                # Non-MTP speculative methods stay as free-form extras.
+                extras += ["--speculative-config", cfg]
         elif a == "--tensor-parallel-size":
             v = take_val()
             try:
@@ -409,6 +472,52 @@ def _args_to_config(args: list[str], env: list[str]) -> dict[str, Any]:
     if extras:
         out["extra_flags"] = " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in extras)
     return out
+
+
+def _dedupe_env(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        item = (item or "").strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k:
+            continue
+        if k in seen:
+            out = [e for e in out if not e.startswith(k + "=")]
+        seen.add(k)
+        out.append(f"{k}={v}")
+    return out
+
+
+def _strip_flag_from_extra(extra: str, flag: str) -> str:
+    """Remove ``flag`` and its value from a free-form extra_flags string."""
+    s = (extra or "").strip()
+    if not s or flag not in s:
+        return s
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        parts = s.split()
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p == flag:
+            # skip flag + following value if present
+            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if p.startswith(flag + "="):
+            i += 1
+            continue
+        out.append(p)
+        i += 1
+    return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
 def extract_serve_candidates(
@@ -459,6 +568,7 @@ def extract_serve_candidates(
 
     for c in candidates:
         c.score, c.reasons = score_candidate(c, readme, detected=detected)
+        _sanitize_moe_backend_on_candidate(c, detected)
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates
 
@@ -505,10 +615,20 @@ def score_candidate(
 
     # Performance / Spark-relevant flags from the card
     moe = (cfg.get("moe_backend") or "").strip()
+    flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det)
+    marlin_unsafe = _marlin_unsafe_for_checkpoint(det)
     if moe:
-        score += 25
-        reasons.append(f"--moe-backend {moe}")
-    if any(e.startswith("CUTE_DSL_ARCH=") for e in cfg.get("docker_env") or []):
+        if moe == "flashinfer_b12x" and flashinfer_unsafe:
+            reasons.append(f"--moe-backend {moe} (will be stripped — unsafe for checkpoint)")
+        elif moe == "marlin" and marlin_unsafe:
+            reasons.append(
+                f"--moe-backend {moe} (will be stripped — unsupported for this MoE on vLLM 0.25)"
+            )
+        else:
+            score += 25
+            reasons.append(f"--moe-backend {moe}")
+    has_cute = any(e.startswith("CUTE_DSL_ARCH=") for e in cfg.get("docker_env") or [])
+    if has_cute:
         score += 30
         reasons.append("CUTE_DSL_ARCH (Spark / cute-DSL path)")
     if cfg.get("quantization"):
@@ -530,9 +650,9 @@ def score_candidate(
     if cfg.get("load_format"):
         score += 5
     if cfg.get("mtp") or "speculative-config" in (cfg.get("extra_flags") or ""):
-        # MTP is optional on cards — slight boost but not always "best first boot"
-        score += 6
-        reasons.append("speculative/MTP (optional)")
+        # MTP is optional — never preferred as first-boot default over stable recipes
+        score -= 25
+        reasons.append("speculative/MTP (optional — not default first boot)")
 
     # Penalize toy/debug max lengths when other recipes exist
     ml = cfg.get("max_model_len")
@@ -553,28 +673,57 @@ def score_candidate(
         score -= 50
         reasons.append("placeholder command")
 
-    # Bare `vllm serve model` with no flags: baseline only
-    if not cfg.get("quantization") and not cfg.get("moe_backend") and not cfg.get("docker_env"):
-        if len(c.args) == 0:
+    # Bare `vllm serve model` with no flags: weak default when checkpoint needs flags
+    bare = (
+        not cfg.get("quantization")
+        and not cfg.get("moe_backend")
+        and not cfg.get("docker_env")
+        and len(c.args) == 0
+    )
+    if bare:
+        if det.get("quant_flag") or det.get("is_moe") or det.get("has_nvfp4"):
+            score -= 20
+            reasons.append(
+                "bare serve — weak default when config.json needs quant/MoE (prefer Spark recipe)"
+            )
+        else:
             score += 1
             reasons.append("minimal serve (defaults)")
-        else:
-            score += 3
+    elif not cfg.get("quantization") and not cfg.get("moe_backend") and not cfg.get("docker_env"):
+        score += 3
 
     # Card prose near CUTE_DSL / flashinfer often marks the recommended path
     if "cute_dsl" in raw_l or "CUTE_DSL" in c.raw:
         score += 5
 
+    # Prefer recipes that already set quantization for ModelOpt / NVFP4 MoE
+    if det.get("quant_flag") and cfg.get("quantization") == det.get("quant_flag"):
+        score += 15
+        reasons.append(f"quantization matches config.json ({det.get('quant_flag')})")
+
     # Checkpoint truth from config.json: mixed FP8+NVFP4 MoE rejects flashinfer_b12x on vLLM 0.25.x
-    if _flashinfer_b12x_unsafe_for_checkpoint(det) and moe == "flashinfer_b12x":
+    if flashinfer_unsafe and moe == "flashinfer_b12x":
         score -= 80
         reasons.append(
             "PENALTY: config.json has FP8 MoE layers — flashinfer_b12x crashes "
             "(ValueError: not supported for FP8 MoE)"
         )
+        # Salvage: Spark section + CUTE_DSL still mark the right path after moe strip.
+        if has_cute or "dgx spark" in sec or "spark" in sec:
+            score += 55
+            reasons.append(
+                "salvage: Spark/CUTE path kept after stripping unsafe flashinfer_b12x"
+            )
     elif moe == "flashinfer_b12x" and not det:
-        # unknown checkpoint — keep card score but no extra boost
         pass
+
+    # Marlin is on many NVIDIA cards but crashes MoE on vLLM 0.25 (unquantized MoE path)
+    if marlin_unsafe and moe == "marlin":
+        score -= 80
+        reasons.append(
+            "PENALTY: moe_backend=marlin unsupported for this MoE on vLLM 0.25 "
+            "(ValueError: not supported for unquantized MoE)"
+        )
 
     return score, reasons
 
@@ -596,6 +745,48 @@ def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
     if detected.get("is_moe") and "float-quantized" in formats and "nvfp4" in formats:
         return True
     return False
+
+
+def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
+    """True when --moe-backend marlin crashes on this checkpoint (vLLM 0.25.x).
+
+    Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE):
+      ValueError: moe_backend='marlin' is not supported for unquantized MoE.
+      Expected one of ['triton', 'flashinfer_trtllm', 'flashinfer_cutlass', 'aiter'].
+    Cards still ship marlin recipes; leave moe-backend empty (auto).
+    """
+    if not detected:
+        # MoE/NVFP4 cards are the risk class — if unknown, still treat marlin as unsafe
+        return True
+    if detected.get("is_moe"):
+        return True
+    if detected.get("has_nvfp4") or detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
+        return True
+    return False
+
+
+def _sanitize_moe_backend_on_candidate(
+    c: "ServeCandidate",
+    detected: dict[str, Any] | None,
+) -> None:
+    """Clear moe backends that will crash when the UI Applies this recipe."""
+    det = detected or {}
+    moe = (c.config.get("moe_backend") or "").strip().lower()
+    if not moe:
+        return
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(det):
+        c.config["moe_backend"] = ""
+        if not any("cleared moe_backend" in r for r in c.reasons):
+            c.reasons.append(
+                "cleared moe_backend=flashinfer_b12x on this recipe (unsafe for checkpoint)"
+            )
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det):
+        c.config["moe_backend"] = ""
+        if not any("cleared moe_backend" in r for r in c.reasons):
+            c.reasons.append(
+                "cleared moe_backend=marlin on this recipe "
+                "(vLLM 0.25: marlin unsupported for this MoE path — use auto)"
+            )
 
 
 def _card_has_flashinfer_b12x(
@@ -690,6 +881,18 @@ def _apply_checkpoint_safety(
             cfg["docker_env"] = env
             rationale.append("Kept/added CUTE_DSL_ARCH=sm_121a from card Spark guidance")
 
+    moe = (cfg.get("moe_backend") or "").strip()
+    if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected):
+        cfg["moe_backend"] = ""
+        warnings.append(
+            "Card recipe used --moe-backend marlin, but vLLM 0.25 rejects marlin on this MoE "
+            "path (ValueError: moe_backend='marlin' is not supported for unquantized MoE). "
+            "Cleared moe-backend so vLLM auto-selects a supported backend."
+        )
+        rationale.append(
+            "SAFETY (vLLM 0.25 > card flag): removed marlin MoE backend — use auto"
+        )
+
     # Lab-friendly KV for large NVFP4/MoE when card is silent
     if (
         not cfg.get("kv_cache_dtype")
@@ -703,6 +906,59 @@ def _apply_checkpoint_safety(
     if detected.get("is_moe") and (cfg.get("max_num_seqs") is None):
         cfg["max_num_seqs"] = 4
         rationale.append("MoE (from config) → --max-num-seqs 4 when card omitted it")
+
+
+def _apply_first_boot_defaults(
+    cfg: dict[str, Any],
+    *,
+    mode: str,
+    detected: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """Make Auto-configure → Start serve work on first try (Spark lab posture).
+
+    Cards often ship kitchen-sink demos (MTP + exotic moe backends). First boot
+    should be stable: correct quant, safe moe auto, no speculative decode.
+    """
+    # MTP is opt-in — many cards include it; first boot should not.
+    if cfg.get("mtp"):
+        cfg["mtp"] = False
+        cfg["mtp_num_tokens"] = 2
+        if cfg.get("extra_flags"):
+            cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--speculative-config")
+        warnings.append(
+            "Disabled MTP / speculative decode for first boot (card had it on). "
+            "Re-enable MTP in the form after a healthy serve if you want it."
+        )
+        rationale.append("FIRST BOOT: MTP off (stable serve; re-enable later if needed)")
+
+    # Empty moe = vLLM auto — preferred on Spark unless user forces a known-good backend
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    if moe in ("marlin",) or (moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected)):
+        # already handled by checkpoint safety; ensure empty
+        cfg["moe_backend"] = ""
+
+    # Prefer empty moe for MoE first boot even if card set something exotic we didn't list
+    if detected.get("is_moe") and moe and moe not in ("", "auto", "triton"):
+        # Keep triton if card set it; clear unknown/risky backends
+        if moe not in ("triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"):
+            cfg["moe_backend"] = ""
+            if moe not in ("marlin", "flashinfer_b12x"):  # already warned
+                warnings.append(
+                    f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
+                )
+                rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
+
+    # Lab Safe: don't carry card util=0.85 into lab_safe form without clamp (envelope handles)
+    # Workflow Max first boot on 35B MoE: 262k ctx is OK only with enough util headroom —
+    # leave card max-len but note memory risk.
+    if mode == "workflow_max" and isinstance(cfg.get("max_model_len"), int):
+        if cfg["max_model_len"] >= 200000 and detected.get("is_moe"):
+            rationale.append(
+                f"Card max-model-len={cfg['max_model_len']} kept for Workflow Max — "
+                "watch free UMA; drop to 65536 if load OOMs"
+            )
 
 
 # ─── config.json analysis (fills gaps the card left empty) ────────────────────
@@ -1151,6 +1407,15 @@ def recommend(
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)
 
+    # First-boot lab posture: no MTP, no crashing moe backends (Auto-configure → Start)
+    _apply_first_boot_defaults(
+        cfg,
+        mode=mode,
+        detected=detected,
+        warnings=warnings,
+        rationale=rationale,
+    )
+
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it
     # (even if scoring already picked a non-flashinfer recipe and moe_backend is empty)
     _note_card_flashinfer_avoidance(
@@ -1171,18 +1436,40 @@ def recommend(
             cfg["max_model_len"] = max_pos
             rationale.append(f"Capped max-model-len to config max_position_embeddings={max_pos}")
 
-    # Normalize env
+    # Normalize env (dedupe keys; last wins)
     env_out: list[str] = []
     seen: set[str] = set()
     for e in cfg.get("docker_env") or []:
         if not e or "=" not in e:
             continue
-        k = e.split("=", 1)[0]
+        k = e.split("=", 1)[0].strip()
+        v = e.split("=", 1)[1].strip()
+        if not k:
+            continue
         if k in seen:
             env_out = [x for x in env_out if not x.startswith(k + "=")]
         seen.add(k)
-        env_out.append(e)
+        env_out.append(f"{k}={v}")
     cfg["docker_env"] = env_out
+
+    # If MTP structured flag is on, strip duplicate --speculative-config from extras
+    if cfg.get("mtp") and cfg.get("extra_flags"):
+        cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--speculative-config")
+
+    # GB10 / Spark: Qwen FP8 dense has hit DeepGEMM issues — soft env when card silent
+    if (
+        detected.get("has_fp8")
+        and not detected.get("is_mixed_nvfp4_fp8")
+        and (cfg.get("quantization") or "").lower() == "fp8"
+        and not any(e.startswith("VLLM_USE_DEEP_GEMM=") for e in cfg["docker_env"])
+    ):
+        cfg["docker_env"].append("VLLM_USE_DEEP_GEMM=0")
+        rationale.append(
+            "FP8 checkpoint on Spark → VLLM_USE_DEEP_GEMM=0 (avoids known GB10 DeepGEMM garbage)"
+        )
+        warnings.append(
+            "Added VLLM_USE_DEEP_GEMM=0 for FP8 on GB10. Remove if your vLLM build is fine without it."
+        )
 
     # Alternate recipes from the same card (for UI)
     alternatives = []
@@ -1216,6 +1503,17 @@ def recommend(
     else:
         notes = "Live HF card was not available; result may be incomplete."
 
+    token_ok = False
+    try:
+        token_ok = bool(_hf_token()) and hf_token_usable()
+    except Exception:
+        token_ok = False
+    if _hf_token() and not token_ok:
+        warnings.append(
+            "Stored HF token failed Hub auth (401). Fetches use anonymous access for public "
+            "models. Re-login with `hf auth login` for gated models / higher rate limits."
+        )
+
     return {
         "model": model,
         "mode": mode,
@@ -1224,6 +1522,7 @@ def recommend(
         "notes": notes,
         "card_url": card_url,
         "from_website": from_website,
+        "hf_token_ok": token_ok,
         "detected": detected,
         "config": cfg,
         "sources": sources,

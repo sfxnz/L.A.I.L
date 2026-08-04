@@ -136,7 +136,7 @@ export default function UsagePage() {
           {u.topModels.map((m) => (
             <div
               key={m.model}
-              className="flex items-center justify-between rounded-lg border border-lab-border/60 bg-black/20 px-3 py-2 text-sm"
+              className="flex items-center justify-between rounded-lg border border-lab-border/60 bg-lab-editor px-3 py-2 text-sm"
             >
               <span className="truncate font-mono text-xs">{m.model}</span>
               <span className="text-lab-muted">

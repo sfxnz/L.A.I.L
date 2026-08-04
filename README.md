@@ -1,68 +1,59 @@
 # L.A.I.L — Local AI Lab
 
-**Local-first agentic IDE** for your own models — Cursor-style Composer + project tree + file editor, plus lab tooling for **vLLM / llama.cpp** serve, models, and usage.
+**Serve & eval console for DGX Spark** — clean white UI to start/stop vLLM, run smoke/perf evals, and copy OpenAI-compatible endpoints for **Hermes** (and other clients).
 
-Not just inference/evals: the primary surface is **Workbench** (agent that reads/writes the repo and runs shell tools). Server, Models, and Usage support the lab around that IDE.
+Agentic coding/chat is **not** the primary surface anymore: wire Hermes to the live `:8000` endpoint after Serve.
 
 | Layer | Stack |
 |-------|--------|
-| UI | Next.js 16 App Router + React 19 · dark IDE chrome · Tailwind |
-| Controller | Bun + Hono · sessions, workspaces, agent, HF models, usage, OpenAI `/v1` proxy, WebSockets |
-| Serve-engine | Python FastAPI (ported) · vLLM Lab Safe / Workflow Max, benches, run history |
-| Models | **vLLM** and **llama.cpp** only (no Ollama) |
+| UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
+| Controller | Bun + Hono · lab-status, models, configure, proxy to serve-engine |
+| Serve-engine | Python FastAPI · vLLM Lab Safe / Workflow Max, smoke, benches, run history |
+| Models | **vLLM** and **llama.cpp** (no Ollama) |
 
-## Product surface (matches inspo IDE shell)
+## Product surface
 
-Left sidebar:
+Top nav:
 
-| Section | Contents |
-|---------|----------|
-| **Search** | Filter tasks / sessions |
-| **Workspace** | Status · Workbench · Models · Configure · Usage · Integrations · Server |
-| **Pinned** | Pinned chats |
-| **Tasks** | Recent Composer sessions |
-| **Projects** | Workspace roots + file tree (click a file → editor tab) |
+| Page | Path | Role |
+|------|------|------|
+| **Status** | `/status` | Health, headroom, containers, recent runs |
+| **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
+| **Evals** | `/evals` | Smoke + perf jobs + run history |
+| **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
+| **Models** | `/models` | HF search / download |
+| **Configure** | `/configure` | Default backend / model |
 
-**Workbench** (default home):
-
-- **Modes**: **Plan** · **Ask** · **Agent** (toggle in Composer)  
-- Composer stream: user bubble → **Thought** → **Ran N command(s)** → **Creating** / file write → final answer  
-- **Review-first patches**: Accept / Reject (or Accept all) before disk writes  
-- Streaming replies with **Cancel** mid-run  
-- **Risky shell** approval banner (Allow / Deny) for destructive commands  
-- Bottom bar: **Ask for follow-up changes** · mode · model label · send / stop  
-- Optional **editor** tabs when the agent writes (or you open) a project file  
-- Right **Status** rail: session state, model, workspace, pending patches  
-
-Lab pages (same dark chrome): **Models** (HF search / download), **Server** (full vLLM serve + perf/agentic/history), **Usage**, **Configure**, **Status**, **Integrations**.
+`/` redirects to **Status**. `/workbench` shows a retirement notice → Hermes.
 
 ## Architecture
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │  apps/web  Next.js 16 + React 19                             │
-│  Cursor-style shell · Workbench IDE · Models / Server / …    │
+│  White console · Status · Serve · Evals · Connect            │
 └────────────────────────────┬─────────────────────────────────┘
-                             │ REST + WS :8787
+                             │ REST :8787
 ┌────────────────────────────▼─────────────────────────────────┐
 │  LabController (Bun + Hono)                                  │
-│  sessions · workspaces · composer agent · models · usage     │
-│  OpenAI /v1 proxy · serve/* · bench/* · runs/* ──proxy──▶    │
+│  lab-status · models · configure · serve/* · bench/* proxy   │
 └──────────────┬─────────────────────────────┬─────────────────┘
                │                             │
                ▼                             ▼
      vLLM / llama.cpp                  packages/serve-engine
-     (OpenAI /v1)                      (Python: vLLM docker serve,
-                                        perf, agentic, history)
+     (OpenAI /v1)                      (Python: docker serve,
+                                        smoke, perf, history)
+               │
+               └──────────▶ Hermes / Mac clients
 ```
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the Spark/vLLM serve path (Lab Safe util ≤ 0.4, Workflow Max, stop, agent-restore, benches, envelopes). Composer, HF library, sessions/workspaces, and token metering live in Bun.
+One **LabController** is the public API. The Python **serve-engine** keeps the Spark/vLLM serve path (Lab Safe util ≤ 0.4, Workflow Max, stop, agent-restore, benches, envelopes). Composer agent remains in the backend for now but is **out of the primary UI**.
 
 ### Model resolution
 
-Configure default model, or use `auto`. If the name is `default` / `auto` / empty, the controller probes `/v1/models` and uses the first served id (avoids vLLM 404 on a placeholder name). Prefer setting the real id after serve, e.g. `unsloth/Qwen3.6-35B-A3B-NVFP4`.
+Configure default model, or use `auto`. If the name is `default` / `auto` / empty, the controller probes `/v1/models` and uses the first served id. Prefer setting the real id after serve (e.g. `laguna`).
 
 ## Quick start
 

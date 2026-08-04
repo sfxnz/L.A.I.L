@@ -76,6 +76,8 @@ run(
     LOCAL_AI_LAB_ROOT: root,
     LAIL_DATA_DIR: dataDir,
     LAB_API_PORT: servePort,
+    // uv tool install puts CLI here — needed for tool-eval-bench jobs
+    PATH: `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`,
   },
 );
 
@@ -100,8 +102,12 @@ run(
   join(root, "apps/web"),
   {
     PORT: webPort,
+    // Server-side rewrite target (Next → controller on this host). Do NOT bake
+    // NEXT_PUBLIC_LAIL_WS to 127.0.0.1 — the browser would connect to the
+    // client's loopback (broken for Mac→Spark Tailscale). Client derives WS
+    // from window.location.hostname in apps/web/lib/ws.ts.
+    LAIL_API_URL: `http://127.0.0.1:${apiPort}`,
     NEXT_PUBLIC_LAIL_API: `http://127.0.0.1:${apiPort}`,
-    NEXT_PUBLIC_LAIL_WS: `ws://127.0.0.1:${apiPort}/ws`,
   },
 );
 

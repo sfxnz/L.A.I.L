@@ -35,7 +35,14 @@ export type LabStatus = {
     unreachable?: boolean;
     presets?: string[];
     serve_examples?: Record<string, ServeExample>;
-    tool_eval?: { available: boolean };
+    tool_eval?: {
+      available: boolean;
+      path?: string | null;
+      via?: string;
+      version?: string | null;
+      install?: string;
+      repo?: string;
+    };
   } | null;
 };
 
@@ -76,15 +83,59 @@ export type RunRow = {
   path: string;
 };
 
+export type ToolEvalBoardRow = {
+  run_id: string;
+  created_at?: string;
+  model_id: string;
+  model_short: string;
+  final_score: number | null;
+  rating?: string | null;
+  preset?: string | null;
+  total_scenarios?: number | null;
+  total_points?: number | null;
+  max_points?: number | null;
+  deployability?: number | null;
+  responsiveness?: number | null;
+  safety_passed?: boolean;
+  safety_warnings?: unknown[];
+  categories: Array<{
+    id?: string;
+    label?: string;
+    percent?: number;
+    earned?: number;
+    max?: number;
+    pass?: number;
+    partial?: number;
+    fail?: number;
+  }>;
+  engine_image?: string | null;
+  engine_version?: string | null;
+  quant?: string | null;
+  href: string;
+};
+
 export type ServeRecommend = {
   model: string;
   mode: string;
   confidence: string;
+  label?: string | null;
   notes?: string | null;
+  card_url?: string | null;
+  from_website?: boolean;
+  hf_token_ok?: boolean;
   config: Record<string, unknown>;
   rationale: string[];
   warnings: string[];
   detected: Record<string, unknown>;
+  sources?: Array<{ kind: string; ref: string; notes?: string }>;
+  card_recipes?: Array<{
+    score: number;
+    section?: string;
+    raw: string;
+    selected?: boolean;
+    reasons?: string[];
+    config?: Record<string, unknown>;
+  }>;
 };
 
 export const api = {
@@ -184,12 +235,68 @@ export const api = {
       `/api/serve/recommend?model=${encodeURIComponent(model)}&mode=${encodeURIComponent(mode)}&fetch_remote=${fetchRemote}`,
     ),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
+  jobs: () =>
+    req<
+      Array<{
+        job_id: string;
+        kind: string;
+        status: string;
+        progress: number;
+        message: string;
+        created_at?: string;
+        updated_at?: string;
+      }>
+    >("/api/jobs"),
   smoke: () => req<{ ok: boolean; content: string }>("/api/smoke", { method: "POST" }),
   benchPerf: (body: Record<string, unknown>) =>
     req<{ job_id: string }>("/api/bench/perf", { method: "POST", body: JSON.stringify(body) }),
-  benchAgentic: (body: Record<string, unknown>) =>
-    req<{ job_id: string }>("/api/bench/agentic", { method: "POST", body: JSON.stringify(body) }),
-  runs: () => req<RunRow[]>("/api/runs"),
+  benchAgentic: (body: {
+    suite?: "golden" | "tool_eval";
+    preset?: "short" | "full" | "hardmode" | "coding";
+    seed?: number;
+    model?: string;
+    base_url?: string;
+    intent?: string;
+    context_pressure?: number | null;
+  }) =>
+    req<{ job_id: string }>("/api/bench/agentic", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  toolEvalStatus: () =>
+    req<{
+      available: boolean;
+      path?: string | null;
+      via?: string;
+      version?: string | null;
+      install?: string;
+      repo?: string;
+    }>("/api/bench/tool-eval-status"),
+  runs: (opts?: { kind?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (opts?.kind) q.set("kind", opts.kind);
+    if (opts?.limit) q.set("limit", String(opts.limit));
+    const s = q.toString();
+    return req<RunRow[]>(`/api/runs${s ? `?${s}` : ""}`);
+  },
+  run: (runId: string) =>
+    req<{
+      index: RunRow;
+      envelope: Record<string, unknown> | null;
+      tool_eval_raw?: Record<string, unknown> | null;
+    }>(`/api/runs/${encodeURIComponent(runId)}`),
+  toolEvalBoard: (limit = 40) =>
+    req<{ runs: ToolEvalBoardRow[]; count: number }>(
+      `/api/runs/tool-eval/board?limit=${limit}`,
+    ),
+  toolEvalCompare: (ids: string[]) =>
+    req<{
+      runs: ToolEvalBoardRow[];
+      winner_run_id: string;
+      winner_model?: string;
+      metrics: Array<{ metric: string; values: Record<string, unknown>; delta_best_vs_rest?: number }>;
+      categories: Array<{ id: string; label: string; values: Record<string, number | null | undefined> }>;
+    }>(`/api/runs/tool-eval/compare?ids=${encodeURIComponent(ids.join(","))}`),
 };
 
 export function watchJob(

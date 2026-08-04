@@ -116,37 +116,47 @@ function isPlaceholderModel(model: string | undefined | null): boolean {
   return !m || m === "default" || m === "auto" || m === "none" || m === "mock-model";
 }
 
-/**
- * Resolve the model id to send to the OpenAI-compatible backend.
- * If Configure has a real model name, use it; otherwise probe /v1/models
- * and pick the first served id (fixes vLLM 404 on `default`).
- */
-export async function resolveModelId(kind?: BackendKind): Promise<string> {
-  const settings = getSettings();
-  const configured = settings.defaultModel?.trim();
-  if (!isPlaceholderModel(configured)) {
-    return configured!;
-  }
-
+async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
   const base = openAiBase(kind);
   try {
     const r = await fetch(`${base}/models`, { signal: AbortSignal.timeout(5000) });
-    if (r.ok) {
-      const j = (await r.json()) as { data?: Array<{ id: string }> };
-      const id = j.data?.[0]?.id;
-      if (id) {
-        // Persist so Configure UI shows the real model next time
-        if (isPlaceholderModel(settings.defaultModel)) {
-          putSettings({ defaultModel: id });
-        }
-        return id;
-      }
-    }
+    if (!r.ok) return [];
+    const j = (await r.json()) as { data?: Array<{ id: string }> };
+    return (j.data || []).map((m) => m.id).filter(Boolean);
   } catch {
-    /* fall through */
+    return [];
   }
+}
+
+/**
+ * Model id for Workbench / agent / chat.
+ *
+ * Rule: if the backend is serving something, that is the model — full stop.
+ * Configure "default model" is only a fallback when nothing is up (and a
+ * mirror of the live id for the UI). Never 404 because Configure lagged Server.
+ */
+export async function resolveModelId(kind?: BackendKind): Promise<string> {
+  const served = await listServedModelIds(kind);
+  if (served[0]) {
+    const id = served[0];
+    // Keep Configure / sidebar in sync with live serve (best-effort)
+    try {
+      const cur = getSettings().defaultModel?.trim();
+      if (cur !== id) putSettings({ defaultModel: id });
+    } catch {
+      /* ignore persist errors */
+    }
+    return id;
+  }
+
+  const settings = getSettings();
+  const configured = settings.defaultModel?.trim() || "";
+  if (configured && !isPlaceholderModel(configured)) {
+    return configured;
+  }
+
+  const base = openAiBase(kind);
   throw new Error(
-    `No model configured and could not auto-detect from ${base}/models. ` +
-      `Set Default model in Configure to the served id (e.g. unsloth/Qwen3.6-35B-A3B-NVFP4).`,
+    `Nothing is served at ${base}/models. Start a model on Server, then chat in Workbench.`,
   );
 }

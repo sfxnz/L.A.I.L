@@ -75,6 +75,42 @@ def _parse_extra_flags(extra_flags: str) -> list[str]:
     return shlex.split(s)
 
 
+def _strip_flag(args: list[str], flag: str) -> list[str]:
+    """Drop ``flag`` (+ value) from an argv-style list."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == flag:
+            if i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if a.startswith(flag + "="):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _resolve_hf_token_for_container() -> str:
+    """Return a Hub token only if it authenticates; never inject a known-bad token."""
+    try:
+        from .autoconfig import _hf_token, hf_token_usable
+
+        tok = _hf_token()
+        if not tok:
+            return ""
+        if hf_token_usable():
+            return tok
+        return ""
+    except Exception:
+        # Fallback: env only (legacy path)
+        return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+
+
 def _normalize_docker_env(user_env: list[str] | None) -> list[str]:
     """Only what the user (or GUI) sent — no silent defaults."""
     out: list[str] = []
@@ -152,7 +188,33 @@ def _build_vllm_args(
         # Compact JSON; shlex-safe single token after the flag
         cfg = f'{{"method":"mtp","num_speculative_tokens":{int(mtp_num_tokens)}}}'
         args += ["--speculative-config", cfg]
-    args += _parse_extra_flags(extra_flags)
+    extras = _parse_extra_flags(extra_flags)
+    # Drop free-form duplicates of structured fields we already set.
+    if mtp:
+        extras = _strip_flag(extras, "--speculative-config")
+    if quantization.strip():
+        extras = _strip_flag(extras, "--quantization")
+        extras = _strip_flag(extras, "-q")
+    if kv_cache_dtype.strip():
+        extras = _strip_flag(extras, "--kv-cache-dtype")
+    if moe_backend.strip():
+        extras = _strip_flag(extras, "--moe-backend")
+    if tool_call_parser.strip():
+        extras = _strip_flag(extras, "--tool-call-parser")
+    if reasoning_parser.strip():
+        extras = _strip_flag(extras, "--reasoning-parser")
+    if load_format.strip():
+        extras = _strip_flag(extras, "--load-format")
+    # Lab envelope owns host/port/tp/util/max-len
+    for f in (
+        "--host",
+        "--port",
+        "--tensor-parallel-size",
+        "--gpu-memory-utilization",
+        "--max-model-len",
+    ):
+        extras = _strip_flag(extras, f)
+    args += extras
     return args
 
 
@@ -239,6 +301,28 @@ def serve_model(
             )
             moe_backend = ""
 
+    # Guard: marlin crashes MoE on vLLM 0.25 (NVIDIA 35B-A3B-NVFP4 ModelOpt path)
+    if moe_backend.lower() == "marlin":
+        drop_marlin = True
+        try:
+            from .autoconfig import analyze_config, load_local_fallback, _marlin_unsafe_for_checkpoint
+
+            local = load_local_fallback(model)
+            if local.get("config"):
+                det = analyze_config(local["config"], model)
+                drop_marlin = _marlin_unsafe_for_checkpoint(det)
+            elif "a3b" in mid or "moe" in mid or quant_l in ("modelopt", "compressed-tensors"):
+                drop_marlin = True
+        except Exception:
+            drop_marlin = True
+        if drop_marlin:
+            w(
+                "SAFETY: dropping --moe-backend marlin "
+                "(vLLM 0.25: not supported for unquantized MoE on this checkpoint; leave auto)",
+                0.15,
+            )
+            moe_backend = ""
+
     vllm_args = _build_vllm_args(
         util=util,
         max_model_len=max_model_len,
@@ -284,19 +368,20 @@ def serve_model(
     ]
     for e in env_list:
         cmd += ["-e", e]
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
-    if not hf_token:
-        token_file = Path.home() / ".cache" / "huggingface" / "token"
-        if token_file.is_file():
-            try:
-                hf_token = token_file.read_text().strip()
-            except OSError:
-                hf_token = ""
+    hf_token = _resolve_hf_token_for_container()
+    if hf_token:
+        cmd += [
+            "-e",
+            f"HF_TOKEN={hf_token}",
+            "-e",
+            f"HUGGING_FACE_HUB_TOKEN={hf_token}",
+        ]
+    else:
+        w(
+            "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
+            0.28,
+        )
     cmd += [
-        "-e",
-        f"HF_TOKEN={hf_token}",
-        "-e",
-        f"HUGGING_FACE_HUB_TOKEN={hf_token}",
         image,
         model,
         *vllm_args,
@@ -475,14 +560,26 @@ def _hf_download_env() -> dict[str, str]:
     env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     env.pop("HF_XET_HIGH_PERFORMANCE", None)
     env["HF_HUB_DISABLE_XET"] = "1"
-    # Prefer token from env or cached login (hf stores it; CLI picks it up)
-    token_file = Path.home() / ".cache" / "huggingface" / "token"
-    if not env.get("HF_TOKEN") and token_file.is_file():
-        try:
-            env["HF_TOKEN"] = token_file.read_text().strip()
-            env["HUGGING_FACE_HUB_TOKEN"] = env["HF_TOKEN"]
-        except OSError:
-            pass
+    # Only inject a token that actually authenticates (bad Bearer → 401 on public too)
+    try:
+        from .autoconfig import _hf_token, hf_token_usable
+
+        tok = _hf_token() if hf_token_usable() else ""
+    except Exception:
+        tok = env.get("HF_TOKEN") or env.get("HUGGING_FACE_HUB_TOKEN") or ""
+        if not tok:
+            token_file = Path.home() / ".cache" / "huggingface" / "token"
+            if token_file.is_file():
+                try:
+                    tok = token_file.read_text().strip()
+                except OSError:
+                    tok = ""
+    if tok:
+        env["HF_TOKEN"] = tok
+        env["HUGGING_FACE_HUB_TOKEN"] = tok
+    else:
+        env.pop("HF_TOKEN", None)
+        env.pop("HUGGING_FACE_HUB_TOKEN", None)
     return env
 
 

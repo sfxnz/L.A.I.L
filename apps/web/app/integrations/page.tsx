@@ -40,7 +40,7 @@ export default function IntegrationsPage() {
           <Panel key={it.name} className="p-4">
             <div className="flex items-start justify-between">
               <div className="flex items-center gap-2">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-zinc-800">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-lab-hover">
                   <it.icon className="h-4 w-4 text-lab-accent" />
                 </div>
                 <div className="font-medium">{it.name}</div>

@@ -579,7 +579,10 @@ async function callLlm(opts: {
     messages,
     stream: true,
     temperature: 0.3,
-    chat_template_kwargs: { enable_thinking: false },
+    // Laguna / Qwen-style reasoning: on by default for Composer so agentic
+    // answers can use interleaved thinking. Per-request off still works via
+    // models that honor chat_template_kwargs from the client; we force on here.
+    chat_template_kwargs: { enable_thinking: true },
   };
   if (tools.length) {
     payload.tools = tools;
@@ -620,7 +623,7 @@ async function callLlm(opts: {
           messages: messages.map(({ role, content }) => ({ role, content })),
           stream: false,
           temperature: 0.3,
-          chat_template_kwargs: { enable_thinking: false },
+          chat_template_kwargs: { enable_thinking: true },
         }),
         signal: signal ?? AbortSignal.timeout(180_000),
       });

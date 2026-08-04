@@ -3,8 +3,8 @@ import { AppShell } from "@/components/layout/AppShell";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "L.A.I.L — Local AI Lab",
-  description: "Local-first AI lab: serve, compose, models, usage",
+  title: "L.A.I.L — Serve & Evals",
+  description: "Local AI Lab on DGX Spark: serve models, run evals, connect Hermes",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -21,3 +21,14 @@ data/logs/
 .vscode/
 
 .superpowers/
+
+# local lab runtime (never commit)
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/runs/
+data/benchmarks.sqlite*
+packages/serve-engine/data/
+packages/serve-engine/runs/
+runs/
+*.tsbuildinfo

@@ -75,29 +75,25 @@ export default function ModelsPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#0e0e0e]">
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-[#1f1f1f] px-4">
-        <h1 className="text-[13px] font-semibold text-[#e4e4e4]">Models</h1>
-        <span className="text-[11px] text-[#666]">MODEL LIBRARY</span>
+    <div className="space-y-5">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Models</h1>
+          <p className="page-sub">
+            Find weights, check hardware fit, and download for vLLM / llama.cpp.
+          </p>
+        </div>
       </div>
 
-      <div className="flex min-h-0 flex-1">
-        {/* Left subnav like inspo Get / Serves / Downloads */}
-        <div className="w-[140px] shrink-0 border-r border-[#1f1f1f] bg-[#111] p-2 text-[12px]">
-          <div className="rounded-md bg-[#2a2a2a] px-2 py-1.5 text-white">Get</div>
-          <div className="mt-0.5 rounded-md px-2 py-1.5 text-[#888]">Serves</div>
-          <div className="rounded-md px-2 py-1.5 text-[#888]">Downloads</div>
-        </div>
-
-        {/* Results list */}
-        <div className="flex min-w-0 flex-1 flex-col border-r border-[#1f1f1f]">
-          <div className="border-b border-[#1f1f1f] p-3">
-            <p className="mb-2 text-[12px] text-[#888]">
-              Find the right model, check hardware fit, and download its weights.
+      <div className="lab-card flex min-h-[min(70vh,640px)] overflow-hidden">
+        <div className="flex min-w-0 flex-1 flex-col border-r border-lab-border-subtle">
+          <div className="border-b border-lab-border-subtle p-4">
+            <p className="mb-3 text-[12px] text-lab-muted">
+              Search Hugging Face, inspect fit, pull weights when ready.
             </p>
             <div className="flex gap-2">
               <div className="relative flex-1">
-                <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-[#555]" />
+                <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-lab-muted" />
                 <input
                   className={cn(inputCls, "pl-8")}
                   value={q}
@@ -110,20 +106,20 @@ export default function ModelsPage() {
                 {busy ? "…" : "Search"}
               </Btn>
             </div>
-            {err && <p className="mt-2 text-[11px] text-[#e07070]">{err}</p>}
+            {err && <p className="mt-2 text-[12px] text-lab-danger">{err}</p>}
           </div>
 
           {Object.keys(jobs).length > 0 && (
-            <div className="space-y-1 border-b border-[#1f1f1f] p-3">
+            <div className="space-y-2 border-b border-lab-border-subtle p-4">
               {Object.entries(jobs).map(([id, j]) => (
-                <div key={id} className="text-[11px] text-[#888]">
-                  <div className="mb-0.5 flex justify-between">
-                    <span className="font-mono">{id.slice(0, 8)}</span>
+                <div key={id} className="text-[11px] text-lab-muted">
+                  <div className="mb-1 flex justify-between gap-2">
+                    <span className="font-mono text-lab-text-dim">{id.slice(0, 8)}</span>
                     <span>{j.message}</span>
                   </div>
-                  <div className="h-1 overflow-hidden rounded bg-[#222]">
+                  <div className="h-1 overflow-hidden rounded-full bg-lab-hover">
                     <div
-                      className="h-full bg-[#81a1c1]"
+                      className="h-full rounded-full bg-lab-accent transition-[width] duration-300"
                       style={{ width: `${Math.round(j.progress * 100)}%` }}
                     />
                   </div>
@@ -134,7 +130,7 @@ export default function ModelsPage() {
 
           <div className="flex-1 overflow-y-auto">
             {local.length > 0 && (
-              <div className="border-b border-[#1f1f1f] px-3 py-2 text-[10px] uppercase tracking-wider text-[#555]">
+              <div className="border-b border-lab-border-subtle px-4 py-2 text-[10px] font-medium uppercase tracking-[0.08em] text-lab-muted">
                 Local
               </div>
             )}
@@ -147,7 +143,7 @@ export default function ModelsPage() {
                 local
               />
             ))}
-            <div className="border-b border-[#1f1f1f] px-3 py-2 text-[10px] uppercase tracking-wider text-[#555]">
+            <div className="border-b border-lab-border-subtle px-4 py-2 text-[10px] font-medium uppercase tracking-[0.08em] text-lab-muted">
               Model results
             </div>
             {results.map((m) => (
@@ -162,23 +158,26 @@ export default function ModelsPage() {
           </div>
         </div>
 
-        {/* Card detail */}
-        <div className="hidden w-[340px] shrink-0 overflow-y-auto p-4 lg:block">
+        <div className="hidden w-[320px] shrink-0 overflow-y-auto p-5 lg:block">
           {selected ? (
-            <div className="space-y-3">
-              <h2 className="text-[14px] font-semibold text-white">{selected.name}</h2>
-              <div className="font-mono text-[11px] text-[#888]">{selected.id}</div>
-              <div className="flex flex-wrap gap-1">
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-[15px] font-semibold tracking-[-0.02em] text-lab-text">
+                  {selected.name}
+                </h2>
+                <div className="mt-1 font-mono text-[11px] text-lab-muted">{selected.id}</div>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
                 {selected.license && <Badge tone="muted">{selected.license}</Badge>}
                 <Badge tone="accent">fit: {selected.hardwareFit || "unknown"}</Badge>
                 {selected.pipeline_tag && <Badge tone="muted">{selected.pipeline_tag}</Badge>}
               </div>
-              <Panel className="p-3" title="Model card">
-                <p className="text-[12px] leading-relaxed text-[#aaa]">
+              <Panel className="p-3.5" title="Model card">
+                <p className="text-[12px] leading-relaxed text-lab-muted">
                   Open on Hugging Face for full card, files, and quant variants. Pull downloads
                   weights for vLLM / llama.cpp via HF CLI.
                 </p>
-                <div className="mt-3 flex gap-2">
+                <div className="mt-3 flex flex-wrap gap-2">
                   {!selected.local && (
                     <Btn size="sm" onClick={() => pull(selected.id)}>
                       <Download className="h-3 w-3" /> HF download
@@ -188,7 +187,7 @@ export default function ModelsPage() {
                     href={`https://huggingface.co/${selected.id}`}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex h-7 items-center rounded-md border border-[#2b2b2b] px-2 text-[11px] text-[#aaa] hover:bg-[#1a1a1a]"
+                    className="inline-flex h-8 items-center rounded-[8px] border border-lab-border px-2.5 text-[11px] font-medium text-lab-text-dim transition-colors hover:bg-lab-hover hover:text-lab-text"
                   >
                     Open card
                   </a>
@@ -196,7 +195,7 @@ export default function ModelsPage() {
               </Panel>
             </div>
           ) : (
-            <p className="text-[12px] text-[#555]">Select a model to inspect</p>
+            <p className="pt-8 text-center text-[12px] text-lab-muted">Select a model to inspect</p>
           )}
         </div>
       </div>
@@ -218,35 +217,35 @@ function ModelRow({
   local?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onSelect}
+    <div
       className={cn(
-        "flex w-full items-center gap-2 border-b border-[#1a1a1a] px-3 py-2 text-left hover:bg-[#161616]",
-        selected && "bg-[#1c1c1c]",
+        "flex w-full items-center gap-2 border-b border-lab-border-subtle px-4 py-2.5 transition-colors hover:bg-lab-hover",
+        selected && "bg-lab-active",
       )}
     >
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-[12.5px] text-[#e4e4e4]">{m.name}</div>
-        <div className="truncate font-mono text-[10px] text-[#666]">{m.id}</div>
-      </div>
+      <button
+        type="button"
+        onClick={onSelect}
+        className="min-w-0 flex-1 text-left"
+      >
+        <div className="truncate text-[13px] font-medium tracking-[-0.01em] text-lab-text">
+          {m.name}
+        </div>
+        <div className="truncate font-mono text-[10px] text-lab-muted">{m.id}</div>
+      </button>
       {local ? (
         <Badge tone="ok">local</Badge>
       ) : (
         onPull && (
-          <span
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onPull();
-            }}
-            className="text-[11px] text-[#81a1c1] hover:underline"
+          <button
+            type="button"
+            onClick={onPull}
+            className="shrink-0 text-[12px] font-medium text-lab-accent-bright hover:underline"
           >
             Get
-          </span>
+          </button>
         )
       )}
-    </button>
+    </div>
   );
 }

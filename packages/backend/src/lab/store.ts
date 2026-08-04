@@ -244,11 +244,8 @@ export function publishLabRun(id: string, makePublic = true): LabRunSummary {
     // index fallback if entry isn't index.html
     const entry = meta.entry || "index.html";
     if (entry !== "index.html" && existsSync(join(pubDir, entry))) {
-      const idx = join(pubDir, "index.html");
-      if (!existsSync(idx)) {
-        // Prefer real entry as index so /p/slug/ serves the game directly
-        copyFileSync(join(pubDir, entry), idx);
-      }
+      // Always materialize entry as index.html for clean /api/lab/p/<slug>/ URLs
+      copyFileSync(join(pubDir, entry), join(pubDir, "index.html"));
     }
     writeFileSync(
       join(pubDir, "share.json"),

@@ -169,15 +169,24 @@ export default function LabRunDetailPage() {
             </Panel>
           )}
 
-          <Panel title="Share play link">
+          <Panel title="Share for X / internet">
             <p className="mb-2 text-xs text-lab-muted">
-              Serves <strong className="text-lab-text">only the game files</strong> (HTML/JS/CSS/assets).
-              No L.A.I.L admin, no Hermes, no API keys. Secret-like strings are blocked at publish.
+              Serves <strong className="text-lab-text">only game files</strong> — not L.A.I.L, not Hermes.
+              Secret-like strings blocked at publish. CSP locks down the page.
             </p>
             <p className="mb-2 text-xs text-lab-muted">
-              The Tailscale IP in the URL is <strong className="text-lab-text">not the public internet</strong> —
-              only devices on your tailnet (and anyone who can already reach this Spark on LAN if ports
-              are open) can open it. It does not by itself open a hole to the world.
+              <strong className="text-lab-text">For people on X</strong> you need Tailscale Funnel on the
+              artifacts-only server (port 8791), not the full lab:
+            </p>
+            <pre className="mb-2 overflow-x-auto rounded-lg bg-black/40 p-2 text-[11px] text-lab-muted">
+{`cd ~/projects/ai-lab/local-ai-lab
+bun run lab:funnel
+# then restart: bun run dev
+# links become https://spark1.<tailnet>.ts.net/s/<slug>/index.html`}
+            </pre>
+            <p className="mb-2 text-xs text-lab-muted">
+              Without Funnel, Create share link only works on your Tailscale/LAN (fine for you, not for
+              random people on X).
             </p>
             <Btn variant="secondary" disabled={busy} onClick={togglePublic}>
               {run.share?.public ? "Unpublish" : "Create share link"}

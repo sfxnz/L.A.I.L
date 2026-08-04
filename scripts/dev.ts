@@ -92,6 +92,22 @@ run(
     LAIL_SERVE_ENGINE_URL: `http://127.0.0.1:${servePort}`,
     LAIL_ROOT: root,
     LAIL_DATA_DIR: dataDir,
+    LAIL_SHARE_PUBLIC_BASE: process.env.LAIL_SHARE_PUBLIC_BASE || "",
+  },
+);
+
+// Artifacts-only share server (loopback) — Funnel this, never :3000
+const sharePort = process.env.LAIL_SHARE_PORT || "8791";
+run(
+  "lab-public-share",
+  ["bun", "run", "scripts/lab-public-server.ts"],
+  root,
+  {
+    LAIL_ROOT: root,
+    LAIL_DATA_DIR: dataDir,
+    LAIL_SHARE_HOST: "127.0.0.1",
+    LAIL_SHARE_PORT: sharePort,
+    LAIL_LAB_PUBLIC_DIR: join(dataDir, "lab-public"),
   },
 );
 
@@ -117,6 +133,7 @@ console.log(`
 ║  Web:          http://127.0.0.1:${webPort}            ║
 ║  Controller:   http://127.0.0.1:${apiPort}            ║
 ║  Serve-engine: http://127.0.0.1:${servePort}            ║
+║  Public share: http://127.0.0.1:${sharePort} (artifacts) ║
 ╚══════════════════════════════════════════════╝
 `);
 

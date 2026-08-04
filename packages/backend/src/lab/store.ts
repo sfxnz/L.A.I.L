@@ -137,13 +137,23 @@ function toSummary(meta: LabRunMeta): LabRunSummary {
   const dir = join(labRoot(), meta.id);
   const previewPath = join(dir, "preview.png");
   const slug = meta.share?.slug || null;
+  let public_url: string | null = null;
+  if (meta.share?.public && slug) {
+    if (config.sharePublicBase) {
+      // Funnel / internet: short path on artifacts-only server
+      public_url = `${config.sharePublicBase}/s/${slug}/index.html`;
+    } else {
+      // Tailnet / LAN via L.A.I.L controller
+      public_url = `/api/lab/p/${slug}/index.html`;
+    }
+  }
   return {
     ...meta,
     dir,
     preview_url: existsSync(previewPath) ? `/api/lab/runs/${meta.id}/files/preview.png` : null,
     play_url: `/api/lab/runs/${meta.id}/play`,
     gallery_url: `/lab/${meta.id}`,
-    public_url: meta.share?.public && slug ? `/api/lab/p/${slug}/index.html` : null,
+    public_url,
   };
 }
 

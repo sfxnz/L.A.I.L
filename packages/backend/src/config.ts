@@ -29,4 +29,6 @@ export const config = {
     },
   },
   hfToken: process.env.HF_TOKEN || "",
+  /** Internet Funnel origin, e.g. https://spark1.tailxxx.ts.net — artifacts-only server */
+  sharePublicBase: (process.env.LAIL_SHARE_PUBLIC_BASE || "").replace(/\/$/, ""),
 };

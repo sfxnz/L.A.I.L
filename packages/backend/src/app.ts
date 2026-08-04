@@ -292,6 +292,14 @@ export function createApp() {
       openAiBase: openAiBase(),
       backends,
       serve,
+      share: {
+        internet_base: config.sharePublicBase || null,
+        internet_ready: !!config.sharePublicBase,
+        funnel_hint: "cd ~/projects/ai-lab/local-ai-lab && bun run lab:funnel",
+        note: config.sharePublicBase
+          ? "Share links use Tailscale Funnel (internet). Only artifacts-only server is exposed."
+          : "Share links are Tailnet/LAN only until you run: bun run lab:funnel",
+      },
     });
   });
 

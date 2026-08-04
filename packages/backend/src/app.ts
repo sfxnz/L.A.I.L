@@ -29,9 +29,24 @@ import { getUsageSummary } from "./controller/usage";
 import { searchHuggingFace, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
 import { config } from "./config";
+import {
+  ensureDemoLabRuns,
+  getLabRun,
+  importLabRun,
+  listLabFiles,
+  listLabRuns,
+  resolveLabFile,
+} from "./lab/store";
+import { readFileSync } from "fs";
 
 export function createApp() {
   const app = new Hono();
+  // Seed gallery once if empty (demo HTML)
+  try {
+    ensureDemoLabRuns();
+  } catch {
+    /* */
+  }
 
   app.use(
     "*",
@@ -272,6 +287,79 @@ export function createApp() {
       backends,
       serve,
     });
+  });
+
+  // ── Lab gallery (Hermes task artifacts) ─────────────────────────
+  app.get("/api/lab/runs", (c) => {
+    const limit = Number(c.req.query("limit") || 50);
+    const task = c.req.query("task_type") || "";
+    const model = c.req.query("model") || "";
+    let rows = listLabRuns(Math.min(200, Math.max(1, limit)));
+    if (task) rows = rows.filter((r) => r.task_type === task);
+    if (model) rows = rows.filter((r) => (r.model_id || "").includes(model));
+    return c.json({ runs: rows, count: rows.length });
+  });
+
+  app.get("/api/lab/runs/:id", (c) => {
+    const run = getLabRun(c.req.param("id"));
+    if (!run) return c.json({ error: "not_found" }, 404);
+    return c.json({ ...run, files: listLabFiles(run.id) });
+  });
+
+  app.post("/api/lab/runs/import", async (c) => {
+    try {
+      const body = await c.req.json();
+      if (!body?.from || !body?.title) {
+        return c.json({ error: "title_and_from_required" }, 400);
+      }
+      const run = importLabRun({
+        title: String(body.title),
+        from: String(body.from),
+        task_type: body.task_type,
+        model_id: body.model_id,
+        entry: body.entry,
+        tags: body.tags,
+        brief: body.brief,
+        eval_run_id: body.eval_run_id,
+        hermes: body.hermes,
+        serve: body.serve,
+        share_public: !!body.share_public,
+      });
+      return c.json(run, 201);
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const status = err.code === "not_found" ? 404 : 400;
+      return c.json({ error: err.code || "import_failed", message: err.message }, status);
+    }
+  });
+
+  app.get("/api/lab/runs/:id/play", (c) => {
+    const id = c.req.param("id");
+    const run = getLabRun(id);
+    if (!run) return c.json({ error: "not_found" }, 404);
+    const entry = run.entry || "index.html";
+    return c.redirect(`/api/lab/runs/${id}/files/artifacts/${entry}`, 302);
+  });
+
+  app.get("/api/lab/runs/:id/files/*", (c) => {
+    const id = c.req.param("id");
+    const rel = c.req.path.replace(`/api/lab/runs/${id}/files/`, "");
+    try {
+      const { abs, contentType } = resolveLabFile(id, rel);
+      const data = readFileSync(abs);
+      return new Response(data, {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "no-cache",
+          // allow iframe embed from L.A.I.L web origin
+          "X-Frame-Options": "SAMEORIGIN",
+        },
+      });
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const status = err.code === "not_found" ? 404 : 400;
+      return c.json({ error: err.code || "error", message: err.message }, status);
+    }
   });
 
   // Legacy + serve proxy under /api

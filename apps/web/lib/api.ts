@@ -114,6 +114,25 @@ export type ToolEvalBoardRow = {
   href: string;
 };
 
+export type LabArtifactRun = {
+  id: string;
+  kind: string;
+  task_type: string;
+  title: string;
+  model_id: string;
+  created_at: string;
+  entry: string;
+  tags: string[];
+  brief?: string;
+  eval_run_id?: string | null;
+  play_url: string;
+  preview_url?: string | null;
+  task_fingerprint?: string;
+  hermes?: { session?: string; source?: string } | null;
+  share?: { public: boolean; slug: string | null };
+  files?: string[];
+};
+
 export type ServeRecommend = {
   model: string;
   mode: string;
@@ -297,6 +316,32 @@ export const api = {
       metrics: Array<{ metric: string; values: Record<string, unknown>; delta_best_vs_rest?: number }>;
       categories: Array<{ id: string; label: string; values: Record<string, number | null | undefined> }>;
     }>(`/api/runs/tool-eval/compare?ids=${encodeURIComponent(ids.join(","))}`),
+  lab: {
+    list: (opts?: { limit?: number; task_type?: string; model?: string }) => {
+      const q = new URLSearchParams();
+      if (opts?.limit) q.set("limit", String(opts.limit));
+      if (opts?.task_type) q.set("task_type", opts.task_type);
+      if (opts?.model) q.set("model", opts.model);
+      const s = q.toString();
+      return req<{ runs: LabArtifactRun[]; count: number }>(`/api/lab/runs${s ? `?${s}` : ""}`);
+    },
+    get: (id: string) =>
+      req<LabArtifactRun & { files: string[] }>(`/api/lab/runs/${encodeURIComponent(id)}`),
+    import: (body: {
+      title: string;
+      from: string;
+      task_type?: string;
+      model_id?: string;
+      entry?: string;
+      tags?: string[];
+      brief?: string;
+      eval_run_id?: string;
+    }) =>
+      req<LabArtifactRun>("/api/lab/runs/import", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+  },
 };
 
 export function watchJob(

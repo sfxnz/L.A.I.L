@@ -28,6 +28,7 @@ data/*.sqlite-shm
 data/*.sqlite-wal
 data/runs/
 data/benchmarks.sqlite*
+data/lab-runs/
 packages/serve-engine/data/
 packages/serve-engine/runs/
 runs/

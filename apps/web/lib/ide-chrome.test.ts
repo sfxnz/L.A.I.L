@@ -21,11 +21,12 @@ describe("ide-chrome nav contract", () => {
     expect([...SIDEBAR_SECTION_LABELS]).toEqual(["Lab"]);
   });
 
-  test("exposes serve+evals nav destinations", () => {
+  test("exposes serve+evals+lab nav destinations", () => {
     expect([...WORKSPACE_NAV_LABELS]).toEqual([
       "Status",
       "Serve",
       "Evals",
+      "Lab",
       "Connect",
       "Models",
       "Configure",
@@ -34,6 +35,7 @@ describe("ide-chrome nav contract", () => {
       "/status",
       "/server",
       "/evals",
+      "/lab",
       "/connect",
       "/models",
       "/configure",

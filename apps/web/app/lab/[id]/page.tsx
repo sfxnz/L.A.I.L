@@ -169,12 +169,18 @@ export default function LabRunDetailPage() {
             </Panel>
           )}
 
-          <Panel title="Public share">
+          <Panel title="Share play link">
             <p className="mb-2 text-xs text-lab-muted">
-              Artifacts only — no L.A.I.L chrome, no API keys. Safe to send a play link.
+              Serves <strong className="text-lab-text">only the game files</strong> (HTML/JS/CSS/assets).
+              No L.A.I.L admin, no Hermes, no API keys. Secret-like strings are blocked at publish.
+            </p>
+            <p className="mb-2 text-xs text-lab-muted">
+              The Tailscale IP in the URL is <strong className="text-lab-text">not the public internet</strong> —
+              only devices on your tailnet (and anyone who can already reach this Spark on LAN if ports
+              are open) can open it. It does not by itself open a hole to the world.
             </p>
             <Btn variant="secondary" disabled={busy} onClick={togglePublic}>
-              {run.share?.public ? "Unpublish" : "Publish public link"}
+              {run.share?.public ? "Unpublish" : "Create share link"}
             </Btn>
             {publicUrl && (
               <div className="mt-3 space-y-2">
@@ -182,7 +188,7 @@ export default function LabRunDetailPage() {
                   {publicUrl}
                 </code>
                 <Btn variant="ghost" onClick={() => copy("pub", publicUrl)}>
-                  {copied === "pub" ? "Copied" : "Copy public URL"}
+                  {copied === "pub" ? "Copied" : "Copy share URL"}
                 </Btn>
               </div>
             )}

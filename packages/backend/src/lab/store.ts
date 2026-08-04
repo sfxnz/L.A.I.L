@@ -251,10 +251,10 @@ export function publishLabRun(id: string, makePublic = true): LabRunSummary {
       join(pubDir, "share.json"),
       JSON.stringify(
         {
+          // Minimal metadata for ops — never served over play URL
           title: meta.title,
           model_id: meta.model_id,
           task_type: meta.task_type,
-          run_id: meta.id,
           created_at: meta.created_at,
         },
         null,
@@ -298,13 +298,74 @@ export function resolvePublicFile(slug: string, relPath: string): { abs: string;
   if (!pub) throw Object.assign(new Error("not found"), { code: "not_found" });
   let clean = (relPath || "index.html").replace(/^\/+/, "").replace(/\\/g, "/");
   if (!clean || clean.endsWith("/")) clean = `${clean}index.html`;
-  if (clean.includes("..")) throw Object.assign(new Error("bad path"), { code: "bad_path" });
-  // never serve outside public bundle; block share.json optional? allow share.json
+  if (clean.includes("..") || clean.includes("\0")) {
+    throw Object.assign(new Error("bad path"), { code: "bad_path" });
+  }
+  // Never expose internal metadata over the play URL
+  const base = clean.split("/").pop() || clean;
+  if (base === "share.json" || base === "meta.json" || base.startsWith(".")) {
+    throw Object.assign(new Error("not found"), { code: "not_found" });
+  }
+  // Allowlist extensions for public play (no server configs)
+  const ext = extname(clean).toLowerCase() || ".html";
+  const allowed = new Set([
+    ".html",
+    ".htm",
+    ".js",
+    ".mjs",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".wasm",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".mp3",
+    ".ogg",
+    ".wav",
+    ".json", // game data only; share.json blocked above
+    ".txt",
+    ".map",
+  ]);
+  if (!allowed.has(ext)) {
+    throw Object.assign(new Error("type not allowed"), { code: "forbidden_type" });
+  }
   const abs = safeResolveUnder(pub.dir, clean);
   if (!existsSync(abs) || !statSync(abs).isFile()) {
     throw Object.assign(new Error("file not found"), { code: "not_found" });
   }
   return { abs, contentType: mimeFor(abs) };
+}
+
+/** Safe response headers for untrusted model-generated HTML/JS. */
+export function publicPlayHeaders(contentType: string): Record<string, string> {
+  return {
+    "Content-Type": contentType,
+    "Cache-Control": "public, max-age=120",
+    "X-Robots-Tag": "noindex, nofollow",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    // Lock down what the game page can do. Model HTML is untrusted.
+    "Content-Security-Policy": [
+      "default-src 'none'",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "media-src 'self' blob:",
+      "connect-src 'self'",
+      "form-action 'none'",
+      "frame-ancestors 'self'",
+      "base-uri 'none'",
+      "object-src 'none'",
+    ].join("; "),
+    // Do not let other sites embed as a tracking pixel / data siphon easily
+    "X-Frame-Options": "SAMEORIGIN",
+  };
 }
 
 const SECRET_PATTERNS = [

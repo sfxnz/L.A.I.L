@@ -38,6 +38,7 @@ import {
   listLabFiles,
   listLabRuns,
   listLabRunsByFingerprint,
+  publicPlayHeaders,
   publishLabRun,
   resolveLabFile,
   resolvePublicFile,
@@ -414,11 +415,7 @@ export function createApp() {
     try {
       const { abs, contentType } = resolvePublicFile(c.req.param("slug"), "index.html");
       return new Response(readFileSync(abs), {
-        headers: {
-          "Content-Type": contentType,
-          "Cache-Control": "public, max-age=60",
-          "X-Robots-Tag": "noindex",
-        },
+        headers: publicPlayHeaders(contentType),
       });
     } catch {
       return c.json({ error: "not_found" }, 404);
@@ -431,15 +428,12 @@ export function createApp() {
     try {
       const { abs, contentType } = resolvePublicFile(slug, rel);
       return new Response(readFileSync(abs), {
-        headers: {
-          "Content-Type": contentType,
-          "Cache-Control": "public, max-age=300",
-          "X-Robots-Tag": "noindex",
-        },
+        headers: publicPlayHeaders(contentType),
       });
     } catch (e) {
       const err = e as Error & { code?: string };
-      return c.json({ error: err.code || "error", message: err.message }, 404);
+      const status = err.code === "forbidden_type" ? 403 : 404;
+      return c.json({ error: err.code || "error", message: err.message }, status);
     }
   });
 

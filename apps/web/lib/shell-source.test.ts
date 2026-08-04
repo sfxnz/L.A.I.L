@@ -29,24 +29,19 @@ describe("shipped AppShell source labels", () => {
 describe("shipped Workbench retirement page", () => {
   const wb = readFileSync(join(webRoot, "app/workbench/page.tsx"), "utf8");
 
-  test("points users to Hermes / Serve / Evals / Lab", () => {
+  test("points users to Hermes / Serve / Evals / public site", () => {
     expect(wb).toContain("Hermes");
     expect(wb).toContain("/server");
     expect(wb).toContain("/evals");
-    expect(wb).toContain("/lab");
+    expect(wb).toContain("sfxnz.github.io/dgx-lab");
+    expect(wb).not.toContain('href="/lab"');
   });
 });
 
-describe("shipped Evals + Lab routes exist", () => {
+describe("shipped Evals route exists", () => {
   test("evals page present", () => {
     const p = readFileSync(join(webRoot, "app/evals/page.tsx"), "utf8");
     expect(p).toContain("Run smoke");
     expect(p).toContain("benchPerf");
-  });
-
-  test("lab page present", () => {
-    const p = readFileSync(join(webRoot, "app/lab/page.tsx"), "utf8");
-    expect(p).toContain("Lab");
-    expect(p).toContain("api.lab");
   });
 });

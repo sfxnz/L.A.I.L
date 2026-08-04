@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation";
 import {
   Activity,
   FlaskConical,
-  Gamepad2,
   LayoutDashboard,
   Server,
   Settings2,
@@ -21,7 +20,6 @@ const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; stroke
   Status: LayoutDashboard,
   Serve: Server,
   Evals: FlaskConical,
-  Lab: Gamepad2,
   Configure: Settings2,
 };
 
@@ -131,13 +129,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       <footer className="border-t border-lab-border-subtle bg-lab-bg/90">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-4 py-3 text-[11px] text-lab-muted md:px-6">
-          <span className="tracking-[-0.01em]">Serve · eval · Lab gallery · agent work in Hermes</span>
-          <Link
-            href="/lab"
+          <span className="tracking-[-0.01em]">Serve · eval · Hermes builds · public on GitHub Pages</span>
+          <a
+            href="https://sfxnz.github.io/dgx-lab/"
+            target="_blank"
+            rel="noreferrer"
             className="font-medium text-lab-accent-bright transition-colors hover:text-lab-accent"
           >
-            Open Lab →
-          </Link>
+            Public site →
+          </a>
         </div>
       </footer>
     </div>

@@ -8,7 +8,6 @@ export const WORKSPACE_NAV_LABELS = [
   "Status",
   "Serve",
   "Evals",
-  "Lab",
   "Configure",
 ] as const;
 
@@ -16,7 +15,6 @@ export const WORKSPACE_NAV = [
   { href: "/status", label: "Status" as const },
   { href: "/server", label: "Serve" as const },
   { href: "/evals", label: "Evals" as const },
-  { href: "/lab", label: "Lab" as const },
   { href: "/configure", label: "Configure" as const },
 ];
 

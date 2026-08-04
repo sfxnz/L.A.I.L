@@ -23,9 +23,14 @@ export default function WorkbenchRetiredPage() {
           <Link href="/evals" className={btnClass("secondary", "md")}>
             Evals
           </Link>
-          <Link href="/lab" className={btnClass("secondary", "md")}>
-            Lab
-          </Link>
+          <a
+            href="https://sfxnz.github.io/dgx-lab/"
+            target="_blank"
+            rel="noreferrer"
+            className={btnClass("secondary", "md")}
+          >
+            Public site
+          </a>
         </div>
       </Panel>
     </div>

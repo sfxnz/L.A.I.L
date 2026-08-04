@@ -9,33 +9,55 @@ import { Badge, Btn, Panel, btnClass } from "@/components/ui";
 export default function LabRunDetailPage() {
   const params = useParams();
   const id = String(params?.id || "");
-  const [run, setRun] = useState<(LabArtifactRun & { files?: string[] }) | null>(null);
+  const [run, setRun] = useState<(LabArtifactRun & { files?: string[]; siblings?: LabArtifactRun[] }) | null>(
+    null,
+  );
   const [err, setErr] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
+  const reload = () => {
     if (!id) return;
     api.lab
       .get(id)
       .then(setRun)
       .catch((e) => setErr(String(e.message || e)));
+  };
+
+  useEffect(() => {
+    reload();
   }, [id]);
 
-  const shareUrl =
-    typeof window !== "undefined" ? `${window.location.origin}/lab/${id}` : `/lab/${id}`;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const shareUrl = `${origin}/lab/${id}`;
   const playUrl = run?.play_url || `/api/lab/runs/${id}/play`;
+  const publicUrl = run?.public_url ? `${origin}${run.public_url}` : null;
 
-  async function copyShare() {
+  async function copy(label: string, text: string) {
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      await navigator.clipboard.writeText(text);
+      setCopied(label);
+      setTimeout(() => setCopied(null), 1500);
     } catch {
       /* */
     }
   }
 
-  if (err) {
+  async function togglePublic() {
+    if (!run) return;
+    setBusy(true);
+    try {
+      const next = !(run.share?.public);
+      const updated = await api.lab.share(run.id, next);
+      setRun({ ...run, ...updated });
+    } catch (e) {
+      setErr(String((e as Error).message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (err && !run) {
     return (
       <div className="space-y-4">
         <Link href="/lab" className="text-sm text-lab-accent">
@@ -49,6 +71,8 @@ export default function LabRunDetailPage() {
   if (!run) {
     return <div className="text-sm text-lab-muted">Loading…</div>;
   }
+
+  const siblingIds = [run.id, ...(run.siblings || []).map((s) => s.id)].slice(0, 4);
 
   return (
     <div className="space-y-5">
@@ -65,14 +89,29 @@ export default function LabRunDetailPage() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone="ok">{run.task_type}</Badge>
+          {run.share?.public && <Badge tone="ok">public</Badge>}
           <a className={btnClass("primary")} href={playUrl} target="_blank" rel="noreferrer">
             Open fullscreen
           </a>
-          <Btn variant="ghost" onClick={copyShare}>
-            {copied ? "Copied" : "Copy link"}
+          {(run.siblings?.length || 0) > 0 && (
+            <Link
+              className={btnClass("secondary")}
+              href={`/lab/compare?ids=${siblingIds.join(",")}`}
+            >
+              Compare siblings
+            </Link>
+          )}
+          <Btn variant="ghost" onClick={() => copy("link", shareUrl)}>
+            {copied === "link" ? "Copied" : "Copy gallery link"}
           </Btn>
         </div>
       </div>
+
+      {err && (
+        <div className="rounded-xl border border-lab-danger/30 bg-lab-danger/10 px-3 py-2 text-sm text-lab-danger">
+          {err}
+        </div>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-2">
@@ -90,27 +129,29 @@ export default function LabRunDetailPage() {
             <div className="space-y-2 text-sm">
               <div>
                 <div className="text-[11px] uppercase tracking-wide text-lab-muted">Model id</div>
-                <div className="font-mono text-xs text-lab-text break-all">{run.model_id}</div>
+                <div className="break-all font-mono text-xs text-lab-text">{run.model_id}</div>
               </div>
+              {run.task_fingerprint && (
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-lab-muted">
+                    Task fingerprint
+                  </div>
+                  <Link
+                    className="font-mono text-xs text-lab-accent hover:underline"
+                    href={`/lab/compare?fingerprint=${run.task_fingerprint}`}
+                  >
+                    {run.task_fingerprint}
+                  </Link>
+                </div>
+              )}
               {run.hermes?.source && (
                 <div>
                   <div className="text-[11px] uppercase tracking-wide text-lab-muted">Source</div>
                   <div>{run.hermes.source}</div>
                 </div>
               )}
-              {run.eval_run_id && (
-                <div>
-                  <div className="text-[11px] uppercase tracking-wide text-lab-muted">Eval run</div>
-                  <Link
-                    className="text-lab-accent hover:underline"
-                    href={`/evals/tool/${run.eval_run_id}`}
-                  >
-                    {run.eval_run_id}
-                  </Link>
-                </div>
-              )}
               <div className="flex flex-wrap gap-1 pt-1">
-                {(run.tags || []).map((t) => (
+                {(run.tags || []).map((t: string) => (
                   <span
                     key={t}
                     className="rounded-md bg-white/5 px-1.5 py-0.5 text-[10px] uppercase text-lab-muted"
@@ -128,9 +169,42 @@ export default function LabRunDetailPage() {
             </Panel>
           )}
 
+          <Panel title="Public share">
+            <p className="mb-2 text-xs text-lab-muted">
+              Artifacts only — no L.A.I.L chrome, no API keys. Safe to send a play link.
+            </p>
+            <Btn variant="secondary" disabled={busy} onClick={togglePublic}>
+              {run.share?.public ? "Unpublish" : "Publish public link"}
+            </Btn>
+            {publicUrl && (
+              <div className="mt-3 space-y-2">
+                <code className="block break-all rounded-lg bg-black/40 p-2 text-[11px] text-lab-text">
+                  {publicUrl}
+                </code>
+                <Btn variant="ghost" onClick={() => copy("pub", publicUrl)}>
+                  {copied === "pub" ? "Copied" : "Copy public URL"}
+                </Btn>
+              </div>
+            )}
+          </Panel>
+
+          {(run.siblings?.length || 0) > 0 && (
+            <Panel title="Same brief (other models)">
+              <ul className="space-y-1 text-sm">
+                {run.siblings!.map((s) => (
+                  <li key={s.id}>
+                    <Link className="text-lab-accent hover:underline" href={`/lab/${s.id}`}>
+                      {(s.model_id || s.id).split("/").pop()}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </Panel>
+          )}
+
           <Panel title="Files">
-            <ul className="space-y-1 text-xs font-mono text-lab-muted">
-              {(run.files || []).map((f) => (
+            <ul className="space-y-1 font-mono text-xs text-lab-muted">
+              {(run.files || []).map((f: string) => (
                 <li key={f}>
                   <a
                     className="hover:text-lab-accent"
@@ -142,18 +216,8 @@ export default function LabRunDetailPage() {
                   </a>
                 </li>
               ))}
-              {!run.files?.length && <li className="text-lab-muted">—</li>}
+              {!run.files?.length && <li>—</li>}
             </ul>
-          </Panel>
-
-          <Panel title="Share">
-            <p className="mb-2 text-xs text-lab-muted">
-              Anyone on your Tailscale can open this page and play the artifact. Public internet
-              share comes later (static export only).
-            </p>
-            <code className="block break-all rounded-lg bg-black/40 p-2 text-[11px] text-lab-text">
-              {shareUrl}
-            </code>
           </Panel>
         </div>
       </div>

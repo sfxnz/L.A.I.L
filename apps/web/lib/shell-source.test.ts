@@ -29,24 +29,24 @@ describe("shipped AppShell source labels", () => {
 describe("shipped Workbench retirement page", () => {
   const wb = readFileSync(join(webRoot, "app/workbench/page.tsx"), "utf8");
 
-  test("points users to Hermes / Serve / Evals", () => {
+  test("points users to Hermes / Serve / Evals / Lab", () => {
     expect(wb).toContain("Hermes");
     expect(wb).toContain("/server");
     expect(wb).toContain("/evals");
-    expect(wb).toContain("/connect");
+    expect(wb).toContain("/lab");
   });
 });
 
-describe("shipped Evals + Connect routes exist", () => {
+describe("shipped Evals + Lab routes exist", () => {
   test("evals page present", () => {
     const p = readFileSync(join(webRoot, "app/evals/page.tsx"), "utf8");
     expect(p).toContain("Run smoke");
     expect(p).toContain("benchPerf");
   });
 
-  test("connect page present", () => {
-    const p = readFileSync(join(webRoot, "app/connect/page.tsx"), "utf8");
-    expect(p).toContain("Hermes");
-    expect(p).toContain("OPENAI_BASE_URL");
+  test("lab page present", () => {
+    const p = readFileSync(join(webRoot, "app/lab/page.tsx"), "utf8");
+    expect(p).toContain("Lab");
+    expect(p).toContain("api.lab");
   });
 });

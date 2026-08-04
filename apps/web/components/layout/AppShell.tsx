@@ -4,8 +4,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Activity,
-  Boxes,
-  Cable,
   FlaskConical,
   Gamepad2,
   LayoutDashboard,
@@ -24,8 +22,6 @@ const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; stroke
   Serve: Server,
   Evals: FlaskConical,
   Lab: Gamepad2,
-  Connect: Cable,
-  Models: Boxes,
   Configure: Settings2,
 };
 
@@ -135,12 +131,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       <footer className="border-t border-lab-border-subtle bg-lab-bg/90">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-4 py-3 text-[11px] text-lab-muted md:px-6">
-          <span className="tracking-[-0.01em]">Serve &amp; eval on Spark · agent work → Hermes</span>
+          <span className="tracking-[-0.01em]">Serve · eval · Lab gallery · agent work in Hermes</span>
           <Link
-            href="/connect"
+            href="/lab"
             className="font-medium text-lab-accent-bright transition-colors hover:text-lab-accent"
           >
-            Wire Hermes →
+            Open Lab →
           </Link>
         </div>
       </footer>

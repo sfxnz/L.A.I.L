@@ -127,10 +127,13 @@ export type LabArtifactRun = {
   eval_run_id?: string | null;
   play_url: string;
   preview_url?: string | null;
+  gallery_url?: string;
+  public_url?: string | null;
   task_fingerprint?: string;
   hermes?: { session?: string; source?: string } | null;
   share?: { public: boolean; slug: string | null };
   files?: string[];
+  siblings?: LabArtifactRun[];
 };
 
 export type ServeRecommend = {
@@ -317,16 +320,26 @@ export const api = {
       categories: Array<{ id: string; label: string; values: Record<string, number | null | undefined> }>;
     }>(`/api/runs/tool-eval/compare?ids=${encodeURIComponent(ids.join(","))}`),
   lab: {
-    list: (opts?: { limit?: number; task_type?: string; model?: string }) => {
+    list: (opts?: { limit?: number; task_type?: string; model?: string; fingerprint?: string }) => {
       const q = new URLSearchParams();
       if (opts?.limit) q.set("limit", String(opts.limit));
       if (opts?.task_type) q.set("task_type", opts.task_type);
       if (opts?.model) q.set("model", opts.model);
+      if (opts?.fingerprint) q.set("fingerprint", opts.fingerprint);
       const s = q.toString();
       return req<{ runs: LabArtifactRun[]; count: number }>(`/api/lab/runs${s ? `?${s}` : ""}`);
     },
     get: (id: string) =>
-      req<LabArtifactRun & { files: string[] }>(`/api/lab/runs/${encodeURIComponent(id)}`),
+      req<LabArtifactRun & { files: string[]; siblings?: LabArtifactRun[] }>(
+        `/api/lab/runs/${encodeURIComponent(id)}`,
+      ),
+    compare: (ids: string[]) =>
+      req<{
+        runs: LabArtifactRun[];
+        task_fingerprint: string | null;
+        same_brief: boolean;
+        brief: string | null;
+      }>(`/api/lab/compare?ids=${encodeURIComponent(ids.join(","))}`),
     import: (body: {
       title: string;
       from: string;
@@ -336,10 +349,16 @@ export const api = {
       tags?: string[];
       brief?: string;
       eval_run_id?: string;
+      share_public?: boolean;
     }) =>
       req<LabArtifactRun>("/api/lab/runs/import", {
         method: "POST",
         body: JSON.stringify(body),
+      }),
+    share: (id: string, makePublic = true) =>
+      req<LabArtifactRun>(`/api/lab/runs/${encodeURIComponent(id)}/share`, {
+        method: "POST",
+        body: JSON.stringify({ public: makePublic }),
       }),
   },
 };

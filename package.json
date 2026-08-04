@@ -13,7 +13,8 @@
     "dev:api": "bun run --filter @lail/backend dev",
     "build": "bun run --filter @lail/web build && bun run --filter @lail/backend build",
     "start": "bun run --filter @lail/backend start",
-    "typecheck": "bun run --filter @lail/backend typecheck && bun run --filter @lail/web typecheck"
+    "typecheck": "bun run --filter @lail/backend typecheck && bun run --filter @lail/web typecheck",
+    "lab:publish": "bun run scripts/lail-lab-publish.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

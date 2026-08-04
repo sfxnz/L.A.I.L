@@ -61,8 +61,8 @@ export default function StatusPage() {
           <Link href="/evals" className={btnClass("secondary", "sm")}>
             Evals
           </Link>
-          <Link href="/connect" className={btnClass("ghost", "sm")}>
-            Connect
+          <Link href="/lab" className={btnClass("ghost", "sm")}>
+            Lab
           </Link>
         </div>
       </div>

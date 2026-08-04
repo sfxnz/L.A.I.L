@@ -23,6 +23,8 @@ const nextConfig: NextConfig = {
     return [
       { source: "/api/:path*", destination: `${api}/api/:path*` },
       { source: "/v1/:path*", destination: `${api}/v1/:path*` },
+      // public artifact share (static only — proxied to controller)
+      { source: "/p/:path*", destination: `${api}/p/:path*` },
     ];
   },
 };

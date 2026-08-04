@@ -23,8 +23,8 @@ export default function WorkbenchRetiredPage() {
           <Link href="/evals" className={btnClass("secondary", "md")}>
             Evals
           </Link>
-          <Link href="/connect" className={btnClass("secondary", "md")}>
-            Connect Hermes
+          <Link href="/lab" className={btnClass("secondary", "md")}>
+            Lab
           </Link>
         </div>
       </Panel>

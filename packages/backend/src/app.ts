@@ -31,11 +31,16 @@ import { proxyOpenAI } from "./controller/llm-proxy";
 import { config } from "./config";
 import {
   ensureDemoLabRuns,
+  compareLabRuns,
   getLabRun,
+  getPublicBySlug,
   importLabRun,
   listLabFiles,
   listLabRuns,
+  listLabRunsByFingerprint,
+  publishLabRun,
   resolveLabFile,
+  resolvePublicFile,
 } from "./lab/store";
 import { readFileSync } from "fs";
 
@@ -294,16 +299,32 @@ export function createApp() {
     const limit = Number(c.req.query("limit") || 50);
     const task = c.req.query("task_type") || "";
     const model = c.req.query("model") || "";
-    let rows = listLabRuns(Math.min(200, Math.max(1, limit)));
+    const fp = c.req.query("fingerprint") || "";
+    let rows = fp
+      ? listLabRunsByFingerprint(fp, Math.min(50, Math.max(1, limit)))
+      : listLabRuns(Math.min(200, Math.max(1, limit)));
     if (task) rows = rows.filter((r) => r.task_type === task);
     if (model) rows = rows.filter((r) => (r.model_id || "").includes(model));
     return c.json({ runs: rows, count: rows.length });
   });
 
+  app.get("/api/lab/compare", (c) => {
+    const ids = (c.req.query("ids") || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (ids.length < 2) return c.json({ error: "need_2_to_4_ids" }, 400);
+    return c.json(compareLabRuns(ids));
+  });
+
   app.get("/api/lab/runs/:id", (c) => {
     const run = getLabRun(c.req.param("id"));
     if (!run) return c.json({ error: "not_found" }, 404);
-    return c.json({ ...run, files: listLabFiles(run.id) });
+    const siblings = run.task_fingerprint
+      ? listLabRunsByFingerprint(run.task_fingerprint, 12).filter((r) => r.id !== run.id)
+      : [];
+    return c.json({ ...run, files: listLabFiles(run.id), siblings });
   });
 
   app.post("/api/lab/runs/import", async (c) => {
@@ -328,8 +349,23 @@ export function createApp() {
       return c.json(run, 201);
     } catch (e) {
       const err = e as Error & { code?: string };
-      const status = err.code === "not_found" ? 404 : 400;
+      const status =
+        err.code === "not_found" ? 404 : err.code === "secret_detected" ? 422 : 400;
       return c.json({ error: err.code || "import_failed", message: err.message }, status);
+    }
+  });
+
+  app.post("/api/lab/runs/:id/share", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({ public: true }));
+      const makePublic = body.public !== false;
+      const run = publishLabRun(c.req.param("id"), makePublic);
+      return c.json(run);
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const status =
+        err.code === "not_found" ? 404 : err.code === "secret_detected" ? 422 : 400;
+      return c.json({ error: err.code || "share_failed", message: err.message }, status);
     }
   });
 
@@ -351,7 +387,6 @@ export function createApp() {
         headers: {
           "Content-Type": contentType,
           "Cache-Control": "no-cache",
-          // allow iframe embed from L.A.I.L web origin
           "X-Frame-Options": "SAMEORIGIN",
         },
       });
@@ -360,6 +395,61 @@ export function createApp() {
       const status = err.code === "not_found" ? 404 : 400;
       return c.json({ error: err.code || "error", message: err.message }, status);
     }
+  });
+
+  // Public static share — artifacts only (under /api so Next rewrites always hit controller)
+  app.get("/api/lab/public/:slug", (c) => {
+    const pub = getPublicBySlug(c.req.param("slug"));
+    if (!pub) return c.json({ error: "not_found" }, 404);
+    return c.json({
+      slug: pub.slug,
+      ...pub.meta,
+      play_url: `/api/lab/p/${pub.slug}/`,
+    });
+  });
+
+  app.get("/api/lab/p/:slug", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
+
+  app.get("/api/lab/p/:slug/", (c) => {
+    try {
+      const { abs, contentType } = resolvePublicFile(c.req.param("slug"), "index.html");
+      return new Response(readFileSync(abs), {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "public, max-age=60",
+          "X-Robots-Tag": "noindex",
+        },
+      });
+    } catch {
+      return c.json({ error: "not_found" }, 404);
+    }
+  });
+
+  app.get("/api/lab/p/:slug/*", (c) => {
+    const slug = c.req.param("slug");
+    const rel = c.req.path.replace(`/api/lab/p/${slug}/`, "");
+    try {
+      const { abs, contentType } = resolvePublicFile(slug, rel);
+      return new Response(readFileSync(abs), {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "public, max-age=300",
+          "X-Robots-Tag": "noindex",
+        },
+      });
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      return c.json({ error: err.code || "error", message: err.message }, 404);
+    }
+  });
+
+  // Short aliases
+  app.get("/p/:slug", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
+  app.get("/p/:slug/", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
+  app.get("/p/:slug/*", (c) => {
+    const slug = c.req.param("slug");
+    const rel = c.req.path.replace(`/p/${slug}/`, "");
+    return c.redirect(`/api/lab/p/${slug}/${rel}`, 302);
   });
 
   // Legacy + serve proxy under /api

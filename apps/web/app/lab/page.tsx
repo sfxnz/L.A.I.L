@@ -155,13 +155,17 @@ export default function LabGalleryPage() {
           </li>
           <li>
             <strong className="text-lab-text">Hermes</strong> builds a self-contained HTML game /
-            animation (Connect tab for base URL)
+            animation against the served OpenAI endpoint
           </li>
           <li>
             <strong className="text-lab-text">Import</strong> into Lab — open anytime, compare models,
-            share play link on Tailscale
+            Share play link on Tailscale or publish a public <code className="text-lab-text">/p/…</code>{" "}
+            artifact URL
           </li>
         </ol>
+        <p className="mt-3 text-xs text-lab-muted">
+          Hermes: <code className="text-lab-text">bun run lab:publish -- --title … --from … [--public]</code>
+        </p>
       </Panel>
     </div>
   );

@@ -3,15 +3,16 @@
  * Internet-facing static share server — ONLY data/lab-public artifacts.
  * Never mounts L.A.I.L admin, Hermes, or serve-engine.
  *
- * Bind: 127.0.0.1:8791 (loopback). Expose with:
- *   bun run scripts/lab-share-funnel.sh
+ * MUST bind 127.0.0.1 only. Expose with: bun run lab:funnel
+ * (Tailscale Funnel → this process only, not :3000/:8787)
  */
 import { existsSync, readFileSync, statSync } from "fs";
 import { join, resolve } from "path";
 
 const root = resolve(process.env.LAIL_ROOT || join(import.meta.dir, ".."));
 const pubRoot = resolve(process.env.LAIL_LAB_PUBLIC_DIR || join(root, "data/lab-public"));
-const host = process.env.LAIL_SHARE_HOST || "127.0.0.1";
+// Hard rule: never listen on all interfaces — Funnel reaches us via loopback.
+const host = "127.0.0.1";
 const port = Number(process.env.LAIL_SHARE_PORT || 8791);
 
 const ALLOWED_EXT = new Set([
@@ -33,6 +34,7 @@ const ALLOWED_EXT = new Set([
   ".mp3",
   ".ogg",
   ".wav",
+  // game data only — share.json / meta.json blocked by name below
   ".json",
   ".txt",
   ".map",
@@ -66,6 +68,8 @@ function headers(ct: string): HeadersInit {
     "X-Robots-Tag": "noindex, nofollow",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+    "Cross-Origin-Resource-Policy": "cross-origin",
     "Content-Security-Policy": [
       "default-src 'none'",
       "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
@@ -78,6 +82,7 @@ function headers(ct: string): HeadersInit {
       "frame-ancestors *",
       "base-uri 'none'",
       "object-src 'none'",
+      "upgrade-insecure-requests",
     ].join("; "),
   };
 }
@@ -86,21 +91,34 @@ function safeJoin(slug: string, rel: string): string | null {
   if (!/^[a-f0-9]{8,32}$/i.test(slug)) return null;
   let clean = (rel || "index.html").replace(/^\/+/, "").replace(/\\/g, "/");
   if (!clean || clean.endsWith("/")) clean += "index.html";
-  if (clean.includes("..") || clean.includes("\0")) return null;
+  if (clean.includes("..") || clean.includes("\0") || clean.includes("%")) return null;
   const base = clean.split("/").pop() || "";
-  if (base === "share.json" || base === "meta.json" || base.startsWith(".")) return null;
+  if (
+    base === "share.json" ||
+    base === "meta.json" ||
+    base.startsWith(".") ||
+    base.toLowerCase().includes("env")
+  ) {
+    return null;
+  }
   const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")).toLowerCase() : ".html";
   if (!ALLOWED_EXT.has(ext)) return null;
-  const abs = resolve(pubRoot, slug, clean);
-  const rootN = resolve(pubRoot, slug) + "/";
-  if (abs !== resolve(pubRoot, slug) && !abs.startsWith(rootN)) return null;
+  const slugRoot = resolve(pubRoot, slug);
+  const abs = resolve(slugRoot, clean);
+  const rootN = slugRoot.endsWith("/") ? slugRoot : slugRoot + "/";
+  if (abs !== slugRoot && !abs.startsWith(rootN)) return null;
   if (!existsSync(abs) || !statSync(abs).isFile()) return null;
+  // cap file size (20MB)
+  if (statSync(abs).size > 20_000_000) return null;
   return abs;
 }
 
 function parsePath(pathname: string): { slug: string; rel: string } | null {
-  // /s/<slug>/...  or  /p/<slug>/...  or  /api/lab/p/<slug>/...
-  const patterns = [/^\/s\/([^/]+)\/?(.*)$/, /^\/p\/([^/]+)\/?(.*)$/, /^\/api\/lab\/p\/([^/]+)\/?(.*)$/];
+  const patterns = [
+    /^\/s\/([^/]+)\/?(.*)$/,
+    /^\/p\/([^/]+)\/?(.*)$/,
+    /^\/api\/lab\/p\/([^/]+)\/?(.*)$/,
+  ];
   for (const re of patterns) {
     const m = pathname.match(re);
     if (m) return { slug: m[1], rel: m[2] || "index.html" };
@@ -112,12 +130,17 @@ const server = Bun.serve({
   hostname: host,
   port,
   fetch(req) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return new Response("Method not allowed", { status: 405 });
+    }
     const url = new URL(req.url);
-    if (url.pathname === "/" || url.pathname === "/health") {
-      return Response.json({
-        ok: true,
-        service: "lail-lab-public-share",
-        note: "artifacts only — not L.A.I.L admin",
+    if (url.pathname === "/health") {
+      return Response.json({ ok: true, service: "lail-lab-public-share" });
+    }
+    if (url.pathname === "/") {
+      return new Response("L.A.I.L public artifact share", {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
     const parsed = parsePath(url.pathname);
@@ -125,12 +148,15 @@ const server = Bun.serve({
     const abs = safeJoin(parsed.slug, parsed.rel || "index.html");
     if (!abs) return new Response("Not found", { status: 404 });
     const body = readFileSync(abs);
-    return new Response(body, { headers: headers(mime(abs)) });
+    return new Response(req.method === "HEAD" ? null : body, {
+      headers: headers(mime(abs)),
+    });
   },
 });
 
 console.log(
-  `lab-public-share listening http://${host}:${port} root=${pubRoot} (loopback-only recommended)`,
+  `lab-public-share listening http://${host}:${port} root=${pubRoot} (loopback ONLY)`,
 );
-console.log(`  health: http://${host}:${port}/health`);
-console.log(`  play:   http://${host}:${port}/s/<slug>/index.html`);
+console.log(`  play: http://${host}:${port}/s/<slug>/index.html`);
+// keep process alive reference
+void server;

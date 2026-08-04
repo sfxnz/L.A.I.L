@@ -139,11 +139,17 @@ function toSummary(meta: LabRunMeta): LabRunSummary {
   const slug = meta.share?.slug || null;
   let public_url: string | null = null;
   if (meta.share?.public && slug) {
-    if (config.sharePublicBase) {
-      // Funnel / internet: short path on artifacts-only server
+    const taskSeg = String(meta.task_type || "artifact")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 48) || "artifact";
+    // Prefer Wesche-style static site (GitHub Pages) when configured
+    if (config.shareSiteBase) {
+      public_url = `${config.shareSiteBase}/dgx/${taskSeg}/${slug}/index.html`;
+    } else if (config.sharePublicBase) {
       public_url = `${config.sharePublicBase}/s/${slug}/index.html`;
     } else {
-      // Tailnet / LAN via L.A.I.L controller
       public_url = `/api/lab/p/${slug}/index.html`;
     }
   }

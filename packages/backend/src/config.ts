@@ -29,6 +29,8 @@ export const config = {
     },
   },
   hfToken: process.env.HF_TOKEN || "",
-  /** Internet Funnel origin, e.g. https://spark1.tailxxx.ts.net — artifacts-only server */
+  /** Internet Funnel origin (legacy) — prefer shareSiteBase for X */
   sharePublicBase: (process.env.LAIL_SHARE_PUBLIC_BASE || "").replace(/\/$/, ""),
+  /** GitHub Pages / static site origin, e.g. https://user.github.io/dgx-lab */
+  shareSiteBase: (process.env.LAIL_SITE_BASE || "").replace(/\/$/, ""),
 };

@@ -293,12 +293,21 @@ export function createApp() {
       backends,
       serve,
       share: {
-        internet_base: config.sharePublicBase || null,
-        internet_ready: !!config.sharePublicBase,
-        funnel_hint: "cd ~/projects/ai-lab/local-ai-lab && bun run lab:funnel",
-        note: config.sharePublicBase
-          ? "Share links use Tailscale Funnel (internet). Only artifacts-only server is exposed."
-          : "Share links are Tailnet/LAN only until you run: bun run lab:funnel",
+        site_base: config.shareSiteBase || null,
+        internet_base: config.shareSiteBase || config.sharePublicBase || null,
+        internet_ready: !!(config.shareSiteBase || config.sharePublicBase),
+        mode: config.shareSiteBase
+          ? "github_pages"
+          : config.sharePublicBase
+            ? "tailscale_funnel"
+            : "tailnet_only",
+        funnel_hint: "bun run lab:funnel  # optional; prefer GitHub Pages for X",
+        site_hint: "See docs/LAB_SITE.md — bun run lab:site-deploy",
+        note: config.shareSiteBase
+          ? "Share links use static GitHub Pages (Spark private)."
+          : config.sharePublicBase
+            ? "Share links use Tailscale Funnel artifacts server."
+            : "Set LAIL_SITE_BASE + deploy site for X (Wesche-style). Until then links are Tailnet/LAN only.",
       },
     });
   });

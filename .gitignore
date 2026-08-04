@@ -30,6 +30,8 @@ data/runs/
 data/benchmarks.sqlite*
 data/lab-runs/
 data/lab-public/
+site/dist/
+site/
 packages/serve-engine/data/
 packages/serve-engine/runs/
 runs/

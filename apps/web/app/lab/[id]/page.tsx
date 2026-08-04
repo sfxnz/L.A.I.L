@@ -169,35 +169,33 @@ export default function LabRunDetailPage() {
             </Panel>
           )}
 
-          <Panel title="Share for X / internet">
+          <Panel title="Share on X (static site)">
             <p className="mb-2 text-xs text-lab-muted">
-              Serves <strong className="text-lab-text">only game files</strong> — not L.A.I.L, not Hermes.
-              Secret-like strings blocked at publish. CSP locks down the page.
-            </p>
-            <p className="mb-2 text-xs text-lab-muted">
-              <strong className="text-lab-text">For people on X</strong> you need Tailscale Funnel on the
-              artifacts-only server (port 8791), not the full lab:
+              Same model as Wesche: publish <strong className="text-lab-text">static HTML</strong> to
+              GitHub Pages. Spark stays private — X users hit CDN only.
             </p>
             <pre className="mb-2 overflow-x-auto rounded-lg bg-black/40 p-2 text-[11px] text-lab-muted">
-{`cd ~/projects/ai-lab/local-ai-lab
-bun run lab:funnel
-# then restart: bun run dev
-# links become https://spark1.<tailnet>.ts.net/s/<slug>/index.html`}
+{`# one-time: create public repo + Pages from gh-pages
+export LAIL_SITE_REPO=git@github.com:YOU/dgx-lab.git
+export LAIL_SITE_BASE=https://YOU.github.io/dgx-lab
+
+# after Create share link:
+bun run lab:site-deploy`}
             </pre>
             <p className="mb-2 text-xs text-lab-muted">
-              Without Funnel, Create share link only works on your Tailscale/LAN (fine for you, not for
-              random people on X).
+              Full guide: <code className="text-lab-text">docs/LAB_SITE.md</code>
             </p>
             <Btn variant="secondary" disabled={busy} onClick={togglePublic}>
-              {run.share?.public ? "Unpublish" : "Create share link"}
+              {run.share?.public ? "Unpublish from lab-public" : "Stage for site (lab-public)"}
             </Btn>
             {publicUrl && (
               <div className="mt-3 space-y-2">
+                <div className="text-[11px] uppercase tracking-wide text-lab-muted">Play URL</div>
                 <code className="block break-all rounded-lg bg-black/40 p-2 text-[11px] text-lab-text">
                   {publicUrl}
                 </code>
                 <Btn variant="ghost" onClick={() => copy("pub", publicUrl)}>
-                  {copied === "pub" ? "Copied" : "Copy share URL"}
+                  {copied === "pub" ? "Copied" : "Copy URL"}
                 </Btn>
               </div>
             )}

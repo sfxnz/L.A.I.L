@@ -405,26 +405,20 @@ export function createApp() {
     return c.json({
       slug: pub.slug,
       ...pub.meta,
-      play_url: `/api/lab/p/${pub.slug}/`,
+      play_url: `/api/lab/p/${pub.slug}/index.html`,
     });
   });
 
-  app.get("/api/lab/p/:slug", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
-
-  app.get("/api/lab/p/:slug/", (c) => {
-    try {
-      const { abs, contentType } = resolvePublicFile(c.req.param("slug"), "index.html");
-      return new Response(readFileSync(abs), {
-        headers: publicPlayHeaders(contentType),
-      });
-    } catch {
-      return c.json({ error: "not_found" }, 404);
-    }
-  });
+  // No slash redirects — Next.js 308-strips trailing slashes and loops with 302-add-slash.
+  // Share URL is always .../index.html so relative game assets resolve under /p/<slug>/.
+  app.get("/api/lab/p/:slug", (c) => servePublicIndex(c.req.param("slug")));
+  app.get("/api/lab/p/:slug/", (c) => servePublicIndex(c.req.param("slug")));
+  app.get("/api/lab/p/:slug/index.html", (c) => servePublicIndex(c.req.param("slug")));
 
   app.get("/api/lab/p/:slug/*", (c) => {
     const slug = c.req.param("slug");
-    const rel = c.req.path.replace(`/api/lab/p/${slug}/`, "");
+    let rel = c.req.path.replace(`/api/lab/p/${slug}/`, "").replace(/^\/+/, "");
+    if (!rel || rel === "index.html") return servePublicIndex(slug);
     try {
       const { abs, contentType } = resolvePublicFile(slug, rel);
       return new Response(readFileSync(abs), {
@@ -437,9 +431,9 @@ export function createApp() {
     }
   });
 
-  // Short aliases
-  app.get("/p/:slug", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
-  app.get("/p/:slug/", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/`, 302));
+  // Short aliases → stable index.html URL
+  app.get("/p/:slug", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/index.html`, 302));
+  app.get("/p/:slug/", (c) => c.redirect(`/api/lab/p/${c.req.param("slug")}/index.html`, 302));
   app.get("/p/:slug/*", (c) => {
     const slug = c.req.param("slug");
     const rel = c.req.path.replace(`/p/${slug}/`, "");
@@ -456,4 +450,15 @@ export function createApp() {
   });
 
   return app;
+}
+
+function servePublicIndex(slug: string): Response {
+  try {
+    const { abs, contentType } = resolvePublicFile(slug, "index.html");
+    return new Response(readFileSync(abs), {
+      headers: publicPlayHeaders(contentType),
+    });
+  } catch {
+    return Response.json({ error: "not_found" }, { status: 404 });
+  }
 }

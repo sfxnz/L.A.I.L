@@ -143,7 +143,7 @@ function toSummary(meta: LabRunMeta): LabRunSummary {
     preview_url: existsSync(previewPath) ? `/api/lab/runs/${meta.id}/files/preview.png` : null,
     play_url: `/api/lab/runs/${meta.id}/play`,
     gallery_url: `/lab/${meta.id}`,
-    public_url: meta.share?.public && slug ? `/api/lab/p/${slug}/` : null,
+    public_url: meta.share?.public && slug ? `/api/lab/p/${slug}/index.html` : null,
   };
 }
 

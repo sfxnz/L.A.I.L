@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .. import db
 from ..config import DEFAULT_BASE_URL, MODEL_PRESETS, RUNS_DIR, SERVE_EXAMPLES
-from ..services import agentic, autoconfig, jobs, metadata, perf, serve
+from ..services import agentic, autoconfig, cluster, jobs, metadata, perf, serve
 
 router = APIRouter()
 
@@ -37,6 +37,10 @@ async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
     model_id = None
     if probe.get("models"):
         model_id = probe["models"][0].get("id")
+    try:
+        cluster_info = cluster.collect_cluster()
+    except Exception as e:
+        cluster_info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
     return {
         "healthy": probe.get("healthy"),
         "base_url": base_url,
@@ -51,7 +55,17 @@ async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
         "presets": list(MODEL_PRESETS.keys()),
         "serve_examples": SERVE_EXAMPLES,
         "tool_eval": agentic.tool_eval_available(),
+        "cluster": cluster_info,
     }
+
+
+@router.get("/cluster")
+async def cluster_status() -> dict[str, Any]:
+    """Dual-Spark fabric + per-node serve health (L.A.I.L cluster SoT)."""
+    try:
+        return cluster.collect_cluster()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/hardware")

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, type LabStatus, type RunRow } from "@/lib/api";
+import { ClusterPanel } from "@/components/ClusterPanel";
 import { Badge, Btn, EmptyState, Metric, Panel, StatusDot, btnClass } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
@@ -32,23 +33,37 @@ export default function StatusPage() {
   }, []);
 
   const serve = status?.serve;
+  const cluster = status?.cluster || serve?.cluster || null;
   const healthy = !!(serve && !serve.unreachable && serve.healthy);
   const modelShort = serve?.model_id?.split("/").pop() || "—";
   const freeGib = serve?.hardware?.available_gib;
+  const clusterHealthy = !!cluster?.summary?.healthy;
+  const multiMode = cluster?.summary?.multi?.mode;
 
   return (
     <div className="space-y-6">
       <div className="page-header">
         <div>
-          <div className="mb-2 flex items-center gap-2">
-            <StatusDot live={healthy} />
-            <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-lab-muted">
-              {healthy ? "Endpoint live" : "Endpoint down"}
-            </span>
+          <div className="mb-2 flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <StatusDot live={healthy} />
+              <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-lab-muted">
+                {healthy ? "Endpoint live" : "Endpoint down"}
+              </span>
+            </div>
+            {cluster && (
+              <div className="flex items-center gap-2">
+                <StatusDot live={clusterHealthy} />
+                <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-lab-muted">
+                  {clusterHealthy ? "Cluster fabric ok" : "Cluster issue"}
+                  {multiMode && multiMode !== "none" ? ` · ${multiMode.replace(/_/g, " ")}` : ""}
+                </span>
+              </div>
+            )}
           </div>
           <h1 className="page-title">Status</h1>
           <p className="page-sub">
-            Lab health, hardware headroom, containers, and recent runs.
+            Dual-Spark cluster health, model load map, hardware headroom, and recent runs.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -77,6 +92,12 @@ export default function StatusPage() {
           {err}
         </div>
       )}
+
+      <div className="bento">
+        <div className="bento-span-12">
+          <ClusterPanel cluster={cluster} />
+        </div>
+      </div>
 
       <div className="bento">
         <div className="bento-span-3">

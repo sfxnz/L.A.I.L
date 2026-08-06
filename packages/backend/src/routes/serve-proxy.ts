@@ -67,6 +67,7 @@ const paths = [
 
 // Explicit routes for Hono
 serveProxy.all("/status", (c) => forward(c, "/api/status"));
+serveProxy.all("/cluster", (c) => forward(c, "/api/cluster"));
 serveProxy.all("/hardware", (c) => forward(c, "/api/hardware"));
 serveProxy.all("/serve/*", (c) => {
   const u = new URL(c.req.url);

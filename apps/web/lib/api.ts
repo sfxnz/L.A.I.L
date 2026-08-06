@@ -12,6 +12,76 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return r.json();
 }
 
+export type ClusterNode = {
+  id: string;
+  label: string;
+  role?: string;
+  local?: boolean;
+  online?: boolean;
+  state?: "offline" | "idle" | "loading" | "serving" | string;
+  probe_error?: string | null;
+  hostname?: string | null;
+  lan_ip?: string | null;
+  tailscale_ip?: string | null;
+  qsfp_ip?: string | null;
+  gpu_sku?: string | null;
+  ram_gib?: number | null;
+  available_gib?: number | null;
+  endpoint_healthy?: boolean;
+  model_id?: string | null;
+  models?: Array<{ id?: string }>;
+  containers?: Array<{ name: string; status: string; image: string }>;
+  tensor_parallel_size?: number | null;
+  ray_hint?: boolean;
+  qsfp_if?: string | null;
+  qsfp_carrier?: number | null;
+  qsfp_speed_mbps?: number | null;
+  roce_up_ifs?: string[];
+  vllm_url?: string | null;
+  ssh_host?: string;
+};
+
+export type ClusterStatus = {
+  name?: string;
+  updated_from?: string;
+  error?: string;
+  nodes: ClusterNode[];
+  fabric?: {
+    ok?: boolean;
+    note?: string;
+    links?: Array<{
+      from: string;
+      to: string;
+      via?: string;
+      target_ip?: string;
+      ok?: boolean;
+      rtt_ms?: number | null;
+      from_carrier?: number | null;
+      to_carrier?: number | null;
+      from_speed_mbps?: number | null;
+      to_speed_mbps?: number | null;
+      error?: string | null;
+    }>;
+  };
+  summary?: {
+    nodes_total?: number;
+    nodes_online?: number;
+    nodes_serving?: number;
+    cluster_reachable?: boolean;
+    fabric_ok?: boolean;
+    healthy?: boolean;
+    multi?: {
+      mode?: string;
+      model_id?: string | null;
+      nodes_serving?: string[];
+      tensor_parallel_hint?: number | null;
+      fabric_ok?: boolean;
+      message?: string;
+      models_by_node?: Record<string, string | null | undefined>;
+    };
+  };
+};
+
 export type LabStatus = {
   controller: string;
   defaultBackend: string;
@@ -43,7 +113,9 @@ export type LabStatus = {
       install?: string;
       repo?: string;
     };
+    cluster?: ClusterStatus;
   } | null;
+  cluster?: ClusterStatus | null;
 };
 
 export type ServeExample = {
@@ -164,6 +236,7 @@ export const api = {
   health: () => req<{ status: string }>("/api/health"),
   labStatus: () => req<LabStatus>("/api/lab-status"),
   status: () => req<Record<string, unknown>>("/api/status"),
+  cluster: () => req<ClusterStatus>("/api/cluster"),
   bootstrap: () => req<{ workspace: Workspace; settings: Settings }>("/api/bootstrap"),
   configure: {
     get: () => req<Settings>("/api/configure"),

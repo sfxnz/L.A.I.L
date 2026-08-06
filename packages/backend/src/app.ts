@@ -292,6 +292,10 @@ export function createApp() {
       openAiBase: openAiBase(),
       backends,
       serve,
+      cluster:
+        serve && typeof serve === "object" && serve !== null && "cluster" in serve
+          ? (serve as { cluster?: unknown }).cluster
+          : null,
       share: {
         site_base: config.shareSiteBase || null,
         internet_base: config.shareSiteBase || config.sharePublicBase || null,

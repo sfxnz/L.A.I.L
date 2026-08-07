@@ -41,6 +41,7 @@ export default function ServerPage() {
   const [kvCacheDtype, setKvCacheDtype] = useState("");
   const [moeBackend, setMoeBackend] = useState("");
   const [maxNumSeqs, setMaxNumSeqs] = useState("");
+  const [tpSize, setTpSize] = useState("");
   const [loadFormat, setLoadFormat] = useState("");
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [enableAutoTool, setEnableAutoTool] = useState(false);
@@ -99,6 +100,7 @@ export default function ServerPage() {
       kvCacheDtype.trim() ||
       moeBackend.trim() ||
       maxNumSeqs.trim() ||
+      tpSize.trim() ||
       loadFormat.trim() ||
       toolCallParser.trim() ||
       reasoningParser.trim() ||
@@ -116,6 +118,7 @@ export default function ServerPage() {
     kvCacheDtype,
     moeBackend,
     maxNumSeqs,
+    tpSize,
     loadFormat,
     toolCallParser,
     reasoningParser,
@@ -201,6 +204,8 @@ export default function ServerPage() {
     setToolCallParser(String(c.tool_call_parser ?? ""));
     setEnableAutoTool(!!c.enable_auto_tool_choice);
     setMaxNumSeqs(c.max_num_seqs != null && c.max_num_seqs !== "" ? String(c.max_num_seqs) : "");
+    if (c.tensor_parallel_size != null && c.tensor_parallel_size !== "")
+      setTpSize(String(c.tensor_parallel_size));
     setDockerEnv(((c.docker_env as string[]) || []).join("\n"));
     setExtra(String(c.extra_flags || ""));
     setMtp(!!c.mtp);
@@ -258,6 +263,7 @@ export default function ServerPage() {
     setKvCacheDtype("");
     setMoeBackend("");
     setMaxNumSeqs("");
+    setTpSize("");
     setLoadFormat("");
     setTrustRemoteCode(false);
     setEnableAutoTool(false);
@@ -331,6 +337,7 @@ export default function ServerPage() {
     if (maxLen) body.max_model_len = parseInt(maxLen, 10);
     if (image.trim()) body.image = image.trim();
     if (maxNumSeqs) body.max_num_seqs = parseInt(maxNumSeqs, 10);
+    if (tpSize) body.tensor_parallel_size = parseInt(tpSize, 10);
     setStartBusy(true);
     try {
       const { job_id } = await api.startServe(body);
@@ -543,6 +550,15 @@ export default function ServerPage() {
                     )}
                     {!!rec.detected?.is_mixed_nvfp4_fp8 && (
                       <Badge tone="warn">mixed NVFP4+FP8</Badge>
+                    )}
+                    {rec.topology && (rec.topology.nodes ?? 1) >= 2 && (
+                      <Badge tone={rec.topology.fabric_ok ? "ok" : "warn"} dot>
+                        {rec.topology.nodes}-node · TP={rec.topology.tensor_parallel_size ?? rec.topology.nodes}
+                        {rec.topology.fabric_ok ? " · fabric ok" : " · fabric check failed"}
+                      </Badge>
+                    )}
+                    {rec.topology?.overlay && (
+                      <Badge tone="accent">family: {rec.topology.overlay}</Badge>
                     )}
                   </div>
                   {rec.card_url && (
@@ -782,6 +798,14 @@ export default function ServerPage() {
                 </Field>
                 <Field label="Port" htmlFor="serve-port">
                   <Input id="serve-port" value={port} onChange={(e) => setPort(e.target.value)} />
+                </Field>
+                <Field label="tensor-parallel-size (Sparks)" htmlFor="serve-tp">
+                  <Input
+                    id="serve-tp"
+                    value={tpSize}
+                    onChange={(e) => setTpSize(e.target.value)}
+                    placeholder="1"
+                  />
                 </Field>
               </div>
 

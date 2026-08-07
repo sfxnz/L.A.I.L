@@ -221,6 +221,14 @@ export type ServeRecommend = {
   rationale: string[];
   warnings: string[];
   detected: Record<string, unknown>;
+  topology?: {
+    nodes?: number;
+    fabric_ok?: boolean;
+    head_ip?: string | null;
+    worker_ips?: string[];
+    tensor_parallel_size?: number;
+    overlay?: string | null;
+  };
   sources?: Array<{ kind: string; ref: string; notes?: string }>;
   card_recipes?: Array<{
     score: number;

@@ -148,6 +148,7 @@ def _build_vllm_args(
     enable_chunked_prefill: bool = False,
     enable_prefix_caching: bool = False,
     extra_flags: str = "",
+    tensor_parallel_size: int = 1,
 ) -> list[str]:
     """Assemble the vLLM CLI from explicit fields + free-form extras. Nothing silent."""
     args: list[str] = [
@@ -156,7 +157,7 @@ def _build_vllm_args(
         "--port",
         str(port),
         "--tensor-parallel-size",
-        "1",
+        str(max(1, int(tensor_parallel_size or 1))),
         "--gpu-memory-utilization",
         str(util),
         "--max-model-len",
@@ -241,6 +242,7 @@ def serve_model(
     enable_chunked_prefill: bool = False,
     enable_prefix_caching: bool = False,
     extra_flags: str = "",
+    tensor_parallel_size: int | None = None,
     stop_first: bool = True,
     log: Any = None,
     progress: Callable | None = None,
@@ -341,6 +343,7 @@ def serve_model(
         enable_chunked_prefill=enable_chunked_prefill,
         enable_prefix_caching=enable_prefix_caching,
         extra_flags=extra_flags,
+        tensor_parallel_size=int(tensor_parallel_size or 1),
     )
 
     if stop_first:

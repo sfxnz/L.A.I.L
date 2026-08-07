@@ -355,8 +355,11 @@ def test_serve_ui_wires_auto_configure():
     assert "cr.reasons" in st or "reasons" in st
     assert "card_recipes" in st
     assert "warnings" in st
-    # Job log must remain visible outside Serve tab
-    assert "Job:" in st
+    # Topology-aware auto-config surfaces cluster plan + TP in the form
+    assert "rec.topology" in st
+    assert "tensor_parallel_size" in st
+    # Job log panel must remain present (Job dock streams serve logs)
+    assert "Job" in st and "LogView" in st
 
 
 def test_fixture_card_mixed_moe_surfaces_flashinfer_warning_via_recommend_path(monkeypatch):
@@ -389,3 +392,109 @@ def test_fixture_card_mixed_moe_surfaces_flashinfer_warning_via_recommend_path(m
     assert (r["config"].get("moe_backend") or "") == ""
     assert any("flashinfer_b12x" in w for w in (r.get("warnings") or []))
     assert any("flashinfer" in x.lower() or "SAFETY" in x for x in (r.get("rationale") or []))
+
+
+# ─── Topology-aware auto-config + model-family overlay ───────────────────────
+
+DSV4 = "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+
+def _two_spark_topo():
+    return {
+        "nodes": 2,
+        "node_list": [],
+        "head": {"id": "spark1", "qsfp_ip": "10.100.8.1", "qsfp_if": "enp1s0f1np1", "local": True},
+        "workers": [{"id": "spark2", "qsfp_ip": "10.100.8.2", "qsfp_if": "enp1s0f1np1"}],
+        "fabric_ok": True,
+        "available": True,
+    }
+
+
+def _one_spark_topo():
+    t = _two_spark_topo()
+    t.update({"nodes": 1, "workers": [], "fabric_ok": False})
+    return t
+
+
+def test_family_overlay_matches_deepseek_v4():
+    ov = ac._family_overlay(DSV4, {})
+    assert ov is not None
+    assert ov["family_key"] == "deepseek_v4_dspark"
+    c = ov["config"]
+    assert c["image"].startswith("ghcr.io/anemll/dspark-vllm-gx10")
+    assert c["kv_cache_dtype"] == "nvfp4_ds_mla"
+    assert c["moe_backend"] == "flashinfer_b12x"
+    assert c["tool_call_parser"] == "deepseek_v4"
+    # DSpark rides --speculative-config (method=dspark), not the structured mtp flag
+    assert c["mtp"] is False
+    assert "dspark" in c["extra_flags"]
+
+
+def test_family_overlay_ignores_normal_models():
+    assert ac._family_overlay(NVIDIA, {}) is None
+    assert ac._family_overlay("meta-llama/Llama-4-Scout", {}) is None
+
+
+def test_topology_two_sparks_sets_tp2_and_fabric():
+    cfg = ac._empty_config(DSV4)
+    warnings, rationale = [], []
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), warnings=warnings, rationale=rationale)
+    assert cfg["tensor_parallel_size"] == 2
+    assert "--nnodes 2" in cfg["extra_flags"]
+    assert "--master-addr 10.100.8.1" in cfg["extra_flags"]
+    env = cfg["docker_env"]
+    assert any(e == "VLLM_HOST_IP=10.100.8.1" for e in env)
+    assert any(e == "WORKER_VLLM_HOST_IP=10.100.8.2" for e in env)
+    assert any(e.startswith("NCCL_SOCKET_IFNAME=enp1s0f1np1") for e in env)
+    assert not warnings, f"fabric ok → no warnings, got {warnings}"
+
+
+def test_topology_one_spark_strips_multinode_and_dp():
+    cfg = ac._empty_config(DSV4)
+    cfg["extra_flags"] = "--data-parallel-size 4 --tensor-parallel-size 2"
+    warnings, rationale = [], []
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_one_spark_topo(), warnings=warnings, rationale=rationale)
+    assert cfg.get("tensor_parallel_size") is None
+    assert "--data-parallel-size" not in cfg["extra_flags"]
+    assert "--nnodes" not in cfg["extra_flags"]
+    assert not any(e.startswith("VLLM_HOST_IP=") for e in cfg["docker_env"])
+    assert any("single-node" in w or "1 Spark" in w for w in warnings)
+
+
+def test_recommend_dsv4_two_sparks_end_to_end(monkeypatch):
+    """Full recommend: overlay + topology produce Mia's 2-node DSv4 recipe."""
+    monkeypatch.setattr(ac, "_cluster_topology", _two_spark_topo)
+    r = ac.recommend(DSV4, mode="workflow_max", fetch_remote=False)
+    c = r["config"]
+    assert r["topology"]["nodes"] == 2
+    assert r["topology"]["overlay"] == "deepseek_v4_dspark"
+    assert c["image"].startswith("ghcr.io/anemll/dspark-vllm-gx10")
+    assert c["kv_cache_dtype"] == "nvfp4_ds_mla"
+    assert c["moe_backend"] == "flashinfer_b12x"
+    assert c["tensor_parallel_size"] == 2
+    assert c["util"] == 0.80
+    assert c["max_model_len"] == 1048576  # 1M preserved (not clamped by envelope)
+    ex = c["extra_flags"]
+    assert "--nnodes 2" in ex and "--speculative-config" in ex and "dspark" in ex
+    assert "--data-parallel-size" not in ex
+    assert "--enable-expert-parallel" not in ex  # card garbage dropped with card path
+
+
+def test_serve_build_args_passes_tp_through():
+    from app.services import serve
+
+    args = serve._build_vllm_args(
+        util=0.8,
+        max_model_len=1048576,
+        port=8000,
+        kv_cache_dtype="nvfp4_ds_mla",
+        moe_backend="flashinfer_b12x",
+        extra_flags="--nnodes 2 --master-addr 10.100.8.1 --tensor-parallel-size 9",
+        tensor_parallel_size=2,
+    )
+    joined = " ".join(args)
+    # TP honored from the structured field; the duplicate extra TP is stripped (envelope owns it)
+    assert joined.count("--tensor-parallel-size") == 1
+    i = args.index("--tensor-parallel-size")
+    assert args[i + 1] == "2"
+    assert "--nnodes 2" in joined and "--master-addr 10.100.8.1" in joined

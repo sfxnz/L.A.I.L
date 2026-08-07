@@ -492,6 +492,195 @@ def _dedupe_env(items: list[str]) -> list[str]:
     return out
 
 
+# ─── Cluster topology + model-family overlays ─────────────────────────────────
+
+# Anemll GX10 / DGX Spark port of vLLM 0.25 with native DSpark / NVFP4 DS-MLA / b12x.
+DSPARK_IMAGE = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+
+
+def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Model-family serve overlay for checkpoints whose correct Spark recipe is NOT
+    on the HF card. Returns None when the card is authoritative (normal models).
+
+    The card is the source of truth for most models — but a few (DeepSeek DSpark)
+    serve via a separate runtime repo with a custom image / MoE backend / KV path
+    that the card's generic `vllm serve` snippet gets wrong. Overlay wins over card.
+    """
+    mid = (model or "").lower()
+    if "deepseek" in mid and ("v4" in mid or "dspark" in mid or "flash" in mid):
+        return {
+            "family_key": "deepseek_v4_dspark",
+            "label": "DeepSeek V4 Flash DSpark (2-node DGX Spark recipe)",
+            "source": "https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark",
+            "config": {
+                "image": DSPARK_IMAGE,
+                "quantization": "",  # NVFP4 weights are native; no --quantization flag on Anemll
+                "kv_cache_dtype": "nvfp4_ds_mla",
+                "moe_backend": "flashinfer_b12x",
+                "trust_remote_code": True,
+                "tool_call_parser": "deepseek_v4",
+                "reasoning_parser": "deepseek_v4",
+                "enable_auto_tool_choice": True,
+                "max_num_seqs": 6,
+                # DSpark runs through --speculative-config (method=dspark) in extra_flags,
+                # NOT the structured mtp flag (serve.py would re-emit a conflicting mtp config).
+                "mtp": False,
+                "mtp_num_tokens": 5,  # checkpoint dspark_block_size is 5; k>=5
+                "enable_prefix_caching": True,
+                "enable_chunked_prefill": True,
+                "max_model_len": 1048576,  # 1M ceiling; envelope may lower
+                "util": 0.80,
+                "docker_env": [
+                    "VLLM_USE_FLASHINFER_SAMPLER=1",
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH=0",
+                    "VLLM_USE_B12X_MOE=1",
+                    "CUTE_DSL_ARCH=sm_121a",
+                    "TORCH_CUDA_ARCH_LIST=12.1a",
+                    "FLASHINFER_CUDA_ARCH_LIST=12.1a",
+                    "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1",
+                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+                ],
+                # DSpark speculative-config + tokenizer/reasoning go through extra flags
+                # because they are structured / non-form-mapped on this runtime.
+                "extra_flags": (
+                    "--tokenizer-mode deepseek_v4 "
+                    "--speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\"}' "
+                    "--reasoning-config '{\"reasoning_parser\":\"deepseek_v4\",\"reasoning_start_str\":\"<think>\",\"reasoning_end_str\":\"</think>\"}' "
+                    "--enable-prompt-tokens-details --async-scheduling "
+                    "--block-size 256 --generation-config vllm --enable-flashinfer-autotune"
+                ),
+            },
+            "rationale": [
+                "DeepSeek V4 Flash serves via the DSpark/NVFP4-DS-MLA path, not the stock vLLM image.",
+                "Overlay from MiaAI-Lab 2x DGX Spark recipe (Anemll dspark-vllm-gx10 image).",
+                "Card's generic recipe (fp8 KV, deep_gemm moe, data-parallel) is wrong for GB10 — overridden.",
+            ],
+        }
+    return None
+
+
+def _cluster_topology() -> dict[str, Any]:
+    """Live cluster shape for serve planning. Never raises — falls back to single-node."""
+    fallback = {
+        "nodes": 1,
+        "node_list": [],
+        "head": None,
+        "workers": [],
+        "fabric_ok": False,
+        "available": False,
+    }
+    try:
+        from . import cluster as _cluster
+
+        data = _cluster.collect_cluster()
+        nodes = data.get("nodes") or []
+        online = [n for n in nodes if n.get("state") != "offline" and (n.get("online") or n.get("local"))]
+        if not online:
+            return fallback
+        head = next((n for n in online if n.get("local")), online[0])
+        workers = [n for n in online if n is not head]
+        return {
+            "nodes": len(online),
+            "node_list": online,
+            "head": head,
+            "workers": workers,
+            "fabric_ok": bool((data.get("fabric") or {}).get("ok")),
+            "available": True,
+        }
+    except Exception:
+        return fallback
+
+
+def _apply_topology(
+    cfg: dict[str, Any],
+    *,
+    overlay: Optional[dict[str, Any]],
+    topology: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """Compute TP / nnodes / fabric env from the live cluster. This is the layer that
+    was missing: Auto-configure used to strip tensor_parallel_size and assume TP=1."""
+    n = int(topology.get("nodes") or 1)
+    head = topology.get("head") or {}
+    workers = topology.get("workers") or []
+    fabric_ok = bool(topology.get("fabric_ok"))
+    multi = n >= 2
+
+    # Strip any card-supplied data-parallel — DP is a multi-node recipe artifact that
+    # does not apply to a 1/2-GB10 UMA cluster (tensor-parallel is the correct split).
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--data-parallel-size")
+
+    if not multi:
+        # Single Spark: TP=1, remove any multi-node residue.
+        cfg.pop("tensor_parallel_size", None)
+        for f in ("--nnodes", "--node-rank", "--master-addr", "--master-port", "--pipeline-parallel-size"):
+            if cfg.get("extra_flags"):
+                cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], f)
+        cfg["docker_env"] = [
+            e
+            for e in (cfg.get("docker_env") or [])
+            if not e.startswith(
+                ("VLLM_HOST_IP=", "WORKER_VLLM_HOST_IP=", "NCCL_", "TP_SOCKET_IFNAME=", "GLOO_SOCKET_IFNAME=", "MASTER_ADDR=", "NODE_RANK=")
+            )
+        ]
+        if overlay:
+            warnings.append(
+                f"{overlay['label']} is a multi-node recipe, but only 1 Spark is online — "
+                "serving single-node (TP=1). Multi-node flags + fabric env dropped."
+            )
+        rationale.append("Topology: 1 Spark online → TP=1 (single-node serve)")
+        return
+
+    # Multi-node (2+ Sparks): TP across the QSFP RoCE fabric.
+    tp = n
+    cfg["tensor_parallel_size"] = tp
+    head_if = head.get("qsfp_if") or "enp1s0f1np1"
+    head_ip = head.get("qsfp_ip")
+    worker_ip = workers[0].get("qsfp_ip") if workers else None
+
+    dist_flags = (
+        f"--tensor-parallel-size {tp} --pipeline-parallel-size 1 --nnodes {n} "
+        f"--node-rank 0 --master-addr {head_ip or 'HEAD_ROCE_IP'} --master-port 25000 "
+        f"--distributed-executor-backend mp"
+    )
+    existing = cfg.get("extra_flags") or ""
+    cfg["extra_flags"] = (existing + " " + dist_flags).strip()
+
+    env = list(cfg.get("docker_env") or [])
+    if head_ip:
+        env.append(f"VLLM_HOST_IP={head_ip}")
+    if worker_ip:
+        env.append(f"WORKER_VLLM_HOST_IP={worker_ip}")
+    env += [
+        f"NCCL_SOCKET_IFNAME={head_if}",
+        f"TP_SOCKET_IFNAME={head_if}",
+        f"GLOO_SOCKET_IFNAME={head_if}",
+        "NCCL_NET=IB",
+        "NCCL_IB_DISABLE=0",
+        "NCCL_CROSS_NIC=1",
+        "NCCL_NVLS_ENABLE=0",
+    ]
+    cfg["docker_env"] = _dedupe_env(env)
+
+    rationale.append(
+        f"Topology: {n} Sparks online → TP={tp} across QSFP RoCE ({head_if})"
+        + (f"; head={head_ip}" if head_ip else "")
+        + (f", worker={worker_ip}" if worker_ip else "")
+    )
+    if not fabric_ok:
+        warnings.append(
+            "Multi-node serve planned but the QSFP RoCE fabric check did not pass. "
+            "Verify enp1s0f1np1 carrier + 10.100.8.x reachability on both nodes before Start."
+        )
+    if not head_ip or not worker_ip:
+        warnings.append(
+            "RoCE IPs not fully discovered — VLLM_HOST_IP / WORKER_VLLM_HOST_IP may need "
+            "manual entry (10.100.8.1 head / 10.100.8.2 worker on this lab)."
+        )
+
+
 def _strip_flag_from_extra(extra: str, flag: str) -> str:
     """Remove ``flag`` and its value from a free-form extra_flags string."""
     s = (extra or "").strip()
@@ -1227,7 +1416,7 @@ def _fill_from_config_detection(
         base["trust_remote_code"] = True
 
 
-def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], card_set_max_len: bool) -> None:
+def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], card_set_max_len: bool, card_set_util: bool = False) -> None:
     if mode == "lab_safe":
         if cfg.get("util") is None:
             cfg["util"] = SAFE_UTIL
@@ -1253,7 +1442,9 @@ def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], c
         if not cfg.get("image"):
             cfg["image"] = DEFAULT_IMAGE_MAX
 
-    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9:
+    # Lab Safe clamps util, but never below a card/overlay-specified floor (large NVFP4 /
+    # DSpark weights need the card's util just to load — clamping to 0.4 would brick the boot).
+    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9 and not card_set_util:
         cfg["util"] = SAFE_UTIL
         rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
 
@@ -1349,9 +1540,17 @@ def recommend(
         detected["config_source"] = None
         warnings.append("No HF config.json available — quant detection limited")
 
+    # Model-family overlay (e.g. DeepSeek DSpark) + live cluster topology. The overlay
+    # supplies the correct serve path when the card's generic recipe is wrong; topology
+    # decides TP/nnodes/fabric from how many Sparks are actually online.
+    overlay = _family_overlay(model, detected)
+    topology = _cluster_topology()
+
     # ── Parse card for best vllm serve (scored with config.json knowledge) ──
+    # When a family overlay matches, the card's generic recipe is wrong for this
+    # checkpoint — skip card-candidate fill entirely and let the overlay drive.
     candidates: list[ServeCandidate] = []
-    if readme:
+    if readme and not overlay:
         candidates = extract_serve_candidates(readme, detected=detected)
         if candidates:
             best = candidates[0]
@@ -1387,48 +1586,62 @@ def recommend(
 
     card_set_max_len = cfg.get("max_model_len") is not None
 
-    # Card may recommend multi-GPU; this lab serves single-GPU (Spark)
-    tp = cfg.pop("tensor_parallel_size", None)
-    if tp is not None:
-        try:
-            tp_n = int(tp)
-        except (TypeError, ValueError):
-            tp_n = 1
-        if tp_n > 1:
-            warnings.append(
-                f"HF card uses --tensor-parallel-size {tp_n}; this lab serves with TP=1 "
-                f"(single GPU). Edit extra flags if you have a multi-GPU cluster."
-            )
-            rationale.append(f"Card tensor-parallel-size={tp_n} noted but not applied (lab TP=1)")
-
     # Gaps only: HF config.json / tags (still from the model on the hub)
     _fill_from_config_detection(cfg, detected, rationale)
 
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)
 
-    # First-boot lab posture: no MTP, no crashing moe backends (Auto-configure → Start)
-    _apply_first_boot_defaults(
-        cfg,
-        mode=mode,
-        detected=detected,
-        warnings=warnings,
-        rationale=rationale,
-    )
+    # Model-family overlay wins over the card when the card's recipe is wrong for this
+    # checkpoint's Spark path (DeepSeek DSpark: custom image + b12x + nvfp4_ds_mla).
+    if overlay:
+        overlay_cfg = overlay["config"]
+        for k, v in overlay_cfg.items():
+            if k == "docker_env":
+                cfg["docker_env"] = _dedupe_env(list(cfg.get("docker_env") or []) + list(v))
+            elif k == "extra_flags":
+                cfg["extra_flags"] = ((cfg.get("extra_flags") or "") + " " + v).strip()
+            else:
+                cfg[k] = v
+        for r in overlay["rationale"]:
+            rationale.append(r)
+        sources.insert(
+            0,
+            {"kind": "family_overlay", "ref": overlay["source"], "notes": overlay["label"]},
+        )
+        confidence = "high"
 
-    # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it
-    # (even if scoring already picked a non-flashinfer recipe and moe_backend is empty)
-    _note_card_flashinfer_avoidance(
-        candidates=candidates,
-        readme=readme,
-        detected=detected,
-        cfg=cfg,
-        warnings=warnings,
-        rationale=rationale,
-    )
+    # Topology: TP / nnodes / fabric env from live cluster (replaces the old TP=1 strip).
+    _apply_topology(cfg, overlay=overlay, topology=topology, warnings=warnings, rationale=rationale)
 
-    # Mode envelope for util / defaults when card silent
-    _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len)
+    # First-boot lab posture: no MTP, no crashing moe backends (Auto-configure → Start).
+    # Skip when a family overlay deliberately enables MTP/exotic backends (DSpark needs them).
+    if not overlay:
+        _apply_first_boot_defaults(
+            cfg,
+            mode=mode,
+            detected=detected,
+            warnings=warnings,
+            rationale=rationale,
+        )
+
+    # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
+    # Overlay already encodes the correct backend, so only run for card-driven configs.
+    if not overlay:
+        _note_card_flashinfer_avoidance(
+            candidates=candidates,
+            readme=readme,
+            detected=detected,
+            cfg=cfg,
+            warnings=warnings,
+            rationale=rationale,
+        )
+
+    # Mode envelope for util / defaults when card silent. util/max-len set by the card OR a
+    # family overlay are authoritative — the envelope only fills gaps, never overrides them.
+    card_set_util = cfg.get("util") is not None
+    card_set_max_len = cfg.get("max_model_len") is not None
+    _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
 
     max_pos = detected.get("max_position_embeddings")
     if isinstance(max_pos, int) and max_pos > 0 and cfg.get("max_model_len"):
@@ -1485,7 +1698,9 @@ def recommend(
         )
 
     label = None
-    if candidates:
+    if overlay:
+        label = overlay["label"]
+    elif candidates:
         label = f"HF card: {candidates[0].section or 'vLLM recipe'}"
     elif from_website:
         label = "HF config (no serve recipe on card)"
@@ -1493,7 +1708,12 @@ def recommend(
         label = "Offline / incomplete"
 
     notes = None
-    if from_website and candidates:
+    if overlay:
+        notes = (
+            f"{overlay['label']} — family overlay overrides the generic HF card recipe "
+            f"({overlay['source']}). Topology: {topology.get('nodes', 1)} Spark(s) online."
+        )
+    elif from_website and candidates:
         notes = (
             f"Derived from the live Hugging Face card ({card_url}). "
             f"Picked the highest-scoring of {len(candidates)} vllm serve recipe(s) on the card."
@@ -1502,6 +1722,15 @@ def recommend(
         notes = f"Fetched {card_url} but found no vllm serve blocks; used config.json + tags."
     else:
         notes = "Live HF card was not available; result may be incomplete."
+
+    topology_out = {
+        "nodes": topology.get("nodes", 1),
+        "fabric_ok": topology.get("fabric_ok", False),
+        "head_ip": (topology.get("head") or {}).get("qsfp_ip"),
+        "worker_ips": [w.get("qsfp_ip") for w in (topology.get("workers") or []) if w.get("qsfp_ip")],
+        "tensor_parallel_size": cfg.get("tensor_parallel_size") or 1,
+        "overlay": overlay["family_key"] if overlay else None,
+    }
 
     token_ok = False
     try:
@@ -1525,6 +1754,7 @@ def recommend(
         "hf_token_ok": token_ok,
         "detected": detected,
         "config": cfg,
+        "topology": topology_out,
         "sources": sources,
         "rationale": rationale,
         "warnings": warnings,

@@ -100,6 +100,7 @@ class ServeRequest(BaseModel):
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
     extra_flags: str = ""
+    tensor_parallel_size: Optional[int] = None
     stop_first: bool = True
     download: bool = False
 
@@ -132,6 +133,7 @@ async def serve_start(body: ServeRequest) -> dict[str, str]:
             enable_chunked_prefill=body.enable_chunked_prefill,
             enable_prefix_caching=body.enable_prefix_caching,
             extra_flags=body.extra_flags,
+            tensor_parallel_size=body.tensor_parallel_size,
             stop_first=body.stop_first,
             log=log,
             progress=progress,

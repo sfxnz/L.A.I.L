@@ -278,7 +278,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
         </div>
         <div className="flex items-center gap-1.5">
           {nodes.map((n) => {
-            const filled = n.state === "serving";
+            const filled = n.state === "serving" || n.state === "serving_worker";
             const loading = n.state === "loading";
             return (
               <div key={n.id} className="flex items-center gap-1.5">
@@ -290,7 +290,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
                     !filled && !loading && n.state === "idle" && "border-lab-border bg-lab-hover",
                     n.state === "offline" && "border-lab-danger/50 bg-[rgba(255,69,58,0.2)]",
                   )}
-                  title={`${n.id}: ${n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
+                  title={`${n.id}: ${n.state === "serving_worker" ? "TP worker (headless)" : n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
                 />
                 <span className="text-[10px] font-medium uppercase tracking-[0.04em] text-lab-muted">
                   {n.id}

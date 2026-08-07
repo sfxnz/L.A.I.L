@@ -92,6 +92,14 @@ def build_multi_node_launch(
             "docker", "run", "-d", "--name", name, "--restart", "no",
             "--gpus", "all", "--network", "host", "--ipc", "host", "--shm-size=32g",
             "--device", "/dev/infiniband",
+            # RDMA needs locked (pinned) memory + raw verbs access; without these
+            # NCCL fails at init with "unhandled system error".
+            "--cap-add", "IPC_LOCK",
+            "--ulimit", "memlock=-1:-1",
+            # Runtime images (e.g. Anemll dspark-vllm-gx10) ship ENTRYPOINT=vllm.
+            # Clear it so our bash wrapper runs as the command instead of being
+            # appended as arguments to vllm (=> "unrecognized arguments" exit 2).
+            "--entrypoint", "bash",
             "-v", f"{hf}:/cache/huggingface",
         ]
         for e in shared_env:
@@ -119,7 +127,9 @@ def build_multi_node_launch(
         args += base_args
         return args
 
-    entry = ["bash", "-lc", 'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"', "--"]
+    # --entrypoint is bash, so args start at bash's own flags (no leading "bash").
+    # `bash -lc 'exec "$@"' -- vllm serve …` makes "--" $0 and the rest "$@".
+    entry = ["-lc", 'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"', "--"]
 
     head_cmd = docker_prefix(f"spark-vllm-n0", head.get("qsfp_ip")) + [
         "-e", "NODE_RANK=0", "-e", f"MASTER_ADDR={master_addr}",

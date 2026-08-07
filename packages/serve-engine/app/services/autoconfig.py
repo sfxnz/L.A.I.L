@@ -747,6 +747,32 @@ def plan_placement(
     }
 
 
+def _ib_hca_for_iface(iface: str) -> Optional[str]:
+    """Map a QSFP netdev (enp1s0f1np1) to its RoCE HCA (rocep1s0f1).
+
+    GB10 exposes 4 HCAs, 2 of them DOWN. Without NCCL_IB_HCA pinned, NCCL picks a
+    dead one and dies with 'unhandled system error' at init_device.
+    """
+    try:
+        import glob as _glob
+        import os as _os
+
+        for netpath in _glob.glob("/sys/class/infiniband/*/device/net/*"):
+            if _os.path.basename(netpath) == iface:
+                hca = netpath.split("/sys/class/infiniband/")[1].split("/")[0]
+                state = ""
+                try:
+                    with open(f"/sys/class/infiniband/{hca}/ports/1/state") as fh:
+                        state = fh.read().strip()
+                except Exception:
+                    pass
+                if "ACTIVE" in state.upper() or not state:
+                    return hca
+    except Exception:
+        pass
+    return None
+
+
 def _apply_topology(
     cfg: dict[str, Any],
     *,
@@ -851,6 +877,17 @@ def _apply_topology(
         "NCCL_CROSS_NIC=1",
         "NCCL_NVLS_ENABLE=0",
     ]
+    # Pin the RoCE HCA: GB10 exposes 4 HCAs (2 DOWN). Unpinned, NCCL picks a dead
+    # one and fails init_device with "unhandled system error".
+    hca = _ib_hca_for_iface(head_if)
+    if hca:
+        env.append(f"NCCL_IB_HCA={hca}")
+        rationale.append(f"NCCL_IB_HCA={hca} pinned (RoCE HCA for {head_if}; other HCAs are DOWN)")
+    else:
+        warnings.append(
+            f"Could not resolve the RoCE HCA for {head_if}. If NCCL fails with "
+            "'unhandled system error', set NCCL_IB_HCA manually in docker env."
+        )
     cfg["docker_env"] = _dedupe_env(env)
 
     wtxt = f"~{weights_gib} GiB weights" if weights_gib else "weights unknown"

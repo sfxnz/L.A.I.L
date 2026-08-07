@@ -413,11 +413,29 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
+    """Rank of a running headless multi-node worker container (spark-vllm-nN, N>=1).
+
+    Headless workers intentionally expose no /v1/models endpoint, so they can never
+    be detected via endpoint health — they must be identified by their container.
+    """
+    for c in n.get("containers") or []:
+        m = re.match(r"spark-vllm-n(\d+)$", str(c.get("name", "")))
+        if m and "up" in str(c.get("status", "")).lower():
+            rank = int(m.group(1))
+            if rank >= 1:
+                return rank
+    return None
+
+
 def _node_state(n: dict[str, Any]) -> str:
     if not n.get("online") and not n.get("local"):
         return "offline"
     if n.get("endpoint_healthy") and n.get("model_id"):
         return "serving"
+    # Headless TP worker: container up, no endpoint by design → still serving.
+    if _multinode_worker_rank(n) is not None:
+        return "serving_worker"
     if n.get("containers"):
         # container present but endpoint not healthy yet
         up = any("up" in str(c.get("status", "")).lower() for c in n.get("containers") or [])
@@ -433,7 +451,16 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
         n["state"] = _node_state(n)
 
     online = sum(1 for n in nodes if n.get("state") != "offline")
-    serving = [n for n in nodes if n.get("state") == "serving"]
+    head_serving = [n for n in nodes if n.get("state") == "serving"]
+    workers_serving = [n for n in nodes if n.get("state") == "serving_worker"]
+    # A headless worker serves the head's model — attribute it for display.
+    if head_serving and workers_serving:
+        head_model = head_serving[0].get("model_id")
+        for w in workers_serving:
+            if not w.get("model_id"):
+                w["model_id"] = head_model
+            w["headless_worker"] = True
+    serving = head_serving + workers_serving
     models = [n.get("model_id") for n in serving if n.get("model_id")]
     unique_models = sorted({m for m in models if m})
 
@@ -449,6 +476,12 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
     tps = [int(n["tensor_parallel_size"]) for n in nodes if n.get("tensor_parallel_size")]
     if tps:
         multi["tensor_parallel_hint"] = max(tps)
+    # Headless workers don't publish a TP flag we can read; infer it from the
+    # head + running worker ranks so a real 2-node serve reports TP=2.
+    if workers_serving and head_serving:
+        multi["tensor_parallel_hint"] = max(
+            multi.get("tensor_parallel_hint") or 0, len(head_serving) + len(workers_serving)
+        )
 
     if len(serving) == 0:
         loading = [n for n in nodes if n.get("state") == "loading"]
@@ -478,8 +511,13 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
         multi["message"] = "Nodes serving different models — not a clean multi-node load."
         multi["models_by_node"] = {n["id"]: n.get("model_id") for n in serving}
 
-    # partial: one serving one idle with TP expected
-    if multi["mode"] == "single" and multi.get("tensor_parallel_hint") and multi["tensor_parallel_hint"] >= 2:
+    # partial: one serving one idle with TP expected (only when no headless worker is up)
+    if (
+        multi["mode"] == "single"
+        and multi.get("tensor_parallel_hint")
+        and multi["tensor_parallel_hint"] >= 2
+        and not workers_serving
+    ):
         multi["mode"] = "multi_partial"
         multi["message"] = (
             f"TP≥2 hinted but only {serving[0]['id']} is serving — worker may be down or still loading."

@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
   switch (state) {
     case "serving":
+    case "serving_worker":
       return "ok";
     case "loading":
       return "warn";
@@ -68,7 +69,7 @@ function NodeCard({ node }: { node: ClusterNode }) {
     <div
       className={cn(
         "relative flex min-h-[168px] flex-col rounded-[14px] border bg-lab-panel2/60 p-4 transition-all duration-300",
-        node.state === "serving" &&
+        (node.state === "serving" || node.state === "serving_worker") &&
           "border-[rgba(48,209,88,0.4)] shadow-[0_0_24px_rgba(48,209,88,0.12),inset_0_0_0_1px_rgba(48,209,88,0.08)]",
         node.state === "loading" && "border-[rgba(255,214,10,0.28)]",
         node.state === "offline" && "border-[rgba(255,69,58,0.28)]",
@@ -80,18 +81,24 @@ function NodeCard({ node }: { node: ClusterNode }) {
           <div className="flex items-center gap-2">
             <StatusDot
               live={
-                node.state === "serving" ? true : node.state === "offline" ? false : null
+                node.state === "serving" || node.state === "serving_worker"
+                  ? true
+                  : node.state === "offline"
+                    ? false
+                    : null
               }
               label={
                 node.state === "serving"
                   ? "Serving"
-                  : node.state === "offline"
-                    ? "Offline"
-                    : node.state === "loading"
-                      ? "Loading"
-                      : node.state === "idle"
-                        ? "Idle"
-                        : node.state || "Unknown"
+                  : node.state === "serving_worker"
+                    ? "TP worker"
+                    : node.state === "offline"
+                      ? "Offline"
+                      : node.state === "loading"
+                        ? "Loading"
+                        : node.state === "idle"
+                          ? "Idle"
+                          : node.state || "Unknown"
               }
             />
             <span className="text-[15px] font-semibold tracking-[-0.02em] text-lab-text">
@@ -109,7 +116,7 @@ function NodeCard({ node }: { node: ClusterNode }) {
           </div>
         </div>
         <Badge tone={stateTone(node.state)} dot>
-          {node.state || "—"}
+          {node.state === "serving_worker" ? "TP worker" : node.state || "—"}
         </Badge>
       </div>
 

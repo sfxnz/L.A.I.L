@@ -568,6 +568,31 @@ def test_multi_node_launch_head_worker_split():
     assert launch["workers"][0]["rank"] == 1
 
 
+def test_multi_node_launch_clears_image_entrypoint():
+    """Regression: Anemll image ships ENTRYPOINT=vllm. Without --entrypoint bash the
+    wrapper is appended as vllm arguments and the container dies with exit 2
+    ('unrecognized arguments'). Verified live on spark1/spark2 2026-08-07."""
+    from app.services import serve
+
+    launch = serve.build_multi_node_launch(
+        image="ghcr.io/anemll/dspark-vllm-gx10:0.1.1", model="m",
+        vllm_args=["--kv-cache-dtype", "nvfp4_ds_mla"],
+        env_list=[],
+        head={"id": "spark1", "qsfp_ip": "10.100.8.1"},
+        workers=[{"id": "spark2", "qsfp_ip": "10.100.8.2", "ssh_host": "spark2"}],
+        nnodes=2, port=8000,
+    )
+    for cmd in (launch["head"]["cmd"], launch["workers"][0]["cmd"]):
+        assert "--entrypoint" in cmd, "must clear the image ENTRYPOINT"
+        assert cmd[cmd.index("--entrypoint") + 1] == "bash"
+        # image must be followed by bash flags, never a second literal "bash"
+        img_i = cmd.index("ghcr.io/anemll/dspark-vllm-gx10:0.1.1")
+        assert cmd[img_i + 1] == "-lc", f"expected bash flags after image, got {cmd[img_i + 1]}"
+        assert cmd[img_i + 1 : img_i + 2] != ["bash"]
+        # the real serve command still reaches vllm
+        assert "vllm" in cmd and "serve" in cmd
+
+
 def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
     """User can add a future model via data/serve_overlays.json with no code change."""
     import json as _json

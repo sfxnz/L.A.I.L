@@ -59,7 +59,7 @@ export default function StatusPage() {
   const serve = status?.serve;
   const cluster = status?.cluster || serve?.cluster || null;
   const healthy = !!(serve && !serve.unreachable && serve.healthy);
-  const modelShort = serve?.model_id?.split("/").pop() || "—";
+  const modelShort = loading ? "—" : serve?.model_id?.split("/").pop() || "None loaded";
   const freeGib = serve?.hardware?.available_gib;
   const clusterHealthy = !!cluster?.summary?.healthy;
   const multiMode = cluster?.summary?.multi?.mode;
@@ -119,8 +119,11 @@ export default function StatusPage() {
           <Link href="/server" className={btnClass("primary", "sm")}>
             Serve
           </Link>
-          <Link href="/evals" className={btnClass("ghost", "sm")}>
-            Evals
+          <Link
+            href="/evals"
+            className="px-1.5 text-[12px] font-medium text-lab-muted transition-colors hover:text-lab-text"
+          >
+            Evals →
           </Link>
         </div>
       </div>
@@ -167,7 +170,7 @@ export default function StatusPage() {
           <Metric
             label="vLLM endpoint"
             value={loading ? "—" : healthy ? "Healthy" : "Idle"}
-            sub={serve?.base_url || "—"}
+            sub={loading ? "Probing :8000" : serve?.base_url || "No endpoint configured"}
             tone={loading ? undefined : healthy ? "ok" : "muted"}
             large
             loading={loading}

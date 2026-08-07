@@ -281,7 +281,7 @@ export function Field({
           {error}
         </span>
       ) : hint ? (
-        <span className="block text-[11px] text-lab-muted" id={hintId}>
+        <span className="block text-[12px] leading-snug text-lab-text-dim/80" id={hintId}>
           {hint}
         </span>
       ) : null}

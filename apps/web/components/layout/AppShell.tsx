@@ -27,7 +27,7 @@ const PAGE_TITLES: Array<{ match: (p: string) => boolean; title: string }> = [
   { match: (p) => p.startsWith("/evals/tool"), title: "Tool Eval" },
   { match: (p) => p.startsWith("/evals"), title: "Evals" },
   { match: (p) => p.startsWith("/server"), title: "Serve" },
-  { match: (p) => p.startsWith("/configure"), title: "Settings" },
+  { match: (p) => p.startsWith("/configure"), title: "Configure" },
   { match: (p) => p.startsWith("/status") || p === "/", title: "Status" },
   { match: (p) => p.startsWith("/connect"), title: "Connect" },
   { match: (p) => p.startsWith("/lab"), title: "Lab" },
@@ -159,8 +159,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {serveOk === null ? (
               <Badge tone="muted">checking…</Badge>
             ) : (
-              <Badge tone={serveOk ? "ok" : "muted"} dot>
-                {serveOk ? "vLLM" : "no serve"}
+              <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
+                {serveOk ? "vLLM serving" : "idle"}
               </Badge>
             )}
             {modelLabel && (

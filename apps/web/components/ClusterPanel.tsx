@@ -184,24 +184,34 @@ function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
   const ok = !!cluster.fabric?.ok;
   const rtt = link?.rtt_ms;
   const speed = link?.from_speed_mbps || link?.to_speed_mbps;
+  const speedG = speed && speed > 0 ? Math.round(speed / 1000) : null;
 
   return (
-    <div className="flex min-h-[168px] flex-col items-center justify-center px-2 py-4">
+    <div
+      className="flex min-h-[168px] flex-col items-center justify-center gap-2 px-2 py-4"
+      role="img"
+      aria-label={
+        ok
+          ? `QSFP RoCE fabric up${speedG ? `, ${speedG}G` : ""}${rtt != null ? `, ${rtt.toFixed(1)} ms` : ""}`
+          : "Cluster fabric down"
+      }
+    >
       <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-lab-muted">
         Fabric
       </div>
-      <div className="relative mt-4 flex w-full max-w-[140px] items-center">
+      <div className="relative flex w-full max-w-[150px] items-center">
         <div
           className={cn(
             "h-[2px] flex-1 rounded-full",
-            ok ? "bg-lab-ok/70" : "bg-lab-danger/50",
+            ok ? "lab-fabric-line text-lab-ok/80" : "bg-lab-danger/50",
           )}
+          aria-hidden
         />
         <div
           className={cn(
-            "mx-1 flex h-8 w-8 items-center justify-center rounded-full border text-[10px] font-semibold",
+            "mx-1.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-[10px] font-semibold",
             ok
-              ? "border-[rgba(48,209,88,0.4)] bg-[rgba(48,209,88,0.12)] text-lab-ok"
+              ? "border-[rgba(48,209,88,0.4)] bg-[rgba(48,209,88,0.12)] text-lab-ok shadow-[0_0_14px_rgba(48,209,88,0.25)]"
               : "border-[rgba(255,69,58,0.35)] bg-[rgba(255,69,58,0.1)] text-lab-danger",
           )}
         >
@@ -210,18 +220,19 @@ function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
         <div
           className={cn(
             "h-[2px] flex-1 rounded-full",
-            ok ? "bg-lab-ok/70" : "bg-lab-danger/50",
+            ok ? "lab-fabric-line text-lab-ok/80" : "bg-lab-danger/50",
           )}
+          aria-hidden
         />
       </div>
-      <div className="mt-3 text-center">
+      <div className="text-center">
         <div className="text-[12px] font-medium text-lab-text-dim">
           {ok ? "QSFP RoCE" : "Fabric down"}
         </div>
-        <div className="mt-1 font-mono text-[10px] text-lab-muted">
-          {link?.target_ip || "10.100.8.x"}
-          {speed && speed > 0 ? ` · ${Math.round(speed / 1000)}G` : ""}
-          {rtt != null ? ` · ${rtt.toFixed(1)} ms` : ""}
+        <div className="mt-0.5 font-mono text-[10px] tabular-nums text-lab-muted">
+          {[speedG ? `${speedG}G` : null, rtt != null ? `${rtt.toFixed(1)} ms` : null]
+            .filter(Boolean)
+            .join(" · ") || link?.target_ip || "—"}
         </div>
       </div>
     </div>
@@ -339,15 +350,16 @@ export function ClusterPanel({
       className="overflow-hidden"
       title="Cluster"
       action={
-        <div className="flex items-center gap-2">
-          <Badge tone={healthy ? "ok" : "danger"} dot>
-            {healthy ? "cluster ok" : "cluster issue"}
-          </Badge>
-          <span className="hidden text-[11px] tabular-nums text-lab-muted sm:inline">
-            {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
-            {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
-          </span>
-        </div>
+        <span
+          className={cn(
+            "flex items-center gap-2 text-[11px] font-medium tabular-nums",
+            healthy ? "text-lab-ok" : "text-lab-danger",
+          )}
+        >
+          <StatusDot live={healthy} label={healthy ? "Cluster healthy" : "Cluster issue"} />
+          {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
+          {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
+        </span>
       }
     >
       <div className="space-y-3 p-3 sm:p-4">

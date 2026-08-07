@@ -134,14 +134,11 @@ export default function EvalsPage() {
           <p className="page-sub">Smoke, perf, and tool-eval quality vs the live serve</p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Link href="/evals/tool" className={btnClass("secondary", "sm")}>
-            Tool Eval board
-          </Link>
           <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing}>
             Refresh
           </Btn>
-          <Link href="/server" className={btnClass("primary", "sm")}>
-            Open Serve
+          <Link href="/evals/tool" className={btnClass("primary", "sm")}>
+            Tool Eval board
           </Link>
         </div>
       </div>

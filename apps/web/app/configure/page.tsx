@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils";
 import { usePageTitle } from "@/lib/usePageTitle";
 
 export default function ConfigurePage() {
-  usePageTitle("Settings");
+  usePageTitle("Configure");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -37,7 +37,7 @@ export default function ConfigurePage() {
       <div className="space-y-5 lab-fade-in">
         <div className="page-header">
           <div>
-            <h1 className="page-title">Settings</h1>
+            <h1 className="page-title">Configure</h1>
             <p className="page-sub">vLLM / llama.cpp · default model · HF token · context budget</p>
           </div>
         </div>
@@ -90,7 +90,7 @@ export default function ConfigurePage() {
     <div className="space-y-5 lab-fade-in">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Settings</h1>
+          <h1 className="page-title">Configure</h1>
           <p className="page-sub">vLLM / llama.cpp · default model · HF token · context budget</p>
         </div>
       </div>

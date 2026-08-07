@@ -200,6 +200,7 @@ export function Metric({
   tone,
   large,
   loading,
+  progress,
 }: {
   label: string;
   value: string;
@@ -208,6 +209,8 @@ export function Metric({
   tone?: "ok" | "danger" | "warn" | "muted";
   large?: boolean;
   loading?: boolean;
+  /** 0–100: renders an animated meter under the value. */
+  progress?: number | null;
 }) {
   const valueTone =
     tone === "ok"
@@ -246,6 +249,25 @@ export function Metric({
               {sub}
             </div>
           ) : null}
+          {progress != null && (
+            <div
+              className="mt-2.5 h-1 overflow-hidden rounded-full bg-lab-hover"
+              role="img"
+              aria-label={`${label}: ${Math.round(progress)}%`}
+            >
+              <div
+                className={cn(
+                  "h-full rounded-full transition-[width] duration-700 ease-out",
+                  progress < 15
+                    ? "bg-lab-warn"
+                    : tone === "danger"
+                      ? "bg-lab-danger"
+                      : "bg-lab-accent",
+                )}
+                style={{ width: `${Math.max(0, Math.min(100, progress))}%` }}
+              />
+            </div>
+          )}
         </>
       )}
     </Panel>

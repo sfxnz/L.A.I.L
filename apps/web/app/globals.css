@@ -339,6 +339,85 @@ input[type="checkbox"]:disabled {
   animation: lab-fabric-flow 1.5s linear infinite;
 }
 
+/* ---- Teeming-with-life layer: state you can *see* (calm, one accent) ---- */
+
+/* Breathing glow on live status dots (ok = serving / fabric up) */
+@keyframes lab-glow-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.18), 0 0 10px rgba(48, 209, 88, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(48, 209, 88, 0.1), 0 0 18px rgba(48, 209, 88, 0.55);
+  }
+}
+.lab-dot-live {
+  animation: lab-pulse 2.4s ease-in-out infinite, lab-glow-pulse 2.4s ease-in-out infinite;
+}
+
+/* Card depth + hover lift */
+.lab-card {
+  transition: border-color 0.2s ease, box-shadow 0.25s ease, transform 0.2s ease;
+}
+.lab-card:hover {
+  border-color: var(--color-lab-border-strong);
+  box-shadow:
+    0 0 0 0.5px rgba(255, 255, 255, 0.05) inset,
+    0 2px 6px rgba(0, 0, 0, 0.4),
+    0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+/* Staggered panel entrance */
+@keyframes lab-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.lab-rise {
+  animation: lab-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.lab-rise-1 {
+  animation-delay: 0.04s;
+}
+.lab-rise-2 {
+  animation-delay: 0.1s;
+}
+.lab-rise-3 {
+  animation-delay: 0.16s;
+}
+.lab-rise-4 {
+  animation-delay: 0.22s;
+}
+
+/* Accent glow ring for primary actions / active states */
+.lab-glow-accent {
+  box-shadow:
+    0 0 0 1px rgba(10, 132, 255, 0.35),
+    0 0 16px rgba(10, 132, 255, 0.22);
+}
+
+/* Live "serving" shimmer on the model load strip */
+@keyframes lab-strip-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+.lab-strip-live {
+  background-image: linear-gradient(
+    100deg,
+    rgba(48, 209, 88, 0) 30%,
+    rgba(48, 209, 88, 0.14) 50%,
+    rgba(48, 209, 88, 0) 70%
+  );
+  background-size: 200% 100%;
+  animation: lab-strip-shimmer 2.6s linear infinite;
+}
+
 /* Skip link — keyboard first */
 .lab-skip-link {
   position: absolute;
@@ -403,6 +482,9 @@ input[type="checkbox"]:disabled {
   .lab-skeleton,
   .lab-progress-indeterminate,
   .lab-fade-in,
+  .lab-fabric-line,
+  .lab-strip-live,
+  .lab-rise,
   .lab-spin {
     animation: none !important;
   }

@@ -67,8 +67,9 @@ function NodeCard({ node }: { node: ClusterNode }) {
   return (
     <div
       className={cn(
-        "relative flex min-h-[168px] flex-col rounded-[14px] border bg-lab-panel2/60 p-4 transition-colors",
-        node.state === "serving" && "border-[rgba(48,209,88,0.35)]",
+        "relative flex min-h-[168px] flex-col rounded-[14px] border bg-lab-panel2/60 p-4 transition-all duration-300",
+        node.state === "serving" &&
+          "border-[rgba(48,209,88,0.4)] shadow-[0_0_24px_rgba(48,209,88,0.12),inset_0_0_0_1px_rgba(48,209,88,0.08)]",
         node.state === "loading" && "border-[rgba(255,214,10,0.28)]",
         node.state === "offline" && "border-[rgba(255,69,58,0.28)]",
         node.state === "idle" && "border-lab-border",
@@ -246,7 +247,12 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
   const modelShort = multi?.model_id?.split("/").pop();
 
   return (
-    <div className="rounded-[12px] border border-lab-border-subtle bg-lab-editor/80 px-4 py-3.5">
+    <div
+      className={cn(
+        "rounded-[12px] border border-lab-border-subtle bg-lab-editor/80 px-4 py-3.5 transition-shadow duration-300",
+        mode === "multi_aligned" && "lab-strip-live",
+      )}
+    >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2.5">
           <Badge tone={multiTone(mode)} dot>

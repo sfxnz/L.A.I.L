@@ -159,13 +159,13 @@ export default function StatusPage() {
         </Callout>
       )}
 
-      <div className="bento">
+      <div className="bento lab-rise">
         <div className="bento-span-12">
           <ClusterPanel cluster={cluster} loading={loading} />
         </div>
       </div>
 
-      <div className="bento">
+      <div className="bento lab-rise lab-rise-1">
         <div className="bento-span-3">
           <Metric
             label="vLLM endpoint"
@@ -201,6 +201,11 @@ export default function StatusPage() {
             })()}
             tone={freeGib != null && freeGib < 15 ? "warn" : undefined}
             loading={loading}
+            progress={
+              freeGib != null && serve?.hardware?.ram_gib
+                ? (freeGib / serve.hardware.ram_gib) * 100
+                : null
+            }
           />
         </div>
         <div className="bento-span-3">
@@ -215,7 +220,7 @@ export default function StatusPage() {
         </div>
       </div>
 
-      <div className="bento">
+      <div className="bento lab-rise lab-rise-2">
         <div className="bento-span-6">
           <Panel
             className="flex h-full min-h-[220px] flex-col"

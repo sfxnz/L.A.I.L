@@ -120,9 +120,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   href={href}
                   aria-current={active ? "page" : undefined}
                   className={cn(
-                    "flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium tracking-[-0.01em] transition-colors",
+                    "flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium tracking-[-0.01em] transition-all duration-200",
                     active
-                      ? "bg-lab-active text-lab-text shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]"
+                      ? "bg-lab-active text-lab-text shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08),0_0_12px_rgba(10,132,255,0.14)]"
                       : "text-lab-muted hover:bg-lab-hover hover:text-lab-text-dim",
                   )}
                 >
@@ -139,7 +139,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             aria-atomic="true"
           >
             <div
-              className="flex items-center gap-1.5 rounded-full border border-lab-border-subtle bg-lab-panel/80 px-2 py-1"
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-2 py-1 transition-all duration-300",
+                healthy
+                  ? "border-[rgba(48,209,88,0.28)] bg-[rgba(48,209,88,0.07)]"
+                  : "border-lab-border-subtle bg-lab-panel/80",
+              )}
               title={probeNote}
             >
               <StatusDot
@@ -159,9 +164,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {serveOk === null ? (
               <Badge tone="muted">checking…</Badge>
             ) : (
-              <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
-                {serveOk ? "vLLM serving" : "idle"}
-              </Badge>
+              <span
+                className={cn(
+                  "inline-flex rounded-full transition-shadow duration-300",
+                  serveOk && "shadow-[0_0_14px_rgba(48,209,88,0.3)]",
+                )}
+              >
+                <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
+                  {serveOk ? "vLLM serving" : "idle"}
+                </Badge>
+              </span>
             )}
             {modelLabel && (
               <span

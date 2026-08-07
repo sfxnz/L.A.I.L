@@ -551,10 +551,20 @@ export default function ServerPage() {
                     {!!rec.detected?.is_mixed_nvfp4_fp8 && (
                       <Badge tone="warn">mixed NVFP4+FP8</Badge>
                     )}
-                    {rec.topology && (rec.topology.nodes ?? 1) >= 2 && (
-                      <Badge tone={rec.topology.fabric_ok ? "ok" : "warn"} dot>
-                        {rec.topology.nodes}-node · TP={rec.topology.tensor_parallel_size ?? rec.topology.nodes}
-                        {rec.topology.fabric_ok ? " · fabric ok" : " · fabric check failed"}
+                    {rec.topology && (rec.topology.nodes ?? 1) >= 1 && (
+                      <Badge
+                        tone={rec.topology.fits === false ? "danger" : rec.topology.fabric_ok || (rec.topology.nodes_used ?? 1) === 1 ? "ok" : "warn"}
+                        dot
+                      >
+                        {(rec.topology.nodes_used ?? 1) >= 2
+                          ? `${rec.topology.nodes_used}-node · TP=${rec.topology.tensor_parallel_size ?? rec.topology.nodes_used}`
+                          : "single-node · TP=1"}
+                        {rec.topology.weights_gib ? ` · ~${rec.topology.weights_gib} GiB` : ""}
+                        {(rec.topology.nodes_used ?? 1) >= 2
+                          ? rec.topology.fabric_ok
+                            ? " · fabric ok"
+                            : " · fabric check failed"
+                          : ""}
                       </Badge>
                     )}
                     {rec.topology?.overlay && (

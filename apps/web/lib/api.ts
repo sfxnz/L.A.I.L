@@ -223,10 +223,17 @@ export type ServeRecommend = {
   detected: Record<string, unknown>;
   topology?: {
     nodes?: number;
+    nodes_used?: number;
     fabric_ok?: boolean;
     head_ip?: string | null;
     worker_ips?: string[];
     tensor_parallel_size?: number;
+    pipeline_parallel_size?: number;
+    weights_gib?: number | null;
+    per_node_weights_gib?: number | null;
+    util_computed?: number | null;
+    fits?: boolean;
+    node_ram_gib?: number | null;
     overlay?: string | null;
   };
   sources?: Array<{ kind: string; ref: string; notes?: string }>;

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from ..config import (
     CONTAINER_MAX,
     CONTAINER_SAFE,
+    DATA_DIR,
     DEFAULT_IMAGE_MAX,
     DEFAULT_IMAGE_SAFE,
     DEFAULT_PORT,
@@ -27,6 +28,225 @@ from ..config import (
 from .metadata import available_gib, list_vllm_containers
 
 
+# ─── Multi-node launcher ──────────────────────────────────────────────────────
+
+def _strip_structured_flags(args: list[str]) -> list[str]:
+    """Remove flags the launcher already sets explicitly, so a free-form extra_flags
+    blob can be reused verbatim for both head and worker without duplicates."""
+    drop = {
+        "--tensor-parallel-size",
+        "--pipeline-parallel-size",
+        "--nnodes",
+        "--node-rank",
+        "--master-addr",
+        "--master-port",
+        "--distributed-executor-backend",
+        "--host",
+        "--port",
+    }
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in drop:
+            if i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if any(a.startswith(f + "=") for f in drop):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def build_multi_node_launch(
+    *,
+    image: str,
+    model: str,
+    vllm_args: list[str],
+    env_list: list[str],
+    head: dict[str, Any],
+    workers: list[dict[str, Any]],
+    nnodes: int,
+    port: int,
+    headless: bool = True,
+) -> dict[str, Any]:
+    """Build the per-node docker command set for a TP=nnodes multi-node serve.
+    Pure function (no subprocess) so it is fully testable. Returns head + worker cmds."""
+    hf = str(Path.home() / ".cache" / "huggingface")
+    master_addr = head.get("qsfp_ip") or "127.0.0.1"
+    base_args = _strip_structured_flags(vllm_args)
+
+    # Environment that is identical across nodes (model/runtime knobs), minus host-IP keys.
+    shared_env = [
+        e
+        for e in env_list
+        if not e.startswith(("VLLM_HOST_IP=", "WORKER_VLLM_HOST_IP=", "NODE_RANK=", "MASTER_ADDR="))
+    ]
+
+    def docker_prefix(name: str, node_ip: str | None) -> list[str]:
+        cmd = [
+            "docker", "run", "-d", "--name", name, "--restart", "no",
+            "--gpus", "all", "--network", "host", "--ipc", "host", "--shm-size=32g",
+            "--device", "/dev/infiniband",
+            "-v", f"{hf}:/cache/huggingface",
+        ]
+        for e in shared_env:
+            cmd += ["-e", e]
+        if node_ip:
+            cmd += ["-e", f"VLLM_HOST_IP={node_ip}"]
+        cmd += ["-e", "HF_HOME=/cache/huggingface"]
+        return cmd
+
+    def serve_suffix(rank: int, is_head: bool) -> list[str]:
+        args = [
+            "vllm", "serve", model,
+            "--tensor-parallel-size", str(nnodes),
+            "--pipeline-parallel-size", "1",
+            "--nnodes", str(nnodes),
+            "--node-rank", str(rank),
+            "--master-addr", master_addr,
+            "--master-port", "25000",
+            "--distributed-executor-backend", "mp",
+        ]
+        if is_head:
+            args += ["--host", "0.0.0.0", "--port", str(port)]
+        elif headless:
+            args += ["--headless"]
+        args += base_args
+        return args
+
+    entry = ["bash", "-lc", 'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"', "--"]
+
+    head_cmd = docker_prefix(f"spark-vllm-n0", head.get("qsfp_ip")) + [
+        "-e", "NODE_RANK=0", "-e", f"MASTER_ADDR={master_addr}",
+        image, *entry, *serve_suffix(0, True),
+    ]
+    worker_cmds = []
+    for idx, wnode in enumerate(workers, start=1):
+        wc = docker_prefix(f"spark-vllm-n{idx}", wnode.get("qsfp_ip")) + [
+            "-e", f"NODE_RANK={idx}", "-e", f"MASTER_ADDR={master_addr}",
+            image, *entry, *serve_suffix(idx, False),
+        ]
+        worker_cmds.append({"node": wnode.get("id") or f"worker{idx}", "ssh_host": wnode.get("ssh_host") or wnode.get("id"), "rank": idx, "cmd": wc})
+
+    return {"head": {"rank": 0, "cmd": head_cmd}, "workers": worker_cmds, "nnodes": nnodes, "port": port, "model": model, "image": image}
+
+
+_MULTINODE_STATE = DATA_DIR / "multinode_serve.json"
+
+
+def _redact(parts: list[str]) -> str:
+    out = []
+    for c in parts:
+        if c.startswith(("HF_TOKEN=", "HUGGING_FACE_HUB_TOKEN=")):
+            out.append(c.split("=", 1)[0] + "=***")
+        else:
+            out.append(shlex.quote(c))
+    return " ".join(out)
+
+
+def _launch_multi_node(
+    launch: dict[str, Any],
+    *,
+    port: int,
+    log: Any = None,
+    progress: Callable | None = None,
+) -> dict[str, Any]:
+    """Start workers (ssh) then head, then wait for /v1/models on the head. Records a
+    state file so stop_all can tear the whole cluster down."""
+
+    def w(msg: str, p: float = 0.3) -> None:
+        if log:
+            log.write(msg)
+        if progress:
+            progress(p, msg)
+
+    nnodes = launch["nnodes"]
+    # 1) workers first (headless ranks), each over SSH
+    for wc in launch["workers"]:
+        host = wc["ssh_host"]
+        w(f"Starting worker rank {wc['rank']} on {wc['node']} ({host})…")
+        remote = _redact(wc["cmd"])
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, remote],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"worker {wc['node']} failed to start: {r.stderr or r.stdout}")
+        w(f"worker {wc['node']} up")
+
+    # 2) head (serves the API)
+    w("Starting head (rank 0, API)…", 0.5)
+    hr = subprocess.run(launch["head"]["cmd"], capture_output=True, text=True)
+    if hr.returncode != 0:
+        raise RuntimeError(f"head failed to start: {hr.stderr or hr.stdout}")
+
+    # 3) record state for stop_all
+    try:
+        _MULTINODE_STATE.write_text(
+            __import__("json").dumps(
+                {
+                    "model": launch["model"],
+                    "image": launch["image"],
+                    "nnodes": nnodes,
+                    "port": port,
+                    "workers": [{"ssh_host": w["ssh_host"], "node": w["node"], "rank": w["rank"]} for w in launch["workers"]],
+                },
+                indent=2,
+            )
+        )
+    except Exception:
+        pass
+
+    # 4) wait for readiness on the head endpoint
+    w("Waiting for /v1/models on head (multi-node load can take 15–30+ min)…", 0.6)
+    ready = False
+    for i in range(360):  # up to 30 min
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3)
+            ready = True
+            break
+        except Exception:
+            time.sleep(5)
+            if i % 12 == 0:
+                w(f"still loading… ({i * 5}s)")
+    if not ready:
+        raise RuntimeError("Timeout waiting for multi-node /v1/models on head")
+    w(f"Multi-node serve ready on :{port} ({nnodes} nodes)", 1.0)
+    return {"ok": True, "multi_node": True, "nnodes": nnodes, "model": launch["model"], "port": port}
+
+
+def stop_multi_node(log: Any = None) -> dict[str, Any]:
+    """Tear down a recorded multi-node serve across head + workers."""
+    stopped: list[str] = []
+    try:
+        import json as _json
+
+        st = _json.loads(_MULTINODE_STATE.read_text())
+    except Exception:
+        return {"ok": False, "reason": "no multinode state"}
+    for wr in st.get("workers") or []:
+        host = wr.get("ssh_host")
+        if host:
+            subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                 f"docker rm -f spark-vllm-n{wr.get('rank', 1)}"],
+                capture_output=True, text=True, timeout=60,
+            )
+            stopped.append(str(wr.get("node")))
+    subprocess.run(["docker", "rm", "-f", "spark-vllm-n0"], capture_output=True, text=True)
+    stopped.append("head")
+    try:
+        _MULTINODE_STATE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"ok": True, "stopped": stopped}
+
+
 def serve_examples() -> dict[str, dict]:
     return SERVE_EXAMPLES
 
@@ -37,6 +257,14 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
             log.write(msg)
         if progress:
             progress(0.3, msg)
+
+    # Tear down any recorded multi-node serve first (workers over SSH + head).
+    try:
+        mn = stop_multi_node(log=log)
+        if mn.get("ok"):
+            w(f"Stopped multi-node serve: {mn.get('stopped')}")
+    except Exception:
+        pass
 
     if SPARK_LAB.exists():
         w(f"Running {SPARK_LAB} stop")
@@ -345,6 +573,40 @@ def serve_model(
         extra_flags=extra_flags,
         tensor_parallel_size=int(tensor_parallel_size or 1),
     )
+
+    # Multi-node (TP across Sparks): build per-node launch + orchestrate head/workers.
+    tp_n = int(tensor_parallel_size or 1)
+    if tp_n >= 2:
+        from .autoconfig import _cluster_topology, plan_placement, estimate_weights_gib
+
+        topo = _cluster_topology()
+        weights = estimate_weights_gib(model, None)
+        plan = plan_placement(weights, topo, mode=mode, overlay=None)
+        if plan["nodes_available"] < tp_n:
+            raise RuntimeError(
+                f"TP={tp_n} requested but only {plan['nodes_available']} node(s) online. "
+                "Bring the cluster up or lower tensor-parallel-size."
+            )
+        head = plan.get("head") or {}
+        workers = (plan.get("planned_nodes") or [])[1:]
+        # strip structured TP/nnodes from extras so the launcher can set them per rank
+        clean_args = _strip_structured_flags(vllm_args)
+        launch = build_multi_node_launch(
+            image=image,
+            model=model,
+            vllm_args=clean_args,
+            env_list=env_list,
+            head=head,
+            workers=workers,
+            nnodes=tp_n,
+            port=port,
+        )
+        if stop_first:
+            w("Stopping existing vLLM containers (head + workers)…", 0.05)
+            stop_multi_node(log=log)
+            stop_all(log=log)
+        w(f"Multi-node launch: TP={tp_n} across {tp_n} node(s) on QSFP RoCE", 0.2)
+        return _launch_multi_node(launch, port=port, log=log, progress=progress)
 
     if stop_first:
         w("Stopping existing vLLM containers…", 0.05)

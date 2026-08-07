@@ -400,14 +400,11 @@ DSV4 = "deepseek-ai/DeepSeek-V4-Flash-0731"
 
 
 def _two_spark_topo():
-    return {
-        "nodes": 2,
-        "node_list": [],
-        "head": {"id": "spark1", "qsfp_ip": "10.100.8.1", "qsfp_if": "enp1s0f1np1", "local": True},
-        "workers": [{"id": "spark2", "qsfp_ip": "10.100.8.2", "qsfp_if": "enp1s0f1np1"}],
-        "fabric_ok": True,
-        "available": True,
-    }
+    nodes = [
+        {"id": "spark1", "qsfp_ip": "10.100.8.1", "qsfp_if": "enp1s0f1np1", "ram_gib": 121.7, "local": True, "ssh_host": "spark1"},
+        {"id": "spark2", "qsfp_ip": "10.100.8.2", "qsfp_if": "enp1s0f1np1", "ram_gib": 121.7, "local": False, "ssh_host": "spark2"},
+    ]
+    return {"nodes": 2, "node_list": nodes, "head": nodes[0], "workers": [nodes[1]], "fabric_ok": True, "available": True}
 
 
 def _one_spark_topo():
@@ -438,7 +435,7 @@ def test_family_overlay_ignores_normal_models():
 def test_topology_two_sparks_sets_tp2_and_fabric():
     cfg = ac._empty_config(DSV4)
     warnings, rationale = [], []
-    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), warnings=warnings, rationale=rationale)
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
     assert cfg["tensor_parallel_size"] == 2
     assert "--nnodes 2" in cfg["extra_flags"]
     assert "--master-addr 10.100.8.1" in cfg["extra_flags"]
@@ -453,7 +450,7 @@ def test_topology_one_spark_strips_multinode_and_dp():
     cfg = ac._empty_config(DSV4)
     cfg["extra_flags"] = "--data-parallel-size 4 --tensor-parallel-size 2"
     warnings, rationale = [], []
-    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_one_spark_topo(), warnings=warnings, rationale=rationale)
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_one_spark_topo(), weights_gib=21.0, mode="lab_safe", warnings=warnings, rationale=rationale)
     assert cfg.get("tensor_parallel_size") is None
     assert "--data-parallel-size" not in cfg["extra_flags"]
     assert "--nnodes" not in cfg["extra_flags"]
@@ -498,3 +495,96 @@ def test_serve_build_args_passes_tp_through():
     i = args.index("--tensor-parallel-size")
     assert args[i + 1] == "2"
     assert "--nnodes 2" in joined and "--master-addr 10.100.8.1" in joined
+
+
+# ─── Placement engine + multi-node launcher ──────────────────────────────────
+
+
+def _topo(n: int):
+    nodes = [
+        {"id": f"spark{i+1}", "qsfp_ip": f"10.100.8.{i+1}", "qsfp_if": "enp1s0f1np1", "ram_gib": 121.7, "local": i == 0, "ssh_host": f"spark{i+1}"}
+        for i in range(n)
+    ]
+    return {
+        "nodes": n,
+        "node_list": nodes,
+        "head": nodes[0],
+        "workers": nodes[1:],
+        "fabric_ok": True,
+        "available": True,
+    }
+
+
+def test_placement_small_model_single_node():
+    p = ac.plan_placement(21.0, _topo(2), mode="workflow_max", overlay=None)
+    assert p["nodes_needed"] == 1
+    assert p["tensor_parallel_size"] == 1
+    assert p["util_computed"] == 0.4  # (21+15)/121.7 = 0.30 -> clamped to 0.40 floor
+    assert p["fits"] is True
+
+
+def test_placement_dsv4_needs_two_nodes_computed_util():
+    p = ac.plan_placement(155.4, _topo(2), mode="workflow_max", overlay=None)
+    assert p["nodes_needed"] == 2
+    assert p["tensor_parallel_size"] == 2
+    assert p["per_node_weights_gib"] == 77.7
+    assert p["util_computed"] == 0.76  # (77.7+15)/121.7
+    assert p["fits"] is True
+
+
+def test_placement_too_big_warns_no_fit():
+    p = ac.plan_placement(400.0, _topo(2), mode="workflow_max", overlay=None)
+    assert p["nodes_needed"] == 2  # capped at available
+    assert p["fits"] is False  # 200 GiB/node won't fit
+
+
+def test_placement_future_4node_minimal_and_full():
+    # DSv4 on 4 nodes still uses only the 2 it needs (no waste)
+    p = ac.plan_placement(155.4, _topo(4), mode="workflow_max", overlay=None)
+    assert p["nodes_needed"] == 2
+    # a much larger model spreads to all 4
+    p2 = ac.plan_placement(420.0, _topo(4), mode="workflow_max", overlay=None)
+    assert p2["nodes_needed"] == 4
+    assert p2["tensor_parallel_size"] == 4
+
+
+def test_multi_node_launch_head_worker_split():
+    from app.services import serve
+
+    launch = serve.build_multi_node_launch(
+        image="img", model="m",
+        vllm_args=["--host", "0.0.0.0", "--port", "8000", "--tensor-parallel-size", "2", "--kv-cache-dtype", "nvfp4_ds_mla", "--nnodes", "2"],
+        env_list=["VLLM_HOST_IP=10.100.8.1", "WORKER_VLLM_HOST_IP=10.100.8.2", "NCCL_SOCKET_IFNAME=enp1s0f1np1"],
+        head={"id": "spark1", "qsfp_ip": "10.100.8.1"},
+        workers=[{"id": "spark2", "qsfp_ip": "10.100.8.2", "ssh_host": "spark2"}],
+        nnodes=2, port=8000,
+    )
+    head = " ".join(launch["head"]["cmd"])
+    worker = " ".join(launch["workers"][0]["cmd"])
+    assert "--node-rank 0" in head and "--host 0.0.0.0" in head and "--headless" not in head
+    assert "--node-rank 1" in worker and "--headless" in worker and "--host" not in worker
+    assert head.count("--tensor-parallel-size") == 1  # structured flag deduped
+    assert "VLLM_HOST_IP=10.100.8.2" in worker
+    assert launch["workers"][0]["rank"] == 1
+
+
+def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
+    """User can add a future model via data/serve_overlays.json with no code change."""
+    import json as _json
+    import app.config as cfgmod
+
+    (tmp_path / "serve_overlays.json").write_text(_json.dumps([
+        {
+            "match": {"all": ["futuremodel"], "any": ["nvfp4"]},
+            "family_key": "future_x",
+            "label": "Future Model X",
+            "source": "https://example.com",
+            "config": {"image": "img:x", "kv_cache_dtype": "nvfp4_ds_mla"},
+            "rationale": [],
+        }
+    ]))
+    monkeypatch.setattr(cfgmod, "DATA_DIR", tmp_path)
+    ov = ac._family_overlay("org/FutureModel-NVFP4", {})
+    assert ov is not None and ov["family_key"] == "future_x"
+    # built-in still present
+    assert ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash-0731", {}) is not None

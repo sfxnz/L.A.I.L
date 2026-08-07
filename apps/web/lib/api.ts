@@ -443,8 +443,23 @@ export function watchJob(
   onResult?: (r: unknown) => void,
 ): () => void {
   const es = new EventSource(`/api/jobs/${jobId}/logs`);
+  let closed = false;
+  let errorTicks = 0;
+
+  const finish = (payload?: unknown) => {
+    if (closed) return;
+    closed = true;
+    try {
+      es.close();
+    } catch {
+      /* */
+    }
+    if (payload !== undefined) onResult?.(payload);
+  };
+
   es.addEventListener("log", (e) => onLog((e as MessageEvent).data));
   es.addEventListener("status", (e) => {
+    errorTicks = 0;
     try {
       onStatus(JSON.parse((e as MessageEvent).data));
     } catch {
@@ -453,13 +468,38 @@ export function watchJob(
   });
   es.addEventListener("result", (e) => {
     try {
-      onResult?.(JSON.parse((e as MessageEvent).data));
+      finish(JSON.parse((e as MessageEvent).data));
     } catch {
-      /* */
+      finish(null);
     }
-    es.close();
   });
-  return () => es.close();
+  es.onerror = () => {
+    errorTicks += 1;
+    // EventSource retries; after a few consecutive errors, resolve via job API
+    if (errorTicks < 3 || closed) return;
+    void api
+      .job(jobId)
+      .then((j) => {
+        onStatus({
+          status: j.status,
+          progress: j.progress ?? 0,
+          message: j.message || (j.status === "running" ? "reconnecting…" : j.status),
+        });
+        if (j.status !== "running" && j.status !== "queued") {
+          finish(j);
+        }
+      })
+      .catch(() => {
+        onStatus({
+          status: "failed",
+          progress: 0,
+          message: "Lost job stream — job may be orphaned after a restart",
+        });
+        finish(null);
+      });
+  };
+
+  return () => finish();
 }
 
 export type Workspace = {

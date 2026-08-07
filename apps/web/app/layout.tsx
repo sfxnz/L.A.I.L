@@ -3,7 +3,10 @@ import { AppShell } from "@/components/layout/AppShell";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "L.A.I.L — Serve & Evals",
+  title: {
+    default: "L.A.I.L — Serve & Evals",
+    template: "%s · L.A.I.L",
+  },
   description: "Local AI Lab on DGX Spark: serve models, run evals, connect Hermes",
 };
 

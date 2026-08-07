@@ -1,7 +1,7 @@
 "use client";
 
 import type { ClusterNode, ClusterStatus } from "@/lib/api";
-import { Badge, Panel, StatusDot } from "@/components/ui";
+import { Badge, EmptyState, Panel, Skeleton, StatusDot } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
@@ -80,6 +80,17 @@ function NodeCard({ node }: { node: ClusterNode }) {
             <StatusDot
               live={
                 node.state === "serving" ? true : node.state === "offline" ? false : null
+              }
+              label={
+                node.state === "serving"
+                  ? "Serving"
+                  : node.state === "offline"
+                    ? "Offline"
+                    : node.state === "loading"
+                      ? "Loading"
+                      : node.state === "idle"
+                        ? "Idle"
+                        : node.state || "Unknown"
               }
             />
             <span className="text-[15px] font-semibold tracking-[-0.02em] text-lab-text">
@@ -272,11 +283,39 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
   );
 }
 
-export function ClusterPanel({ cluster }: { cluster: ClusterStatus | null | undefined }) {
+export function ClusterPanel({
+  cluster,
+  loading,
+}: {
+  cluster: ClusterStatus | null | undefined;
+  loading?: boolean;
+}) {
+  if (loading) {
+    return (
+      <Panel
+        title="Cluster"
+        action={<Badge tone="muted">probing…</Badge>}
+        className="overflow-hidden"
+      >
+        <div className="space-y-3 p-3 sm:p-4" aria-busy="true" aria-label="Loading cluster">
+          <Skeleton className="h-14 w-full rounded-[12px]" />
+          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_auto_1fr]">
+            <Skeleton className="min-h-[168px] rounded-[14px]" />
+            <Skeleton className="hidden h-24 w-16 rounded-full lg:block" />
+            <Skeleton className="min-h-[168px] rounded-[14px]" />
+          </div>
+        </div>
+      </Panel>
+    );
+  }
+
   if (!cluster) {
     return (
       <Panel title="Cluster" padded>
-        <div className="text-[13px] text-lab-muted">Cluster probe unavailable.</div>
+        <EmptyState title="Cluster probe unavailable">
+          Serve-engine didn’t return dual-Spark topology. Check :8765 and SSH to spark2 when you
+          need the fabric map.
+        </EmptyState>
       </Panel>
     );
   }
@@ -284,7 +323,9 @@ export function ClusterPanel({ cluster }: { cluster: ClusterStatus | null | unde
   if (cluster.error) {
     return (
       <Panel title="Cluster" padded>
-        <div className="text-[13px] text-lab-danger">{cluster.error}</div>
+        <EmptyState title="Cluster probe failed">
+          <span className="text-lab-danger">{cluster.error}</span>
+        </EmptyState>
       </Panel>
     );
   }

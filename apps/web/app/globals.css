@@ -103,9 +103,9 @@ body {
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 1.5rem;
-  padding-bottom: 1.25rem;
+  gap: 0.75rem;
+  margin-bottom: 1.1rem;
+  padding-bottom: 0.9rem;
   border-bottom: 1px solid var(--color-lab-border-subtle);
 }
 
@@ -254,6 +254,39 @@ body {
   background: var(--color-lab-muted);
 }
 
+/* Skeleton shimmer — calm, not carnival */
+@keyframes lab-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+.lab-skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.04) 0%,
+    rgba(255, 255, 255, 0.09) 45%,
+    rgba(255, 255, 255, 0.04) 90%
+  );
+  background-size: 200% 100%;
+  animation: lab-shimmer 1.4s ease-in-out infinite;
+}
+
+/* Indeterminate progress bar */
+@keyframes lab-progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+.lab-progress-indeterminate {
+  animation: lab-progress-slide 1.15s ease-in-out infinite;
+}
+
 /* Subtle hairline separator */
 .lab-sep {
   height: 1px;
@@ -261,10 +294,72 @@ body {
   border: 0;
 }
 
+/* Skip link — keyboard first */
+.lab-skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  z-index: 50;
+  border-radius: 10px;
+  background: var(--color-lab-accent);
+  color: #fff;
+  padding: 0.5rem 0.85rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: top 0.15s ease;
+}
+.lab-skip-link:focus {
+  top: 0.75rem;
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* Screen-reader only */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Soft enter for live regions */
+@keyframes lab-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.lab-fade-in {
+  animation: lab-fade-in 0.22s ease-out;
+}
+
+.lab-spin {
+  animation: spin 0.75s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-  .lab-dot-live {
-    animation: none;
+  .lab-dot-live,
+  .lab-skeleton,
+  .lab-progress-indeterminate,
+  .lab-fade-in,
+  .lab-spin {
+    animation: none !important;
   }
   * {
     transition-duration: 0.01ms !important;

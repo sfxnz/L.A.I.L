@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type ToolEvalBoardRow } from "@/lib/api";
-import { Badge, Btn, EmptyState, Panel, btnClass } from "@/components/ui";
+import { Badge, Btn, Callout, EmptyState, Panel, Skeleton, btnClass } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 function shortDate(iso?: string) {
@@ -23,6 +23,7 @@ function shortDate(iso?: string) {
 export default function ToolEvalBoardPage() {
   const [rows, setRows] = useState<ToolEvalBoardRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string[]>([]);
   const [compare, setCompare] = useState<Awaited<ReturnType<typeof api.toolEvalCompare>> | null>(
     null,
@@ -30,10 +31,15 @@ export default function ToolEvalBoardPage() {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
+    setLoading(true);
     api
       .toolEvalBoard(40)
-      .then((r) => setRows(r.runs || []))
-      .catch((e) => setErr(String(e.message || e)));
+      .then((r) => {
+        setRows(r.runs || []);
+        setErr(null);
+      })
+      .catch((e) => setErr(String(e.message || e)))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
@@ -69,7 +75,7 @@ export default function ToolEvalBoardPage() {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 lab-fade-in">
       <div className="page-header">
         <div>
           <h1 className="page-title">Tool Eval</h1>
@@ -79,22 +85,58 @@ export default function ToolEvalBoardPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Btn variant="secondary" size="sm" onClick={refresh}>
+          <Btn variant="secondary" size="sm" onClick={refresh} loading={loading && rows.length > 0}>
             Refresh
           </Btn>
           <Link href="/server" className={btnClass("secondary", "sm")}>
             Run on Serve
           </Link>
-          <Btn size="sm" disabled={selected.length < 2 || busy} onClick={() => void runCompare()}>
+          <Btn
+            size="sm"
+            disabled={selected.length < 2 || busy}
+            loading={busy}
+            title={selected.length < 2 ? "Select at least 2 runs" : undefined}
+            onClick={() => void runCompare()}
+          >
             Compare ({selected.length})
           </Btn>
         </div>
       </div>
 
       {err && (
-        <div className="rounded-[12px] border border-[rgba(255,69,58,0.28)] bg-[rgba(255,69,58,0.1)] px-3.5 py-2.5 text-[13px] text-lab-danger">
+        <Callout tone="danger" title="Board error" onDismiss={() => setErr(null)}>
           {err}
-        </div>
+        </Callout>
+      )}
+
+      {loading && !rows.length && (
+        <Panel title="Leaderboard" padded>
+          <div className="space-y-3" aria-busy="true" aria-label="Loading tool-eval board">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="flex items-center gap-3">
+                <Skeleton className="h-4 w-4 rounded" />
+                <Skeleton className="h-4 w-32" />
+                <Skeleton className="h-4 flex-1" />
+                <Skeleton className="h-6 w-14 rounded-full" />
+              </div>
+            ))}
+          </div>
+        </Panel>
+      )}
+
+      {!loading && !rows.length && !err && (
+        <Panel padded>
+          <EmptyState
+            title="No tool-eval runs yet"
+            action={
+              <Link href="/server" className={btnClass("primary", "sm")}>
+                Open Serve → Agentic
+              </Link>
+            }
+          >
+            Run tool-eval-bench from Serve when a model is healthy. Results land here score-first.
+          </EmptyState>
+        </Panel>
       )}
 
       {compare && (
@@ -218,7 +260,7 @@ export default function ToolEvalBoardPage() {
                         "bg-lab-accent",
                         "bg-lab-ok",
                         "bg-lab-warn",
-                        "bg-[#bf5af2]",
+                        "bg-lab-accent-bright",
                       ];
                       return (
                         <div key={r.run_id} className="flex items-center gap-2">
@@ -242,6 +284,7 @@ export default function ToolEvalBoardPage() {
         </Panel>
       )}
 
+      {rows.length > 0 && (
       <Panel
         title="Leaderboard"
         action={
@@ -250,11 +293,6 @@ export default function ToolEvalBoardPage() {
           </span>
         }
       >
-        {!rows.length ? (
-          <EmptyState title="No tool-eval runs yet">
-            Serve a model, open Serve → Agentic, run Tool Eval Bench. Results land here.
-          </EmptyState>
-        ) : (
           <div className="overflow-x-auto">
             <table className="lab-table">
               <thead>
@@ -331,8 +369,8 @@ export default function ToolEvalBoardPage() {
               </tbody>
             </table>
           </div>
-        )}
       </Panel>
+      )}
 
       {selectedRows.length > 0 && !compare && (
         <p className="text-center text-[12px] text-lab-muted">

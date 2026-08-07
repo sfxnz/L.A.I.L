@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
-import { Badge, Btn, EmptyState, Panel, btnClass } from "@/components/ui";
+import { Badge, Btn, Callout, EmptyState, Panel, PageSkeleton, btnClass } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 type Scenario = {
@@ -101,12 +101,12 @@ export default function ToolEvalRunDetailPage() {
       </div>
 
       {err && (
-        <div className="rounded-[12px] border border-[rgba(255,69,58,0.28)] bg-[rgba(255,69,58,0.1)] px-3.5 py-2.5 text-[13px] text-lab-danger">
+        <Callout tone="danger" title="Couldn’t load run">
           {err}
-        </div>
+        </Callout>
       )}
 
-      {!envelope && !err && <div className="text-[13px] text-lab-muted">Loading run…</div>}
+      {!envelope && !err && <PageSkeleton rows={4} />}
 
       {envelope && (
         <>

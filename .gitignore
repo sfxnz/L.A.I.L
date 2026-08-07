@@ -28,6 +28,11 @@ data/*.sqlite-shm
 data/*.sqlite-wal
 data/runs/
 data/benchmarks.sqlite*
+data/multinode_serve.json
+
+# agent / editor scratch
+.hermes/
+.worktrees/
 data/lab-runs/
 data/lab-public/
 site/dist/
@@ -36,3 +41,4 @@ packages/serve-engine/data/
 packages/serve-engine/runs/
 runs/
 *.tsbuildinfo
+apps/web/next-env.d.ts

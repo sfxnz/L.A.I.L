@@ -169,11 +169,12 @@ function NodeCard({ node }: { node: ClusterNode }) {
             <span className="truncate font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
               {node.label || node.id}
             </span>
-            {node.local && (
-              <span className="animus-chamfer-sm shrink-0 border border-[color:var(--animus-hairline)] px-1.5 py-[3px] font-[family-name:var(--font-display)] text-[9px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
-                local
-              </span>
-            )}
+            {/* Always render the origin tag, never only for the local node —
+                an occupied slot on one card and an empty one on the other
+                breaks the mirror the two-column composition rests on. */}
+            <span className="animus-chamfer-sm shrink-0 border border-[color:var(--animus-hairline)] px-1.5 py-[3px] font-[family-name:var(--font-display)] text-[9px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
+              {node.local ? "local" : "remote"}
+            </span>
           </div>
           <div className="mt-1.5 truncate font-mono text-[10px] text-lab-muted">
             {node.hostname || node.id}

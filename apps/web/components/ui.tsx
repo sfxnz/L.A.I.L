@@ -78,7 +78,10 @@ export const btnVariants = {
   primary:
     "border border-[color:var(--animus-accent-edge)] bg-[color:color-mix(in_srgb,var(--color-lab-accent)_30%,#000)] bg-[image:var(--animus-selection-fade)] text-white hover:border-[color:var(--color-lab-accent-bright)] hover:bg-[color:color-mix(in_srgb,var(--color-lab-accent)_55%,#000)]",
   secondary:
-    "border border-lab-border bg-transparent text-lab-text-dim hover:border-lab-line hover:bg-lab-hover hover:text-lab-text",
+    // A bare outlined rectangle reads as a stock web button. The leading
+    // structure rule (thick left edge, hairline elsewhere) is the HUD tell —
+    // the structural sibling of primary's crimson leading block.
+    "border border-lab-border border-l-2 border-l-[color:var(--animus-hairline)] bg-transparent text-lab-text-dim hover:border-lab-line hover:border-l-[color:var(--color-lab-line)] hover:bg-lab-hover hover:text-lab-text",
   danger:
     "border border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] text-lab-danger hover:border-[color:var(--color-lab-danger)] hover:bg-[color:color-mix(in_srgb,var(--color-lab-danger)_17%,transparent)]",
   ghost:

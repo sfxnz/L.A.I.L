@@ -130,7 +130,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <Tick className="hidden h-6 md:block" />
 
           <nav
-            className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            // Navigation is primary chrome: it must NEVER be the thing that
+            // gives way. This was `min-w-0 flex-1 overflow-x-auto` against a
+            // `shrink-0` status cluster, so once a model started serving the
+            // cluster grew (controller + vLLM badge + model + memory) and the
+            // nav absorbed the entire squeeze — 343px of links crushed into
+            // 176px, silently scroll-clipping EVALS and CONFIGURE off-screen
+            // with no scrollbar to hint they existed. Secondary telemetry
+            // truncates instead; see the status cluster below.
+            className="flex shrink-0 items-center gap-1"
             aria-label="Main"
           >
             {WORKSPACE_NAV.map(({ href, label }) => {
@@ -168,7 +176,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </nav>
 
           <div
-            className="flex shrink-0 items-center gap-2 sm:gap-2.5"
+            // Secondary telemetry: this is the side that yields. `min-w-0`
+            // + `flex-1` lets it soak up the remaining space and truncate
+            // (its children already hide progressively at sm/lg/xl), so the
+            // nav above always renders in full.
+            className="flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
             aria-live="polite"
             aria-atomic="true"
           >

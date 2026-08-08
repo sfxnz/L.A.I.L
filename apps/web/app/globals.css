@@ -173,9 +173,12 @@
   --color-lab-warn: #6b4a00;
   --color-lab-danger: #a81d12;
 
-  --animus-field-node: rgba(20, 34, 46, 0.72);
-  --animus-field-line: rgba(34, 52, 66, 0.36);
-  --animus-field-poly: rgba(40, 60, 76, 0.075);
+  /* Light needs more alpha than dark for equal legibility: dark ink on a bone
+     plate loses contrast far faster than cyan on a void, and the reference
+     plates carry a clearly-read lattice, not a whisper. */
+  --animus-field-node: rgba(20, 34, 46, 0.9);
+  --animus-field-line: rgba(30, 48, 62, 0.5);
+  --animus-field-poly: rgba(40, 60, 76, 0.1);
   --animus-field-glow: rgba(107, 15, 22, 0.95);
   --animus-grain-opacity: 0.085;
   --animus-grain-blend: multiply;

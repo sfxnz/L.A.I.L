@@ -410,7 +410,7 @@ html.animus-theming .animus-plate {
   top: -14vw;
   left: -10vw;
   background: radial-gradient(circle, var(--animus-haze-a) 0%, transparent 68%);
-  animation: animus-breathe-1 31s ease-in-out infinite;
+  animation: animus-breathe-1 19s ease-in-out infinite;
 }
 .animus-haze-2 {
   width: 46vw;
@@ -418,7 +418,7 @@ html.animus-theming .animus-plate {
   bottom: -16vw;
   right: -8vw;
   background: radial-gradient(circle, var(--animus-haze-b) 0%, transparent 66%);
-  animation: animus-breathe-2 43s ease-in-out infinite;
+  animation: animus-breathe-2 26s ease-in-out infinite;
 }
 .animus-haze-3 {
   width: 40vw;
@@ -426,7 +426,7 @@ html.animus-theming .animus-plate {
   top: 32%;
   left: 46%;
   background: radial-gradient(circle, var(--animus-haze-c) 0%, transparent 70%);
-  animation: animus-breathe-3 37s ease-in-out infinite;
+  animation: animus-breathe-3 23s ease-in-out infinite;
 }
 /* The frame was measured ending in a wall: the bottom third sat at local
    std 0.5–1.0 against 19 at the top edge. This pool gives the lower band
@@ -441,18 +441,43 @@ html.animus-theming .animus-plate {
     var(--animus-haze-d) 0%,
     transparent 72%
   );
-  animation: animus-breathe-4 53s ease-in-out infinite;
+  animation: animus-breathe-4 31s ease-in-out infinite;
 }
 
+/*
+  Wandering paths, not oscillations.
+
+  These were two-stop keyframes (0 → 50 → back), which is a pure sine on one
+  axis: the pool retraces the same line forever and the eye stops registering
+  it as movement. Six irregular stops make each pool drift a closed but
+  non-obvious loop, scaling and fading out of phase with its own travel, so
+  the field keeps rearranging itself.
+
+  Clocks are 19/26/23/31s — pairwise coprime, so the four-pool composite only
+  repeats every ~3.4 hours. Transform and opacity only: both composite on the
+  GPU, so four large blurred layers cost no layout or paint.
+*/
 @keyframes animus-breathe-4 {
   0%,
   100% {
     transform: translate3d(0, 0, 0) scale(1.04);
-    opacity: 0.72;
+    opacity: 0.66;
   }
-  50% {
-    transform: translate3d(3vw, -2vh, 0) scale(0.94);
+  22% {
+    transform: translate3d(7vw, -3vh, 0) scale(0.9);
     opacity: 1;
+  }
+  41% {
+    transform: translate3d(2vw, 4vh, 0) scale(1.14);
+    opacity: 0.78;
+  }
+  63% {
+    transform: translate3d(-6vw, -1vh, 0) scale(0.96);
+    opacity: 1;
+  }
+  84% {
+    transform: translate3d(-2vw, 3vh, 0) scale(1.08);
+    opacity: 0.72;
   }
 }
 
@@ -460,33 +485,69 @@ html.animus-theming .animus-plate {
   0%,
   100% {
     transform: translate3d(0, 0, 0) scale(1);
-    opacity: 0.75;
+    opacity: 0.68;
   }
-  50% {
-    transform: translate3d(4vw, 3vh, 0) scale(1.16);
+  19% {
+    transform: translate3d(8vw, 4vh, 0) scale(1.22);
     opacity: 1;
+  }
+  37% {
+    transform: translate3d(3vw, 9vh, 0) scale(0.9);
+    opacity: 0.74;
+  }
+  58% {
+    transform: translate3d(-5vw, 5vh, 0) scale(1.16);
+    opacity: 1;
+  }
+  79% {
+    transform: translate3d(-3vw, -3vh, 0) scale(0.94);
+    opacity: 0.8;
   }
 }
 @keyframes animus-breathe-2 {
   0%,
   100% {
-    transform: translate3d(0, 0, 0) scale(1.1);
+    transform: translate3d(0, 0, 0) scale(1.12);
     opacity: 1;
   }
-  50% {
-    transform: translate3d(-5vw, -4vh, 0) scale(0.92);
-    opacity: 0.7;
+  24% {
+    transform: translate3d(-9vw, -6vh, 0) scale(0.86);
+    opacity: 0.66;
+  }
+  46% {
+    transform: translate3d(-4vw, 3vh, 0) scale(1.2);
+    opacity: 0.95;
+  }
+  68% {
+    transform: translate3d(4vw, -5vh, 0) scale(0.92);
+    opacity: 0.72;
+  }
+  87% {
+    transform: translate3d(1vw, 2vh, 0) scale(1.06);
+    opacity: 1;
   }
 }
 @keyframes animus-breathe-3 {
   0%,
   100% {
-    transform: translate3d(-50%, -50%, 0) scale(0.95);
-    opacity: 0.6;
+    transform: translate3d(-50%, -50%, 0) scale(0.92);
+    opacity: 0.52;
   }
-  50% {
-    transform: translate3d(-56%, -44%, 0) scale(1.2);
-    opacity: 0.95;
+  21% {
+    transform: translate3d(-62%, -40%, 0) scale(1.26);
+    opacity: 1;
+  }
+  44% {
+    transform: translate3d(-44%, -58%, 0) scale(0.96);
+    opacity: 0.66;
+  }
+  66% {
+    transform: translate3d(-58%, -62%, 0) scale(1.18);
+    opacity: 0.98;
+  }
+  85% {
+    transform: translate3d(-40%, -46%, 0) scale(1.02);
+    opacity: 0.7;
   }
 }
 

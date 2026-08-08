@@ -114,11 +114,16 @@
   --animus-scan-opacity: 0.035;
 
   /* Breathing atmosphere: cyan depth with one crimson ember, so the void
-     reads as a lit volume rather than flat black. */
-  --animus-haze-a: rgba(30, 120, 165, 0.3);
-  --animus-haze-b: rgba(120, 30, 44, 0.22);
-  --animus-haze-c: rgba(40, 150, 180, 0.18);
-  --animus-haze-blur: 70px;
+     reads as a lit volume rather than flat black.
+     Amplitudes are set by measurement, not taste — .hermes/depth-probe.py
+     scores macro swing and bloom falloff against reference frames. The first
+     pass measured 36 macro swing vs a 105 reference and was correctly called
+     flat; these values are the corrected ones. */
+  --animus-haze-a: rgba(46, 158, 210, 0.82);
+  --animus-haze-b: rgba(178, 40, 58, 0.6);
+  --animus-haze-c: rgba(56, 186, 220, 0.5);
+  --animus-haze-d: rgba(34, 124, 168, 0.66);
+  --animus-haze-blur: 90px;
 
   /* --- Elevation ---
      Panels are HUD projections, not opaque cards: the reconstruction field
@@ -200,10 +205,11 @@
 
   /* On the bone plate the haze is a cool shadow-bloom, not a glow — it must
      read as depth in the paper, never as a coloured stain. */
-  --animus-haze-a: rgba(96, 126, 152, 0.24);
-  --animus-haze-b: rgba(120, 40, 46, 0.11);
-  --animus-haze-c: rgba(78, 108, 136, 0.16);
-  --animus-haze-blur: 80px;
+  --animus-haze-a: rgba(88, 120, 150, 0.4);
+  --animus-haze-b: rgba(122, 42, 48, 0.2);
+  --animus-haze-c: rgba(70, 102, 132, 0.28);
+  --animus-haze-d: rgba(84, 112, 140, 0.3);
+  --animus-haze-blur: 90px;
 
   --animus-panel-bg: linear-gradient(
     168deg,
@@ -421,6 +427,33 @@ html.animus-theming .animus-plate {
   left: 46%;
   background: radial-gradient(circle, var(--animus-haze-c) 0%, transparent 70%);
   animation: animus-breathe-3 37s ease-in-out infinite;
+}
+/* The frame was measured ending in a wall: the bottom third sat at local
+   std 0.5–1.0 against 19 at the top edge. This pool gives the lower band
+   somewhere to recede into. */
+.animus-haze-4 {
+  width: 76vw;
+  height: 34vw;
+  bottom: -14vw;
+  left: 8vw;
+  background: radial-gradient(
+    ellipse at center,
+    var(--animus-haze-d) 0%,
+    transparent 72%
+  );
+  animation: animus-breathe-4 53s ease-in-out infinite;
+}
+
+@keyframes animus-breathe-4 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.04);
+    opacity: 0.72;
+  }
+  50% {
+    transform: translate3d(3vw, -2vh, 0) scale(0.94);
+    opacity: 1;
+  }
 }
 
 @keyframes animus-breathe-1 {
@@ -725,12 +758,14 @@ html.animus-theming .animus-plate {
 @keyframes lab-glow-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-lab-ok) 20%, transparent),
-      0 0 9px color-mix(in srgb, var(--color-lab-ok) 45%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-lab-ok) 24%, transparent),
+      0 0 12px color-mix(in srgb, var(--color-lab-ok) 60%, transparent),
+      0 0 34px color-mix(in srgb, var(--color-lab-ok) 30%, transparent);
   }
   50% {
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-lab-ok) 10%, transparent),
-      0 0 17px color-mix(in srgb, var(--color-lab-ok) 70%, transparent);
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-lab-ok) 14%, transparent),
+      0 0 22px color-mix(in srgb, var(--color-lab-ok) 85%, transparent),
+      0 0 52px color-mix(in srgb, var(--color-lab-ok) 45%, transparent);
   }
 }
 
@@ -906,7 +941,8 @@ input[type="checkbox"]:disabled {
 .lab-glow-accent {
   box-shadow:
     0 0 0 1px var(--animus-accent-edge),
-    0 0 18px color-mix(in srgb, var(--color-lab-accent) 30%, transparent);
+    0 0 20px color-mix(in srgb, var(--color-lab-accent) 45%, transparent),
+    0 0 56px color-mix(in srgb, var(--color-lab-accent) 24%, transparent);
 }
 
 @keyframes lab-strip-shimmer {

@@ -379,6 +379,7 @@ export function AnimusField() {
         <span className="animus-haze animus-haze-1" />
         <span className="animus-haze animus-haze-2" />
         <span className="animus-haze animus-haze-3" />
+        <span className="animus-haze animus-haze-4" />
       </div>
       <canvas
         ref={ref}

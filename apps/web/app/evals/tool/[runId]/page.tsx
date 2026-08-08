@@ -250,16 +250,37 @@ export default function ToolEvalRunDetailPage() {
               ← Tool Eval
             </Link>
             <span aria-hidden className="h-3 w-px bg-[color:var(--animus-hairline)]" />
-            <Badge tone="muted">{String(workload.preset || "run")}</Badge>
-            <Badge tone={safetyOk ? "ok" : "danger"} dot>
-              {safetyOk ? "safety ok" : "safety warn"}
-            </Badge>
+            {/* Cold-path honesty: the preset and safety verdict are claims about
+                a run. Until the envelope lands they are unknown, so say so —
+                a default "safety ok" badge over no data is a lie. */}
+            {envelope ? (
+              <>
+                <Badge tone="muted">{String(workload.preset || "run")}</Badge>
+                <Badge tone={safetyOk ? "ok" : "danger"} dot>
+                  {safetyOk ? "safety ok" : "safety warn"}
+                </Badge>
+              </>
+            ) : (
+              <Badge tone="muted">{err ? "unavailable" : "loading…"}</Badge>
+            )}
           </div>
-          <h1 className="page-title">{String(modelId).split("/").pop()}</h1>
+          <h1 className="page-title">
+            {envelope ? (
+              String(modelId).split("/").pop()
+            ) : (
+              <span className="text-lab-muted">{err ? "Run not found" : "Loading run…"}</span>
+            )}
+          </h1>
           <p className="page-sub font-mono text-[12px]">
-            {modelId}
-            {engine.version ? ` · vLLM ${String(engine.version)}` : ""}
-            {runId ? ` · ${runId}` : ""}
+            {envelope ? (
+              <>
+                {modelId}
+                {engine.version ? ` · vLLM ${String(engine.version)}` : ""}
+                {runId ? ` · ${runId}` : ""}
+              </>
+            ) : (
+              runId
+            )}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -273,7 +294,15 @@ export default function ToolEvalRunDetailPage() {
       </div>
 
       {err && (
-        <Callout tone="danger" title="Couldn’t load run">
+        <Callout
+          tone="danger"
+          title="Couldn’t load run"
+          action={
+            <Link href="/evals/tool" className={btnClass("secondary", "sm")}>
+              Back to leaderboard
+            </Link>
+          }
+        >
           {err}
         </Callout>
       )}

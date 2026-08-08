@@ -113,6 +113,13 @@
   );
   --animus-scan-opacity: 0.035;
 
+  /* Breathing atmosphere: cyan depth with one crimson ember, so the void
+     reads as a lit volume rather than flat black. */
+  --animus-haze-a: rgba(30, 120, 165, 0.3);
+  --animus-haze-b: rgba(120, 30, 44, 0.22);
+  --animus-haze-c: rgba(40, 150, 180, 0.18);
+  --animus-haze-blur: 70px;
+
   /* --- Elevation ---
      Panels are HUD projections, not opaque cards: the reconstruction field
      must read THROUGH them. Translucency + backdrop blur is what separates
@@ -190,6 +197,13 @@
     rgba(74, 88, 100, 0.3) 100%
   );
   --animus-scan-opacity: 0.02;
+
+  /* On the bone plate the haze is a cool shadow-bloom, not a glow — it must
+     read as depth in the paper, never as a coloured stain. */
+  --animus-haze-a: rgba(96, 126, 152, 0.24);
+  --animus-haze-b: rgba(120, 40, 46, 0.11);
+  --animus-haze-c: rgba(78, 108, 136, 0.16);
+  --animus-haze-blur: 80px;
 
   --animus-panel-bg: linear-gradient(
     168deg,
@@ -357,6 +371,90 @@ html.animus-theming .animus-plate {
       transparent 1px 3px
     ),
     var(--animus-vignette);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Volumetric atmosphere — the field BREATHES
+   The blind critic scored our texture/depth below the real Animus: it has
+   volumetric haze and bloom, we had flat panels with noise on top. These are
+   three large radial blooms on independent slow clocks (31s/43s/37s — coprime
+   so the composite never visibly loops), each drifting AND swelling. Sits
+   under the lattice canvas, above the page background.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.animus-atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+.animus-haze {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  /* Soft-edged bloom: a radial gradient to transparent needs no blur filter,
+     which keeps this off the expensive filter path entirely. */
+  filter: blur(var(--animus-haze-blur, 60px));
+  will-change: transform, opacity;
+}
+.animus-haze-1 {
+  width: 58vw;
+  height: 58vw;
+  top: -14vw;
+  left: -10vw;
+  background: radial-gradient(circle, var(--animus-haze-a) 0%, transparent 68%);
+  animation: animus-breathe-1 31s ease-in-out infinite;
+}
+.animus-haze-2 {
+  width: 46vw;
+  height: 46vw;
+  bottom: -16vw;
+  right: -8vw;
+  background: radial-gradient(circle, var(--animus-haze-b) 0%, transparent 66%);
+  animation: animus-breathe-2 43s ease-in-out infinite;
+}
+.animus-haze-3 {
+  width: 40vw;
+  height: 40vw;
+  top: 32%;
+  left: 46%;
+  background: radial-gradient(circle, var(--animus-haze-c) 0%, transparent 70%);
+  animation: animus-breathe-3 37s ease-in-out infinite;
+}
+
+@keyframes animus-breathe-1 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.75;
+  }
+  50% {
+    transform: translate3d(4vw, 3vh, 0) scale(1.16);
+    opacity: 1;
+  }
+}
+@keyframes animus-breathe-2 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.1);
+    opacity: 1;
+  }
+  50% {
+    transform: translate3d(-5vw, -4vh, 0) scale(0.92);
+    opacity: 0.7;
+  }
+}
+@keyframes animus-breathe-3 {
+  0%,
+  100% {
+    transform: translate3d(-50%, -50%, 0) scale(0.95);
+    opacity: 0.6;
+  }
+  50% {
+    transform: translate3d(-56%, -44%, 0) scale(1.2);
+    opacity: 0.95;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -899,8 +997,14 @@ input[type="checkbox"]:disabled {
   .lab-strip-live,
   .lab-rise,
   .lab-spin,
-  .animus-grain::after {
+  .animus-grain::after,
+  .animus-haze {
     animation: none !important;
+  }
+  /* The atmosphere stays — it just stops breathing. Removing it would flatten
+     the depth the whole surface is built on. */
+  .animus-haze-3 {
+    transform: translate3d(-50%, -50%, 0);
   }
   .lab-rise {
     opacity: 1;

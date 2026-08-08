@@ -229,6 +229,24 @@ export default function ServerPage() {
 
   const examples = (status?.serve?.serve_examples || {}) as Record<string, ServeExample>;
   const modelHints = status?.serve?.presets || [];
+  /**
+   * Spine numbering. The presets block is conditional, so hardcoded numerals
+   * render 01 → 02 → 04 when no presets exist — a skipped step reads as a
+   * missing section. Derive the sequence from what is actually on screen.
+   */
+  const hasPresets = Object.keys(examples).length > 0;
+  const step = (() => {
+    let n = 0;
+    const next = () => String(++n).padStart(2, "0");
+    return {
+      envelope: next(),
+      target: next(),
+      presets: hasPresets ? next() : "",
+      flags: next(),
+      launch: next(),
+      job: next(),
+    };
+  })();
   const jobRunning = jobStatus === "running" || jobStatus === "queued";
 
   const advancedHasValues = useMemo(() => {
@@ -588,7 +606,7 @@ export default function ServerPage() {
           {/* 01 · ENVELOPE — one mode row: control, one-line hint, abort/restore. */}
           <section className="animus-chamfer border border-lab-border bg-[color:var(--animus-glass)] px-4 py-3.5">
             <Seq
-              n="01"
+              n={step.envelope}
               label="Envelope"
               hint="memory ceiling applied to every launch"
               action={
@@ -640,7 +658,7 @@ export default function ServerPage() {
             <Panel className="lg:col-span-2">
               <div className="space-y-3.5 p-4">
                 <Seq
-                  n="02"
+                  n={step.target}
                   label="Target"
                   hint="hugging face id · live card lookup"
                   action={
@@ -952,7 +970,7 @@ export default function ServerPage() {
             <Panel>
               <div className="space-y-3.5 p-4">
                 <Seq
-                  n="03"
+                  n={step.presets}
                   label="Proven presets"
                   hint="fills the form only — nothing launches"
                   action={
@@ -1022,7 +1040,7 @@ export default function ServerPage() {
           <Panel>
             <div className="space-y-4 p-4">
               <Seq
-                n="04"
+                n={step.flags}
                 label="Engine flags"
                 hint="envelope first · advanced on demand"
                 action={
@@ -1260,7 +1278,7 @@ export default function ServerPage() {
                 : "border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)]",
             )}
           >
-            <Seq n="05" label="Launch" hint="starts a real vLLM container on Spark" />
+            <Seq n={step.launch} label="Launch" hint="starts a real vLLM container on Spark" />
             <div className="animus-rule mt-3" aria-hidden />
             <div className="mt-3.5 flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
               <div className="min-w-0 space-y-1.5">
@@ -1348,7 +1366,7 @@ export default function ServerPage() {
         >
           <div className="space-y-3.5 p-4">
             <Seq
-              n="06"
+              n={step.job}
               label="Job dock"
               hint="serve · stop · bench · agentic telemetry"
               action={

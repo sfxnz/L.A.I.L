@@ -367,19 +367,33 @@ export function AnimusField() {
   }, []);
 
   return (
-    <canvas
-      ref={ref}
-      aria-hidden="true"
-      // Inline rather than utility classes: the field must be correctly placed
-      // and inert on its own, independent of stylesheet load order.
-      style={{
-        position: "fixed",
-        inset: 0,
-        width: "100%",
-        height: "100%",
-        zIndex: 0,
-        pointerEvents: "none",
-      }}
-    />
+    <>
+      {/*
+        Volumetric haze — the breathing atmosphere the lattice floats in.
+        Three slow, offset radial blooms that drift and swell on their own
+        clocks, so the field never settles into a static wallpaper. Kept in
+        CSS rather than canvas: large soft gradients composite on the GPU for
+        free, where per-frame canvas gradient fills of this size would not.
+      */}
+      <div className="animus-atmosphere" aria-hidden="true">
+        <span className="animus-haze animus-haze-1" />
+        <span className="animus-haze animus-haze-2" />
+        <span className="animus-haze animus-haze-3" />
+      </div>
+      <canvas
+        ref={ref}
+        aria-hidden="true"
+        // Inline rather than utility classes: the field must be correctly placed
+        // and inert on its own, independent of stylesheet load order.
+        style={{
+          position: "fixed",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          zIndex: 0,
+          pointerEvents: "none",
+        }}
+      />
+    </>
   );
 }

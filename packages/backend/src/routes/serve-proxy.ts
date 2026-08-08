@@ -27,6 +27,16 @@ async function forward(c: { req: { raw: Request; url: string; method: string; he
           "Content-Type": rct,
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
+          // Never let an intermediary compress or buffer an event stream.
+          // Next's dev proxy honours the browser's `Accept-Encoding: gzip` and
+          // gzips this response; gzip buffers, so the browser holds an open
+          // connection and receives ZERO bytes until the stream closes — the
+          // job dock sits on "running / 0 log bytes" for the whole serve while
+          // curl (which sends no Accept-Encoding by default) streams fine.
+          // `identity` opts the stream out of compression; `X-Accel-Buffering`
+          // does the same for nginx-style proxies in front of the lab.
+          "Content-Encoding": "identity",
+          "X-Accel-Buffering": "no",
         },
       });
     }

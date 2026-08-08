@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   api,
   watchJob,
@@ -12,6 +12,8 @@ import {
   Badge,
   Btn,
   Callout,
+  CheckboxRow,
+  EmptyState,
   Field,
   Input,
   LogView,
@@ -19,6 +21,7 @@ import {
   ProgressBar,
   SegmentedControl,
   Skeleton,
+  StatusDot,
   inputCls,
   btnClass,
 } from "@/components/ui";
@@ -26,6 +29,148 @@ import { cn } from "@/lib/utils";
 import { usePageTitle } from "@/lib/usePageTitle";
 
 type Tab = "serve" | "perf" | "agentic" | "history";
+
+const TAB_HINTS: Record<Tab, string> = {
+  serve: "target · envelope · flags · launch",
+  perf: "throughput / latency on the live endpoint",
+  agentic: "tool-calling quality suites",
+  history: "runs recorded on this box",
+};
+
+/* ---------------------------------------------------------------------------
+   Local HUD atoms. Everything chromatic here resolves through lab-* tokens so
+   the light "reconstruction plate" and the dark "in simulation" void both come
+   out deliberate. Nothing below owns behaviour.
+   ------------------------------------------------------------------------- */
+
+/** Hairline divider between readout cells — same idiom as the app header. */
+function Tick({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]", className)}
+    />
+  );
+}
+
+/**
+ * Unset value. A bare em-dash reads as "broken"; a condensed muted word reads
+ * as "nothing here yet, and that is the correct state".
+ */
+function Unset({ children = "Awaiting" }: { children?: ReactNode }) {
+  return (
+    <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
+      {children}
+    </span>
+  );
+}
+
+/**
+ * Numbered step head. This is the page's spine: every block on Serve carries
+ * one, so model → envelope → presets → flags → launch reads as a single
+ * operator sequence instead of a stack of unrelated cards.
+ *
+ * `n` is decorative — sequence position, or "——" for blocks that sit off the
+ * spine. Either way a screen reader announcing "em dash em dash" is noise,
+ * so the numeral slot is hidden from the a11y tree; the label carries meaning.
+ */
+function Seq({
+  n,
+  label,
+  hint,
+  action,
+}: {
+  n: string;
+  label: string;
+  hint?: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span
+          aria-hidden
+          className="font-mono text-[10px] leading-none tabular-nums text-lab-muted"
+        >
+          {n}
+        </span>
+        <span aria-hidden className="h-3 w-px shrink-0 bg-lab-accent" />
+        <span className="animus-eyebrow whitespace-nowrap text-lab-text-dim">{label}</span>
+        {hint ? (
+          <>
+            <Tick className="hidden md:block" />
+            <span className="hidden min-w-0 truncate text-[11px] leading-none text-lab-muted md:inline">
+              {hint}
+            </span>
+          </>
+        ) : null}
+      </div>
+      {action ? <div className="flex flex-wrap items-center gap-2">{action}</div> : null}
+    </div>
+  );
+}
+
+/** One row of the live-endpoint readout: condensed label, tabular value. */
+function Readout({
+  label,
+  value,
+  unset = "Awaiting",
+  mono = true,
+  children,
+}: {
+  label: string;
+  value?: string | null;
+  unset?: string;
+  mono?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 border-b border-lab-border-subtle py-1.5 last:border-b-0">
+      <dt className="animus-eyebrow shrink-0 text-[10px] tracking-[0.14em]">{label}</dt>
+      <dd
+        className={cn(
+          "min-w-0 break-all text-right text-[11px] leading-snug text-lab-text-dim",
+          mono && "font-mono tabular-nums",
+        )}
+      >
+        {children ?? (value ? value : <Unset>{unset}</Unset>)}
+      </dd>
+    </div>
+  );
+}
+
+/** Telemetry cell for the job dock — condensed label over a tabular value. */
+function Telem({
+  label,
+  children,
+  tone,
+}: {
+  label: string;
+  children: ReactNode;
+  tone?: "ok" | "warn" | "danger" | "accent";
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="animus-eyebrow text-[9px] tracking-[0.18em]">{label}</div>
+      <div
+        className={cn(
+          "mt-1 truncate font-mono text-[12px] leading-none tabular-nums",
+          tone === "ok"
+            ? "text-lab-ok"
+            : tone === "warn"
+              ? "text-lab-warn"
+              : tone === "danger"
+                ? "text-lab-danger"
+                : tone === "accent"
+                  ? "text-lab-accent-bright"
+                  : "text-lab-text-dim",
+        )}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
 
 export default function ServerPage() {
   usePageTitle("Serve");
@@ -91,6 +236,24 @@ export default function ServerPage() {
 
   const examples = (status?.serve?.serve_examples || {}) as Record<string, ServeExample>;
   const modelHints = status?.serve?.presets || [];
+  /**
+   * Spine numbering. The presets block is conditional, so hardcoded numerals
+   * render 01 → 02 → 04 when no presets exist — a skipped step reads as a
+   * missing section. Derive the sequence from what is actually on screen.
+   */
+  const hasPresets = Object.keys(examples).length > 0;
+  const step = (() => {
+    let n = 0;
+    const next = () => String(++n).padStart(2, "0");
+    return {
+      envelope: next(),
+      target: next(),
+      presets: hasPresets ? next() : "",
+      flags: next(),
+      launch: next(),
+      job: next(),
+    };
+  })();
   const jobRunning = jobStatus === "running" || jobStatus === "queued";
 
   const advancedHasValues = useMemo(() => {
@@ -375,13 +538,27 @@ export default function ServerPage() {
   const confTone =
     rec?.confidence === "high" ? "ok" : rec?.confidence === "medium" ? "warn" : "muted";
 
+  // Presentation only — mirrors the existing disabled expression exactly so the
+  // launch control can explain WHY it is disarmed instead of just dimming.
+  const hasModel = !!model.trim();
+  const startDisabledReason = !hasModel
+    ? "Enter a model id first"
+    : jobRunning
+      ? "Wait for the current job to finish"
+      : null;
+
   return (
     <div className="space-y-4 lab-fade-in">
       <div className="page-header">
         <div>
+          <div className="animus-eyebrow mb-1 flex items-center gap-2">
+            <span aria-hidden className="h-2.5 w-px bg-lab-accent" />
+            Launch control
+          </div>
           <h1 className="page-title">Serve</h1>
           <p className="page-sub">
-            Serve local / HF models on Spark · Auto-configure from live model card · benches · history
+            Arm a vLLM container on Spark. Auto-configure reads the live model card, the
+            envelope caps memory, advanced flags stay folded until you need them.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2" aria-live="polite">
@@ -410,131 +587,156 @@ export default function ServerPage() {
         </div>
       </div>
 
-      <SegmentedControl
-        ariaLabel="Serve sections"
-        value={tab}
-        onChange={setTab}
-        options={[
-          { id: "serve", label: "Serve" },
-          { id: "perf", label: "Perf" },
-          { id: "agentic", label: "Agentic" },
-          { id: "history", label: "History" },
-        ]}
-      />
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <SegmentedControl
+            ariaLabel="Serve sections"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { id: "serve", label: "Serve" },
+              { id: "perf", label: "Perf" },
+              { id: "agentic", label: "Agentic" },
+              { id: "history", label: "History" },
+            ]}
+          />
+          <Tick className="hidden sm:block" />
+          <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted sm:inline">
+            {TAB_HINTS[tab]}
+          </span>
+        </div>
+        <div className="animus-rule" aria-hidden />
+      </div>
 
       {tab === "serve" && (
         <div className="space-y-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <SegmentedControl
-              ariaLabel="Serve mode envelope"
-              value={mode}
-              onChange={setMode}
-              options={[
-                { id: "lab_safe", label: "Lab Safe" },
-                { id: "workflow_max", label: "Workflow Max" },
-              ]}
+          {/* 01 · ENVELOPE — one mode row: control, one-line hint, abort/restore. */}
+          <section className="animus-chamfer border border-lab-border bg-[color:var(--animus-glass)] px-4 py-3.5">
+            <Seq
+              n={step.envelope}
+              label="Envelope"
+              hint="memory ceiling applied to every launch"
+              action={
+                <>
+                  <Btn
+                    variant="danger"
+                    onClick={stop}
+                    disabled={startBusy}
+                    title={
+                      startBusy ? "Wait for start request to register" : "Stop all vLLM containers"
+                    }
+                  >
+                    Stop all
+                  </Btn>
+                  <Btn
+                    variant="secondary"
+                    onClick={restore}
+                    disabled={jobRunning}
+                    title={
+                      jobRunning
+                        ? "Wait for the current job to finish"
+                        : "Restore agent-friendly serve"
+                    }
+                  >
+                    Agent restore
+                  </Btn>
+                </>
+              }
             />
-            <span className="hidden max-w-md text-[11px] leading-snug text-lab-muted sm:inline">
-              {mode === "lab_safe"
-                ? "util ≤ 0.4 · headroom for OS / Hermes · re-run Auto-configure after switch"
-                : "util ~0.7–0.85 · large weights / long ctx · re-run Auto-configure after switch"}
-            </span>
-            <div className="ml-auto flex flex-wrap gap-2">
-              <Btn
-                variant="danger"
-                onClick={stop}
-                disabled={startBusy}
-                title={startBusy ? "Wait for start request to register" : "Stop all vLLM containers"}
-              >
-                Stop all
-              </Btn>
-              <Btn
-                variant="secondary"
-                onClick={restore}
-                disabled={jobRunning}
-                title={jobRunning ? "Wait for the current job to finish" : "Restore agent-friendly serve"}
-              >
-                Agent restore
-              </Btn>
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+              <SegmentedControl
+                ariaLabel="Serve mode envelope"
+                value={mode}
+                onChange={setMode}
+                options={[
+                  { id: "lab_safe", label: "Lab Safe" },
+                  { id: "workflow_max", label: "Workflow Max" },
+                ]}
+              />
+              <span className="max-w-md text-[11px] leading-snug text-lab-muted">
+                {mode === "lab_safe"
+                  ? "util ≤ 0.4 · headroom for OS / Hermes · re-run Auto-configure after switch"
+                  : "util ~0.7–0.85 · large weights / long ctx · re-run Auto-configure after switch"}
+              </span>
             </div>
-          </div>
+          </section>
 
           <div className="grid gap-3 lg:grid-cols-3">
-            <Panel className="space-y-3 p-4 lg:col-span-2">
-              <h2 className="text-sm font-semibold">Auto-configure from Hugging Face card</h2>
-              <p className="text-[11px] text-lab-muted">
-                Fetches the live model card + config from huggingface.co, scores every{" "}
-                <code className="text-lab-text">vllm serve</code> recipe, applies checkpoint
-                safety (e.g. strips flashinfer_b12x on mixed FP8 MoE), then fills Lab Safe /
-                Workflow Max envelope gaps.
-              </p>
-              <div className="flex flex-wrap items-end gap-3">
-                <div className="min-w-[16rem] flex-1">
-                  <Field label="Model (HF id)" htmlFor="serve-model">
-                    <input
-                      id="serve-model"
-                      className={inputCls}
-                      list="model-hints"
-                      placeholder="org/model-name"
-                      value={model}
-                      onChange={(e) => setModel(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && model.trim() && !recBusy) void autoConfigure();
-                      }}
-                      aria-invalid={!!startError && !model.trim() ? true : undefined}
-                    />
-                    <datalist id="model-hints">
-                      {modelHints.map((p) => (
-                        <option key={p} value={p} />
-                      ))}
-                    </datalist>
-                  </Field>
-                </div>
-                <Btn
-                  variant="secondary"
-                  onClick={() => void autoConfigure()}
-                  disabled={!model.trim()}
-                  loading={recBusy}
-                  title={!model.trim() ? "Enter a model id first" : undefined}
-                >
-                  {recBusy ? "Fetching card…" : "Auto-configure from HF"}
-                </Btn>
-                <Btn
-                  onClick={() => void start()}
-                  disabled={jobRunning || !model.trim()}
-                  loading={startBusy}
-                  title={
-                    !model.trim()
-                      ? "Enter a model id first"
-                      : jobRunning
-                        ? "Wait for the current job to finish"
-                        : undefined
+            <Panel className="lg:col-span-2">
+              <div className="space-y-3.5 p-4">
+                <Seq
+                  n={step.target}
+                  label="Target"
+                  hint="hugging face id · live card lookup"
+                  action={
+                    <Badge tone={hasModel ? "accent" : "muted"}>
+                      {hasModel ? "model set" : "no target"}
+                    </Badge>
                   }
-                >
-                  Start serve
-                </Btn>
-              </div>
-              {recError && (
-                <Callout
-                  tone="danger"
-                  title="Auto-configure failed"
-                  onDismiss={() => setRecError(null)}
-                >
-                  <span className="whitespace-pre-wrap">{recError}</span>
-                </Callout>
-              )}
-              {startError && (
-                <Callout
-                  tone="danger"
-                  title="Serve action failed"
-                  onDismiss={() => setStartError(null)}
-                >
-                  <span className="whitespace-pre-wrap">{startError}</span>
-                </Callout>
-              )}
-              {rec && (
-                <div className="rounded-lg border border-lab-border bg-lab-editor p-3 text-xs space-y-2">
-                  <div className="flex flex-wrap gap-2 items-center">
+                />
+                <div className="animus-rule" aria-hidden />
+                <p className="text-[11px] leading-relaxed text-lab-muted">
+                  Fetches the live model card + config from huggingface.co, scores every{" "}
+                  <code className="font-mono text-[10.5px] text-lab-text-dim">vllm serve</code>{" "}
+                  recipe, applies checkpoint safety (e.g. strips flashinfer_b12x on mixed FP8
+                  MoE), then fills Lab Safe / Workflow Max envelope gaps.
+                </p>
+                <div className="flex flex-wrap items-end gap-3">
+                  <div className="min-w-[16rem] flex-1">
+                    <Field label="Model (HF id)" htmlFor="serve-model">
+                      <input
+                        id="serve-model"
+                        className={inputCls}
+                        list="model-hints"
+                        placeholder="org/model-name"
+                        value={model}
+                        onChange={(e) => setModel(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && model.trim() && !recBusy) void autoConfigure();
+                        }}
+                        aria-invalid={!!startError && !model.trim() ? true : undefined}
+                      />
+                      <datalist id="model-hints">
+                        {modelHints.map((p) => (
+                          <option key={p} value={p} />
+                        ))}
+                      </datalist>
+                    </Field>
+                  </div>
+                  <Btn
+                    variant="secondary"
+                    onClick={() => void autoConfigure()}
+                    disabled={!model.trim()}
+                    loading={recBusy}
+                    title={!model.trim() ? "Enter a model id first" : undefined}
+                  >
+                    {recBusy ? "Fetching card…" : "Auto-configure from HF"}
+                  </Btn>
+                </div>
+                {recError && (
+                  <Callout
+                    tone="danger"
+                    title="Auto-configure failed"
+                    onDismiss={() => setRecError(null)}
+                  >
+                    <span className="whitespace-pre-wrap">{recError}</span>
+                  </Callout>
+                )}
+                {startError && (
+                  <Callout
+                    tone="danger"
+                    title="Serve action failed"
+                    onDismiss={() => setStartError(null)}
+                  >
+                    <span className="whitespace-pre-wrap">{startError}</span>
+                  </Callout>
+                )}
+                {rec && (
+                  <div className="animus-chamfer-sm animus-bracketed relative border border-lab-border bg-lab-editor p-3.5 text-xs space-y-2.5 before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!">
+                    <div className="animus-eyebrow text-[9px] tracking-[0.2em]">
+                      Reconstruction · card analysis
+                    </div>
+                    <div className="flex flex-wrap gap-2 items-center">
                     <Badge tone={confTone}>confidence: {rec.confidence}</Badge>
                     <Badge tone={rec.from_website ? "ok" : "warn"}>
                       {rec.from_website ? "live HF card" : "offline / cache"}
@@ -573,7 +775,7 @@ export default function ServerPage() {
                   </div>
                   {rec.card_url && (
                     <a
-                      className="text-lab-accent-bright underline break-all"
+                      className="block break-all font-mono text-[11px] text-lab-accent-bright underline-offset-2 hover:underline"
                       href={rec.card_url}
                       target="_blank"
                       rel="noreferrer"
@@ -581,9 +783,11 @@ export default function ServerPage() {
                       {rec.card_url}
                     </a>
                   )}
-                  {rec.notes && <p className="text-lab-muted">{rec.notes}</p>}
+                  {rec.notes && (
+                    <p className="text-[11px] leading-relaxed text-lab-muted">{rec.notes}</p>
+                  )}
                   {(rec.warnings || []).length > 0 && (
-                    <ul className="list-disc pl-4 space-y-1 text-lab-warn">
+                    <ul className="space-y-1 border-l-2 border-l-lab-warn pl-3 text-[11px] leading-relaxed text-lab-warn">
                       {rec.warnings.map((w, i) => (
                         <li key={i}>{w}</li>
                       ))}
@@ -591,7 +795,7 @@ export default function ServerPage() {
                   )}
                   {(rec.card_recipes || []).length > 0 && (
                     <details open className="text-lab-muted">
-                      <summary className="cursor-pointer text-lab-text">
+                      <summary className="animus-eyebrow cursor-pointer text-[10px] text-lab-text-dim hover:text-lab-text">
                         Card recipes ({rec.card_recipes!.length}) — click Apply to try another
                       </summary>
                       <ul className="mt-2 space-y-2">
@@ -599,17 +803,19 @@ export default function ServerPage() {
                           <li
                             key={i}
                             className={cn(
-                              "rounded border px-2 py-1.5 font-mono text-[11px]",
+                              "animus-notch border-l-2 px-2.5 py-2 font-mono text-[11px]",
                               cr.selected
-                                ? "border-lab-accent/40 bg-lab-accent/10"
-                                : "border-lab-border",
+                                ? "border border-l-[color:var(--color-lab-accent)] border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)]"
+                                : "border border-l-[color:var(--animus-hairline)] border-lab-border-subtle",
                             )}
                           >
                             <div className="flex flex-wrap items-center gap-2 text-lab-text">
-                              <span>score {cr.score}</span>
+                              <span className="tabular-nums">score {cr.score}</span>
                               {cr.selected && <Badge tone="ok">selected</Badge>}
                               {cr.section && (
-                                <span className="opacity-70 font-sans">{cr.section}</span>
+                                <span className="font-[family-name:var(--font-display)] text-[10px] uppercase tracking-[0.14em] text-lab-muted">
+                                  {cr.section}
+                                </span>
                               )}
                               {!cr.selected && cr.config && (
                                 <Btn
@@ -621,11 +827,11 @@ export default function ServerPage() {
                                 </Btn>
                               )}
                             </div>
-                            <div className="mt-1 whitespace-pre-wrap break-all opacity-90">
+                            <div className="mt-1.5 whitespace-pre-wrap break-all text-lab-text-dim">
                               {cr.raw}
                             </div>
                             {(cr.reasons || []).length > 0 && (
-                              <ul className="mt-1 list-disc space-y-0.5 pl-4 font-sans text-[10px] text-lab-muted">
+                              <ul className="mt-1.5 list-disc space-y-0.5 pl-4 font-sans text-[10px] text-lab-muted">
                                 {cr.reasons!.map((reason, ri) => (
                                   <li
                                     key={ri}
@@ -643,7 +849,7 @@ export default function ServerPage() {
                           </li>
                         ))}
                       </ul>
-                      <p className="mt-2 font-sans text-[10px] text-lab-muted">
+                      <p className="mt-2 font-sans text-[10px] leading-relaxed text-lab-muted">
                         &quot;Apply raw recipe&quot; fills form fields from that card snippet only —
                         checkpoint safety / envelope are not re-run. Prefer the selected recipe
                         (already safety-merged) unless you know what you&apos;re doing.
@@ -651,18 +857,22 @@ export default function ServerPage() {
                     </details>
                   )}
                   <details className="text-lab-muted">
-                    <summary className="cursor-pointer text-lab-text">Why these flags</summary>
-                    <ul className="mt-2 list-disc space-y-1 pl-4">
+                    <summary className="animus-eyebrow cursor-pointer text-[10px] text-lab-text-dim hover:text-lab-text">
+                      Why these flags
+                    </summary>
+                    <ul className="mt-2 list-disc space-y-1 pl-4 text-[11px] leading-relaxed">
                       {(rec.rationale || []).map((r, i) => (
                         <li key={i}>{r}</li>
                       ))}
                     </ul>
                     {(rec.sources || []).length > 0 && (
-                      <div className="mt-2">
-                        <div className="font-medium text-lab-text">Fetched from</div>
-                        <ul className="mt-1 space-y-1">
+                      <div className="mt-2.5">
+                        <div className="animus-eyebrow text-[9px] tracking-[0.2em]">
+                          Fetched from
+                        </div>
+                        <ul className="mt-1.5 space-y-1">
                           {rec.sources!.map((s, i) => (
-                            <li key={i} className="font-mono text-[11px] break-all">
+                            <li key={i} className="font-mono text-[10.5px] break-all">
                               [{s.kind}] {s.ref}
                               {s.notes ? ` — ${s.notes}` : ""}
                             </li>
@@ -671,124 +881,184 @@ export default function ServerPage() {
                       </div>
                     )}
                   </details>
-                </div>
-              )}
+                  </div>
+                )}
+              </div>
             </Panel>
 
-            <Panel className="space-y-3 p-4">
-              <h2 className="text-sm font-semibold">Live status</h2>
-              {statusLoading ? (
-                <div className="space-y-3" aria-busy="true" aria-label="Loading live status">
-                  <Skeleton className="h-4 w-full" />
-                  <Skeleton className="h-4 w-[80%]" />
-                  <Skeleton className="h-4 w-[60%]" />
-                  <Skeleton className="h-4 w-[66%]" />
-                </div>
-              ) : (
-                <>
-                  <dl className="space-y-2 text-sm">
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-lab-muted">Served model</dt>
-                      <dd className="break-all text-right font-mono text-xs">
-                        {serve?.model_id || "—"}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-lab-muted">Endpoint</dt>
-                      <dd className="font-mono text-xs">{serve?.base_url || "—"}</dd>
-                    </div>
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-lab-muted">Available UMA</dt>
-                      <dd className="font-mono">
-                        {avail != null ? `${avail} GiB` : "—"}
-                        {headroom ? ` · ${headroom}` : ""}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-lab-muted">GPU</dt>
-                      <dd className="text-right text-xs">
-                        {String(serve?.hardware?.gpu_sku || "—")
-                          .replace(/\s*,?\s*\[?N\/A\]?/gi, "")
-                          .replace(/\s{2,}/g, " ")
-                          .trim() || "—"}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-lab-muted">Health</dt>
-                      <dd>
+            <Panel>
+              <div className="space-y-3.5 p-4">
+                <Seq
+                  n="——"
+                  label="Live endpoint"
+                  action={
+                    <StatusDot
+                      live={statusLoading ? null : healthy}
+                      label={
+                        statusLoading
+                          ? "Checking endpoint"
+                          : healthy
+                            ? "Endpoint healthy"
+                            : serve?.unreachable
+                              ? "Engine down"
+                              : "Endpoint idle"
+                      }
+                    />
+                  }
+                />
+                <div className="animus-rule" aria-hidden />
+                {statusLoading ? (
+                  <div className="space-y-3" aria-busy="true" aria-label="Loading live status">
+                    <Skeleton className="h-4 w-full" />
+                    <Skeleton className="h-4 w-[80%]" />
+                    <Skeleton className="h-4 w-[60%]" />
+                    <Skeleton className="h-4 w-[66%]" />
+                  </div>
+                ) : (
+                  <>
+                    <dl>
+                      <Readout label="Served model" value={serve?.model_id} unset="No model" />
+                      <Readout label="Endpoint" value={serve?.base_url} unset="Not set" />
+                      <Readout
+                        label="Available UMA"
+                        value={
+                          avail != null
+                            ? `${avail} GiB${headroom ? ` · ${headroom}` : ""}`
+                            : undefined
+                        }
+                        unset="Unknown"
+                      />
+                      <Readout
+                        label="GPU"
+                        mono={false}
+                        value={
+                          String(serve?.hardware?.gpu_sku || "")
+                            .replace(/\s*,?\s*\[?N\/A\]?/gi, "")
+                            .replace(/\s{2,}/g, " ")
+                            .trim() || undefined
+                        }
+                        unset="Unknown"
+                      />
+                      <Readout label="Health">
                         <Badge tone={healthy ? "ok" : "muted"} dot>
                           {healthy ? "Healthy" : serve?.unreachable ? "Engine down" : "Idle"}
                         </Badge>
-                      </dd>
+                      </Readout>
+                    </dl>
+                    <div className="space-y-1.5">
+                      <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Containers</div>
+                      {(serve?.containers || []).length === 0 && (
+                        <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] px-2.5 py-2">
+                          <Unset>No vLLM containers</Unset>
+                        </div>
+                      )}
+                      {(serve?.containers || []).map((c) => (
+                        <div
+                          key={c.name}
+                          className={cn(
+                            "animus-notch flex items-center justify-between gap-2 border border-l-2 border-lab-border-subtle px-2.5 py-1.5 text-[11px]",
+                            c.status.includes("Up")
+                              ? "border-l-lab-ok"
+                              : "border-l-[color:var(--animus-hairline)]",
+                          )}
+                        >
+                          <span className="truncate font-mono text-lab-text-dim">{c.name}</span>
+                          <Badge tone={c.status.includes("Up") ? "ok" : "muted"}>{c.status}</Badge>
+                        </div>
+                      ))}
                     </div>
-                  </dl>
-                  <div className="space-y-1">
-                    <div className="text-[10px] uppercase tracking-wide text-lab-muted">
-                      Containers
-                    </div>
-                    {(serve?.containers || []).length === 0 && (
-                      <p className="text-xs text-lab-muted">None matching vLLM.</p>
-                    )}
-                    {(serve?.containers || []).map((c) => (
-                      <div
-                        key={c.name}
-                        className="flex items-center justify-between gap-2 rounded border border-lab-border px-2 py-1.5 text-[11px]"
-                      >
-                        <span className="truncate font-mono">{c.name}</span>
-                        <Badge tone={c.status.includes("Up") ? "ok" : "muted"}>{c.status}</Badge>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
+                  </>
+                )}
+              </div>
             </Panel>
           </div>
 
           {Object.keys(examples).length > 0 && (
-            <Panel className="p-4">
-              <h2 className="mb-1 text-sm font-semibold">Proven examples (fill form only)</h2>
-              <p className="mb-2 text-[11px] text-lab-muted">
-                Static Spark-proven presets. Prefer Auto-configure for newest HF cards.
-              </p>
-              {formFlash && (
-                <Callout tone="ok" className="mb-3" title="Form updated">
-                  {formFlash}
-                </Callout>
-              )}
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(examples).map(([k, ex]) => {
-                  const selected = appliedExample === k || appliedExample === (ex.label || ex.model);
-                  return (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => applyExample(ex, k)}
-                    aria-pressed={selected}
-                    className={cn(
-                      "rounded-[10px] border px-3 py-2.5 text-left text-xs transition-colors",
-                      selected
-                        ? "border-lab-accent/45 bg-[rgba(10,132,255,0.1)] text-lab-text"
-                        : "border-lab-border text-lab-muted hover:border-lab-accent/40 hover:text-lab-text",
-                    )}
-                  >
-                    <div className="font-medium text-lab-text">{ex.label || k}</div>
-                    {ex.model && <div className="font-mono opacity-70">{ex.model}</div>}
-                  </button>
-                  );
-                })}
+            <Panel>
+              <div className="space-y-3.5 p-4">
+                <Seq
+                  n={step.presets}
+                  label="Proven presets"
+                  hint="fills the form only — nothing launches"
+                  action={
+                    appliedExample ? (
+                      <Badge tone="accent">applied</Badge>
+                    ) : (
+                      <Unset>None applied</Unset>
+                    )
+                  }
+                />
+                <div className="animus-rule" aria-hidden />
+                <p className="text-[11px] leading-relaxed text-lab-muted">
+                  Static Spark-proven presets. Prefer Auto-configure for newest HF cards.
+                </p>
+                {formFlash && (
+                  <Callout tone="ok" title="Form updated">
+                    {formFlash}
+                  </Callout>
+                )}
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {Object.entries(examples).map(([k, ex]) => {
+                    const selected =
+                      appliedExample === k || appliedExample === (ex.label || ex.model);
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => applyExample(ex, k)}
+                        aria-pressed={selected}
+                        className={cn(
+                          "animus-notch relative border border-l-2 px-3 py-2.5 text-left text-xs transition-colors",
+                          // The chamfer clips the global focus ring — carry an inset one.
+                          "focus-visible:outline-none! focus-visible:shadow-[inset_0_0_0_2px_var(--color-lab-line)]!",
+                          selected
+                            ? "border-[color:var(--animus-accent-edge)] border-l-[color:var(--color-lab-accent)] bg-[color:var(--animus-accent-wash)] text-lab-text"
+                            : "border-lab-border-subtle border-l-[color:var(--animus-hairline)] text-lab-muted hover:border-lab-border hover:border-l-lab-line hover:bg-lab-hover/60 hover:text-lab-text",
+                        )}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="truncate font-[family-name:var(--font-display)] text-[12px] font-semibold uppercase tracking-[0.1em] text-lab-text">
+                            {ex.label || k}
+                          </span>
+                          {selected && (
+                            <span
+                              aria-hidden
+                              className="ml-auto h-1.5 w-1.5 shrink-0 rotate-45 bg-lab-accent"
+                            />
+                          )}
+                        </div>
+                        {ex.model ? (
+                          <div className="mt-1 truncate font-mono text-[10.5px] text-lab-muted">
+                            {ex.model}
+                          </div>
+                        ) : (
+                          <div className="mt-1">
+                            <Unset>No model pinned</Unset>
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </Panel>
           )}
 
-          <Panel
-            title="Engine flags"
-            action={
-              <span className="text-[11px] text-lab-muted">
-                Envelope first · advanced on demand
-              </span>
-            }
-          >
+          <Panel>
             <div className="space-y-4 p-4">
+              <Seq
+                n={step.flags}
+                label="Engine flags"
+                hint="envelope first · advanced on demand"
+                action={
+                  advancedHasValues ? (
+                    <Badge tone="accent">advanced set</Badge>
+                  ) : (
+                    <Unset>Defaults</Unset>
+                  )
+                }
+              />
+              <div className="animus-rule" aria-hidden />
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <Field label="gpu-memory-utilization" htmlFor="serve-util">
                   <Input
@@ -819,40 +1089,46 @@ export default function ServerPage() {
                 </Field>
               </div>
 
-              <label className="flex cursor-pointer items-center gap-2.5 rounded-[10px] border border-lab-border-subtle bg-lab-editor/50 px-3 py-2 text-[12px] text-lab-text-dim">
-                <input
-                  type="checkbox"
-                  className="h-3.5 w-3.5 accent-lab-accent"
-                  checked={download}
-                  onChange={(e) => setDownload(e.target.checked)}
-                />
-                Download weights first (hf download) before docker start
-              </label>
+              <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] bg-lab-editor/50 px-2 py-1">
+                <CheckboxRow id="serve-download" checked={download} onChange={setDownload}>
+                  Download weights first (hf download) before docker start
+                </CheckboxRow>
+              </div>
 
               <details
-                className="group rounded-[12px] border border-lab-border-subtle bg-lab-editor/40 open:bg-lab-editor/60"
+                className="group animus-chamfer-sm border border-lab-border-subtle bg-lab-editor/40 open:bg-lab-editor/60"
                 open={advOpen}
                 onToggle={(e) => setAdvOpen((e.currentTarget as HTMLDetailsElement).open)}
               >
-                <summary className="cursor-pointer list-none px-3.5 py-2.5 text-[12px] font-medium tracking-[-0.01em] text-lab-text-dim marker:content-none [&::-webkit-details-marker]:hidden">
+                <summary className="cursor-pointer list-none px-3.5 py-2.5 marker:content-none [&::-webkit-details-marker]:hidden">
                   <span className="inline-flex items-center gap-2">
-                    <span className="text-lab-muted transition-transform group-open:rotate-90">▸</span>
-                    Advanced flags
-                    <span className="font-normal text-lab-muted">
+                    <span
+                      aria-hidden
+                      className="font-mono text-[10px] leading-none text-lab-line transition-transform group-open:rotate-90"
+                    >
+                      ▸
+                    </span>
+                    <span className="animus-eyebrow text-[10px] text-lab-text-dim">
+                      Advanced flags
+                    </span>
+                    <Tick className="hidden sm:block" />
+                    <span className="hidden text-[11px] leading-none text-lab-muted sm:inline">
                       image · quant · tools · MTP · docker env
                     </span>
                   </span>
                 </summary>
                 <div className="grid gap-3 border-t border-lab-border-subtle p-3.5 sm:grid-cols-2 lg:grid-cols-3">
-                  <Field label="vLLM image">
+                  <Field label="vLLM image" htmlFor="adv-image">
                     <Input
+                      id="adv-image"
                       value={image}
                       onChange={(e) => setImage(e.target.value)}
                       placeholder="vllm/vllm-openai:v0.26.0"
                     />
                   </Field>
-                  <Field label="--quantization">
+                  <Field label="--quantization" htmlFor="adv-quant">
                     <Input
+                      id="adv-quant"
                       value={quantization}
                       onChange={(e) => setQuantization(e.target.value)}
                       list="quant-hints"
@@ -864,8 +1140,9 @@ export default function ServerPage() {
                       <option value="compressed-tensors" />
                     </datalist>
                   </Field>
-                  <Field label="--kv-cache-dtype">
+                  <Field label="--kv-cache-dtype" htmlFor="adv-kv">
                     <Input
+                      id="adv-kv"
                       value={kvCacheDtype}
                       onChange={(e) => setKvCacheDtype(e.target.value)}
                       list="kv-hints"
@@ -876,8 +1153,9 @@ export default function ServerPage() {
                       <option value="auto" />
                     </datalist>
                   </Field>
-                  <Field label="--moe-backend">
+                  <Field label="--moe-backend" htmlFor="adv-moe">
                     <Input
+                      id="adv-moe"
                       value={moeBackend}
                       onChange={(e) => setMoeBackend(e.target.value)}
                       list="moe-hints"
@@ -888,85 +1166,88 @@ export default function ServerPage() {
                       <option value="triton" />
                     </datalist>
                   </Field>
-                  <Field label="--max-num-seqs">
+                  <Field label="--max-num-seqs" htmlFor="adv-seqs">
                     <Input
+                      id="adv-seqs"
                       value={maxNumSeqs}
                       onChange={(e) => setMaxNumSeqs(e.target.value)}
                       placeholder="4"
                     />
                   </Field>
-                  <Field label="--load-format">
-                    <Input value={loadFormat} onChange={(e) => setLoadFormat(e.target.value)} />
-                  </Field>
-                  <Field label="--tool-call-parser">
+                  <Field label="--load-format" htmlFor="adv-loadfmt">
                     <Input
+                      id="adv-loadfmt"
+                      value={loadFormat}
+                      onChange={(e) => setLoadFormat(e.target.value)}
+                    />
+                  </Field>
+                  <Field label="--tool-call-parser" htmlFor="adv-toolparser">
+                    <Input
+                      id="adv-toolparser"
                       value={toolCallParser}
                       onChange={(e) => setToolCallParser(e.target.value)}
                       placeholder="qwen3_coder"
                     />
                   </Field>
-                  <Field label="--reasoning-parser">
+                  <Field label="--reasoning-parser" htmlFor="adv-reasonparser">
                     <Input
+                      id="adv-reasonparser"
                       value={reasoningParser}
                       onChange={(e) => setReasoningParser(e.target.value)}
                       placeholder="qwen3"
                     />
                   </Field>
-                  <Field label="MTP speculative tokens">
+                  <Field label="MTP speculative tokens" htmlFor="adv-mtptokens">
                     <Input
+                      id="adv-mtptokens"
                       value={mtpTokens}
                       onChange={(e) => setMtpTokens(e.target.value)}
                       disabled={!mtp}
                     />
                   </Field>
-                  <label className="flex items-center gap-2 text-sm text-lab-muted">
-                    <input
-                      type="checkbox"
-                      className="accent-lab-accent"
-                      checked={trustRemoteCode}
-                      onChange={(e) => setTrustRemoteCode(e.target.checked)}
-                    />
-                    --trust-remote-code
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-lab-muted">
-                    <input
-                      type="checkbox"
-                      className="accent-lab-accent"
-                      checked={enableAutoTool}
-                      onChange={(e) => setEnableAutoTool(e.target.checked)}
-                    />
-                    --enable-auto-tool-choice
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-lab-muted">
-                    <input
-                      type="checkbox"
-                      className="accent-lab-accent"
-                      checked={chunkedPrefill}
-                      onChange={(e) => setChunkedPrefill(e.target.checked)}
-                    />
-                    --enable-chunked-prefill
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-lab-muted">
-                    <input
-                      type="checkbox"
-                      className="accent-lab-accent"
-                      checked={prefixCaching}
-                      onChange={(e) => setPrefixCaching(e.target.checked)}
-                    />
-                    --enable-prefix-caching
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-lab-muted">
-                    <input
-                      type="checkbox"
-                      className="accent-lab-accent"
-                      checked={mtp}
-                      onChange={(e) => setMtp(e.target.checked)}
-                    />
-                    MTP (--speculative-config method=mtp)
-                  </label>
+                  <div className="space-y-1.5 sm:col-span-2 lg:col-span-3">
+                    <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Toggles</div>
+                    <div className="animus-rule" aria-hidden />
+                    <div className="grid gap-x-4 sm:grid-cols-2 lg:grid-cols-3">
+                      <CheckboxRow
+                        id="adv-trc"
+                        checked={trustRemoteCode}
+                        onChange={setTrustRemoteCode}
+                      >
+                        <span className="font-mono text-[11px]">--trust-remote-code</span>
+                      </CheckboxRow>
+                      <CheckboxRow
+                        id="adv-autotool"
+                        checked={enableAutoTool}
+                        onChange={setEnableAutoTool}
+                      >
+                        <span className="font-mono text-[11px]">--enable-auto-tool-choice</span>
+                      </CheckboxRow>
+                      <CheckboxRow
+                        id="adv-chunked"
+                        checked={chunkedPrefill}
+                        onChange={setChunkedPrefill}
+                      >
+                        <span className="font-mono text-[11px]">--enable-chunked-prefill</span>
+                      </CheckboxRow>
+                      <CheckboxRow
+                        id="adv-prefix"
+                        checked={prefixCaching}
+                        onChange={setPrefixCaching}
+                      >
+                        <span className="font-mono text-[11px]">--enable-prefix-caching</span>
+                      </CheckboxRow>
+                      <CheckboxRow id="adv-mtp" checked={mtp} onChange={setMtp}>
+                        <span className="font-mono text-[11px]">
+                          MTP (--speculative-config method=mtp)
+                        </span>
+                      </CheckboxRow>
+                    </div>
+                  </div>
                   <div className="sm:col-span-2 lg:col-span-3">
-                    <Field label="Docker env (KEY=VALUE per line)">
+                    <Field label="Docker env (KEY=VALUE per line)" htmlFor="adv-dockerenv">
                       <textarea
+                        id="adv-dockerenv"
                         className={cn(inputCls, "min-h-[72px] font-mono text-xs")}
                         value={dockerEnv}
                         onChange={(e) => setDockerEnv(e.target.value)}
@@ -975,8 +1256,9 @@ export default function ServerPage() {
                     </Field>
                   </div>
                   <div className="sm:col-span-2 lg:col-span-3">
-                    <Field label="Extra free-form vLLM flags">
+                    <Field label="Extra free-form vLLM flags" htmlFor="adv-extra">
                       <textarea
+                        id="adv-extra"
                         className={cn(inputCls, "min-h-[56px] font-mono text-xs")}
                         value={extra}
                         onChange={(e) => setExtra(e.target.value)}
@@ -988,6 +1270,78 @@ export default function ServerPage() {
               </details>
             </div>
           </Panel>
+
+          {/*
+            05 · LAUNCH — the one primary CTA on this surface. Armed when a
+            model is set and no job is in flight; otherwise deliberately
+            disarmed with the reason spelled out both in the title attribute
+            and on the plate itself.
+          */}
+          <section
+            className={cn(
+              "animus-chamfer animus-bracketed relative border px-4 py-4 transition-colors",
+              startDisabledReason
+                ? "border-lab-border-subtle bg-lab-panel/60"
+                : "border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)]",
+            )}
+          >
+            <Seq n={step.launch} label="Launch" hint="starts a real vLLM container on Spark" />
+            <div className="animus-rule mt-3" aria-hidden />
+            <div className="mt-3.5 flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "h-2 w-2 rotate-45",
+                      startDisabledReason
+                        ? "bg-transparent shadow-[inset_0_0_0_1px_var(--color-lab-muted)]"
+                        : "bg-lab-accent shadow-[0_0_10px_var(--animus-accent-edge)]",
+                    )}
+                  />
+                  <span
+                    className={cn(
+                      "font-[family-name:var(--font-display)] text-[12px] font-semibold uppercase leading-none tracking-[0.18em]",
+                      startDisabledReason ? "text-lab-muted" : "text-lab-accent-bright",
+                    )}
+                  >
+                    {startBusy ? "Arming" : startDisabledReason ? "Disarmed" : "Armed"}
+                  </span>
+                </div>
+                <p className="max-w-lg text-[11px] leading-relaxed text-lab-muted">
+                  {startDisabledReason
+                    ? `${startDisabledReason}. Start stays disarmed until then.`
+                    : "Stops running vLLM containers first, then boots the configured serve. Live output docks below."}
+                </p>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] tabular-nums text-lab-muted">
+                  <span className="truncate">{model.trim() || "no target"}</span>
+                  <Tick />
+                  <span>{mode === "lab_safe" ? "lab_safe" : "workflow_max"}</span>
+                  <Tick />
+                  <span>:{port || "8000"}</span>
+                </div>
+              </div>
+              {/* pointer-events-none on a disabled button swallows hover, so the
+                  wrapper carries the tooltip too. */}
+              <span title={startDisabledReason ?? undefined}>
+                <Btn
+                  onClick={() => void start()}
+                  disabled={jobRunning || !model.trim()}
+                  loading={startBusy}
+                  title={
+                    !model.trim()
+                      ? "Enter a model id first"
+                      : jobRunning
+                        ? "Wait for the current job to finish"
+                        : undefined
+                  }
+                  className="h-11 px-7 text-[13px] tracking-[0.2em]"
+                >
+                  Start serve
+                </Btn>
+              </span>
+            </div>
+          </section>
         </div>
       )}
 
@@ -1006,40 +1360,83 @@ export default function ServerPage() {
         ref={jobPanelRef}
         id="serve-job-dock"
         className={cn(
-          jobRunning &&
-            "sticky bottom-3 z-10 rounded-[16px] shadow-[0_-8px_32px_rgba(0,0,0,0.45)]",
+          // Both themes: elevation comes from the per-theme panel shadow token,
+          // never a hardcoded black.
+          jobRunning && "sticky bottom-3 z-10 shadow-[var(--animus-panel-shadow-hover)]",
         )}
       >
         <Panel
-          title="Job"
-          className={cn(jobRunning && "border-lab-accent/30 ring-1 ring-[rgba(10,132,255,0.12)]")}
-          action={
-            <div className="flex items-center gap-2">
-              {(jobRunning || jobStatus || logs) && (
-                <Btn variant="ghost" size="sm" onClick={clearJobPanel} title="Clear job panel">
-                  Dismiss
-                </Btn>
-              )}
-              <Badge
-                tone={
-                  jobStatus === "done" || jobStatus === "completed"
-                    ? "ok"
-                    : jobStatus === "error" || jobStatus === "failed"
-                      ? "danger"
-                      : jobRunning
-                        ? "accent"
-                        : "muted"
-                }
-                dot={jobRunning}
-              >
-                {jobStatus || "idle"}
-              </Badge>
-            </div>
-          }
+          className={cn(
+            jobRunning &&
+              "border-[color:var(--animus-accent-edge)] shadow-[0_0_0_1px_var(--animus-accent-edge)]",
+          )}
         >
-          <div className="space-y-3 p-4">
+          <div className="space-y-3.5 p-4">
+            <Seq
+              n={step.job}
+              label="Job dock"
+              hint="serve · stop · bench · agentic telemetry"
+              action={
+                <>
+                  {(jobRunning || jobStatus || logs) && (
+                    <Btn
+                      variant="ghost"
+                      size="sm"
+                      onClick={clearJobPanel}
+                      title="Clear job panel"
+                    >
+                      Dismiss
+                    </Btn>
+                  )}
+                  <span aria-live="polite" aria-atomic="true" className="inline-flex">
+                    <Badge
+                      tone={
+                        jobStatus === "done" || jobStatus === "completed"
+                          ? "ok"
+                          : jobStatus === "error" || jobStatus === "failed"
+                            ? "danger"
+                            : jobRunning
+                              ? "accent"
+                              : "muted"
+                      }
+                      dot={jobRunning}
+                    >
+                      {jobStatus || "idle"}
+                    </Badge>
+                  </span>
+                </>
+              }
+            />
+            <div className="animus-rule" aria-hidden />
             {jobRunning || jobStatus || logs ? (
               <>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
+                  <Telem
+                    label="State"
+                    tone={
+                      jobStatus === "done" || jobStatus === "completed"
+                        ? "ok"
+                        : jobStatus === "error" || jobStatus === "failed"
+                          ? "danger"
+                          : jobRunning
+                            ? "accent"
+                            : undefined
+                    }
+                  >
+                    {jobStatus || "idle"}
+                  </Telem>
+                  <Telem label="Progress">
+                    {jobProgress > 0
+                      ? `${Math.round((jobProgress || 0) * 100)}%`
+                      : jobRunning
+                        ? "—— %"
+                        : "0%"}
+                  </Telem>
+                  <Telem label="Stream" tone={jobRunning ? "accent" : undefined}>
+                    {jobRunning ? "live" : "closed"}
+                  </Telem>
+                  <Telem label="Log bytes">{logs.length.toLocaleString()}</Telem>
+                </div>
                 <ProgressBar
                   value={Math.round((jobProgress || 0) * 100)}
                   indeterminate={jobRunning && !(jobProgress > 0)}
@@ -1052,9 +1449,9 @@ export default function ServerPage() {
                 />
               </>
             ) : (
-              <p className="text-[12px] leading-relaxed text-lab-muted">
-                Idle — start a serve, stop, bench, or agentic run and live logs stream here.
-              </p>
+              <EmptyState title="No job">
+                Start a serve, stop, bench, or agentic run — live logs stream into this dock.
+              </EmptyState>
             )}
           </div>
         </Panel>
@@ -1076,84 +1473,105 @@ function PerfTab({
   const [smokeResult, setSmokeResult] = useState<string | null>(null);
 
   return (
-    <Panel className="space-y-3 p-4">
-      <h2 className="text-sm font-semibold">Performance bench</h2>
-      <p className="text-xs text-lab-muted">
-        Requires a healthy endpoint (usually :8000). Serve first → smoke → bench. Logs appear in
-        the Job panel below.
-      </p>
-      {!healthy && (
-        <Callout tone="warn" title="Endpoint down">
-          Start a model on Serve first. Smoke and perf need a healthy :8000.
-        </Callout>
-      )}
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Intent tag" htmlFor="perf-intent">
-          <select
-            id="perf-intent"
-            className={inputCls}
-            value={intent}
-            onChange={(e) => setIntent(e.target.value)}
+    <Panel>
+      <div className="space-y-3.5 p-4">
+        <Seq
+          n="——"
+          label="Performance bench"
+          hint="serve → smoke → bench"
+          action={
+            <Badge tone={healthy ? "ok" : "muted"} dot={healthy}>
+              {healthy ? "endpoint ready" : "endpoint down"}
+            </Badge>
+          }
+        />
+        <div className="animus-rule" aria-hidden />
+        <p className="text-[11px] leading-relaxed text-lab-muted">
+          Requires a healthy endpoint (usually :8000). Logs stream into the job dock below.
+        </p>
+        {!healthy && (
+          <Callout tone="warn" title="Endpoint down">
+            Start a model on Serve first. Smoke and perf need a healthy :8000.
+          </Callout>
+        )}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Intent tag" htmlFor="perf-intent">
+            <select
+              id="perf-intent"
+              className={inputCls}
+              value={intent}
+              onChange={(e) => setIntent(e.target.value)}
+            >
+              <option value="lab_safe">lab_safe</option>
+              <option value="workflow_max">workflow_max</option>
+              <option value="attach">attach</option>
+            </select>
+          </Field>
+          <Field label="Runner" htmlFor="perf-runner">
+            <select
+              id="perf-runner"
+              className={inputCls}
+              value={runner}
+              onChange={(e) => setRunner(e.target.value as typeof runner)}
+            >
+              <option value="workflow">workflow (realistic multi-turn)</option>
+              <option value="prefill">prefill / decode</option>
+              <option value="concurrency">concurrency sweep</option>
+            </select>
+          </Field>
+        </div>
+        {err && (
+          <Callout tone="danger" title="Perf action failed" onDismiss={() => setErr(null)}>
+            {err}
+          </Callout>
+        )}
+        {smokeResult && (
+          <div className="space-y-1.5">
+            <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Smoke response</div>
+            <pre className="max-h-56 overflow-auto rounded-[2px] border border-l-2 border-lab-border border-l-lab-line bg-lab-editor p-3 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap">
+              {smokeResult}
+            </pre>
+          </div>
+        )}
+        <div className="animus-rule" aria-hidden />
+        <div className="flex flex-wrap items-center gap-2">
+          <Btn
+            variant="secondary"
+            disabled={!healthy}
+            title={!healthy ? "Start a model first" : undefined}
+            onClick={async () => {
+              setErr(null);
+              try {
+                const r = await api.smoke();
+                setSmokeResult(JSON.stringify(r, null, 2));
+              } catch (e) {
+                setErr(e instanceof Error ? e.message : String(e));
+              }
+            }}
           >
-            <option value="lab_safe">lab_safe</option>
-            <option value="workflow_max">workflow_max</option>
-            <option value="attach">attach</option>
-          </select>
-        </Field>
-        <Field label="Runner" htmlFor="perf-runner">
-          <select
-            id="perf-runner"
-            className={inputCls}
-            value={runner}
-            onChange={(e) => setRunner(e.target.value as typeof runner)}
+            Smoke
+          </Btn>
+          <Btn
+            disabled={!healthy}
+            title={!healthy ? "Start a model first" : undefined}
+            onClick={async () => {
+              setErr(null);
+              try {
+                const { job_id } = await api.benchPerf({ intent, kind: runner, runner });
+                track(job_id);
+              } catch (e) {
+                setErr(e instanceof Error ? e.message : String(e));
+              }
+            }}
           >
-            <option value="workflow">workflow (realistic multi-turn)</option>
-            <option value="prefill">prefill / decode</option>
-            <option value="concurrency">concurrency sweep</option>
-          </select>
-        </Field>
-      </div>
-      {err && (
-        <Callout tone="danger" title="Perf action failed" onDismiss={() => setErr(null)}>
-          {err}
-        </Callout>
-      )}
-      {smokeResult && (
-        <pre className="rounded border border-lab-border bg-lab-editor p-2 text-[11px] whitespace-pre-wrap">
-          {smokeResult}
-        </pre>
-      )}
-      <div className="flex flex-wrap gap-2">
-        <Btn
-          disabled={!healthy}
-          title={!healthy ? "Start a model first" : undefined}
-          onClick={async () => {
-            setErr(null);
-            try {
-              const r = await api.smoke();
-              setSmokeResult(JSON.stringify(r, null, 2));
-            } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
-            }
-          }}
-        >
-          Smoke
-        </Btn>
-        <Btn
-          disabled={!healthy}
-          title={!healthy ? "Start a model first" : undefined}
-          onClick={async () => {
-            setErr(null);
-            try {
-              const { job_id } = await api.benchPerf({ intent, kind: runner, runner });
-              track(job_id);
-            } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
-            }
-          }}
-        >
-          Run {runner} perf
-        </Btn>
+            Run {runner} perf
+          </Btn>
+          {!healthy && (
+            <span className="text-[11px] text-lab-muted">
+              Disarmed — no healthy endpoint to bench.
+            </span>
+          )}
+        </div>
       </div>
     </Panel>
   );
@@ -1186,116 +1604,150 @@ function AgenticTab({
 
   return (
     <div className="space-y-4">
-      <Panel className="space-y-3 p-4">
-        <h2 className="text-sm font-semibold tracking-[-0.01em]">Golden tools</h2>
-        <p className="text-[12px] leading-relaxed text-lab-muted">
-          Fast 12-case smoke: does the model pick the right tool (or none)? Needs{" "}
-          <code className="font-mono text-[11px] text-lab-text-dim">--enable-auto-tool-choice</code>{" "}
-          + tool-call parser on serve. Logs in the Job panel below.
-        </p>
-        {!healthy && (
-          <Callout tone="warn" title="Endpoint down">
-            Start a model on Serve first. Agentic benches need a healthy OpenAI-compatible endpoint.
-          </Callout>
-        )}
-        {err && (
-          <Callout tone="danger" title="Agentic action failed" onDismiss={() => setErr(null)}>
-            {err}
-          </Callout>
-        )}
-        <Btn
-          onClick={async () => {
-            setErr(null);
-            try {
-              const { job_id } = await api.benchAgentic({ suite: "golden" });
-              track(job_id);
-            } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
+      <Panel>
+        <div className="space-y-3.5 p-4">
+          <Seq
+            n="——"
+            label="Golden tools"
+            hint="12-case tool-selection smoke"
+            action={
+              <Badge tone={healthy ? "ok" : "muted"} dot={healthy}>
+                {healthy ? "endpoint ready" : "endpoint down"}
+              </Badge>
             }
-          }}
-          disabled={!healthy}
-          title={!healthy ? "Start a model first" : undefined}
-        >
-          Run golden tools
-        </Btn>
+          />
+          <div className="animus-rule" aria-hidden />
+          <p className="text-[11px] leading-relaxed text-lab-muted">
+            Fast 12-case smoke: does the model pick the right tool (or none)? Needs{" "}
+            <code className="font-mono text-[10.5px] text-lab-text-dim">
+              --enable-auto-tool-choice
+            </code>{" "}
+            + tool-call parser on serve. Logs stream into the job dock below.
+          </p>
+          {!healthy && (
+            <Callout tone="warn" title="Endpoint down">
+              Start a model on Serve first. Agentic benches need a healthy OpenAI-compatible
+              endpoint.
+            </Callout>
+          )}
+          {err && (
+            <Callout tone="danger" title="Agentic action failed" onDismiss={() => setErr(null)}>
+              {err}
+            </Callout>
+          )}
+          <Btn
+            onClick={async () => {
+              setErr(null);
+              try {
+                const { job_id } = await api.benchAgentic({ suite: "golden" });
+                track(job_id);
+              } catch (e) {
+                setErr(e instanceof Error ? e.message : String(e));
+              }
+            }}
+            disabled={!healthy}
+            title={!healthy ? "Start a model first" : undefined}
+          >
+            Run golden tools
+          </Btn>
+        </div>
       </Panel>
 
-      <Panel className="space-y-3 p-4">
-        <div className="flex flex-wrap items-start justify-between gap-2">
-          <div>
-            <h2 className="text-sm font-semibold tracking-[-0.01em]">Tool Eval Bench</h2>
-            <p className="mt-1 max-w-xl text-[12px] leading-relaxed text-lab-muted">
-              Full tool-calling quality suite (
-              <a
-                href="https://github.com/SeraphimSerapis/tool-eval-bench"
-                target="_blank"
-                rel="noreferrer"
-                className="text-lab-accent-bright hover:underline"
-              >
-                SeraphimSerapis/tool-eval-bench
-              </a>
-              ) — selection, params, multi-step, restraint, safety, structured output. Scores 0–100
-              with safety gating.
-            </p>
-          </div>
-          <Badge tone={available ? "ok" : "warn"} dot>
-            {available
-              ? `installed${teb?.version ? ` · ${teb.version}` : ""}`
-              : "not installed"}
-          </Badge>
-        </div>
+      <Panel>
+        <div className="space-y-3.5 p-4">
+          <Seq
+            n="——"
+            label="Tool Eval Bench"
+            hint="full tool-calling quality suite"
+            action={
+              <Badge tone={available ? "ok" : "warn"} dot>
+                {available
+                  ? `installed${teb?.version ? ` · ${teb.version}` : ""}`
+                  : "not installed"}
+              </Badge>
+            }
+          />
+          <div className="animus-rule" aria-hidden />
+          <p className="max-w-xl text-[11px] leading-relaxed text-lab-muted">
+            Full tool-calling quality suite (
+            <a
+              href="https://github.com/SeraphimSerapis/tool-eval-bench"
+              target="_blank"
+              rel="noreferrer"
+              className="text-lab-accent-bright underline-offset-2 hover:underline"
+            >
+              SeraphimSerapis/tool-eval-bench
+            </a>
+            ) — selection, params, multi-step, restraint, safety, structured output. Scores 0–100
+            with safety gating.
+          </p>
 
-        {!available && (
-          <div className="rounded-[12px] border border-[rgba(255,214,10,0.22)] bg-[rgba(255,214,10,0.08)] px-3.5 py-2.5 text-[12px] text-lab-text-dim">
-            Install on spark1, then restart <code className="font-mono text-[11px]">bun run dev</code>:
-            <pre className="mt-2 overflow-x-auto rounded-[8px] bg-lab-editor p-2.5 font-mono text-[11px] text-lab-text-dim">
-              {teb?.install ||
-                "uv tool install git+https://github.com/SeraphimSerapis/tool-eval-bench.git"}
-            </pre>
-          </div>
-        )}
+          {!available && (
+            <Callout tone="warn" title="Not installed">
+              <div className="space-y-2">
+                <span>
+                  Install on spark1, then restart{" "}
+                  <code className="font-mono text-[10.5px]">bun run dev</code>:
+                </span>
+                <pre className="overflow-x-auto rounded-[2px] border border-l-2 border-lab-border border-l-lab-warn bg-lab-editor p-2.5 font-mono text-[11px] text-lab-text-dim">
+                  {teb?.install ||
+                    "uv tool install git+https://github.com/SeraphimSerapis/tool-eval-bench.git"}
+                </pre>
+              </div>
+            </Callout>
+          )}
 
-        {available && (
-          <>
-            <SegmentedControl
-              ariaLabel="tool-eval-bench preset"
-              value={preset}
-              onChange={setPreset}
-              options={[
-                { id: "short", label: "Short (15)" },
-                { id: "full", label: "Full (69)" },
-                { id: "hardmode", label: "Hard mode" },
-                { id: "coding", label: "Coding cats" },
-              ]}
-            />
-            <p className="text-[11px] text-lab-muted">
-              Runs with <code className="font-mono">--no-think</code> against the live OpenAI-compatible
-              endpoint. Short ≈ minutes; full suite can take much longer on 27B.
-            </p>
-            <div className="flex flex-wrap gap-2">
-              <Btn
-                onClick={async () => {
-                  setErr(null);
-                  try {
-                    const { job_id } = await api.benchAgentic({
-                      suite: "tool_eval",
-                      preset,
-                    });
-                    track(job_id);
-                  } catch (e) {
-                    setErr(e instanceof Error ? e.message : String(e));
+          {available && (
+            <>
+              <SegmentedControl
+                ariaLabel="tool-eval-bench preset"
+                value={preset}
+                onChange={setPreset}
+                options={[
+                  { id: "short", label: "Short (15)" },
+                  { id: "full", label: "Full (69)" },
+                  { id: "hardmode", label: "Hard mode" },
+                  { id: "coding", label: "Coding cats" },
+                ]}
+              />
+              <p className="text-[11px] leading-relaxed text-lab-muted">
+                Runs with <code className="font-mono text-[10.5px]">--no-think</code> against the
+                live OpenAI-compatible endpoint. Short ≈ minutes; full suite can take much longer
+                on 27B.
+              </p>
+              <div className="animus-rule" aria-hidden />
+              <div className="flex flex-wrap items-center gap-2">
+                <Btn
+                  onClick={async () => {
+                    setErr(null);
+                    try {
+                      const { job_id } = await api.benchAgentic({
+                        suite: "tool_eval",
+                        preset,
+                      });
+                      track(job_id);
+                    } catch (e) {
+                      setErr(e instanceof Error ? e.message : String(e));
+                    }
+                  }}
+                  disabled={!healthy || !available}
+                  title={
+                    !healthy
+                      ? "Start a model first"
+                      : !available
+                        ? "Install tool-eval-bench on spark1 first"
+                        : undefined
                   }
-                }}
-                disabled={!healthy || !available}
-              >
-                Run tool-eval-bench ({preset})
-              </Btn>
-              <a href="/evals/tool" className={btnClass("secondary", "md")}>
-                Open results board →
-              </a>
-            </div>
-          </>
-        )}
+                >
+                  Run tool-eval-bench ({preset})
+                </Btn>
+                <a href="/evals/tool" className={btnClass("secondary", "md")}>
+                  Open results board →
+                </a>
+              </div>
+            </>
+          )}
+        </div>
       </Panel>
     </div>
   );
@@ -1327,15 +1779,24 @@ function HistoryTab() {
   }, []);
 
   return (
-    <Panel
-      title="Run history"
-      action={
-        <Btn size="sm" variant="secondary" loading={refreshing} onClick={() => load()}>
-          Refresh
-        </Btn>
-      }
-    >
-      <div className="space-y-3 p-2">
+    <Panel>
+      <div className="space-y-3.5 p-4">
+        <Seq
+          n="——"
+          label="Run history"
+          hint="runs recorded on this box"
+          action={
+            <>
+              <span className="font-mono text-[11px] tabular-nums text-lab-muted">
+                {loading ? "——" : runs.length}
+              </span>
+              <Btn size="sm" variant="secondary" loading={refreshing} onClick={() => load()}>
+                Refresh
+              </Btn>
+            </>
+          }
+        />
+        <div className="animus-rule" aria-hidden />
         {err && (
           <Callout tone="danger" title="Couldn’t load runs" onDismiss={() => setErr(null)}>
             {err}
@@ -1370,7 +1831,7 @@ function HistoryTab() {
                     r.kind === "agentic_tool_eval" || String(r.kind || "").includes("tool");
                   return (
                     <tr key={r.run_id}>
-                      <td className="font-mono text-[11px]">
+                      <td className="font-mono text-[11px] tabular-nums">
                         {isTool ? (
                           <a
                             href={`/evals/tool/${r.run_id}`}
@@ -1383,18 +1844,22 @@ function HistoryTab() {
                         )}
                       </td>
                       <td className="font-mono text-[11px] text-lab-muted">{r.kind}</td>
-                      <td>{r.intent || "—"}</td>
+                      <td>{r.intent || <Unset>Not set</Unset>}</td>
                       <td className="max-w-[200px] truncate">
-                        {r.model_id?.split("/").pop() || "—"}
+                        {r.model_id?.split("/").pop() || <Unset>Unknown</Unset>}
                       </td>
-                      <td className="text-lab-muted">{r.created_at?.slice(0, 19) || "—"}</td>
+                      <td className="font-mono text-[11px] tabular-nums text-lab-muted">
+                        {r.created_at?.slice(0, 19) || <Unset>Unknown</Unset>}
+                      </td>
                     </tr>
                   );
                 })}
               {!loading && !runs.length && (
                 <tr>
-                  <td colSpan={5} className="py-6 text-center text-[12px] text-lab-muted">
-                    No runs yet — smoke or perf when the endpoint is healthy.
+                  <td colSpan={5} className="!p-0">
+                    <EmptyState title="No runs">
+                      Smoke or perf when the endpoint is healthy — results land here.
+                    </EmptyState>
                   </td>
                 </tr>
               )}

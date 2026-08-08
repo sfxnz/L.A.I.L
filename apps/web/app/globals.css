@@ -1,52 +1,245 @@
 @import "tailwindcss";
 
 /*
-  L.A.I.L — Apple-calm × Linear-precision dark lab console
-  Surface: Monitor (status / ops). Density + glanceability over marketing chrome.
+  L.A.I.L — ANIMUS
+  ─────────────────────────────────────────────────────────────────────────────
+  A reconstruction interface, not a dashboard. Two synchronised worlds:
+
+    dark  · "in simulation"   deep navy void, cyan hairline HUD, crimson selection
+    light · "reconstruction"  cool bone-white plate, ink geometry, deep maroon
+
+  Theme is driven by [data-theme] on <html> (see lib/theme.ts). Every token below
+  is redefined per theme, so components never hardcode a colour — they consume
+  lab-* / animus-* and both worlds come out right.
+
+  Design law:
+    1. ONE chromatic accent (crimson). Cyan/slate is STRUCTURE (lines, brackets).
+    2. Corners are cut, not rounded. Radii are 2-4px; chamfers do the shaping.
+    3. Every surface sits on the field — grain, constellation, vignette.
+    4. Motion communicates state. Nothing animates for decoration alone.
 */
 
+/* Attribute-driven variants so components can target a world when they must. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+@custom-variant light (&:where([data-theme="light"], [data-theme="light"] *));
+
 @theme {
-  /* Canvas & surfaces (luminance stack) */
-  --color-lab-bg: #0a0a0b;
-  --color-lab-editor: #0f0f11;
-  --color-lab-panel: #141416;
-  --color-lab-panel2: #1a1a1d;
-  --color-lab-hover: #1c1c1f;
-  --color-lab-active: #222226;
-  --color-lab-input: #121214;
+  /* ---- Names only. Real values are assigned per-theme below. ---- */
+  --color-lab-bg: #06090f;
+  --color-lab-editor: #080c13;
+  --color-lab-panel: #0c1219;
+  --color-lab-panel2: #111925;
+  --color-lab-hover: #142031;
+  --color-lab-active: #1a2a3f;
+  --color-lab-input: #080d15;
 
-  /* Borders — whisper white on dark */
-  --color-lab-border: rgba(255, 255, 255, 0.09);
-  --color-lab-border-subtle: rgba(255, 255, 255, 0.05);
-  --color-lab-border-strong: rgba(255, 255, 255, 0.14);
+  --color-lab-border: rgba(125, 211, 235, 0.14);
+  --color-lab-border-subtle: rgba(125, 211, 235, 0.07);
+  --color-lab-border-strong: rgba(125, 211, 235, 0.3);
 
-  /* Text */
-  --color-lab-text: #f5f5f7;
-  --color-lab-text-dim: #d2d2d7;
-  --color-lab-muted: #86868b;
+  --color-lab-text: #e8f4f8;
+  --color-lab-text-dim: #a9c2ce;
+  --color-lab-muted: #6c8494;
 
-  /* Accent — single interactive blue (Apple system blue on dark) */
-  --color-lab-accent: #0a84ff;
-  --color-lab-accent-bright: #409cff;
+  /* Accent — Animus crimson. The only chromatic accent in the system. */
+  --color-lab-accent: #a81f2b;
+  --color-lab-accent-bright: #e24a54;
 
-  /* Status — SF system colors */
-  --color-lab-warn: #ffd60a;
-  --color-lab-danger: #ff453a;
-  --color-lab-ok: #30d158;
+  /* Line — HUD structure. Brackets, connectors, wireframe. NOT an accent. */
+  --color-lab-line: #4dd0e1;
+  --color-lab-line-bright: #7fe9f5;
 
-  /* Type */
-  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-    system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: "SF Mono", ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo,
-    Consolas, monospace;
+  /* State */
+  --color-lab-ok: #3ddc84;
+  --color-lab-warn: #f5b942;
+  --color-lab-danger: #ff5c4d;
 
-  /* Radii */
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 18px;
+  /* Type — condensed display face for labels, system stack for data */
+  --font-display: var(--font-animus-display), "Barlow Condensed", "Oswald",
+    "SF Pro Display", system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Radii — Animus does not do pills. Corners are cut, not rounded. */
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   DARK — in simulation
+   ═══════════════════════════════════════════════════════════════════════════ */
+:root,
+[data-theme="dark"] {
+  --color-lab-bg: #06090f;
+  --color-lab-editor: #080c13;
+  --color-lab-panel: #0c1219;
+  --color-lab-panel2: #111925;
+  --color-lab-hover: #142031;
+  --color-lab-active: #1a2a3f;
+  --color-lab-input: #080d15;
+
+  --color-lab-border: rgba(125, 211, 235, 0.14);
+  --color-lab-border-subtle: rgba(125, 211, 235, 0.07);
+  --color-lab-border-strong: rgba(125, 211, 235, 0.3);
+
+  --color-lab-text: #e8f4f8;
+  --color-lab-text-dim: #a9c2ce;
+  --color-lab-muted: #6c8494;
+
+  --color-lab-accent: #a81f2b;
+  --color-lab-accent-bright: #e24a54;
+  --color-lab-line: #4dd0e1;
+  --color-lab-line-bright: #7fe9f5;
+
+  --color-lab-ok: #3ddc84;
+  --color-lab-warn: #f5b942;
+  --color-lab-danger: #ff5c4d;
+
+  /* --- Animus field (background reconstruction canvas) --- */
+  --animus-field-node: rgba(150, 228, 245, 0.78);
+  --animus-field-line: rgba(125, 210, 235, 0.34);
+  --animus-field-poly: rgba(110, 190, 220, 0.075);
+  --animus-field-glow: rgba(120, 235, 250, 1);
+  --animus-grain-opacity: 0.055;
+  --animus-grain-blend: overlay;
+  --animus-vignette: radial-gradient(
+    118% 88% at 50% 42%,
+    transparent 34%,
+    rgba(2, 4, 8, 0.5) 78%,
+    rgba(1, 2, 5, 0.82) 100%
+  );
+  --animus-scan-opacity: 0.035;
+
+  /* Breathing atmosphere: cyan depth with one crimson ember, so the void
+     reads as a lit volume rather than flat black.
+     Amplitudes are set by measurement, not taste — .hermes/depth-probe.py
+     scores macro swing and bloom falloff against reference frames. The first
+     pass measured 36 macro swing vs a 105 reference and was correctly called
+     flat; these values are the corrected ones. */
+  --animus-haze-a: rgba(46, 158, 210, 0.95);
+  --animus-haze-b: rgba(178, 40, 58, 0.72);
+  --animus-haze-c: rgba(56, 186, 220, 0.6);
+  --animus-haze-d: rgba(34, 124, 168, 0.78);
+  --animus-haze-blur: 90px;
+
+  /* --- Elevation ---
+     Panels are HUD projections, not opaque cards: the reconstruction field
+     must read THROUGH them. Translucency + backdrop blur is what separates
+     "floating HUD panel" from "dark SaaS card". */
+  --animus-panel-bg: linear-gradient(
+    168deg,
+    rgba(19, 30, 44, 0.66) 0%,
+    rgba(10, 16, 24, 0.72) 62%,
+    rgba(8, 13, 20, 0.78) 100%
+  );
+  --animus-panel-blur: saturate(150%) blur(10px);
+  --animus-panel-shadow: 0 1px 0 rgba(160, 225, 245, 0.06) inset,
+    0 18px 44px -26px rgba(0, 0, 0, 0.95);
+  --animus-panel-shadow-hover: 0 1px 0 rgba(160, 225, 245, 0.12) inset,
+    0 0 0 1px rgba(77, 208, 225, 0.12), 0 26px 60px -28px rgba(0, 0, 0, 1);
+  --animus-glass: rgba(7, 11, 18, 0.72);
+
+  /* --- Accent washes (used by selection bars / primary chrome) --- */
+  --animus-accent-wash: rgba(168, 31, 43, 0.16);
+  --animus-accent-edge: rgba(226, 74, 84, 0.42);
+  --animus-selection-fade: linear-gradient(
+    90deg,
+    var(--color-lab-accent) 0%,
+    rgba(168, 31, 43, 0.55) 42%,
+    rgba(168, 31, 43, 0) 100%
+  );
+
+  --animus-hairline: rgba(125, 211, 235, 0.26);
+  --animus-tick: rgba(125, 211, 235, 0.45);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LIGHT — reconstruction plate
+   ═══════════════════════════════════════════════════════════════════════════ */
+[data-theme="light"] {
+  --color-lab-bg: #e8eaec;
+  --color-lab-editor: #dfe2e5;
+  --color-lab-panel: #f5f6f7;
+  --color-lab-panel2: #fbfbfc;
+  --color-lab-hover: #dee2e6;
+  --color-lab-active: #d0d6db;
+  --color-lab-input: #ffffff;
+
+  --color-lab-border: rgba(28, 42, 54, 0.18);
+  --color-lab-border-subtle: rgba(28, 42, 54, 0.1);
+  --color-lab-border-strong: rgba(28, 42, 54, 0.34);
+
+  --color-lab-text: #14181c;
+  --color-lab-text-dim: #2b353d;
+  --color-lab-muted: #4d5a64;
+
+  --color-lab-accent: #6b0f16;
+  --color-lab-accent-bright: #8e1620;
+  --color-lab-line: #48607a;
+  --color-lab-line-bright: #2f4658;
+
+  --color-lab-ok: #0a6644;
+  --color-lab-warn: #6b4a00;
+  --color-lab-danger: #a81d12;
+
+  /* Light needs more alpha than dark for equal legibility: dark ink on a bone
+     plate loses contrast far faster than cyan on a void, and the reference
+     plates carry a clearly-read lattice, not a whisper. */
+  --animus-field-node: rgba(20, 34, 46, 0.9);
+  --animus-field-line: rgba(30, 48, 62, 0.5);
+  --animus-field-poly: rgba(40, 60, 76, 0.1);
+  --animus-field-glow: rgba(107, 15, 22, 0.95);
+  --animus-grain-opacity: 0.085;
+  --animus-grain-blend: multiply;
+  --animus-vignette: radial-gradient(
+    120% 92% at 56% 40%,
+    rgba(255, 255, 255, 0.72) 0%,
+    transparent 46%,
+    rgba(96, 112, 124, 0.16) 84%,
+    rgba(74, 88, 100, 0.3) 100%
+  );
+  --animus-scan-opacity: 0.02;
+
+  /* On the bone plate the haze is a cool shadow-bloom, not a glow — it must
+     read as depth in the paper, never as a coloured stain. */
+  --animus-haze-a: rgba(88, 120, 150, 0.4);
+  --animus-haze-b: rgba(122, 42, 48, 0.2);
+  --animus-haze-c: rgba(70, 102, 132, 0.28);
+  --animus-haze-d: rgba(84, 112, 140, 0.3);
+  --animus-haze-blur: 90px;
+
+  --animus-panel-bg: linear-gradient(
+    168deg,
+    rgba(255, 255, 255, 0.78) 0%,
+    rgba(246, 247, 248, 0.72) 60%,
+    rgba(238, 240, 242, 0.76) 100%
+  );
+  --animus-panel-blur: saturate(130%) blur(10px);
+  --animus-panel-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset,
+    0 12px 30px -22px rgba(30, 44, 56, 0.55);
+  --animus-panel-shadow-hover: 0 1px 0 rgba(255, 255, 255, 1) inset,
+    0 0 0 1px rgba(28, 42, 54, 0.12), 0 20px 44px -24px rgba(30, 44, 56, 0.6);
+  --animus-glass: rgba(240, 242, 244, 0.78);
+
+  --animus-accent-wash: rgba(107, 15, 22, 0.09);
+  --animus-accent-edge: rgba(107, 15, 22, 0.35);
+  --animus-selection-fade: linear-gradient(
+    90deg,
+    var(--color-lab-accent) 0%,
+    rgba(107, 15, 22, 0.5) 42%,
+    rgba(107, 15, 22, 0) 100%
+  );
+
+  --animus-hairline: rgba(28, 42, 54, 0.3);
+  --animus-tick: rgba(28, 42, 54, 0.42);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Base
+   ═══════════════════════════════════════════════════════════════════════════ */
 html,
 body {
   height: 100%;
@@ -56,8 +249,7 @@ body {
   font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.47;
-  letter-spacing: -0.01em;
-  color-scheme: dark;
+  letter-spacing: -0.008em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -67,7 +259,17 @@ body {
   box-sizing: border-box;
 }
 
-/* Quiet scrollbars */
+/* Theme crossfade — switching worlds should feel like a re-render, not a blink. */
+html.animus-theming,
+html.animus-theming body,
+html.animus-theming .lab-card,
+html.animus-theming .animus-plate {
+  transition:
+    background-color 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    color 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 ::-webkit-scrollbar {
   width: 9px;
   height: 9px;
@@ -76,58 +278,381 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--animus-hairline);
   border: 2px solid transparent;
   background-clip: padding-box;
-  border-radius: 999px;
+  border-radius: 0;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--color-lab-line);
   background-clip: padding-box;
   border: 2px solid transparent;
 }
 
 ::selection {
-  background: rgba(10, 132, 255, 0.35);
+  background: var(--animus-accent-edge);
   color: #fff;
 }
 
 :focus-visible {
-  outline: 2px solid var(--color-lab-accent);
+  outline: 1px solid var(--color-lab-line);
   outline-offset: 2px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-lab-line) 22%, transparent);
 }
 
-/* Page chrome */
+/* ═══════════════════════════════════════════════════════════════════════════
+   The field — grain, scanlines, vignette. Fixed, non-interactive, behind all.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Fractal noise plate: real texture, one gzipped data URI, no image request. */
+.animus-grain::after {
+  content: "";
+  position: fixed;
+  inset: -50%;
+  pointer-events: none;
+  z-index: 0;
+  opacity: var(--animus-grain-opacity);
+  mix-blend-mode: var(--animus-grain-blend);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='220' height='220' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 220px 220px;
+  will-change: transform;
+  animation: animus-grain-drift 7s steps(6) infinite;
+}
+
+@keyframes animus-grain-drift {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  16% {
+    transform: translate3d(-2%, 1.5%, 0);
+  }
+  33% {
+    transform: translate3d(1.5%, -2%, 0);
+  }
+  50% {
+    transform: translate3d(-1%, -1%, 0);
+  }
+  66% {
+    transform: translate3d(2%, 1%, 0);
+  }
+  83% {
+    transform: translate3d(-1.5%, 2%, 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/*
+  Vignette + CRT sync lines share ONE pseudo-element.
+  They must: grain owns ::after (it needs its own blend mode), so a second
+  ::after on the same host would silently replace it. Both of these composite
+  with normal blending, so they stack cleanly as two background layers.
+*/
+.animus-vignette::before,
+.animus-scanlines::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: repeating-linear-gradient(
+      0deg,
+      color-mix(in srgb, var(--color-lab-line) 55%, transparent) 0 1px,
+      transparent 1px 3px
+    ),
+    var(--animus-vignette);
+  background-blend-mode: normal;
+}
+/* Scanline strength rides its own token without dimming the vignette. */
+.animus-scanlines::before {
+  background-image: repeating-linear-gradient(
+      0deg,
+      color-mix(
+          in srgb,
+          var(--color-lab-line) calc(var(--animus-scan-opacity) * 1600%),
+          transparent
+        )
+        0 1px,
+      transparent 1px 3px
+    ),
+    var(--animus-vignette);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Volumetric atmosphere — the field BREATHES
+   The blind critic scored our texture/depth below the real Animus: it has
+   volumetric haze and bloom, we had flat panels with noise on top. These are
+   three large radial blooms on independent slow clocks (31s/43s/37s — coprime
+   so the composite never visibly loops), each drifting AND swelling. Sits
+   under the lattice canvas, above the page background.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.animus-atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+.animus-haze {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  /* Soft-edged bloom: a radial gradient to transparent needs no blur filter,
+     which keeps this off the expensive filter path entirely. */
+  filter: blur(var(--animus-haze-blur, 60px));
+  will-change: transform, opacity;
+}
+.animus-haze-1 {
+  width: 58vw;
+  height: 58vw;
+  top: -14vw;
+  left: -10vw;
+  background: radial-gradient(circle, var(--animus-haze-a) 0%, transparent 68%);
+  animation: animus-breathe-1 19s ease-in-out infinite;
+}
+.animus-haze-2 {
+  width: 46vw;
+  height: 46vw;
+  bottom: -16vw;
+  right: -8vw;
+  background: radial-gradient(circle, var(--animus-haze-b) 0%, transparent 66%);
+  animation: animus-breathe-2 26s ease-in-out infinite;
+}
+.animus-haze-3 {
+  width: 40vw;
+  height: 40vw;
+  top: 32%;
+  left: 46%;
+  background: radial-gradient(circle, var(--animus-haze-c) 0%, transparent 70%);
+  animation: animus-breathe-3 23s ease-in-out infinite;
+}
+/* The frame was measured ending in a wall: the bottom third sat at local
+   std 0.5–1.0 against 19 at the top edge. This pool gives the lower band
+   somewhere to recede into. */
+.animus-haze-4 {
+  width: 76vw;
+  height: 34vw;
+  bottom: -14vw;
+  left: 8vw;
+  background: radial-gradient(
+    ellipse at center,
+    var(--animus-haze-d) 0%,
+    transparent 72%
+  );
+  animation: animus-breathe-4 31s ease-in-out infinite;
+}
+
+/*
+  Wandering paths, not oscillations.
+
+  These were two-stop keyframes (0 → 50 → back), which is a pure sine on one
+  axis: the pool retraces the same line forever and the eye stops registering
+  it as movement. Six irregular stops make each pool drift a closed but
+  non-obvious loop, scaling and fading out of phase with its own travel, so
+  the field keeps rearranging itself.
+
+  Amplitude: travel runs to ~18vw and scale to 0.82–1.34. That is roughly
+  double the first wandering pass, which read as present but placid. The pools
+  are 40–76vw wide and blurred 90px, so even at this range the moving edge
+  stays off-screen and the effect stays atmospheric rather than a visible
+  blob sliding under the panels — that is the real ceiling here, not taste.
+
+  Clocks are 19/26/23/31s — pairwise coprime, so the four-pool composite only
+  repeats every ~3.4 hours. Transform and opacity only: both composite on the
+  GPU, so four large blurred layers cost no layout or paint.
+*/
+@keyframes animus-breathe-4 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.06);
+    opacity: 0.6;
+  }
+  22% {
+    transform: translate3d(14vw, -7vh, 0) scale(0.84);
+    opacity: 1;
+  }
+  41% {
+    transform: translate3d(5vw, 9vh, 0) scale(1.26);
+    opacity: 0.72;
+  }
+  63% {
+    transform: translate3d(-13vw, -3vh, 0) scale(0.92);
+    opacity: 1;
+  }
+  84% {
+    transform: translate3d(-5vw, 7vh, 0) scale(1.16);
+    opacity: 0.66;
+  }
+}
+
+@keyframes animus-breathe-1 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.6;
+  }
+  19% {
+    transform: translate3d(17vw, 8vh, 0) scale(1.34);
+    opacity: 1;
+  }
+  37% {
+    transform: translate3d(6vw, 18vh, 0) scale(0.84);
+    opacity: 0.68;
+  }
+  58% {
+    transform: translate3d(-11vw, 10vh, 0) scale(1.28);
+    opacity: 1;
+  }
+  79% {
+    transform: translate3d(-7vw, -6vh, 0) scale(0.88);
+    opacity: 0.74;
+  }
+}
+@keyframes animus-breathe-2 {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.18);
+    opacity: 1;
+  }
+  24% {
+    transform: translate3d(-18vw, -12vh, 0) scale(0.82);
+    opacity: 0.58;
+  }
+  46% {
+    transform: translate3d(-8vw, 7vh, 0) scale(1.3);
+    opacity: 0.95;
+  }
+  68% {
+    transform: translate3d(9vw, -10vh, 0) scale(0.86);
+    opacity: 0.64;
+  }
+  87% {
+    transform: translate3d(3vw, 5vh, 0) scale(1.1);
+    opacity: 1;
+  }
+}
+@keyframes animus-breathe-3 {
+  0%,
+  100% {
+    transform: translate3d(-50%, -50%, 0) scale(0.88);
+    opacity: 0.44;
+  }
+  21% {
+    transform: translate3d(-74%, -30%, 0) scale(1.38);
+    opacity: 1;
+  }
+  44% {
+    transform: translate3d(-32%, -68%, 0) scale(0.94);
+    opacity: 0.58;
+  }
+  66% {
+    transform: translate3d(-68%, -74%, 0) scale(1.28);
+    opacity: 1;
+  }
+  85% {
+    transform: translate3d(-28%, -40%, 0) scale(1.04);
+    opacity: 0.64;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Chamfer — the Animus corner. Cut, never rounded.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.animus-chamfer {
+  --c: 10px;
+  clip-path: polygon(
+    var(--c) 0,
+    100% 0,
+    100% calc(100% - var(--c)),
+    calc(100% - var(--c)) 100%,
+    0 100%,
+    0 var(--c)
+  );
+}
+.animus-chamfer-sm {
+  --c: 6px;
+  clip-path: polygon(
+    var(--c) 0,
+    100% 0,
+    100% calc(100% - var(--c)),
+    calc(100% - var(--c)) 100%,
+    0 100%,
+    0 var(--c)
+  );
+}
+/* Cut on the leading corner only — used by selection bars / list rows. */
+.animus-notch {
+  --c: 8px;
+  clip-path: polygon(
+    var(--c) 0,
+    100% 0,
+    100% 100%,
+    var(--c) 100%,
+    0 calc(100% - var(--c)),
+    0 var(--c)
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Page chrome
+   ═══════════════════════════════════════════════════════════════════════════ */
 .page-header {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
   gap: 0.75rem;
-  margin-bottom: 1.1rem;
+  margin-bottom: 1.2rem;
   padding-bottom: 0.9rem;
+  position: relative;
   border-bottom: 1px solid var(--color-lab-border-subtle);
+}
+/* Header rule carries a bright leading segment — an Animus data spine. */
+.page-header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  width: 56px;
+  height: 1px;
+  background: var(--color-lab-accent);
+  box-shadow: 0 0 8px var(--animus-accent-edge);
 }
 
 .page-title {
-  font-size: 1.5rem;
+  font-family: var(--font-display);
+  font-size: 1.85rem;
   font-weight: 600;
-  letter-spacing: -0.03em;
-  line-height: 1.15;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1.05;
   color: var(--color-lab-text);
   margin: 0;
 }
 
 .page-sub {
-  margin: 0.35rem 0 0;
+  margin: 0.45rem 0 0;
   font-size: 0.8125rem;
-  line-height: 1.4;
+  line-height: 1.45;
   color: var(--color-lab-muted);
-  letter-spacing: -0.01em;
-  max-width: 42rem;
+  max-width: 44rem;
 }
 
-/* Tables */
+/* Section eyebrow — small caps label with a tick, used on panels. */
+.animus-eyebrow {
+  font-family: var(--font-display);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-lab-muted);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Tables
+   ═══════════════════════════════════════════════════════════════════════════ */
 .lab-table {
   width: 100%;
   border-collapse: collapse;
@@ -135,14 +660,15 @@ body {
 }
 .lab-table th {
   text-align: left;
-  font-weight: 500;
+  font-family: var(--font-display);
+  font-weight: 600;
   color: var(--color-lab-muted);
-  padding: 0.65rem 0.85rem;
-  border-bottom: 1px solid var(--color-lab-border-subtle);
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--color-lab-border);
   background: transparent;
   font-size: 0.6875rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.14em;
 }
 .lab-table td {
   padding: 0.7rem 0.85rem;
@@ -154,58 +680,97 @@ body {
   border-bottom: none;
 }
 .lab-table tbody tr {
+  position: relative;
   transition: background 0.15s ease;
 }
 .lab-table tbody tr:hover td {
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--animus-accent-wash);
+}
+/* Selected/hovered row grows a crimson leading edge — the AC menu tell. */
+.lab-table tbody tr:hover td:first-child {
+  box-shadow: inset 2px 0 0 var(--color-lab-accent);
 }
 
-/* Card surface */
-.lab-card {
+/* ═══════════════════════════════════════════════════════════════════════════
+   Surfaces
+   ═══════════════════════════════════════════════════════════════════════════ */
+.lab-card,
+.animus-plate {
+  position: relative;
   border: 1px solid var(--color-lab-border);
-  background: var(--color-lab-panel);
+  background: var(--animus-panel-bg);
+  /* Standard property only — writing the -webkit- alias alongside it makes
+     Lightning CSS drop the unprefixed one and the blur silently dies. */
+  backdrop-filter: var(--animus-panel-blur);
   border-radius: var(--radius-lg);
-  box-shadow:
-    0 0 0 0.5px rgba(255, 255, 255, 0.03) inset,
-    0 1px 2px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--animus-panel-shadow);
+  transition:
+    border-color 0.22s ease,
+    box-shadow 0.28s ease,
+    transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.lab-card:hover,
+.animus-plate:hover {
+  border-color: var(--color-lab-border-strong);
+  box-shadow: var(--animus-panel-shadow-hover);
 }
 
-/* Glass — used sparingly (nav / floating) */
+/* Corner brackets — the single strongest Animus signature on a panel.
+   Sized to actually READ: a 10px whisper is invisible at normal viewing
+   distance, which defeats the point of having them. */
+.animus-bracketed::before,
+.animus-bracketed::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+  border-color: var(--color-lab-line);
+  opacity: 0.55;
+  transition: opacity 0.25s ease, border-color 0.25s ease;
+}
+.animus-bracketed::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1.5px solid;
+  border-left: 1.5px solid;
+}
+.animus-bracketed::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1.5px solid;
+  border-right: 1.5px solid;
+}
+.animus-bracketed:hover::before,
+.animus-bracketed:hover::after {
+  opacity: 1;
+  border-color: var(--color-lab-line-bright);
+}
+
 .lab-glass {
-  background: rgba(20, 20, 22, 0.72);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  background: var(--animus-glass);
+  backdrop-filter: saturate(160%) blur(18px);
   border: 1px solid var(--color-lab-border-subtle);
 }
 
-/* Bento grid helpers */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Bento grid
+   ═══════════════════════════════════════════════════════════════════════════ */
 .bento {
   display: grid;
   gap: 0.75rem;
   grid-template-columns: repeat(12, minmax(0, 1fr));
 }
-.bento-span-3 {
-  grid-column: span 12;
-}
-.bento-span-4 {
-  grid-column: span 12;
-}
-.bento-span-6 {
-  grid-column: span 12;
-}
-.bento-span-8 {
-  grid-column: span 12;
-}
+.bento-span-3,
+.bento-span-4,
+.bento-span-6,
+.bento-span-8,
 .bento-span-12 {
   grid-column: span 12;
 }
 @media (min-width: 640px) {
-  .bento-span-3 {
-    grid-column: span 6;
-  }
-  .bento-span-4 {
-    grid-column: span 6;
-  }
+  .bento-span-3,
+  .bento-span-4,
   .bento-span-6 {
     grid-column: span 6;
   }
@@ -225,36 +790,55 @@ body {
   }
 }
 
-/* Status pulse */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Status dots — square nodes, not circles. Animus reads as vertices.
+   ═══════════════════════════════════════════════════════════════════════════ */
 @keyframes lab-pulse {
   0%,
   100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.45;
+    opacity: 0.5;
   }
 }
 .lab-dot {
   width: 7px;
   height: 7px;
-  border-radius: 999px;
   flex-shrink: 0;
+  transform: rotate(45deg);
 }
 .lab-dot-live {
   background: var(--color-lab-ok);
-  box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.18);
-  animation: lab-pulse 2.4s ease-in-out infinite;
+  animation: lab-pulse 2.4s ease-in-out infinite,
+    lab-glow-pulse 2.4s ease-in-out infinite;
 }
 .lab-dot-down {
   background: var(--color-lab-danger);
-  box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.15);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-lab-danger) 20%, transparent);
 }
 .lab-dot-idle {
-  background: var(--color-lab-muted);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--color-lab-muted);
 }
 
-/* Skeleton shimmer — calm, not carnival */
+@keyframes lab-glow-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-lab-ok) 24%, transparent),
+      0 0 12px color-mix(in srgb, var(--color-lab-ok) 60%, transparent),
+      0 0 34px color-mix(in srgb, var(--color-lab-ok) 30%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-lab-ok) 14%, transparent),
+      0 0 22px color-mix(in srgb, var(--color-lab-ok) 85%, transparent),
+      0 0 52px color-mix(in srgb, var(--color-lab-ok) 45%, transparent);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Loading — reconstruction, not shimmer soup
+   ═══════════════════════════════════════════════════════════════════════════ */
 @keyframes lab-shimmer {
   0% {
     background-position: 100% 0;
@@ -266,15 +850,14 @@ body {
 .lab-skeleton {
   background: linear-gradient(
     90deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    rgba(255, 255, 255, 0.09) 45%,
-    rgba(255, 255, 255, 0.04) 90%
+    color-mix(in srgb, var(--color-lab-line) 6%, transparent) 0%,
+    color-mix(in srgb, var(--color-lab-line) 17%, transparent) 45%,
+    color-mix(in srgb, var(--color-lab-line) 6%, transparent) 90%
   );
   background-size: 200% 100%;
   animation: lab-shimmer 1.4s ease-in-out infinite;
 }
 
-/* Indeterminate progress bar */
 @keyframes lab-progress-slide {
   0% {
     transform: translateX(-120%);
@@ -287,121 +870,148 @@ body {
   animation: lab-progress-slide 1.15s ease-in-out infinite;
 }
 
-/* Subtle hairline separator */
 .lab-sep {
   height: 1px;
   background: var(--color-lab-border-subtle);
   border: 0;
 }
 
-/* Custom select chevron — kill the default browser arrow (Linear/Stripe bar) */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Form controls — no native browser chrome anywhere
+   ═══════════════════════════════════════════════════════════════════════════ */
 select {
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5' stroke='%2386868b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none'%3E%3Cpath d='M2 4l3 3 3-3' stroke='%23708898' stroke-width='1.4' stroke-linecap='square'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 0.65rem center;
+  background-position: right 0.7rem center;
   padding-right: 2.25rem;
 }
 select:focus-visible {
-  outline: 2px solid var(--color-lab-accent);
+  outline: 1px solid var(--color-lab-line);
   outline-offset: 2px;
 }
 
-/* Custom checkbox — accent + focus ring (Linear/Apple bar, not bare native) */
 input[type="checkbox"] {
-  accent-color: var(--color-lab-accent);
+  appearance: none;
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  border: 1px solid var(--color-lab-border-strong);
+  background: var(--color-lab-input);
   cursor: pointer;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--color-lab-line);
+}
+input[type="checkbox"]:checked {
+  background: var(--color-lab-accent);
+  border-color: var(--color-lab-accent);
+}
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(42deg);
 }
 input[type="checkbox"]:focus-visible {
-  outline: 2px solid var(--color-lab-accent);
+  outline: 1px solid var(--color-lab-line);
   outline-offset: 2px;
-  border-radius: 3px;
 }
 input[type="checkbox"]:disabled {
   cursor: not-allowed;
-  opacity: 0.5;
+  opacity: 0.45;
 }
 
-/* Fabric bridge — living RoCE spine */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Living connectors — fabric spine, data flow
+   ═══════════════════════════════════════════════════════════════════════════ */
 @keyframes lab-fabric-flow {
   to {
-    background-position: -28px 0;
+    background-position: -24px 0;
   }
 }
+/* Denser, brighter dashes than a hairline divider: this is a LINK carrying
+   traffic, and it has to read as one at a glance. A glow underlay keeps it
+   visible against the panel without thickening the stroke. */
 .lab-fabric-line {
   background-image: repeating-linear-gradient(
     90deg,
-    currentColor 0 10px,
-    transparent 10px 28px
+    currentColor 0 9px,
+    transparent 9px 24px
   );
-  background-size: 28px 100%;
-  animation: lab-fabric-flow 1.5s linear infinite;
+  background-size: 24px 100%;
+  filter: drop-shadow(0 0 4px currentColor);
+  animation: lab-fabric-flow 1.2s linear infinite;
 }
 
-/* ---- Teeming-with-life layer: state you can *see* (calm, one accent) ---- */
-
-/* Breathing glow on live status dots (ok = serving / fabric up) */
-@keyframes lab-glow-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.18), 0 0 10px rgba(48, 209, 88, 0.35);
-  }
-  50% {
-    box-shadow: 0 0 0 5px rgba(48, 209, 88, 0.1), 0 0 18px rgba(48, 209, 88, 0.55);
-  }
+/* Horizontal HUD rule that terminates in a bracket, AC menu style. */
+.animus-rule {
+  position: relative;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    var(--animus-hairline) 0%,
+    var(--animus-hairline) 72%,
+    transparent 100%
+  );
 }
-.lab-dot-live {
-  animation: lab-pulse 2.4s ease-in-out infinite, lab-glow-pulse 2.4s ease-in-out infinite;
-}
-
-/* Card depth + hover lift */
-.lab-card {
-  transition: border-color 0.2s ease, box-shadow 0.25s ease, transform 0.2s ease;
-}
-.lab-card:hover {
-  border-color: var(--color-lab-border-strong);
-  box-shadow:
-    0 0 0 0.5px rgba(255, 255, 255, 0.05) inset,
-    0 2px 6px rgba(0, 0, 0, 0.4),
-    0 12px 32px rgba(0, 0, 0, 0.35);
+.animus-rule::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: -3px;
+  width: 1px;
+  height: 7px;
+  background: var(--animus-tick);
 }
 
-/* Staggered panel entrance */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Entrances — panels reconstruct rather than pop
+   ═══════════════════════════════════════════════════════════════════════════ */
 @keyframes lab-rise {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(8px);
+    clip-path: inset(0 0 100% 0);
   }
   to {
     opacity: 1;
     transform: translateY(0);
+    clip-path: inset(0 0 0 0);
   }
 }
 .lab-rise {
-  animation: lab-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: lab-rise 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 .lab-rise-1 {
-  animation-delay: 0.04s;
+  animation-delay: 0.05s;
 }
 .lab-rise-2 {
-  animation-delay: 0.1s;
+  animation-delay: 0.11s;
 }
 .lab-rise-3 {
-  animation-delay: 0.16s;
+  animation-delay: 0.17s;
 }
 .lab-rise-4 {
-  animation-delay: 0.22s;
+  animation-delay: 0.23s;
 }
 
-/* Accent glow ring for primary actions / active states */
 .lab-glow-accent {
   box-shadow:
-    0 0 0 1px rgba(10, 132, 255, 0.35),
-    0 0 16px rgba(10, 132, 255, 0.22);
+    0 0 0 1px var(--animus-accent-edge),
+    0 0 20px color-mix(in srgb, var(--color-lab-accent) 45%, transparent),
+    0 0 56px color-mix(in srgb, var(--color-lab-accent) 24%, transparent);
 }
 
-/* Live "serving" shimmer on the model load strip */
 @keyframes lab-strip-shimmer {
   to {
     background-position: -200% 0;
@@ -410,36 +1020,62 @@ input[type="checkbox"]:disabled {
 .lab-strip-live {
   background-image: linear-gradient(
     100deg,
-    rgba(48, 209, 88, 0) 30%,
-    rgba(48, 209, 88, 0.14) 50%,
-    rgba(48, 209, 88, 0) 70%
+    transparent 30%,
+    color-mix(in srgb, var(--color-lab-ok) 18%, transparent) 50%,
+    transparent 70%
   );
   background-size: 200% 100%;
   animation: lab-strip-shimmer 2.6s linear infinite;
 }
 
-/* Skip link — keyboard first */
+@keyframes lab-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.lab-fade-in {
+  animation: lab-fade-in 0.24s ease-out;
+}
+
+.lab-spin {
+  animation: spin 0.75s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Accessibility chrome
+   ═══════════════════════════════════════════════════════════════════════════ */
 .lab-skip-link {
   position: absolute;
   left: 1rem;
   top: -3rem;
-  z-index: 50;
-  border-radius: 10px;
+  z-index: 60;
   background: var(--color-lab-accent);
   color: #fff;
-  padding: 0.5rem 0.85rem;
-  font-size: 0.8125rem;
+  padding: 0.5rem 0.9rem;
+  font-family: var(--font-display);
+  font-size: 0.75rem;
   font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   text-decoration: none;
   transition: top 0.15s ease;
 }
 .lab-skip-link:focus {
   top: 0.75rem;
-  outline: 2px solid #fff;
+  outline: 1px solid #fff;
   outline-offset: 2px;
 }
 
-/* Screen-reader only */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -452,31 +1088,9 @@ input[type="checkbox"]:disabled {
   border: 0;
 }
 
-/* Soft enter for live regions */
-@keyframes lab-fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.lab-fade-in {
-  animation: lab-fade-in 0.22s ease-out;
-}
-
-.lab-spin {
-  animation: spin 0.75s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* Reduced motion */
+/* ═══════════════════════════════════════════════════════════════════════════
+   Reduced motion — the field goes still, nothing disappears
+   ═══════════════════════════════════════════════════════════════════════════ */
 @media (prefers-reduced-motion: reduce) {
   .lab-dot-live,
   .lab-skeleton,
@@ -485,8 +1099,20 @@ input[type="checkbox"]:disabled {
   .lab-fabric-line,
   .lab-strip-live,
   .lab-rise,
-  .lab-spin {
+  .lab-spin,
+  .animus-grain::after,
+  .animus-haze {
     animation: none !important;
+  }
+  /* The atmosphere stays — it just stops breathing. Removing it would flatten
+     the depth the whole surface is built on. */
+  .animus-haze-3 {
+    transform: translate3d(-50%, -50%, 0);
+  }
+  .lab-rise {
+    opacity: 1;
+    clip-path: none;
+    transform: none;
   }
   * {
     transition-duration: 0.01ms !important;

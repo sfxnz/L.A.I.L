@@ -15,6 +15,8 @@ import { useLabStore } from "@/lib/store";
 import { WORKSPACE_NAV } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
 import { Badge, StatusDot } from "@/components/ui";
+import { AnimusField } from "@/components/animus/AnimusField";
+import { ThemeToggle } from "@/components/animus/ThemeToggle";
 
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   Status: LayoutDashboard,
@@ -33,6 +35,19 @@ const PAGE_TITLES: Array<{ match: (p: string) => boolean; title: string }> = [
   { match: (p) => p.startsWith("/lab"), title: "Lab" },
   { match: (p) => p.startsWith("/workbench"), title: "Workbench" },
 ];
+
+/** Hairline divider between readout cells. */
+function Tick({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]",
+        className,
+      )}
+    />
+  );
+}
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -85,30 +100,45 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }, [setModelLabel]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-lab-bg text-lab-text">
+    <div className="relative isolate flex h-full min-h-0 flex-col bg-lab-bg text-lab-text">
+      {/* Reconstruction field — z-0, behind every layer of chrome. */}
+      <AnimusField />
+
       <a href="#main" className="lab-skip-link">
         Skip to content
       </a>
 
-      <header className="sticky top-0 z-20 border-b border-lab-border-subtle bg-[rgba(10,10,11,0.78)] backdrop-blur-xl backdrop-saturate-150">
-        <div className="mx-auto flex h-14 max-w-6xl items-center gap-5 px-4 md:px-6">
+      <header className="sticky top-0 z-20 shrink-0 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-xl backdrop-saturate-150">
+        <div className="animus-bracketed relative mx-auto flex h-14 max-w-6xl items-center gap-3 px-4 md:gap-5 md:px-6">
           <Link
             href="/status"
-            className="group flex shrink-0 items-center gap-2.5 rounded-lg focus-visible:outline-offset-4"
+            className="group flex shrink-0 items-center gap-2.5 focus-visible:outline-offset-4"
           >
-            <div className="flex h-8 w-8 items-center justify-center rounded-[10px] bg-lab-text text-[13px] font-semibold tracking-tight text-lab-bg shadow-[0_1px_2px_rgba(0,0,0,0.4)] transition-transform group-hover:scale-[1.03]">
+            <span className="animus-chamfer-sm flex h-7 w-7 items-center justify-center bg-lab-accent font-[family-name:var(--font-display)] text-[14px] font-semibold leading-none text-white transition-transform duration-200 group-hover:scale-[1.04]">
               L
-            </div>
-            <div className="leading-tight">
-              <div className="text-[14px] font-semibold tracking-[-0.02em]">L.A.I.L</div>
-              <div className="text-[10px] font-medium tracking-[0.06em] text-lab-muted uppercase">
+            </span>
+            <span className="leading-none">
+              <span className="block font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tracking-[0.22em] text-lab-text md:tracking-[0.3em]">
+                L.A.I.L
+              </span>
+              <span className="mt-1 hidden font-[family-name:var(--font-display)] text-[9px] font-medium uppercase leading-none tracking-[0.26em] text-lab-muted md:block">
                 Local AI Lab
-              </div>
-            </div>
+              </span>
+            </span>
           </Link>
 
+          <Tick className="hidden h-6 md:block" />
+
           <nav
-            className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            // Navigation is primary chrome: it must NEVER be the thing that
+            // gives way. This was `min-w-0 flex-1 overflow-x-auto` against a
+            // `shrink-0` status cluster, so once a model started serving the
+            // cluster grew (controller + vLLM badge + model + memory) and the
+            // nav absorbed the entire squeeze — 343px of links crushed into
+            // 176px, silently scroll-clipping EVALS and CONFIGURE off-screen
+            // with no scrollbar to hint they existed. Secondary telemetry
+            // truncates instead; see the status cluster below.
+            className="flex shrink-0 items-center gap-1"
             aria-label="Main"
           >
             {WORKSPACE_NAV.map(({ href, label }) => {
@@ -120,33 +150,43 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   href={href}
                   aria-current={active ? "page" : undefined}
                   className={cn(
-                    "flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium tracking-[-0.01em] transition-all duration-200",
+                    "relative flex shrink-0 items-center gap-1.5 px-2.5 py-1.5 font-[family-name:var(--font-display)] text-[12px] font-semibold uppercase leading-none tracking-[0.16em] transition-colors duration-200 focus-visible:z-10 md:px-3",
                     active
-                      ? "bg-lab-active text-lab-text shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08),0_0_12px_rgba(10,132,255,0.14)]"
-                      : "text-lab-muted hover:bg-lab-hover hover:text-lab-text-dim",
+                      ? "text-lab-text"
+                      : "text-lab-muted hover:bg-[color:var(--animus-accent-wash)] hover:text-lab-text-dim",
                   )}
                 >
-                  <Icon className="h-3.5 w-3.5 shrink-0 opacity-75" strokeWidth={1.75} aria-hidden />
-                  {label}
+                  {active && (
+                    <>
+                      <span
+                        aria-hidden
+                        className="animus-notch absolute inset-0 bg-[image:var(--animus-selection-fade)] opacity-50"
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-y-0 left-0 w-[2px] bg-lab-accent"
+                      />
+                    </>
+                  )}
+                  <Icon className="relative h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden />
+                  <span className="relative">{label}</span>
                 </Link>
               );
             })}
           </nav>
 
           <div
-            className="hidden shrink-0 items-center gap-2 sm:flex"
+            // Secondary telemetry: this is the side that yields. `min-w-0`
+            // + `flex-1` lets it soak up the remaining space and truncate
+            // (its children already hide progressively at sm/lg/xl), so the
+            // nav above always renders in full.
+            className="flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
             aria-live="polite"
             aria-atomic="true"
           >
-            <div
-              className={cn(
-                "flex items-center gap-1.5 rounded-full border px-2 py-1 transition-all duration-300",
-                healthy
-                  ? "border-[rgba(48,209,88,0.28)] bg-[rgba(48,209,88,0.07)]"
-                  : "border-lab-border-subtle bg-lab-panel/80",
-              )}
-              title={probeNote}
-            >
+            <span className="sr-only">{probeNote}</span>
+
+            <span className="flex items-center gap-1.5" title={probeNote}>
               <StatusDot
                 live={healthy}
                 label={
@@ -157,55 +197,73 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                       : "Controller offline"
                 }
               />
-              <span className="text-[11px] text-lab-muted">
+              <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted lg:inline">
                 {healthy === null ? "…" : healthy ? "controller" : "offline"}
               </span>
-            </div>
-            {serveOk === null ? (
-              <Badge tone="muted">checking…</Badge>
-            ) : (
-              <span
-                className={cn(
-                  "inline-flex rounded-full transition-shadow duration-300",
-                  serveOk && "shadow-[0_0_14px_rgba(48,209,88,0.3)]",
-                )}
-              >
-                <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
-                  {serveOk ? "vLLM serving" : "idle"}
-                </Badge>
-              </span>
-            )}
+            </span>
+
+            <Tick className="hidden sm:block" />
+
+            <span className="hidden sm:inline-flex">
+              {serveOk === null ? (
+                <Badge tone="muted">checking…</Badge>
+              ) : (
+                <span
+                  className={cn(
+                    "inline-flex transition-shadow duration-300",
+                    serveOk &&
+                      "shadow-[0_0_14px_color-mix(in_srgb,var(--color-lab-ok)_32%,transparent)]",
+                  )}
+                >
+                  <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
+                    {serveOk ? "vLLM serving" : "idle"}
+                  </Badge>
+                </span>
+              )}
+            </span>
+
             {modelLabel && (
-              <span
-                className="max-w-[148px] truncate font-mono text-[11px] text-lab-muted"
-                title={modelLabel}
-              >
-                {modelLabel.split("/").pop()}
-              </span>
+              <>
+                <Tick className="hidden xl:block" />
+                <span
+                  className="hidden max-w-[128px] truncate font-mono text-[10px] tabular-nums text-lab-text-dim xl:inline"
+                  title={modelLabel}
+                >
+                  {modelLabel.split("/").pop()}
+                </span>
+              </>
             )}
+
             {avail && (
-              <span className="hidden text-[11px] tabular-nums text-lab-muted lg:inline">
-                {avail}
-              </span>
+              <>
+                <Tick className="hidden lg:block" />
+                <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.12em] tabular-nums text-lab-muted lg:inline">
+                  {avail}
+                </span>
+              </>
             )}
           </div>
+
+          <Tick className="hidden sm:block" />
+
+          <ThemeToggle />
         </div>
       </header>
 
-      <main id="main" className="min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
+      <main id="main" className="relative z-10 min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
         <div className="mx-auto max-w-6xl px-4 py-5 md:px-6 md:py-6">{children}</div>
       </main>
 
-      <footer className="border-t border-lab-border-subtle bg-lab-bg/90">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-4 py-3 text-[11px] text-lab-muted md:px-6">
-          <span className="tracking-[-0.01em]">
+      <footer className="relative z-10 shrink-0 border-t border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-md">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6">
+          <span className="font-[family-name:var(--font-display)] text-[10px] font-medium uppercase leading-none tracking-[0.18em] text-lab-muted">
             Serve · eval · Hermes builds · public on GitHub Pages
           </span>
           <a
             href="https://sfxnz.github.io/dgx-lab/"
             target="_blank"
             rel="noreferrer"
-            className="font-medium text-lab-accent-bright transition-colors hover:text-lab-accent"
+            className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-accent-bright transition-colors hover:text-lab-accent"
           >
             Public site →
           </a>

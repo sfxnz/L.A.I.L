@@ -69,6 +69,10 @@ function Unset({ children = "Awaiting" }: { children?: ReactNode }) {
  * Numbered step head. This is the page's spine: every block on Serve carries
  * one, so model → envelope → presets → flags → launch reads as a single
  * operator sequence instead of a stack of unrelated cards.
+ *
+ * `n` is decorative — sequence position, or "——" for blocks that sit off the
+ * spine. Either way a screen reader announcing "em dash em dash" is noise,
+ * so the numeral slot is hidden from the a11y tree; the label carries meaning.
  */
 function Seq({
   n,
@@ -84,7 +88,10 @@ function Seq({
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
       <div className="flex min-w-0 items-center gap-2.5">
-        <span className="font-mono text-[10px] leading-none tabular-nums text-lab-muted">
+        <span
+          aria-hidden
+          className="font-mono text-[10px] leading-none tabular-nums text-lab-muted"
+        >
           {n}
         </span>
         <span aria-hidden className="h-3 w-px shrink-0 bg-lab-accent" />

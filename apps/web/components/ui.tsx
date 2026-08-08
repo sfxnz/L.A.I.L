@@ -6,6 +6,28 @@ import type {
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 
+/*
+  L.A.I.L primitives — Animus HUD.
+
+  Rules this file obeys (see app/globals.css for the token contract):
+    · corners are CUT (.animus-chamfer*) or 2px, never pills
+    · labels/actions ride the condensed display face, uppercase, wide tracking
+    · crimson (lab-accent) is the ONLY chromatic accent; lab-line is structure
+    · the selection tell is a crimson leading block fading right
+      (--animus-selection-fade) over a darkened accent base so white text stays
+      legible in BOTH worlds
+    · every colour comes from a lab-* token or a color-mix of one, so the light
+      "reconstruction" plate and the dark "in simulation" void both resolve
+
+  Two mechanical gotchas encoded below, don't undo them:
+    1. globals.css is UNLAYERED, so its rules outrank Tailwind utilities.
+       Overriding one (e.g. .animus-bracketed::before offsets) needs a
+       trailing `!`.
+    2. clip-path clips outlines and box-shadows, so any chamfered control must
+       carry its own INSET focus ring. Focusable things that can't afford that
+       (inputs, tabs) get radius-2 instead of a chamfer.
+*/
+
 export function Panel({
   children,
   className,
@@ -20,11 +42,20 @@ export function Panel({
   padded?: boolean;
 }) {
   return (
-    <div className={cn("lab-card overflow-hidden", className)}>
+    <div
+      className={cn(
+        // Brackets are pulled inside the padding box so `overflow-hidden`
+        // (which pages rely on) can't eat them.
+        "lab-card animus-bracketed overflow-hidden",
+        "before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!",
+        className,
+      )}
+    >
       {title && (
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-lab-border-subtle px-4 py-3">
-          <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-lab-muted">
-            {title}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-lab-border-subtle px-4 py-2.5">
+          <div className="flex min-w-0 items-center gap-2">
+            <span aria-hidden className="h-3 w-px shrink-0 bg-lab-accent" />
+            <div className="animus-eyebrow truncate">{title}</div>
           </div>
           {action}
         </div>
@@ -34,20 +65,29 @@ export function Panel({
   );
 }
 
+/**
+ * Primary is the AC menu selection: a solid crimson leading block fading right.
+ *
+ * The base under the gradient is a *deep ink* mix of lab-accent, not the accent
+ * itself — if the base is crimson too, the fade decays crimson-into-crimson and
+ * the button reads as a flat block (verified in-browser). Mixing toward #000
+ * keeps it dark in BOTH worlds, so the white label stays legible on the light
+ * reconstruction plate as well as the dark void.
+ */
 export const btnVariants = {
   primary:
-    "bg-lab-accent text-white hover:bg-lab-accent-bright border border-transparent shadow-[0_1px_2px_rgba(0,0,0,0.35)]",
+    "border border-[color:var(--animus-accent-edge)] bg-[color:color-mix(in_srgb,var(--color-lab-accent)_30%,#000)] bg-[image:var(--animus-selection-fade)] text-white hover:border-[color:var(--color-lab-accent-bright)] hover:bg-[color:color-mix(in_srgb,var(--color-lab-accent)_55%,#000)]",
   secondary:
-    "bg-lab-panel2 text-lab-text-dim hover:bg-lab-hover hover:text-lab-text border border-lab-border",
+    "border border-lab-border bg-transparent text-lab-text-dim hover:border-lab-line hover:bg-lab-hover hover:text-lab-text",
   danger:
-    "bg-[rgba(255,69,58,0.12)] text-lab-danger hover:bg-[rgba(255,69,58,0.18)] border border-[rgba(255,69,58,0.28)]",
+    "border border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] text-lab-danger hover:border-[color:var(--color-lab-danger)] hover:bg-[color:color-mix(in_srgb,var(--color-lab-danger)_17%,transparent)]",
   ghost:
-    "bg-transparent text-lab-muted hover:text-lab-text hover:bg-lab-hover border border-transparent",
+    "border border-transparent bg-transparent text-lab-muted hover:bg-lab-hover hover:text-lab-text",
 } as const;
 
 export const btnSizes = {
-  sm: "h-8 px-3 text-[12px] rounded-[8px]",
-  md: "h-9 px-3.5 text-[13px] rounded-[10px]",
+  sm: "h-8 px-3.5 text-[11px]",
+  md: "h-9 px-4 text-[12px]",
 } as const;
 
 export function btnClass(
@@ -56,7 +96,9 @@ export function btnClass(
   className?: string,
 ) {
   return cn(
-    "inline-flex items-center justify-center gap-1.5 font-medium tracking-[-0.01em] transition-[background,color,border-color,transform,opacity] duration-150 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40",
+    "animus-chamfer-sm inline-flex items-center justify-center gap-1.5 whitespace-nowrap font-[family-name:var(--font-display)] font-semibold uppercase leading-none tracking-[0.12em] transition-[background,color,border-color,transform,opacity] duration-150 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40",
+    // The chamfer clips the global focus outline, so carry an inset one.
+    "focus-visible:outline-none! focus-visible:shadow-[inset_0_0_0_2px_var(--color-lab-line)]!",
     btnVariants[variant],
     btnSizes[size],
     className,
@@ -98,7 +140,7 @@ export function Spinner({
           d="M14 8a6 6 0 0 0-6-6"
           stroke="currentColor"
           strokeWidth="2"
-          strokeLinecap="round"
+          strokeLinecap="square"
         />
       </svg>
     </span>
@@ -147,11 +189,13 @@ export function Badge({
   dot?: boolean;
 }) {
   const tones = {
-    ok: "text-lab-ok bg-[rgba(48,209,88,0.12)] border-[rgba(48,209,88,0.22)]",
-    warn: "text-lab-warn bg-[rgba(255,214,10,0.1)] border-[rgba(255,214,10,0.22)]",
-    danger: "text-lab-danger bg-[rgba(255,69,58,0.12)] border-[rgba(255,69,58,0.22)]",
-    muted: "text-lab-muted bg-lab-hover border-lab-border-subtle",
-    accent: "text-lab-accent-bright bg-[rgba(10,132,255,0.12)] border-[rgba(10,132,255,0.25)]",
+    ok: "border-[color:color-mix(in_srgb,var(--color-lab-ok)_38%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-ok)_12%,transparent)] text-lab-ok",
+    warn: "border-[color:color-mix(in_srgb,var(--color-lab-warn)_38%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-warn)_12%,transparent)] text-lab-warn",
+    danger:
+      "border-[color:color-mix(in_srgb,var(--color-lab-danger)_38%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_12%,transparent)] text-lab-danger",
+    muted: "border-lab-border bg-lab-hover text-lab-text-dim",
+    accent:
+      "border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)] text-lab-accent-bright",
   };
   const dotColor = {
     ok: "bg-lab-ok",
@@ -163,11 +207,13 @@ export function Badge({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium tracking-[0.02em]",
+        "animus-chamfer-sm inline-flex items-center gap-1.5 border px-2 py-[3px] font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.14em]",
         tones[tone],
       )}
     >
-      {dot && <span className={cn("h-1.5 w-1.5 rounded-full", dotColor[tone])} aria-hidden />}
+      {dot && (
+        <span className={cn("h-1.5 w-1.5 rotate-45", dotColor[tone])} aria-hidden />
+      )}
       {children}
     </span>
   );
@@ -183,7 +229,7 @@ export function Skeleton({
   return (
     <div
       className={cn(
-        "rounded-md bg-lab-hover",
+        "rounded-[2px] bg-lab-hover",
         pulse && "lab-skeleton",
         className,
       )}
@@ -224,40 +270,38 @@ export function Metric({
             : "text-lab-text";
 
   return (
-    <Panel className="h-full p-4 transition-colors hover:border-lab-border-strong">
-      <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-lab-muted">
-        {label}
-      </div>
+    <Panel className="h-full p-4">
+      <div className="animus-eyebrow truncate">{label}</div>
       {loading ? (
         <div className="mt-2 space-y-2" aria-busy="true" aria-label={`Loading ${label}`}>
-          <Skeleton className={cn("h-7", large ? "w-28" : "w-24")} />
+          <Skeleton className={cn("h-8", large ? "w-28" : "w-24")} />
           <Skeleton className="h-3 w-36" />
         </div>
       ) : (
         <>
           <div
             className={cn(
-              "mt-2 truncate font-semibold tracking-[-0.03em] tabular-nums",
-              large ? "text-2xl" : "text-xl",
+              "mt-1.5 truncate font-[family-name:var(--font-display)] font-semibold leading-[1.05] tracking-[0.005em] tabular-nums",
+              large ? "text-[30px]" : "text-[26px]",
               valueTone,
             )}
           >
             {value}
           </div>
           {sub ? (
-            <div className="mt-1.5 truncate font-mono text-[11px] text-lab-muted" title={sub}>
+            <div className="mt-1 truncate font-mono text-[11px] tabular-nums text-lab-muted" title={sub}>
               {sub}
             </div>
           ) : null}
           {progress != null && (
             <div
-              className="mt-2.5 h-1 overflow-hidden rounded-full bg-lab-hover"
+              className="mt-3 h-[3px] overflow-hidden bg-lab-hover"
               role="img"
               aria-label={`${label}: ${Math.round(progress)}%`}
             >
               <div
                 className={cn(
-                  "h-full rounded-full transition-[width] duration-700 ease-out",
+                  "h-full transition-[width] duration-700 ease-out",
                   progress < 15
                     ? "bg-lab-warn"
                     : tone === "danger"
@@ -292,7 +336,7 @@ export function Field({
   return (
     <div className="block space-y-1.5">
       <label
-        className="block text-[12px] font-medium text-lab-text-dim"
+        className="block font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.12em] text-lab-text-dim"
         htmlFor={htmlFor}
       >
         {label}
@@ -311,8 +355,13 @@ export function Field({
   );
 }
 
+/**
+ * Not chamfered on purpose: clip-path would swallow the focus ring, and inputs
+ * are the one control that can't afford that. Radius stays at the 2px token and
+ * focus grows a crimson leading edge instead.
+ */
 export const inputCls =
-  "w-full rounded-[10px] border border-lab-border bg-lab-input px-3 py-2 text-[13px] text-lab-text outline-none placeholder:text-lab-muted/70 transition-[border-color,box-shadow] focus:border-lab-accent focus:ring-2 focus:ring-[rgba(10,132,255,0.2)] disabled:cursor-not-allowed disabled:opacity-50";
+  "w-full rounded-[2px] border border-lab-border bg-lab-input px-3 py-2 text-[13px] text-lab-text outline-none placeholder:text-lab-muted/70 transition-[border-color,box-shadow] focus:border-lab-line focus:shadow-[inset_2px_0_0_var(--color-lab-accent)] disabled:cursor-not-allowed disabled:opacity-50";
 
 export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(inputCls, props.className)} {...props} />;
@@ -337,7 +386,11 @@ export function LogView({
   return (
     <pre
       ref={ref}
-      className="max-h-72 overflow-auto rounded-[12px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap"
+      className={cn(
+        "max-h-72 overflow-auto rounded-[2px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap",
+        // Streaming output grows the crimson leading edge.
+        live && "border-l-2 border-l-lab-accent",
+      )}
       aria-live={live ? "polite" : undefined}
     >
       {text || empty}
@@ -350,14 +403,19 @@ export function ModeBanner({ mode }: { mode: "lab_safe" | "workflow_max" }) {
   return (
     <div
       className={cn(
-        "rounded-[12px] border px-3.5 py-3 text-[13px] leading-snug",
+        "rounded-[2px] border border-l-2 px-3.5 py-3 text-[13px] leading-snug",
         safe
-          ? "border-[rgba(10,132,255,0.22)] bg-[rgba(10,132,255,0.08)] text-lab-text-dim"
-          : "border-lab-border-strong bg-lab-panel2 text-lab-text-dim",
+          ? "border-lab-border border-l-lab-line bg-lab-panel2 text-lab-text-dim"
+          : "border-[color:var(--animus-accent-edge)] border-l-[color:var(--color-lab-accent)] bg-[color:var(--animus-accent-wash)] text-lab-text-dim",
       )}
       role="status"
     >
-      <span className={cn("font-semibold", safe ? "text-lab-accent-bright" : "text-lab-text")}>
+      <span
+        className={cn(
+          "font-[family-name:var(--font-display)] font-semibold uppercase tracking-[0.12em]",
+          safe ? "text-lab-text" : "text-lab-accent-bright",
+        )}
+      >
         {safe ? "Lab Safe" : "Workflow Max"}
       </span>
       <span className="text-lab-muted"> — </span>
@@ -405,14 +463,16 @@ export function EmptyState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center px-6 py-8 text-center">
-      {icon ? <div className="mb-2.5 text-lab-muted opacity-70">{icon}</div> : null}
+      {icon ? <div className="mb-2.5 text-lab-line opacity-60">{icon}</div> : null}
       {title ? (
-        <div className="text-[13px] font-medium tracking-[-0.01em] text-lab-text-dim">{title}</div>
+        <div className="font-[family-name:var(--font-display)] text-[13px] font-semibold uppercase tracking-[0.14em] text-lab-text-dim">
+          {title}
+        </div>
       ) : null}
-      <div className={cn("max-w-xs text-[12px] leading-relaxed text-lab-muted", title && "mt-1")}>
+      <div className={cn("max-w-xs text-[12px] leading-relaxed text-lab-muted", title && "mt-1.5")}>
         {children}
       </div>
-      {action ? <div className="mt-3">{action}</div> : null}
+      {action ? <div className="mt-3.5">{action}</div> : null}
     </div>
   );
 }
@@ -434,11 +494,13 @@ export function Callout({
   className?: string;
 }) {
   const tones = {
-    ok: "border-[rgba(48,209,88,0.28)] bg-[rgba(48,209,88,0.08)] text-lab-text-dim",
-    warn: "border-[rgba(255,214,10,0.28)] bg-[rgba(255,214,10,0.08)] text-lab-text-dim",
-    danger: "border-[rgba(255,69,58,0.28)] bg-[rgba(255,69,58,0.1)] text-lab-text-dim",
-    muted: "border-lab-border bg-lab-panel2 text-lab-text-dim",
-    accent: "border-[rgba(10,132,255,0.28)] bg-[rgba(10,132,255,0.08)] text-lab-text-dim",
+    ok: "border-[color:color-mix(in_srgb,var(--color-lab-ok)_30%,transparent)] border-l-[color:var(--color-lab-ok)] bg-[color:color-mix(in_srgb,var(--color-lab-ok)_9%,transparent)] text-lab-text-dim",
+    warn: "border-[color:color-mix(in_srgb,var(--color-lab-warn)_30%,transparent)] border-l-[color:var(--color-lab-warn)] bg-[color:color-mix(in_srgb,var(--color-lab-warn)_9%,transparent)] text-lab-text-dim",
+    danger:
+      "border-[color:color-mix(in_srgb,var(--color-lab-danger)_30%,transparent)] border-l-[color:var(--color-lab-danger)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] text-lab-text-dim",
+    muted: "border-lab-border border-l-lab-line bg-lab-panel2 text-lab-text-dim",
+    accent:
+      "border-[color:var(--animus-accent-edge)] border-l-[color:var(--color-lab-accent)] bg-[color:var(--animus-accent-wash)] text-lab-text-dim",
   };
   const titleTone = {
     ok: "text-lab-ok",
@@ -453,16 +515,23 @@ export function Callout({
     <div
       role={role}
       className={cn(
-        "flex flex-wrap items-start gap-3 rounded-[12px] border px-3.5 py-3 text-[13px] leading-snug",
+        "flex flex-wrap items-start gap-3 rounded-[2px] border border-l-2 px-3.5 py-3 text-[13px] leading-snug",
         tones[tone],
         className,
       )}
     >
       <div className="min-w-0 flex-1">
         {title ? (
-          <div className={cn("font-semibold tracking-[-0.01em]", titleTone[tone])}>{title}</div>
+          <div
+            className={cn(
+              "font-[family-name:var(--font-display)] font-semibold uppercase tracking-[0.1em]",
+              titleTone[tone],
+            )}
+          >
+            {title}
+          </div>
         ) : null}
-        <div className={cn(title && "mt-0.5")}>{children}</div>
+        <div className={cn(title && "mt-1")}>{children}</div>
       </div>
       {(action || onDismiss) && (
         <div className="flex shrink-0 items-center gap-2">
@@ -471,7 +540,7 @@ export function Callout({
             <button
               type="button"
               onClick={onDismiss}
-              className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-lab-muted transition-colors hover:bg-lab-hover hover:text-lab-text"
+              className="animus-chamfer-sm border border-transparent px-2 py-1 font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-muted transition-colors hover:border-lab-border hover:text-lab-text focus-visible:outline-none! focus-visible:shadow-[inset_0_0_0_2px_var(--color-lab-line)]!"
               aria-label="Dismiss"
             >
               Dismiss
@@ -499,12 +568,18 @@ export function ProgressBar({
     <div className={cn("space-y-1.5", className)}>
       {label ? (
         <div className="flex items-center justify-between gap-2 text-[11px] text-lab-muted">
-          <span className="truncate">{label}</span>
-          {!indeterminate && <span className="tabular-nums">{Math.round(pct)}%</span>}
+          <span className="truncate font-[family-name:var(--font-display)] uppercase tracking-[0.1em]">
+            {label}
+          </span>
+          {!indeterminate && (
+            <span className="shrink-0 font-mono tabular-nums text-lab-text-dim">
+              {Math.round(pct)}%
+            </span>
+          )}
         </div>
       ) : null}
       <div
-        className="h-1.5 overflow-hidden rounded-full bg-lab-hover"
+        className="h-[3px] overflow-hidden bg-lab-hover"
         role="progressbar"
         aria-valuemin={0}
         aria-valuemax={100}
@@ -514,7 +589,7 @@ export function ProgressBar({
       >
         <div
           className={cn(
-            "h-full rounded-full bg-lab-accent transition-[width] duration-300 ease-out",
+            "h-full bg-lab-accent transition-[width] duration-300 ease-out",
             indeterminate && "lab-progress-indeterminate w-1/3",
           )}
           style={indeterminate ? undefined : { width: `${pct}%` }}
@@ -550,7 +625,7 @@ export function SegmentedControl<T extends string>({
     <div
       role="tablist"
       aria-label={ariaLabel}
-      className="inline-flex flex-wrap gap-0.5 rounded-full border border-lab-border bg-lab-panel p-1"
+      className="animus-chamfer-sm inline-flex flex-wrap gap-0.5 border border-lab-border bg-lab-panel p-1"
       onKeyDown={(e) => {
         if (e.key === "ArrowRight" || e.key === "ArrowDown") {
           e.preventDefault();
@@ -579,11 +654,13 @@ export function SegmentedControl<T extends string>({
             disabled={opt.disabled}
             onClick={() => onChange(opt.id)}
             className={cn(
-              "rounded-full font-medium tracking-[-0.01em] transition-colors disabled:opacity-40",
-              size === "sm" ? "px-3 py-1 text-[12px]" : "px-3.5 py-1.5 text-[12px]",
+              // Radius, not chamfer: these keep the global focus ring for
+              // arrow-key navigation.
+              "rounded-[2px] font-[family-name:var(--font-display)] font-semibold uppercase tracking-[0.12em] transition-colors disabled:opacity-40",
+              size === "sm" ? "px-3 py-1 text-[11px]" : "px-3.5 py-1.5 text-[12px]",
               selected
-                ? "bg-lab-active text-lab-text shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]"
-                : "text-lab-muted hover:text-lab-text-dim",
+                ? "bg-[color:color-mix(in_srgb,var(--color-lab-accent)_30%,#000)] bg-[image:var(--animus-selection-fade)] text-white"
+                : "text-lab-muted hover:text-lab-text",
             )}
           >
             {opt.label}
@@ -597,15 +674,15 @@ export function SegmentedControl<T extends string>({
 export function PageSkeleton({ rows = 3 }: { rows?: number }) {
   return (
     <div className="space-y-6" aria-busy="true" aria-label="Loading page">
-      <div className="page-header !border-b-lab-border-subtle">
+      <div className="page-header">
         <div className="space-y-2">
           <Skeleton className="h-3 w-24" />
           <Skeleton className="h-8 w-40" />
           <Skeleton className="h-3.5 w-72 max-w-full" />
         </div>
         <div className="flex gap-2">
-          <Skeleton className="h-8 w-20 rounded-[8px]" />
-          <Skeleton className="h-8 w-16 rounded-[8px]" />
+          <Skeleton className="h-8 w-20" />
+          <Skeleton className="h-8 w-16" />
         </div>
       </div>
       <div className="bento">
@@ -613,7 +690,7 @@ export function PageSkeleton({ rows = 3 }: { rows?: number }) {
           <div key={i} className="bento-span-3">
             <Panel className="h-full space-y-3 p-4">
               <Skeleton className="h-3 w-20" />
-              <Skeleton className="h-7 w-28" />
+              <Skeleton className="h-8 w-28" />
               <Skeleton className="h-3 w-36" />
             </Panel>
           </div>
@@ -640,14 +717,14 @@ export function CheckboxRow({
     <label
       htmlFor={id}
       className={cn(
-        "flex cursor-pointer items-start gap-2.5 rounded-[10px] border border-transparent px-1 py-1.5 text-[12px] text-lab-text-dim transition-colors hover:bg-lab-hover/60",
+        "flex cursor-pointer items-start gap-2.5 rounded-[2px] border border-transparent px-1.5 py-1.5 text-[12px] text-lab-text-dim transition-colors hover:border-lab-border-subtle hover:bg-lab-hover/60",
         disabled && "cursor-not-allowed opacity-50",
       )}
     >
       <input
         id={id}
         type="checkbox"
-        className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-lab-border accent-lab-accent"
+        className="mt-0.5 h-3.5 w-3.5 shrink-0 border-lab-border accent-lab-accent"
         checked={checked}
         disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}

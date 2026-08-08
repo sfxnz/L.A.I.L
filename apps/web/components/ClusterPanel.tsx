@@ -1,8 +1,55 @@
 "use client";
 
+import type { ReactNode } from "react";
 import type { ClusterNode, ClusterStatus } from "@/lib/api";
 import { Badge, EmptyState, Panel, Skeleton, StatusDot } from "@/components/ui";
 import { cn } from "@/lib/utils";
+
+/*
+  Cluster readout — the hero instrument on Status.
+
+  Two node cards bridged by the fabric spine. Everything here obeys the Animus
+  contract in app/globals.css: cut corners, condensed uppercase eyebrows, cyan/
+  slate hairlines as STRUCTURE, crimson reserved for the page's single accent
+  (so TP hints ride lab-line, not lab-accent). All state colour goes through
+  color-mix on a lab-* token so the light reconstruction plate resolves too.
+*/
+
+/**
+ * The one null treatment on this surface, shared with app/status/page.tsx: an
+ * absent value is a condensed STATE WORD, never a bare em-dash — an em-dash
+ * reads as broken data. "Awaiting" = hasn't reported yet, "None" = settled and
+ * genuinely empty. .animus-eyebrow supplies the muted colour and the caps.
+ */
+function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 align-middle">
+      <span
+        aria-hidden
+        className="h-[5px] w-[5px] shrink-0 rotate-45 border border-[color:var(--animus-hairline)]"
+      />
+      <span className="animus-eyebrow">{word}</span>
+    </span>
+  );
+}
+
+/** Eyebrow + value stack. The unit every HUD readout on this panel is built from. */
+function Readout({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("min-w-0", className)}>
+      <div className="animus-eyebrow truncate">{label}</div>
+      <div className="mt-1">{children}</div>
+    </div>
+  );
+}
 
 function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
   switch (state) {
@@ -17,6 +64,28 @@ function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent
       return "muted";
     default:
       return "muted";
+  }
+}
+
+/**
+ * Human label for a node state — used for BOTH the dot's accessible name and
+ * the badge, so the raw enum never leaks. `serving_worker` is a headless
+ * multi-node TP worker: it has no /v1/models by design and counts as serving.
+ */
+function stateLabel(state?: string): string {
+  switch (state) {
+    case "serving":
+      return "Serving";
+    case "serving_worker":
+      return "TP worker";
+    case "offline":
+      return "Offline";
+    case "loading":
+      return "Loading";
+    case "idle":
+      return "Idle";
+    default:
+      return state || "Unknown";
   }
 }
 
@@ -64,122 +133,124 @@ function NodeCard({ node }: { node: ClusterNode }) {
         ? `${Math.round(node.qsfp_speed_mbps / 1000)}G`
         : `${node.qsfp_speed_mbps}M`
       : null;
+  const serving = node.state === "serving" || node.state === "serving_worker";
+  const label = stateLabel(node.state);
+  const hasAddrs = !!(node.qsfp_ip || node.tailscale_ip || node.lan_ip);
 
   return (
     <div
       className={cn(
-        "relative flex min-h-[168px] flex-col rounded-[14px] border bg-lab-panel2/60 p-4 transition-all duration-300",
-        (node.state === "serving" || node.state === "serving_worker") &&
-          "border-[rgba(48,209,88,0.4)] shadow-[0_0_24px_rgba(48,209,88,0.12),inset_0_0_0_1px_rgba(48,209,88,0.08)]",
-        node.state === "loading" && "border-[rgba(255,214,10,0.28)]",
-        node.state === "offline" && "border-[rgba(255,69,58,0.28)]",
-        node.state === "idle" && "border-lab-border",
+        // Cut corners, not radius. The chamfer clips box-shadow, so the serving
+        // tell is an INSET bloom rather than an outer glow.
+        "animus-chamfer animus-bracketed relative flex min-h-[172px] flex-col border bg-[color:var(--animus-glass)] p-3.5",
+        // The chamfer clip-path would shear brackets sitting on the -1px edge —
+        // inset them so all four corners actually render (same trick as Panel).
+        "before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!",
+        "transition-[border-color,box-shadow] duration-300",
+        serving &&
+          "border-[color:color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-lab-ok)_10%,transparent),inset_0_0_30px_-14px_color-mix(in_srgb,var(--color-lab-ok)_75%,transparent)]",
+        node.state === "loading" &&
+          "border-[color:color-mix(in_srgb,var(--color-lab-warn)_40%,transparent)]",
+        node.state === "offline" &&
+          "border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)]",
+        !serving &&
+          node.state !== "loading" &&
+          node.state !== "offline" &&
+          "border-lab-border",
       )}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 items-center gap-2">
             <StatusDot
-              live={
-                node.state === "serving" || node.state === "serving_worker"
-                  ? true
-                  : node.state === "offline"
-                    ? false
-                    : null
-              }
-              label={
-                node.state === "serving"
-                  ? "Serving"
-                  : node.state === "serving_worker"
-                    ? "TP worker"
-                    : node.state === "offline"
-                      ? "Offline"
-                      : node.state === "loading"
-                        ? "Loading"
-                        : node.state === "idle"
-                          ? "Idle"
-                          : node.state || "Unknown"
-              }
+              live={serving ? true : node.state === "offline" ? false : null}
+              label={label}
             />
-            <span className="text-[15px] font-semibold tracking-[-0.02em] text-lab-text">
+            <span className="truncate font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
               {node.label || node.id}
             </span>
             {node.local && (
-              <span className="rounded-md bg-lab-hover px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.06em] text-lab-muted">
+              <span className="animus-chamfer-sm shrink-0 border border-[color:var(--animus-hairline)] px-1.5 py-[3px] font-[family-name:var(--font-display)] text-[9px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
                 local
               </span>
             )}
           </div>
-          <div className="mt-1 font-mono text-[11px] text-lab-muted">
+          <div className="mt-1.5 truncate font-mono text-[10px] text-lab-muted">
             {node.hostname || node.id}
             {node.role ? ` · ${node.role}` : ""}
           </div>
         </div>
         <Badge tone={stateTone(node.state)} dot>
-          {node.state === "serving_worker" ? "TP worker" : node.state || "—"}
+          {label}
         </Badge>
       </div>
 
-      <div className="mt-4 flex flex-1 flex-col justify-between gap-3">
-        <div>
-          <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-lab-muted">
-            Model
+      <div aria-hidden className="animus-rule my-3" />
+
+      <Readout label="Model">
+        <div
+          className="truncate text-[13px] font-medium tracking-[-0.01em] text-lab-text"
+          title={node.model_id || undefined}
+        >
+          {modelShort ?? <Nil word="None" />}
+        </div>
+        {node.tensor_parallel_size != null && (
+          <div className="mt-1 font-mono text-[10px] tabular-nums text-lab-line-bright">
+            TP={node.tensor_parallel_size}
+            {node.ray_hint ? " · ray" : ""}
           </div>
+        )}
+      </Readout>
+
+      <div className="mt-auto grid grid-cols-2 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
+        <Readout label="Free">
           <div
             className={cn(
-              "mt-1 truncate text-[14px] font-medium tracking-[-0.02em]",
-              modelShort ? "text-lab-text" : "text-lab-muted",
+              "font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums",
+              free != null && free < 15 ? "text-lab-warn" : "text-lab-text-dim",
             )}
-            title={node.model_id || undefined}
           >
-            {modelShort || "—"}
+            {free != null ? `${free} GiB` : <Nil />}
           </div>
-          {node.tensor_parallel_size != null && (
-            <div className="mt-0.5 font-mono text-[11px] text-lab-accent-bright">
-              TP={node.tensor_parallel_size}
-              {node.ray_hint ? " · ray" : ""}
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-2 gap-2 border-t border-lab-border-subtle pt-3">
-          <div>
-            <div className="text-[10px] uppercase tracking-[0.06em] text-lab-muted">Free</div>
-            <div
-              className={cn(
-                "mt-0.5 tabular-nums text-[13px] font-medium",
-                free != null && free < 15 ? "text-lab-warn" : "text-lab-text-dim",
-              )}
-            >
-              {free != null ? `${free} GiB` : "—"}
-            </div>
+        </Readout>
+        <Readout label="QSFP">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tabular-nums">
+            {node.qsfp_carrier === 1 ? (
+              <span className="text-lab-ok">{speed || "up"}</span>
+            ) : node.qsfp_carrier === 0 ? (
+              <span className="text-lab-danger">down</span>
+            ) : (
+              <Nil />
+            )}
           </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-[0.06em] text-lab-muted">QSFP</div>
-            <div className="mt-0.5 tabular-nums text-[13px] font-medium text-lab-text-dim">
-              {node.qsfp_carrier === 1 ? (
-                <span className="text-lab-ok">{speed || "up"}</span>
-              ) : node.qsfp_carrier === 0 ? (
-                <span className="text-lab-danger">down</span>
-              ) : (
-                "—"
-              )}
-            </div>
+        </Readout>
+        <Readout label="Addrs" className="col-span-2">
+          <div className="space-y-0.5 font-mono text-[10px] leading-[1.5] text-lab-muted">
+            {node.qsfp_ip && (
+              <div className="truncate">
+                <span className="text-lab-line">qsfp</span> {node.qsfp_ip}
+              </div>
+            )}
+            {node.tailscale_ip && (
+              <div className="truncate">
+                <span className="text-lab-line">ts</span> {node.tailscale_ip}
+              </div>
+            )}
+            {node.lan_ip && (
+              <div className="truncate">
+                <span className="text-lab-line">lan</span> {node.lan_ip}
+              </div>
+            )}
+            {!hasAddrs && <Nil word="None" />}
           </div>
-          <div className="col-span-2">
-            <div className="text-[10px] uppercase tracking-[0.06em] text-lab-muted">Addrs</div>
-            <div className="mt-0.5 space-y-0.5 font-mono text-[10px] leading-relaxed text-lab-muted">
-              {node.qsfp_ip && <div>qsfp {node.qsfp_ip}</div>}
-              {node.tailscale_ip && <div>ts {node.tailscale_ip}</div>}
-              {node.lan_ip && <div>lan {node.lan_ip}</div>}
-              {!node.qsfp_ip && !node.tailscale_ip && !node.lan_ip && <div>—</div>}
-            </div>
-          </div>
-        </div>
+        </Readout>
       </div>
 
       {node.probe_error && (
-        <div className="mt-3 truncate rounded-lg bg-[rgba(255,69,58,0.1)] px-2 py-1 text-[10px] text-lab-danger" title={node.probe_error}>
+        <div
+          className="animus-chamfer-sm mt-3 truncate border border-[color:color-mix(in_srgb,var(--color-lab-danger)_35%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] px-2 py-1 font-mono text-[10px] text-lab-danger"
+          title={node.probe_error}
+        >
           {node.probe_error}
         </div>
       )}
@@ -187,16 +258,27 @@ function NodeCard({ node }: { node: ClusterNode }) {
   );
 }
 
+/**
+ * The spine. Animated dashes (.lab-fabric-line, gated on prefers-reduced-motion
+ * in globals.css) run node → node through a diamond hub, so a live QSFP fabric
+ * reads as flow rather than as a static divider.
+ */
 function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
   const link = cluster.fabric?.links?.[0];
   const ok = !!cluster.fabric?.ok;
   const rtt = link?.rtt_ms;
   const speed = link?.from_speed_mbps || link?.to_speed_mbps;
   const speedG = speed && speed > 0 ? Math.round(speed / 1000) : null;
+  const readout =
+    [speedG ? `${speedG}G` : null, rtt != null ? `${rtt.toFixed(1)} ms` : null]
+      .filter(Boolean)
+      .join(" · ") ||
+    link?.target_ip ||
+    null;
 
   return (
     <div
-      className="flex min-h-[168px] flex-col items-center justify-center gap-2 px-2 py-4"
+      className="flex min-h-[172px] flex-col items-center justify-center gap-3 px-1 py-4 lg:w-[172px]"
       role="img"
       aria-label={
         ok
@@ -204,49 +286,65 @@ function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
           : "Cluster fabric down"
       }
     >
-      <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-lab-muted">
-        Fabric
-      </div>
-      <div className="relative flex w-full max-w-[150px] items-center">
-        <div
+      <div className="animus-eyebrow">Fabric</div>
+
+      <div
+        aria-hidden
+        className={cn(
+          "flex w-full min-w-[124px] items-center",
+          ok ? "text-lab-ok" : "text-lab-danger",
+        )}
+      >
+        <span className="h-[5px] w-[5px] shrink-0 rotate-45 border border-current" />
+        <span
           className={cn(
-            "h-[2px] flex-1 rounded-full",
-            ok ? "lab-fabric-line text-lab-ok/80" : "bg-lab-danger/50",
+            "h-[2px] flex-1",
+            ok ? "lab-fabric-line" : "bg-current opacity-45",
           )}
-          aria-hidden
         />
-        <div
+        <span
           className={cn(
-            "mx-1.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border text-[10px] font-semibold",
+            "mx-1.5 flex h-[26px] w-[26px] shrink-0 rotate-45 items-center justify-center border",
             ok
-              ? "border-[rgba(48,209,88,0.4)] bg-[rgba(48,209,88,0.12)] text-lab-ok shadow-[0_0_14px_rgba(48,209,88,0.25)]"
-              : "border-[rgba(255,69,58,0.35)] bg-[rgba(255,69,58,0.1)] text-lab-danger",
+              ? "border-current bg-[color:color-mix(in_srgb,var(--color-lab-ok)_14%,transparent)] shadow-[0_0_16px_color-mix(in_srgb,var(--color-lab-ok)_35%,transparent)]"
+              : "border-current bg-[color:color-mix(in_srgb,var(--color-lab-danger)_12%,transparent)]",
           )}
         >
-          {ok ? "OK" : "!"}
-        </div>
+          <span className="-rotate-45 font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.1em]">
+            {ok ? "ok" : "!"}
+          </span>
+        </span>
+        <span
+          className={cn(
+            "h-[2px] flex-1",
+            ok ? "lab-fabric-line" : "bg-current opacity-45",
+          )}
+        />
+        <span className="h-[5px] w-[5px] shrink-0 rotate-45 border border-current" />
+      </div>
+
+      <div className="flex flex-col items-center gap-1 text-center">
         <div
           className={cn(
-            "h-[2px] flex-1 rounded-full",
-            ok ? "lab-fabric-line text-lab-ok/80" : "bg-lab-danger/50",
+            "font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase leading-none tracking-[0.16em]",
+            ok ? "text-lab-text-dim" : "text-lab-danger",
           )}
-          aria-hidden
-        />
-      </div>
-      <div className="text-center">
-        <div className="text-[12px] font-medium text-lab-text-dim">
+        >
           {ok ? "QSFP RoCE" : "Fabric down"}
         </div>
-        <div className="mt-0.5 font-mono text-[10px] tabular-nums text-lab-muted">
-          {[speedG ? `${speedG}G` : null, rtt != null ? `${rtt.toFixed(1)} ms` : null]
-            .filter(Boolean)
-            .join(" · ") || link?.target_ip || "—"}
+        <div className="font-mono text-[10px] tabular-nums text-lab-muted">
+          {readout ?? <Nil />}
         </div>
       </div>
     </div>
   );
 }
 
+/**
+ * Load map — a flush readout bar welded to the panel head by a hairline, not a
+ * nested card. Keeping it borderless is what stops the cluster reading as a
+ * box-inside-a-box.
+ */
 function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
   const multi = cluster.summary?.multi;
   const nodes = cluster.nodes || [];
@@ -256,27 +354,36 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
   return (
     <div
       className={cn(
-        "rounded-[12px] border border-lab-border-subtle bg-lab-editor/80 px-4 py-3.5 transition-shadow duration-300",
+        "border-b border-lab-border-subtle px-3.5 py-2.5 transition-shadow duration-300 sm:px-4",
         mode === "multi_aligned" && "lab-strip-live",
       )}
     >
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
         <div className="flex min-w-0 items-center gap-2.5">
+          <span className="animus-eyebrow shrink-0">Load map</span>
+          <span
+            aria-hidden
+            className="h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]"
+          />
           <Badge tone={multiTone(mode)} dot>
             {multiLabel(mode)}
           </Badge>
           {modelShort && (
-            <span className="truncate font-mono text-[12px] text-lab-text-dim" title={multi?.model_id || undefined}>
+            <span
+              className="truncate font-mono text-[11px] text-lab-text-dim"
+              title={multi?.model_id || undefined}
+            >
               {modelShort}
             </span>
           )}
           {multi?.tensor_parallel_hint != null && (
-            <span className="font-mono text-[11px] text-lab-accent-bright">
+            <span className="shrink-0 font-mono text-[10px] tabular-nums text-lab-line-bright">
               TP={multi.tensor_parallel_hint}
             </span>
           )}
         </div>
-        <div className="flex items-center gap-1.5">
+
+        <div className="flex items-center gap-2">
           {nodes.map((n) => {
             const filled = n.state === "serving" || n.state === "serving_worker";
             const loading = n.state === "loading";
@@ -284,15 +391,20 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
               <div key={n.id} className="flex items-center gap-1.5">
                 <div
                   className={cn(
-                    "h-2.5 w-10 rounded-full border transition-colors",
-                    filled && "border-lab-ok bg-lab-ok shadow-[0_0_12px_rgba(48,209,88,0.35)]",
-                    loading && "border-lab-warn bg-lab-warn/70 animate-pulse",
-                    !filled && !loading && n.state === "idle" && "border-lab-border bg-lab-hover",
-                    n.state === "offline" && "border-lab-danger/50 bg-[rgba(255,69,58,0.2)]",
+                    "h-2 w-10 border transition-colors",
+                    filled &&
+                      "border-lab-ok bg-lab-ok shadow-[0_0_12px_color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)]",
+                    loading && "animate-pulse border-lab-warn bg-lab-warn/70",
+                    !filled &&
+                      !loading &&
+                      n.state === "idle" &&
+                      "border-lab-border bg-lab-hover",
+                    n.state === "offline" &&
+                      "border-[color:color-mix(in_srgb,var(--color-lab-danger)_50%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_20%,transparent)]",
                   )}
                   title={`${n.id}: ${n.state === "serving_worker" ? "TP worker (headless)" : n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
                 />
-                <span className="text-[10px] font-medium uppercase tracking-[0.04em] text-lab-muted">
+                <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-muted">
                   {n.id}
                 </span>
               </div>
@@ -301,7 +413,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
         </div>
       </div>
       {multi?.message && (
-        <p className="mt-2 text-[12px] leading-snug text-lab-muted">{multi.message}</p>
+        <p className="mt-1.5 text-[11px] leading-snug text-lab-muted">{multi.message}</p>
       )}
     </div>
   );
@@ -321,12 +433,17 @@ export function ClusterPanel({
         action={<Badge tone="muted">probing…</Badge>}
         className="overflow-hidden"
       >
-        <div className="space-y-3 p-3 sm:p-4" aria-busy="true" aria-label="Loading cluster">
-          <Skeleton className="h-14 w-full rounded-[12px]" />
-          <div className="grid grid-cols-1 gap-2 lg:grid-cols-[1fr_auto_1fr]">
-            <Skeleton className="min-h-[168px] rounded-[14px]" />
-            <Skeleton className="hidden h-24 w-16 rounded-full lg:block" />
-            <Skeleton className="min-h-[168px] rounded-[14px]" />
+        <div aria-busy="true" aria-label="Loading cluster">
+          <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
+            <div className="flex items-center justify-between gap-3">
+              <Skeleton className="h-3.5 w-44" />
+              <Skeleton className="h-2.5 w-28" />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 gap-3 p-3.5 sm:p-4 lg:grid-cols-[1fr_auto_1fr]">
+            <Skeleton className="min-h-[172px]" />
+            <Skeleton className="hidden min-h-[172px] w-[172px] lg:block" />
+            <Skeleton className="min-h-[172px]" />
           </div>
         </div>
       </Panel>
@@ -363,22 +480,24 @@ export function ClusterPanel({
       className="overflow-hidden"
       title="Cluster"
       action={
-        <span
-          className={cn(
-            "flex items-center gap-2 text-[11px] font-medium tabular-nums",
-            healthy ? "text-lab-ok" : "text-lab-danger",
-          )}
-        >
+        <span className="flex shrink-0 items-center gap-2">
           <StatusDot live={healthy} label={healthy ? "Cluster healthy" : "Cluster issue"} />
-          {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
-          {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
+          <span
+            className={cn(
+              "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums",
+              healthy ? "text-lab-ok" : "text-lab-danger",
+            )}
+          >
+            {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
+            {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
+          </span>
         </span>
       }
     >
-      <div className="space-y-3 p-3 sm:p-4">
-        <LoadStrip cluster={cluster} />
+      <LoadStrip cluster={cluster} />
 
-        <div className="grid grid-cols-1 items-stretch gap-2 lg:grid-cols-[1fr_auto_1fr]">
+      <div className="p-3.5 sm:p-4">
+        <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-[1fr_auto_1fr]">
           {nodes[0] ? <NodeCard node={nodes[0]} /> : <div />}
           {nodes.length >= 2 ? (
             <FabricBridge cluster={cluster} />
@@ -389,7 +508,7 @@ export function ClusterPanel({
         </div>
 
         {nodes.length > 2 && (
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {nodes.slice(2).map((n) => (
               <NodeCard key={n.id} node={n} />
             ))}

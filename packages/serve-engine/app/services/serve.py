@@ -231,7 +231,7 @@ def _launch_multi_node(
 
 
 def stop_multi_node(log: Any = None) -> dict[str, Any]:
-    """Tear down a recorded multi-node serve across head + workers."""
+    """Tear down a recorded multi-node serve across head + workers (state file)."""
     stopped: list[str] = []
     try:
         import json as _json
@@ -242,19 +242,81 @@ def stop_multi_node(log: Any = None) -> dict[str, Any]:
     for wr in st.get("workers") or []:
         host = wr.get("ssh_host")
         if host:
+            name = f"spark-vllm-n{wr.get('rank', 1)}"
             subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
-                 f"docker rm -f spark-vllm-n{wr.get('rank', 1)}"],
+                 f"docker rm -f {shlex.quote(name)}"],
                 capture_output=True, text=True, timeout=60,
             )
-            stopped.append(str(wr.get("node")))
+            stopped.append(f"{host}:{name}")
     subprocess.run(["docker", "rm", "-f", "spark-vllm-n0"], capture_output=True, text=True)
-    stopped.append("head")
+    stopped.append("spark-vllm-n0")
     try:
         _MULTINODE_STATE.unlink(missing_ok=True)
     except Exception:
         pass
     return {"ok": True, "stopped": stopped}
+
+
+def _vllm_container_name(name: str) -> bool:
+    n = (name or "").lower()
+    return "vllm" in n or n.startswith("spark-vllm")
+
+
+def stop_cluster_remote_vllm(log: Any = None) -> dict[str, Any]:
+    """Stop vLLM containers on non-local cluster nodes via SSH.
+
+    Ground truth is live docker on each node — not multinode_serve.json.
+    That state file can be missing after engine restarts, manual launches,
+    or a prior stop that removed the file while a remote rm failed.
+    """
+    from .cluster import _load_cluster_config
+
+    stopped: list[str] = []
+    errors: list[str] = []
+    cfg = _load_cluster_config()
+    for node in cfg.get("nodes") or []:
+        if node.get("local"):
+            continue
+        host = node.get("ssh_host") or node.get("id")
+        if not host:
+            continue
+        try:
+            listed = subprocess.run(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", str(host),
+                    "docker ps -a --format '{{.Names}}'",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as e:
+            errors.append(f"{host}: list failed: {e}")
+            continue
+        if listed.returncode != 0:
+            errors.append(f"{host}: list exit {listed.returncode}: {(listed.stderr or '')[:200]}")
+            continue
+        names = [ln.strip() for ln in listed.stdout.splitlines() if _vllm_container_name(ln.strip())]
+        if not names:
+            continue
+        if log:
+            log.write(f"Remote {host}: stopping {names}")
+        for name in names:
+            try:
+                rm = subprocess.run(
+                    [
+                        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", str(host),
+                        f"docker rm -f {shlex.quote(name)}",
+                    ],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except Exception as e:
+                errors.append(f"{host}:{name}: {e}")
+                continue
+            if rm.returncode == 0:
+                stopped.append(f"{host}:{name}")
+            else:
+                errors.append(f"{host}:{name}: rm exit {rm.returncode}")
+    return {"ok": not errors, "stopped": stopped, "errors": errors}
 
 
 def serve_examples() -> dict[str, dict]:
@@ -268,14 +330,32 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
         if progress:
             progress(0.3, msg)
 
-    # Tear down any recorded multi-node serve first (workers over SSH + head).
+    stopped: list[str] = []
+
+    # 1) Optional state-file path (fast path when multinode_serve.json exists).
     try:
         mn = stop_multi_node(log=log)
         if mn.get("ok"):
             w(f"Stopped multi-node serve: {mn.get('stopped')}")
+            stopped.extend(mn.get("stopped") or [])
     except Exception:
         pass
 
+    # 2) Always live-discover remote workers. State file is not required.
+    try:
+        rem = stop_cluster_remote_vllm(log=log)
+        if rem.get("stopped"):
+            w(f"Stopped remote vLLM: {rem.get('stopped')}")
+            for item in rem["stopped"]:
+                if item not in stopped:
+                    stopped.append(item)
+        if rem.get("errors") and log:
+            log.write(f"remote stop warnings: {rem['errors']}")
+    except Exception as e:
+        if log:
+            log.write(f"remote cluster stop failed: {e}")
+
+    # 3) Local containers (spark_lab helper if present, else docker rm).
     if SPARK_LAB.exists():
         w(f"Running {SPARK_LAB} stop")
         r = subprocess.run(
@@ -289,13 +369,22 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
             log.write(r.stderr or "")
         if progress:
             progress(1.0, "stopped")
-        return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr}
+        return {
+            "ok": r.returncode == 0,
+            "stopped": stopped,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+        }
 
     names = [c["name"] for c in list_vllm_containers()]
     w(f"Stopping: {names}")
     for n in names:
         subprocess.run(["docker", "rm", "-f", n], capture_output=True, text=True)
-    return {"ok": True, "stopped": names}
+        if n not in stopped:
+            stopped.append(n)
+    if progress:
+        progress(1.0, "stopped")
+    return {"ok": True, "stopped": stopped}
 
 
 def _assert_lab_safe_util(util: float) -> None:

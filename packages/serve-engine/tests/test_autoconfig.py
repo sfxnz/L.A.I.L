@@ -593,6 +593,36 @@ def test_multi_node_launch_clears_image_entrypoint():
         assert "vllm" in cmd and "serve" in cmd
 
 
+def test_stop_all_kills_remote_worker_without_state_file(monkeypatch):
+    """Regression 2026-08-10: Stop only removed local spark-vllm-n0 when
+    multinode_serve.json was missing, leaving spark2 TP worker up (~100 GiB)."""
+    from app.services import serve
+
+    monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/no/such/multinode_serve.json"))
+    monkeypatch.setattr(serve, "SPARK_LAB", type(serve.SPARK_LAB)("/no/such/spark_lab.sh"))
+    monkeypatch.setattr(serve, "list_vllm_containers", lambda: [])
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        class R:
+            returncode = 0
+            stdout = "spark-vllm-n1\nother\n" if "docker ps" in " ".join(cmd) else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(serve.subprocess, "run", fake_run)
+
+    result = serve.stop_all()
+    assert result["ok"] is True
+    assert "spark2:spark-vllm-n1" in result["stopped"]
+    # list + rm over ssh to spark2
+    joined = [" ".join(c) for c in calls]
+    assert any("ssh" in j and "spark2" in j and "docker ps" in j for j in joined)
+    assert any("ssh" in j and "spark2" in j and "docker rm -f spark-vllm-n1" in j for j in joined)
+
+
 def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
     """User can add a future model via data/serve_overlays.json with no code change."""
     import json as _json

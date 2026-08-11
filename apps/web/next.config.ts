@@ -10,7 +10,7 @@ const allowedDevOrigins = [
   "0.0.0.0",
   "spark1",
   "spark1.home",
-  "100.86.121.44",
+  "100.115.190.113",
   ...(process.env.LAIL_DEV_ORIGINS
     ? process.env.LAIL_DEV_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
     : []),

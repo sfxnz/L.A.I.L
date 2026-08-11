@@ -28,7 +28,7 @@ _DEFAULT_CLUSTER = {
             "local": True,
             "ssh_host": "spark1",
             "lan_ip": "10.20.20.48",
-            "tailscale_ip": "100.86.121.44",
+            "tailscale_ip": "100.115.190.113",
             "qsfp_ip": "10.100.8.1",
             "qsfp_if": "enp1s0f1np1",
             "vllm_url": "http://127.0.0.1:8000",

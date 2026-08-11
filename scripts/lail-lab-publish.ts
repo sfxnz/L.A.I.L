@@ -14,7 +14,7 @@
  *
  * Env:
  *   LAIL_API=http://127.0.0.1:8787
- *   LAIL_PUBLIC_BASE=http://100.86.121.44:3000   # for share URLs in output
+ *   LAIL_PUBLIC_BASE=http://100.115.190.113:3000   # for share URLs in output
  */
 import { resolve } from "path";
 
@@ -41,7 +41,7 @@ async function main() {
   }
 
   const api = (process.env.LAIL_API || "http://127.0.0.1:8787").replace(/\/$/, "");
-  const publicBase = (process.env.LAIL_PUBLIC_BASE || "http://100.86.121.44:3000").replace(
+  const publicBase = (process.env.LAIL_PUBLIC_BASE || "http://100.115.190.113:3000").replace(
     /\/$/,
     "",
   );

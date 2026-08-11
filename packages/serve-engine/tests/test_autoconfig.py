@@ -136,6 +136,12 @@ def test_analyze_config_detects_mixed_formats():
         ("deepseek-ai/DeepSeek-V4-Flash", ["DeepseekV4ForCausalLM"], "deepseek_v4"),
         ("THUDM/glm-4-9b-chat", ["ChatGLMModel"], "glm"),
         ("moonshotai/Kimi-K2-Instruct", ["KimiK2ForCausalLM"], "kimi"),
+        ("meta-llama/Llama-3.3-70B-Instruct", ["LlamaForCausalLM"], "llama"),
+        ("meta-llama/Llama-4-Scout-17B-16E-Instruct", ["Llama4ForCausalLM"], "llama4"),
+        ("google/gemma-2-9b-it", ["Gemma2ForCausalLM"], "gemma"),
+        ("google/gemma-4-9b-it", ["Gemma4ForCausalLM"], "gemma4"),
+        ("microsoft/Phi-4-mini-instruct", ["Phi3ForCausalLM"], "phi"),
+        ("ibm-granite/granite-3.3-8b-instruct", ["GraniteForCausalLM"], "granite"),
     ],
 )
 def test_analyze_config_family_detection(model_id, arch, want):
@@ -170,6 +176,41 @@ def test_fill_from_config_minimax_and_mistral_parsers():
     assert mis["reasoning_parser"] == "mistral"
     assert mis["load_format"] == "mistral"
     assert "--tokenizer-mode mistral" in (mis.get("extra_flags") or "")
+
+    llama = ac._empty_config("meta-llama/Llama-3.3-70B-Instruct")
+    ac._fill_from_config_detection(
+        llama, {"family": "llama", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert llama["tool_call_parser"] == "llama3_json"
+
+    llama4 = ac._empty_config("meta-llama/Llama-4-Scout")
+    ac._fill_from_config_detection(
+        llama4, {"family": "llama4", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert llama4["tool_call_parser"] == "llama4_pythonic"
+
+    gemma4 = ac._empty_config("google/gemma-4-9b")
+    ac._fill_from_config_detection(
+        gemma4, {"family": "gemma4", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert gemma4["reasoning_parser"] == "gemma4"
+    assert gemma4["tool_call_parser"] == "gemma4"
+
+    phi = ac._empty_config("microsoft/Phi-4-mini-instruct")
+    ac._fill_from_config_detection(
+        phi,
+        {"family": "phi", "quant_flag": "", "architectures": ["Phi3ForCausalLM"], "model_type": "phi3"},
+        rationale,
+    )
+    assert phi["tool_call_parser"] == "phi4_mini_json"
+
+    gran = ac._empty_config("ibm-granite/granite-4.0-h-small")
+    ac._fill_from_config_detection(
+        gran,
+        {"family": "granite", "quant_flag": "", "architectures": ["GraniteMoeHybridForCausalLM"], "model_type": "granitemoehybrid"},
+        rationale,
+    )
+    assert gran["tool_call_parser"] == "granite4"
 
 
 # ─── Live hub recommend (real entry point) ───────────────────────────────────

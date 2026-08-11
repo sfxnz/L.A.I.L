@@ -1295,16 +1295,25 @@ def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
     Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
 
-    Nemotron hybrid MoE Spark cards (Lightning / Ultra) *require* marlin on GB10 —
-    do not strip those. Unknown / Qwen-style MoE+NVFP4 still treat marlin as unsafe.
+    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE on the
+    current lab image (≥0.27) is generally fine; Qwen MoE still rejects marlin.
+    Mixed FP8+NVFP4 compressed-tensors should leave moe auto (not marlin).
     """
     if not detected:
         return True
-    if detected.get("family") == "nemotron":
+    family = detected.get("family") or ""
+    if family == "nemotron":
+        return False
+    if family == "qwen":
+        return True
+    if detected.get("is_mixed_nvfp4_fp8"):
+        return True
+    # Pure NVFP4 MoE on ≥0.27 — keep card marlin (SM121 often prefers it).
+    if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
         return False
     if detected.get("is_moe"):
         return True
-    if detected.get("has_nvfp4") or detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
+    if detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
         return True
     return False
 
@@ -1628,10 +1637,15 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         family = "glm"
     elif "kimi" in blob or "moonshot" in blob:
         family = "kimi"
+    elif "granite" in blob:
+        family = "granite"
+    elif "phi" in blob or model_type.startswith("phi"):
+        family = "phi"
     elif "llama" in blob:
-        family = "llama"
+        # Llama 4 Scout/Maverick vs 3.x — tool parsers differ.
+        family = "llama4" if ("llama4" in blob or "llama-4" in mid or "scout" in mid or "maverick" in mid) else "llama"
     elif "gemma" in blob:
-        family = "gemma"
+        family = "gemma4" if ("gemma4" in blob or "gemma-4" in mid or "gemma_4" in mid) else "gemma"
 
     return {
         "model_type": model_type or None,
@@ -1848,12 +1862,22 @@ def _fill_from_config_detection(
             base["enable_auto_tool_choice"] = True
         base["trust_remote_code"] = True
     elif family == "glm":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+            + " "
+            + str(base.get("model") or "")
+        ).lower()
+        # Reasoning always glm45 for MoE 4.x; tools split by generation.
         if not base.get("reasoning_parser"):
-            base["reasoning_parser"] = "glm47"
-            rationale.append("GLM family → --reasoning-parser glm47")
+            base["reasoning_parser"] = "glm45"
+            rationale.append("GLM family → --reasoning-parser glm45")
+        tool = "glm47" if ("4.7" in mid or "glm47" in mid or "flash" in mid) else "glm45"
         if not base.get("tool_call_parser"):
-            base["tool_call_parser"] = "glm47"
+            base["tool_call_parser"] = tool
             base["enable_auto_tool_choice"] = True
+            rationale.append(f"GLM family → tool-call-parser {tool}")
         base["trust_remote_code"] = True
     elif family == "kimi":
         # Prefer K3 parser when the id/arch says so; else K2.
@@ -1868,6 +1892,73 @@ def _fill_from_config_detection(
             base["tool_call_parser"] = kimi
             base["enable_auto_tool_choice"] = True
         base["trust_remote_code"] = True
+    elif family == "llama4":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "llama4_pythonic"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Llama 4 → tool-call-parser llama4_pythonic + auto tool choice")
+        # No Meta Llama reasoning parser.
+    elif family == "llama":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "llama3_json"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Llama 3.x → tool-call-parser llama3_json + auto tool choice")
+    elif family == "gemma4":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "gemma4"
+            rationale.append("Gemma 4 → --reasoning-parser gemma4")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "gemma4"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Gemma 4 → tool-call-parser gemma4 + auto tool choice")
+    elif family == "gemma":
+        # Gemma 2/3: no gemma4 parsers; leave empty unless the card set them.
+        pass
+    elif family == "phi":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+        ).lower()
+        # Prefer model id when present on the empty config.
+        mid += " " + str(base.get("model") or "").lower()
+        base["trust_remote_code"] = True
+        if "mini" in mid and "instruct" in mid:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "phi4_mini_json"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Phi-4-mini-instruct → tool-call-parser phi4_mini_json")
+        elif "reasoning" in mid and "mini" not in mid:
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "deepseek_r1"
+                rationale.append("Phi-4-reasoning → --reasoning-parser deepseek_r1")
+        # Strip obsolete --enable-reasoning if a card left it in extras.
+        if base.get("extra_flags") and "--enable-reasoning" in base["extra_flags"]:
+            base["extra_flags"] = _strip_flag_from_extra(base["extra_flags"], "--enable-reasoning")
+            rationale.append("Stripped obsolete --enable-reasoning (removed in vLLM ≥0.10)")
+    elif family == "granite":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+            + " "
+            + str(base.get("model") or "")
+        ).lower()
+        if "granite-4" in mid or "granite4" in mid or "granite_4" in mid:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "granite4"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Granite 4 → tool-call-parser granite4")
+        else:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "granite"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Granite 3.x → tool-call-parser granite")
+            # Reasoning parser only for 3.2 prose markers — not 3.3 <think>.
+            if "3.2" in mid or "granite-3.2" in mid:
+                if not base.get("reasoning_parser"):
+                    base["reasoning_parser"] = "granite"
+                    rationale.append("Granite 3.2 → --reasoning-parser granite")
 
 
 def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], card_set_max_len: bool, card_set_util: bool = False) -> None:

@@ -1500,10 +1500,27 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
 
     family = "unknown"
     blob = f"{model_type} {' '.join(str(a) for a in architectures)} {model_id}".lower()
+    # Most-specific first — MiniMax M3 / DeepSeek V4 must not collapse into siblings.
     if "nemotron" in blob:
         family = "nemotron"
+    elif "minimax" in blob and ("m3" in blob or "minimaxm3" in blob):
+        family = "minimax_m3"
+    elif "minimax" in blob:
+        family = "minimax_m2"
+    elif "deepseek" in blob and ("v4" in blob or "dspark" in blob):
+        family = "deepseek_v4"
+    elif "deepseek" in blob and "r1" in blob:
+        family = "deepseek_r1"
+    elif "deepseek" in blob:
+        family = "deepseek_v3"
     elif "qwen" in blob:
         family = "qwen"
+    elif "mistral" in blob or "mixtral" in blob or "magistral" in blob or "devstral" in blob or "pixtral" in blob:
+        family = "mistral"
+    elif "glm" in blob or "chatglm" in blob:
+        family = "glm"
+    elif "kimi" in blob or "moonshot" in blob:
+        family = "kimi"
     elif "llama" in blob:
         family = "llama"
     elif "gemma" in blob:
@@ -1651,13 +1668,98 @@ def _fill_from_config_detection(
             rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
         if not base.get("trust_remote_code"):
             base["trust_remote_code"] = True
-    if family == "nemotron":
+    elif family == "nemotron":
         if not base.get("reasoning_parser"):
             base["reasoning_parser"] = "nemotron_v3"
             rationale.append("Nemotron (from HF) → --reasoning-parser nemotron_v3")
         base["enable_auto_tool_choice"] = True
         if not base.get("tool_call_parser"):
             base["tool_call_parser"] = "qwen3_coder"
+        base["trust_remote_code"] = True
+    elif family == "minimax_m2":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "minimax_m2"
+            rationale.append("MiniMax M2 → --reasoning-parser minimax_m2")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "minimax_m2"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("MiniMax M2 → tool-call-parser minimax_m2 + auto tool choice")
+        base["trust_remote_code"] = True
+    elif family == "minimax_m3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "minimax_m3"
+            rationale.append("MiniMax M3 → --reasoning-parser minimax_m3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "minimax_m3"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("MiniMax M3 → tool-call-parser minimax_m3 + auto tool choice")
+        base["trust_remote_code"] = True
+        # MSA sparse attention requires block-size 128; refuse is a placement concern.
+        ex = base.get("extra_flags") or ""
+        if "--block-size" not in ex:
+            base["extra_flags"] = (ex + " --block-size 128").strip()
+            rationale.append("MiniMax M3 MSA → --block-size 128")
+    elif family == "mistral":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "mistral"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Mistral family → tool-call-parser mistral + auto tool choice")
+        mid = (detected.get("model_type") or "") + " " + " ".join(
+            str(a) for a in (detected.get("architectures") or [])
+        )
+        # Magistral / reasoning variants use the mistral reasoning parser.
+        if "magistral" in mid.lower() or "reasoning" in mid.lower():
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "mistral"
+                rationale.append("Mistral reasoning variant → --reasoning-parser mistral")
+        if not base.get("load_format"):
+            base["load_format"] = "mistral"
+            rationale.append("Mistral family → --load-format mistral")
+        ex = base.get("extra_flags") or ""
+        if "--tokenizer-mode" not in ex:
+            base["extra_flags"] = (ex + " --tokenizer-mode mistral --config-format mistral").strip()
+    elif family == "deepseek_r1":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_r1"
+            rationale.append("DeepSeek-R1 → --reasoning-parser deepseek_r1")
+        base["trust_remote_code"] = True
+    elif family == "deepseek_v3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_v3"
+            rationale.append("DeepSeek-V3 → --reasoning-parser deepseek_v3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "deepseek_v3"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "deepseek_v4":
+        # Overlay usually owns this; fill gaps if card/overlay missed parsers.
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_v4"
+            rationale.append("DeepSeek-V4 → --reasoning-parser deepseek_v4")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "deepseek_v4"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "glm":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "glm47"
+            rationale.append("GLM family → --reasoning-parser glm47")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "glm47"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "kimi":
+        # Prefer K3 parser when the id/arch says so; else K2.
+        mid = (detected.get("model_type") or "") + " " + " ".join(
+            str(a) for a in (detected.get("architectures") or [])
+        )
+        kimi = "kimi_k3" if "k3" in mid.lower() else "kimi_k2"
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = kimi
+            rationale.append(f"Kimi → --reasoning-parser {kimi}")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = kimi
+            base["enable_auto_tool_choice"] = True
         base["trust_remote_code"] = True
 
 

@@ -125,6 +125,53 @@ def test_analyze_config_detects_mixed_formats():
     assert d["quant_flag"] == "compressed-tensors"
 
 
+@pytest.mark.parametrize(
+    "model_id,arch,want",
+    [
+        ("MiniMaxAI/MiniMax-M2-NVFP4", ["MiniMaxM2ForCausalLM"], "minimax_m2"),
+        ("MiniMaxAI/MiniMax-M3", ["MiniMaxM3ForCausalLM"], "minimax_m3"),
+        ("mistralai/Magistral-Small-2507", ["MistralForCausalLM"], "mistral"),
+        ("deepseek-ai/DeepSeek-R1", ["DeepseekV3ForCausalLM"], "deepseek_r1"),
+        ("deepseek-ai/DeepSeek-V3.2", ["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        ("deepseek-ai/DeepSeek-V4-Flash", ["DeepseekV4ForCausalLM"], "deepseek_v4"),
+        ("THUDM/glm-4-9b-chat", ["ChatGLMModel"], "glm"),
+        ("moonshotai/Kimi-K2-Instruct", ["KimiK2ForCausalLM"], "kimi"),
+    ],
+)
+def test_analyze_config_family_detection(model_id, arch, want):
+    d = ac.analyze_config({"architectures": arch, "model_type": arch[0].lower()}, model_id)
+    assert d["family"] == want
+
+
+def test_fill_from_config_minimax_and_mistral_parsers():
+    rationale: list[str] = []
+    m2 = ac._empty_config("MiniMaxAI/MiniMax-M2")
+    ac._fill_from_config_detection(
+        m2, {"family": "minimax_m2", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert m2["reasoning_parser"] == "minimax_m2"
+    assert m2["tool_call_parser"] == "minimax_m2"
+    assert m2["enable_auto_tool_choice"] is True
+
+    m3 = ac._empty_config("MiniMaxAI/MiniMax-M3")
+    ac._fill_from_config_detection(
+        m3, {"family": "minimax_m3", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert m3["reasoning_parser"] == "minimax_m3"
+    assert "--block-size 128" in (m3.get("extra_flags") or "")
+
+    mis = ac._empty_config("mistralai/Magistral-Small")
+    ac._fill_from_config_detection(
+        mis,
+        {"family": "mistral", "quant_flag": "", "architectures": ["MagistralForCausalLM"], "model_type": "magistral"},
+        rationale,
+    )
+    assert mis["tool_call_parser"] == "mistral"
+    assert mis["reasoning_parser"] == "mistral"
+    assert mis["load_format"] == "mistral"
+    assert "--tokenizer-mode mistral" in (mis.get("extra_flags") or "")
+
+
 # ─── Live hub recommend (real entry point) ───────────────────────────────────
 
 

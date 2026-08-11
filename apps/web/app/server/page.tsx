@@ -1123,7 +1123,7 @@ export default function ServerPage() {
                       id="adv-image"
                       value={image}
                       onChange={(e) => setImage(e.target.value)}
-                      placeholder="vllm/vllm-openai:v0.26.0"
+                      placeholder="vllm/vllm-openai:v0.27.1"
                     />
                   </Field>
                   <Field label="--quantization" htmlFor="adv-quant">

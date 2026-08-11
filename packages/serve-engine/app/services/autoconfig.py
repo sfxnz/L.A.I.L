@@ -796,6 +796,12 @@ def _apply_topology(
     if cfg.get("extra_flags"):
         cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--data-parallel-size")
 
+    # Cards write the model into their own recipe, often as an unexpanded shell var
+    # (`--model $MODEL_CKPT`). serve.py passes the model positionally, so carrying
+    # --model through would serve a checkpoint literally named "$MODEL_CKPT".
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--model")
+
     # GPU arch compile-target env for the detected sku (only when unset).
     arch_env = _gpu_arch_env(topology.get("node_list") or [])
     env0 = list(cfg.get("docker_env") or [])
@@ -1031,6 +1037,16 @@ def score_candidate(
         score += 15
         reasons.append(f"in section «{c.section}»")
 
+    # Cards ship per-GPU recipes. One headed for other silicon is the wrong path on a
+    # Spark even when its flag list scores well (NVFP4 cards carry a W4A16 Ampere
+    # fallback whose flags out-score the real GB10 recipe).
+    spark_section = any(k in sec for k in ("dgx spark", "gb10"))
+    if not spark_section and any(
+        k in sec for k in ("ampere", "a100", "h100", "h200", "gb200", "b200", "rtx", "l40")
+    ):
+        score -= 30
+        reasons.append(f"section «{c.section}» targets non-Spark hardware")
+
     # Performance / Spark-relevant flags from the card
     moe = (cfg.get("moe_backend") or "").strip()
     flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det)
@@ -1142,6 +1158,13 @@ def score_candidate(
             "PENALTY: moe_backend=marlin unsupported for this MoE on vLLM 0.25 "
             "(ValueError: not supported for unquantized MoE)"
         )
+        # Salvage mirrors the flashinfer_b12x case above: the rest of a vendor GB10
+        # recipe is still the right path once marlin is stripped to auto.
+        if has_cute or spark_section:
+            score += 55
+            reasons.append(
+                "salvage: Spark recipe kept after stripping unsupported marlin"
+            )
 
     return score, reasons
 

@@ -99,7 +99,7 @@ cd packages/serve-engine && PYTHONPATH=. python -m pytest tests/test_autoconfig.
 - **Auto-configure** pulls live HF card + config.json; scores recipes; strips unsafe `flashinfer_b12x` on mixed FP8 MoE; Lab Safe util≤0.4 envelope.
 - **UI** (`apps/web/app/server/page.tsx`): full recommend panel (warnings, card recipes, rationale, sources), live status, job log always visible across tabs.
 - **HF token**: stale `hf_oauth_*` in `~/.cache/huggingface/token` 401s public fetches — code retries anonymous + warns. Re-login: `hf auth login` for gated models.
-- Pin image still `vllm/vllm-openai:v0.26.0`.
+- Pin image still `vllm/vllm-openai:v0.27.1`.
 
 ## Related
 

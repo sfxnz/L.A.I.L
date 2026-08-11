@@ -533,8 +533,10 @@ def _build_vllm_args(
         extras = _strip_flag(extras, "--reasoning-parser")
     if load_format.strip():
         extras = _strip_flag(extras, "--load-format")
-    # Lab envelope owns host/port/tp/util/max-len
+    # Launcher owns the model (passed positionally) and the lab envelope owns
+    # host/port/tp/util/max-len.
     for f in (
+        "--model",
         "--host",
         "--port",
         "--tensor-parallel-size",

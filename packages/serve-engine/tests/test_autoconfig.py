@@ -194,9 +194,53 @@ def test_analyze_config_detects_mixed_formats():
         ("ibm-granite/granite-3.3-8b-instruct", ["GraniteForCausalLM"], "granite"),
     ],
 )
+
 def test_analyze_config_family_detection(model_id, arch, want):
     d = ac.analyze_config({"architectures": arch, "model_type": arch[0].lower()}, model_id)
     assert d["family"] == want
+
+
+def test_qwen25_skips_qwen3_parsers():
+    cfg = ac._empty_config("Qwen/Qwen2.5-7B-Instruct")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {"family": "qwen", "quant_flag": "", "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2"},
+        rationale,
+    )
+    assert cfg.get("reasoning_parser") in ("", None)
+    assert cfg.get("tool_call_parser") in ("", None)
+    assert any("Qwen2.5" in r or "Qwen2" in r for r in rationale)
+
+
+def test_qwen3_still_gets_parsers():
+    cfg = ac._empty_config("Qwen/Qwen3-8B")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {"family": "qwen", "quant_flag": "", "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"},
+        rationale,
+    )
+    assert cfg["reasoning_parser"] == "qwen3"
+    assert cfg["tool_call_parser"] == "qwen3_coder"
+
+
+def test_strip_spark_unsafe_flags():
+    cfg = {
+        "extra_flags": "--enable-expert-parallel --data-parallel-size 8 --max-num-batched-tokens 8192",
+        "moe_backend": "humming",
+        "docker_env": ["VLLM_USE_DEEP_GEMM_MEGA_MOE=1", "CUTE_DSL_ARCH=sm_121a"],
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._strip_spark_unsafe_flags(cfg, warnings, rationale)
+    ex = cfg["extra_flags"]
+    assert "--enable-expert-parallel" not in ex
+    assert "--data-parallel-size" not in ex
+    assert "--max-num-batched-tokens" in ex
+    assert cfg["moe_backend"] == ""
+    assert not any(e.startswith("VLLM_USE_DEEP_GEMM_MEGA_MOE=") for e in cfg["docker_env"])
+    assert any(e.startswith("CUTE_DSL_ARCH=") for e in cfg["docker_env"])
 
 
 def test_fill_from_config_minimax_and_mistral_parsers():

@@ -159,6 +159,38 @@ def _redact(parts: list[str]) -> str:
     return " ".join(out)
 
 
+def _ensure_image_present(
+    image: str,
+    *,
+    log: Any = None,
+    progress: Callable | None = None,
+) -> None:
+    """Pull the serve image if it is not already present locally."""
+    image = (image or "").strip()
+    if not image:
+        return
+
+    def w(msg: str, p: float = 0.12) -> None:
+        if log:
+            log.write(msg)
+        if progress:
+            progress(p, msg)
+
+    probe = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return
+    w(f"Image {image} not local — pulling…", 0.12)
+    pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True)
+    if pull.returncode != 0:
+        err = (pull.stderr or pull.stdout or "").strip()[-800:]
+        raise RuntimeError(f"Failed to pull required image {image}: {err}")
+    w(f"Pulled {image}", 0.18)
+
+
 def _launch_multi_node(
     launch: dict[str, Any],
     *,
@@ -685,6 +717,8 @@ def serve_model(
                 0.15,
             )
             moe_backend = ""
+
+    _ensure_image_present(image or "", log=log, progress=progress)
 
     vllm_args = _build_vllm_args(
         util=util,

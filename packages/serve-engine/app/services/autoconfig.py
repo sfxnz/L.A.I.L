@@ -1050,6 +1050,64 @@ def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+# Flags / env that crash or noop-wrong on 1–2× GB10 UMA Spark serves.
+_SPARK_UNSAFE_FLAGS = (
+    "--enable-expert-parallel",
+    "--data-parallel-size",
+    "--data-parallel-address",
+    "--data-parallel-rpc-port",
+    "--data-parallel-backend",
+)
+_SPARK_UNSAFE_ENV_PREFIXES = (
+    "VLLM_USE_DEEP_GEMM_MEGA_MOE=",
+    "VLLM_ALL2ALL_BACKEND=",
+)
+
+
+def _strip_spark_unsafe_flags(
+    cfg: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """Drop card multi-GPU / mega-MoE knobs that do not apply on this cluster."""
+    dropped: list[str] = []
+    ex = cfg.get("extra_flags") or ""
+    for flag in _SPARK_UNSAFE_FLAGS:
+        if flag in ex:
+            ex = _strip_flag_from_extra(ex, flag)
+            dropped.append(flag)
+    if dropped:
+        cfg["extra_flags"] = ex
+        warnings.append(
+            "Stripped Spark-unsafe card flags: " + ", ".join(dropped)
+            + " (expert/DP parallelism is not the 1–2× GB10 path)."
+        )
+        rationale.append("SAFETY: removed Spark-unsafe multi-GPU flags from extras")
+
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    if moe == "humming":
+        cfg["moe_backend"] = ""
+        warnings.append(
+            "Cleared --moe-backend humming (Ampere / non-GB10 recipe; leave auto on Spark)."
+        )
+        rationale.append("SAFETY: humming moe-backend → empty (auto) on GB10")
+
+    env = list(cfg.get("docker_env") or [])
+    kept = []
+    env_drop = []
+    for e in env:
+        if any(e.startswith(p) for p in _SPARK_UNSAFE_ENV_PREFIXES):
+            env_drop.append(e.split("=", 1)[0])
+            continue
+        # Mega MoE deep_gemm toggle often appears as VLLM_USE_DEEP_GEMM=1 with mega notes;
+        # only strip the explicit mega env keys above.
+        kept.append(e)
+    if env_drop:
+        cfg["docker_env"] = kept
+        warnings.append("Stripped Spark-unsafe docker env: " + ", ".join(env_drop))
+        rationale.append("SAFETY: removed mega-MoE / all2all env knobs")
+
+
 _CARD_IMAGE_RE = re.compile(
     r"(?:vllm/vllm-openai|ghcr\.io/anemll/dspark-vllm-gx10)(?::[vV]?\d[\w.\-]*)?",
     re.I,
@@ -1939,15 +1997,34 @@ def _fill_from_config_detection(
 
     family = detected.get("family")
     if family == "qwen":
-        if not base.get("reasoning_parser"):
-            base["reasoning_parser"] = "qwen3"
-            rationale.append("Qwen architecture (from HF config) → --reasoning-parser qwen3")
-        if not base.get("tool_call_parser"):
-            base["tool_call_parser"] = "qwen3_coder"
-            base["enable_auto_tool_choice"] = True
-            rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
-        if not base.get("trust_remote_code"):
-            base["trust_remote_code"] = True
+        mid = (
+            str(base.get("model") or "")
+            + " "
+            + str(detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+        ).lower()
+        # qwen3 parsers break Qwen2.5 / classic Qwen2 chat templates.
+        is_qwen25_or_2 = bool(
+            re.search(r"qwen2\.5|qwen2_5|qwen25", mid)
+            or ("qwen2" in mid and "qwen3" not in mid and "qwen2.5" not in mid)
+        )
+        if is_qwen25_or_2:
+            if not base.get("trust_remote_code"):
+                base["trust_remote_code"] = True
+            rationale.append(
+                "Qwen2.5/Qwen2 checkpoint → skipping qwen3 reasoning/tool parsers (card may still set them)"
+            )
+        else:
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "qwen3"
+                rationale.append("Qwen architecture (from HF config) → --reasoning-parser qwen3")
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "qwen3_coder"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
+            if not base.get("trust_remote_code"):
+                base["trust_remote_code"] = True
     elif family == "nemotron":
         if not base.get("reasoning_parser"):
             base["reasoning_parser"] = "nemotron_v3"
@@ -2388,6 +2465,9 @@ def recommend(
     # Unexpanded $VARS from card recipes must never reach docker.
     if cfg.get("extra_flags"):
         cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
+
+    # Card multi-GPU / mega-MoE knobs crash or mis-route on 1–2× GB10.
+    _strip_spark_unsafe_flags(cfg, warnings, rationale)
 
     max_pos = detected.get("max_position_embeddings")
     if isinstance(max_pos, int) and max_pos > 0 and cfg.get("max_model_len"):

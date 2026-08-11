@@ -208,6 +208,26 @@ def _launch_multi_node(
             progress(p, msg)
 
     nnodes = launch["nnodes"]
+    image = (launch.get("image") or "").strip()
+    # Ensure image on head + each worker before docker run (common DSpark failure mode).
+    if image:
+        _ensure_image_present(image, log=log, progress=progress)
+        for wc in launch["workers"]:
+            host = wc.get("ssh_host")
+            if not host:
+                continue
+            w(f"Ensuring image on worker {wc.get('node')} ({host})…", 0.22)
+            probe = subprocess.run(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                    f"docker image inspect {image} >/dev/null 2>&1 || docker pull {image}",
+                ],
+                capture_output=True, text=True, timeout=600,
+            )
+            if probe.returncode != 0:
+                err = (probe.stderr or probe.stdout or "").strip()[-800:]
+                raise RuntimeError(f"Failed to pull {image} on {host}: {err}")
+
     # 1) workers first (headless ranks), each over SSH
     for wc in launch["workers"]:
         host = wc["ssh_host"]

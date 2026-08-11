@@ -988,3 +988,27 @@ def test_size_memory_skips_multinode_tp():
         warnings=warnings,
     )
     assert cfg["max_model_len"] == 1048576
+
+
+def test_stock_image_semver_and_at_least():
+    assert ac._stock_image_semver("vllm/vllm-openai:v0.27.1") == (0, 27, 1)
+    assert ac._stock_image_semver("ghcr.io/anemll/dspark-vllm-gx10:0.1.1") is None
+    assert ac._image_at_least("vllm/vllm-openai:v0.27.1", 0, 27, 0) is True
+    assert ac._image_at_least("vllm/vllm-openai:v0.25.0", 0, 27, 0) is False
+
+
+def test_marlin_version_gate_pure_nvfp4():
+    det = {
+        "family": "unknown",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": False,
+        "quant_flag": "modelopt_fp4",
+    }
+    # Old stock image: strip marlin for non-Nemotron pure NVFP4
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.25.0") is True
+    # Current lab image: keep marlin
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.27.1") is False
+    # Nemotron always keeps marlin
+    det["family"] = "nemotron"
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.25.0") is False

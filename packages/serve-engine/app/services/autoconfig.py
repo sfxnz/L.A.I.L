@@ -1156,6 +1156,38 @@ def _semver_tuple(tag: str) -> tuple[int, ...]:
     return tuple(int(x) for x in nums[:4]) if nums else (0,)
 
 
+def _stock_image_semver(image: str | None) -> tuple[int, ...] | None:
+    """Parse vLLM openai image tag; None for Anemll/custom/non-semver pins."""
+    if not image:
+        return None
+    s = image.strip()
+    if "anemll" in s.lower() or "dspark-vllm" in s.lower():
+        return None  # independent version lineage
+    if "vllm/vllm-openai:" not in s and not s.startswith("vllm-openai:"):
+        # bare tag or other repo — try last :tag
+        if ":" not in s:
+            return None
+    tag = s.rsplit(":", 1)[-1]
+    if not tag or tag in ("latest", "nightly") or tag.startswith("nightly"):
+        return None
+    # strip arch/cuda suffixes: v0.27.1-aarch64 → 0.27.1
+    tag = tag.split("-")[0]
+    ver = _semver_tuple(tag)
+    return ver if ver != (0,) else None
+
+
+def _image_at_least(image: str | None, major: int, minor: int, patch: int = 0) -> bool:
+    ver = _stock_image_semver(image)
+    if ver is None:
+        # Unknown/custom: assume current lab default capability (≥0.27).
+        return True
+    target = (major, minor, patch)
+    # pad compare
+    a = ver + (0,) * (3 - len(ver))
+    b = target + (0,) * (3 - len(target))
+    return a[:3] >= b[:3]
+
+
 def _resolve_stock_image(default: str, card_image: str | None, rationale: list[str]) -> str:
     """Raise the lab default to the card's min stock tag; never downgrade; never replace Anemll."""
     if not card_image:
@@ -1286,13 +1318,13 @@ def score_candidate(
     # Performance / Spark-relevant flags from the card
     moe = (cfg.get("moe_backend") or "").strip()
     flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det)
-    marlin_unsafe = _marlin_unsafe_for_checkpoint(det)
+    marlin_unsafe = _marlin_unsafe_for_checkpoint(det, cfg.get("image"))
     if moe:
         if moe == "flashinfer_b12x" and flashinfer_unsafe:
             reasons.append(f"--moe-backend {moe} (will be stripped — unsafe for checkpoint)")
         elif moe == "marlin" and marlin_unsafe:
             reasons.append(
-                f"--moe-backend {moe} (will be stripped — unsupported for this MoE on vLLM 0.25)"
+                f"--moe-backend {moe} (will be stripped — unsupported for this MoE on selected image)"
             )
         else:
             score += 25
@@ -1391,7 +1423,7 @@ def score_candidate(
     if marlin_unsafe and moe == "marlin":
         score -= 80
         reasons.append(
-            "PENALTY: moe_backend=marlin unsupported for this MoE on vLLM 0.25 "
+            "PENALTY: moe_backend=marlin unsupported for this MoE on selected image "
             "(ValueError: not supported for unquantized MoE)"
         )
         # Salvage mirrors the flashinfer_b12x case above: the rest of a vendor GB10
@@ -1468,15 +1500,18 @@ def _quant_flags_compatible(detected_flag: str, candidate_flag: str) -> bool:
     return a in modelopt and b in modelopt
 
 
-def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when --moe-backend marlin will crash on this checkpoint.
+def _marlin_unsafe_for_checkpoint(
+    detected: dict[str, Any],
+    image: str | None = None,
+) -> bool:
+    """True when --moe-backend marlin will crash on this checkpoint×image.
 
     Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
 
-    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE on the
-    current lab image (≥0.27) is generally fine; Qwen MoE still rejects marlin.
-    Mixed FP8+NVFP4 compressed-tensors should leave moe auto (not marlin).
+    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE is
+    generally fine on ≥0.27; on older images treat non-Nemotron marlin as unsafe.
+    Qwen MoE still rejects marlin. Mixed FP8+NVFP4 should leave moe auto.
     """
     if not detected:
         return True
@@ -1487,9 +1522,11 @@ def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
         return True
     if detected.get("is_mixed_nvfp4_fp8"):
         return True
-    # Pure NVFP4 MoE on ≥0.27 — keep card marlin (SM121 often prefers it).
+    # Pure NVFP4 MoE: keep marlin on ≥0.27 (SM121); strip on older stock images.
     if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
-        return False
+        if _image_at_least(image, 0, 27, 0):
+            return False
+        return True
     if detected.get("is_moe"):
         return True
     qf = (detected.get("quant_flag") or "").lower()
@@ -1513,12 +1550,12 @@ def _sanitize_moe_backend_on_candidate(
             c.reasons.append(
                 "cleared moe_backend=flashinfer_b12x on this recipe (unsafe for checkpoint)"
             )
-    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det):
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det, c.config.get("image")):
         c.config["moe_backend"] = ""
         if not any("cleared moe_backend" in r for r in c.reasons):
             c.reasons.append(
                 "cleared moe_backend=marlin on this recipe "
-                "(vLLM 0.25: marlin unsupported for this MoE path — use auto)"
+                "(unsupported for this MoE path on the selected image — use auto)"
             )
 
 
@@ -1615,15 +1652,15 @@ def _apply_checkpoint_safety(
             rationale.append("Kept/added CUTE_DSL_ARCH=sm_121a from card Spark guidance")
 
     moe = (cfg.get("moe_backend") or "").strip()
-    if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected):
+    if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, cfg.get("image")):
         cfg["moe_backend"] = ""
         warnings.append(
-            "Card recipe used --moe-backend marlin, but vLLM 0.25 rejects marlin on this MoE "
+            "Card recipe used --moe-backend marlin, but this image rejects marlin on this MoE "
             "path (ValueError: moe_backend='marlin' is not supported for unquantized MoE). "
             "Cleared moe-backend so vLLM auto-selects a supported backend."
         )
         rationale.append(
-            "SAFETY (vLLM 0.25 > card flag): removed marlin MoE backend — use auto"
+            "SAFETY (image capability > card flag): removed marlin MoE backend — use auto"
         )
 
     # Lab-friendly KV for large NVFP4/MoE when card is silent
@@ -1668,16 +1705,17 @@ def _apply_first_boot_defaults(
 
     # Empty moe = vLLM auto — preferred on Spark unless user/card forces a known-good backend
     moe = (cfg.get("moe_backend") or "").strip().lower()
+    img = cfg.get("image")
     if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected):
         cfg["moe_backend"] = ""
-    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(detected):
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, img):
         cfg["moe_backend"] = ""
 
     # Prefer empty moe for MoE first boot even if card set something exotic we didn't list.
-    # Keep backends that are known-safe for this checkpoint (incl. Nemotron marlin).
+    # Keep backends that are known-safe for this checkpoint×image (incl. Nemotron marlin).
     moe = (cfg.get("moe_backend") or "").strip().lower()
     allowed = {"", "auto", "triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"}
-    if not _marlin_unsafe_for_checkpoint(detected):
+    if not _marlin_unsafe_for_checkpoint(detected, img):
         allowed.add("marlin")
     if detected.get("is_moe") and moe and moe not in allowed:
         cfg["moe_backend"] = ""

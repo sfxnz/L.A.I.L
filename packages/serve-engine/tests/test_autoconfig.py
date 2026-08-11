@@ -346,6 +346,7 @@ def test_checkpoint_safety_strips_marlin_on_moe():
         "has_nvfp4": True,
         "quant_flag": "modelopt",
         "quant_method": "modelopt",
+        "family": "qwen",
     }
     serve_cfg = {
         "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
@@ -368,6 +369,59 @@ def test_checkpoint_safety_strips_marlin_on_moe():
     )
     assert serve_cfg["mtp"] is False
     assert "speculative-config" not in (serve_cfg.get("extra_flags") or "")
+
+
+def test_marlin_kept_for_nemotron_family():
+    detected = {
+        "is_moe": True,
+        "has_nvfp4": True,
+        "quant_flag": "modelopt",
+        "quant_method": "modelopt",
+        "family": "nemotron",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(detected) is False
+    cfg = {"moe_backend": "marlin", "mtp": False, "extra_flags": "", "docker_env": []}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_checkpoint_safety(cfg, detected, warnings, rationale)
+    assert cfg["moe_backend"] == "marlin"
+    ac._apply_first_boot_defaults(
+        cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+    )
+    assert cfg["moe_backend"] == "marlin"
+
+
+def test_scrub_unexpanded_shell_vars():
+    warnings: list[str] = []
+    out = ac._scrub_unexpanded_shell_vars(
+        "--mamba-backend flashinfer --speculative_config.model $DSPARK_CKPT --speculative_config.method dspark",
+        warnings,
+    )
+    assert "$" not in out
+    assert "--speculative_config.method dspark" in out
+    assert "--mamba-backend flashinfer" in out
+    assert any("DSPARK" in w or "$" in w for w in warnings)
+
+
+def test_resolve_stock_image_raises_never_downgrades():
+    rat: list[str] = []
+    assert (
+        ac._resolve_stock_image("vllm/vllm-openai:v0.27.0", "vllm/vllm-openai:v0.27.1", rat)
+        == "vllm/vllm-openai:v0.27.1"
+    )
+    rat.clear()
+    assert (
+        ac._resolve_stock_image("vllm/vllm-openai:v0.27.1", "vllm/vllm-openai:v0.26.0", rat)
+        == "vllm/vllm-openai:v0.27.1"
+    )
+    assert any("downgrade" in r.lower() or "older" in r.lower() for r in rat)
+    # Anemll overlay image never replaced by stock card pin
+    assert (
+        ac._resolve_stock_image(
+            "ghcr.io/anemll/dspark-vllm-gx10:0.1.1", "vllm/vllm-openai:v0.27.1", []
+        )
+        == "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    )
 
 
 def test_recommend_requires_model():

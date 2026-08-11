@@ -944,6 +944,107 @@ def _strip_flag_from_extra(extra: str, flag: str) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
+    """Drop argv tokens that still contain ``$VAR`` after card parsing.
+
+    Cards write ``--model $MODEL_CKPT`` / ``--speculative_config.model $DSPARK_CKPT``.
+    Leaving those through would make vLLM try to load a literal ``$…`` path.
+    """
+    s = (extra or "").strip()
+    if not s or "$" not in s:
+        return s
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        parts = s.split()
+    out: list[str] = []
+    dropped: list[str] = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        # Flag whose *value* is a shell var — drop both.
+        if (
+            p.startswith("--")
+            and i + 1 < len(parts)
+            and "$" in parts[i + 1]
+            and not parts[i + 1].startswith("-")
+        ):
+            dropped.append(f"{p} {parts[i + 1]}")
+            i += 2
+            continue
+        if "$" in p:
+            dropped.append(p)
+            i += 1
+            continue
+        out.append(p)
+        i += 1
+    if dropped:
+        warnings.append(
+            "Stripped unexpanded shell variables from card flags: "
+            + ", ".join(dropped)
+            + " (fill the real path or re-run after exporting them)."
+        )
+    return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
+
+
+_CARD_IMAGE_RE = re.compile(
+    r"(?:vllm/vllm-openai|ghcr\.io/anemll/dspark-vllm-gx10)(?::[vV]?\d[\w.\-]*)?",
+    re.I,
+)
+
+
+def _parse_card_image_requirement(readme: str | None) -> str | None:
+    """First concrete image pin mentioned on the card (bare tag preferred)."""
+    if not readme:
+        return None
+    # Prefer Spark-section hits: walk near "DGX Spark" / "GB10" first.
+    spark_hits: list[str] = []
+    other: list[str] = []
+    for m in _CARD_IMAGE_RE.finditer(readme):
+        ref = m.group(0)
+        if ":" not in ref:
+            continue  # untagged — useless as a pin
+        tag = ref.split(":", 1)[1].lower()
+        if tag in ("latest", "nightly") or tag.startswith("nightly"):
+            continue
+        window = readme[max(0, m.start() - 400) : m.start()].lower()
+        if "dgx spark" in window or "gb10" in window:
+            spark_hits.append(ref)
+        else:
+            other.append(ref)
+    return (spark_hits or other or [None])[0]
+
+
+def _semver_tuple(tag: str) -> tuple[int, ...]:
+    t = tag.lstrip("vV")
+    nums = re.findall(r"\d+", t)
+    return tuple(int(x) for x in nums[:4]) if nums else (0,)
+
+
+def _resolve_stock_image(default: str, card_image: str | None, rationale: list[str]) -> str:
+    """Raise the lab default to the card's min stock tag; never downgrade; never replace Anemll."""
+    if not card_image:
+        return default
+    if "anemll" in (default or "").lower() or "dspark-vllm" in (default or "").lower():
+        return default
+    if not card_image.startswith("vllm/vllm-openai:"):
+        return default
+    d_tag = default.split(":")[-1] if ":" in default else ""
+    c_tag = card_image.split(":")[-1]
+    if _semver_tuple(c_tag) > _semver_tuple(d_tag):
+        rationale.append(
+            f"Card requires newer stock image {card_image} than lab default {default} → using card pin"
+        )
+        return card_image
+    if card_image != default and _semver_tuple(c_tag) == _semver_tuple(d_tag):
+        return default
+    if _semver_tuple(c_tag) < _semver_tuple(d_tag):
+        rationale.append(
+            f"Card pin {card_image} is older than lab default {default} — keeping lab default (no downgrade)"
+        )
+    return default
+
+
 def extract_serve_candidates(
     readme: str,
     *,
@@ -1189,16 +1290,18 @@ def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
 
 
 def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when --moe-backend marlin crashes on this checkpoint (vLLM 0.25.x).
+    """True when --moe-backend marlin will crash on this checkpoint.
 
-    Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE):
+    Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
-      Expected one of ['triton', 'flashinfer_trtllm', 'flashinfer_cutlass', 'aiter'].
-    Cards still ship marlin recipes; leave moe-backend empty (auto).
+
+    Nemotron hybrid MoE Spark cards (Lightning / Ultra) *require* marlin on GB10 —
+    do not strip those. Unknown / Qwen-style MoE+NVFP4 still treat marlin as unsafe.
     """
     if not detected:
-        # MoE/NVFP4 cards are the risk class — if unknown, still treat marlin as unsafe
         return True
+    if detected.get("family") == "nemotron":
+        return False
     if detected.get("is_moe"):
         return True
     if detected.get("has_nvfp4") or detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
@@ -1374,22 +1477,26 @@ def _apply_first_boot_defaults(
         )
         rationale.append("FIRST BOOT: MTP off (stable serve; re-enable later if needed)")
 
-    # Empty moe = vLLM auto — preferred on Spark unless user forces a known-good backend
+    # Empty moe = vLLM auto — preferred on Spark unless user/card forces a known-good backend
     moe = (cfg.get("moe_backend") or "").strip().lower()
-    if moe in ("marlin",) or (moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected)):
-        # already handled by checkpoint safety; ensure empty
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected):
+        cfg["moe_backend"] = ""
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(detected):
         cfg["moe_backend"] = ""
 
-    # Prefer empty moe for MoE first boot even if card set something exotic we didn't list
-    if detected.get("is_moe") and moe and moe not in ("", "auto", "triton"):
-        # Keep triton if card set it; clear unknown/risky backends
-        if moe not in ("triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"):
-            cfg["moe_backend"] = ""
-            if moe not in ("marlin", "flashinfer_b12x"):  # already warned
-                warnings.append(
-                    f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
-                )
-                rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
+    # Prefer empty moe for MoE first boot even if card set something exotic we didn't list.
+    # Keep backends that are known-safe for this checkpoint (incl. Nemotron marlin).
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    allowed = {"", "auto", "triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"}
+    if not _marlin_unsafe_for_checkpoint(detected):
+        allowed.add("marlin")
+    if detected.get("is_moe") and moe and moe not in allowed:
+        cfg["moe_backend"] = ""
+        if moe not in ("marlin", "flashinfer_b12x"):
+            warnings.append(
+                f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
+            )
+            rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
 
     # Long card contexts are clamped by _apply_mode_envelope on single-node Spark.
     # Multi-node overlays (TP>=2) keep their pin.
@@ -1791,9 +1898,18 @@ def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], c
 
     # Lab Safe clamps util, but never below a card/overlay-specified floor (large NVFP4 /
     # DSpark weights need the card's util just to load — clamping to 0.4 would brick the boot).
-    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9 and not card_set_util:
+    # Exception: Lab Safe Start hard-fails above SAFE_UTIL, so always clamp for that mode and
+    # tell the user to switch to Workflow Max when the recipe needed more.
+    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9:
+        prev = cfg["util"]
         cfg["util"] = SAFE_UTIL
-        rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
+        if card_set_util:
+            rationale.append(
+                f"clamped util {prev} → {SAFE_UTIL} for Lab Safe "
+                "(card/overlay needs more — use Workflow Max to load this checkpoint)"
+            )
+        else:
+            rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
 
     # Single-node Spark: card/demo 1M contexts OOMs under realistic util. Multi-node
     # overlays (TP>=2) that intentionally pin a huge window keep it.
@@ -2008,9 +2124,20 @@ def recommend(
 
     # Mode envelope for util / defaults when card silent. util/max-len set by the card OR a
     # family overlay are authoritative — the envelope only fills gaps, never overrides them.
+    # Lab Safe still clamps util ≤ SAFE_UTIL so Start cannot hard-fail the contract.
     card_set_util = cfg.get("util") is not None
     card_set_max_len = cfg.get("max_model_len") is not None
     _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
+
+    # Card image pin: raise stock default when the card asks for a newer tag; never downgrade;
+    # never replace an Anemll/DSpark overlay image.
+    card_image = _parse_card_image_requirement(readme)
+    if cfg.get("image"):
+        cfg["image"] = _resolve_stock_image(cfg["image"], card_image, rationale)
+
+    # Unexpanded $VARS from card recipes must never reach docker.
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
 
     max_pos = detected.get("max_position_embeddings")
     if isinstance(max_pos, int) and max_pos > 0 and cfg.get("max_model_len"):
@@ -2093,6 +2220,13 @@ def recommend(
         notes = "Live HF card was not available; result may be incomplete."
 
     plan = cfg.get("topology_plan") or {}
+    fits = bool(plan.get("fits", True))
+    serve_blocked = not fits
+    if serve_blocked:
+        warnings.append(
+            "SERVE BLOCKED: weights do not fit the online cluster — Start will refuse until "
+            "you add nodes or pick a smaller checkpoint."
+        )
     topology_out = {
         "nodes": topology.get("nodes", 1),
         "nodes_used": plan.get("nodes_needed", 1),
@@ -2104,7 +2238,7 @@ def recommend(
         "weights_gib": weights_gib,
         "per_node_weights_gib": plan.get("per_node_weights_gib"),
         "util_computed": plan.get("util_computed"),
-        "fits": plan.get("fits", True),
+        "fits": fits,
         "node_ram_gib": plan.get("node_ram_gib"),
         "overlay": overlay["family_key"] if overlay else None,
     }
@@ -2129,6 +2263,7 @@ def recommend(
         "card_url": card_url,
         "from_website": from_website,
         "hf_token_ok": token_ok,
+        "serve_blocked": serve_blocked,
         "detected": detected,
         "config": cfg,
         "topology": topology_out,

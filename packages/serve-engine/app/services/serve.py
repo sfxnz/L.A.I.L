@@ -747,11 +747,30 @@ def serve_model(
             "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
             0.28,
         )
-    cmd += [
-        image,
-        model,
-        *vllm_args,
-    ]
+
+    # Custom Spark images (Anemll dspark-vllm-gx10) ship ENTRYPOINT=vllm. Clear it so our
+    # argv is not appended as unrecognized vllm flags (exit 2). Stock vllm-openai is fine.
+    img_l = (image or "").lower()
+    needs_entrypoint = "anemll" in img_l or "dspark-vllm" in img_l or "gx10" in img_l
+    if needs_entrypoint:
+        cmd += [
+            "--entrypoint",
+            "bash",
+            image,
+            "-lc",
+            'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"',
+            "--",
+            "vllm",
+            "serve",
+            model,
+            *vllm_args,
+        ]
+    else:
+        cmd += [
+            image,
+            model,
+            *vllm_args,
+        ]
 
     def _redact_cmd(parts: list[str]) -> str:
         """Never log HF tokens / secrets in job logs."""

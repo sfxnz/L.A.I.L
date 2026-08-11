@@ -1391,15 +1391,8 @@ def _apply_first_boot_defaults(
                 )
                 rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
 
-    # Lab Safe: don't carry card util=0.85 into lab_safe form without clamp (envelope handles)
-    # Workflow Max first boot on 35B MoE: 262k ctx is OK only with enough util headroom —
-    # leave card max-len but note memory risk.
-    if mode == "workflow_max" and isinstance(cfg.get("max_model_len"), int):
-        if cfg["max_model_len"] >= 200000 and detected.get("is_moe"):
-            rationale.append(
-                f"Card max-model-len={cfg['max_model_len']} kept for Workflow Max — "
-                "watch free UMA; drop to 65536 if load OOMs"
-            )
+    # Long card contexts are clamped by _apply_mode_envelope on single-node Spark.
+    # Multi-node overlays (TP>=2) keep their pin.
 
 
 # ─── config.json analysis (fills gaps the card left empty) ────────────────────
@@ -1699,6 +1692,18 @@ def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], c
     if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9 and not card_set_util:
         cfg["util"] = SAFE_UTIL
         rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
+
+    # Single-node Spark: card/demo 1M contexts OOMs under realistic util. Multi-node
+    # overlays (TP>=2) that intentionally pin a huge window keep it.
+    ceiling = SAFE_MAX_LEN if mode == "lab_safe" else WORKFLOW_MAX_LEN
+    ml = cfg.get("max_model_len")
+    tp = int(cfg.get("tensor_parallel_size") or 1)
+    if isinstance(ml, int) and ml > ceiling and tp < 2:
+        cfg["max_model_len"] = ceiling
+        rationale.append(
+            f"clamped max-model-len {ml} → {ceiling} "
+            f"({mode} envelope on single-node Spark; raise TP or edit form for longer ctx)"
+        )
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────

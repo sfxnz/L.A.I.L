@@ -1,11 +1,29 @@
 {
   "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
   "mode": "workflow_max",
-  "note": "TODO: what the vendor's published recipe requires",
+  "note": "Vendor 1x DGX Spark (GB10) recipe. Marlin is stripped to auto (vLLM MoE safety). Single-node envelope clamps card 1M context to 262144. DSpark speculative decode is kept (NVIDIA's Spark recommendation).",
   "expect": {
-    "label_contains": "",
-    "config": {},
-    "extra_flags_contains": [],
-    "forbidden": []
+    "label_contains": "DGX Spark",
+    "config": {
+      "reasoning_parser": "nemotron_v3",
+      "tool_call_parser": "qwen3_coder",
+      "kv_cache_dtype": "fp8",
+      "moe_backend": "",
+      "enable_prefix_caching": true,
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true,
+      "max_model_len": 262144
+    },
+    "extra_flags_contains": [
+      "--mamba-backend flashinfer",
+      "--mamba-cache-mode align",
+      "--speculative_config.method dspark"
+    ],
+    "forbidden": [
+      "humming",
+      "marlin",
+      "$MODEL",
+      "--model "
+    ]
   }
 }

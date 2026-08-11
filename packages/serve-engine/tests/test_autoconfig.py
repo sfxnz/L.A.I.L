@@ -934,3 +934,57 @@ def test_family_overlay_matches_detected_family_without_id_hint():
         {"family": "minimax_m2"},
     )
     assert ov is not None and ov["family_key"] == "minimax_m2"
+
+def test_size_memory_clamps_huge_context_single_node():
+    cfg = {
+        "max_model_len": 1048576,
+        "util": 0.85,
+        "max_num_seqs": 4,
+        "kv_cache_dtype": "fp8",
+        "tensor_parallel_size": 1,
+    }
+    hf = {
+        "num_hidden_layers": 48,
+        "num_key_value_heads": 8,
+        "num_attention_heads": 32,
+        "hidden_size": 4096,
+        "head_dim": 128,
+    }
+    rationale: list[str] = []
+    warnings: list[str] = []
+    ac._size_memory_for_spark(
+        cfg,
+        hf_config=hf,
+        detected={"family": "qwen"},
+        weights_gib=40.0,
+        node_ram_gib=121.7,
+        mode="workflow_max",
+        rationale=rationale,
+        warnings=warnings,
+    )
+    assert cfg["max_model_len"] < 1048576
+    assert cfg["max_model_len"] in ac._CONTEXT_LADDER
+    assert any("MEMORY:" in r for r in rationale)
+
+
+def test_size_memory_skips_multinode_tp():
+    cfg = {
+        "max_model_len": 1048576,
+        "util": 0.8,
+        "max_num_seqs": 6,
+        "kv_cache_dtype": "nvfp4_ds_mla",
+        "tensor_parallel_size": 2,
+    }
+    rationale: list[str] = []
+    warnings: list[str] = []
+    ac._size_memory_for_spark(
+        cfg,
+        hf_config={"num_hidden_layers": 60},
+        detected={"family": "deepseek_v4"},
+        weights_gib=155.4,
+        node_ram_gib=121.7,
+        mode="workflow_max",
+        rationale=rationale,
+        warnings=warnings,
+    )
+    assert cfg["max_model_len"] == 1048576

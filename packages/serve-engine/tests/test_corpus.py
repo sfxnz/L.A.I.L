@@ -62,6 +62,28 @@ def _load(case_dir: Path) -> dict:
     return case
 
 
+def _two_spark_topo() -> dict:
+    nodes = [
+        {
+            "id": f"spark{i}",
+            "qsfp_ip": f"10.100.8.{i}",
+            "qsfp_if": "enp1s0f1np1",
+            "ram_gib": 121.7,
+            "local": i == 1,
+            "ssh_host": f"spark{i}",
+        }
+        for i in (1, 2)
+    ]
+    return {
+        "nodes": 2,
+        "node_list": nodes,
+        "head": nodes[0],
+        "workers": nodes[1:],
+        "fabric_ok": True,
+        "available": True,
+    }
+
+
 def _recommend_offline(monkeypatch, case: dict) -> dict:
     """Run the shipped recommend() against captured fixtures only."""
     model = case["model"]
@@ -78,7 +100,11 @@ def _recommend_offline(monkeypatch, case: dict) -> dict:
         }
 
     monkeypatch.setattr(ac, "fetch_hf_card", _fake_fetch)
-    monkeypatch.setattr(ac, "_cluster_topology", _one_spark_topo)
+    topo = _two_spark_topo if case.get("topology") == "two_spark" else _one_spark_topo
+    monkeypatch.setattr(ac, "_cluster_topology", topo)
+    # Overlay placement needs weights; pin a known-fit DSv4-sized blob when fixtures omit Hub.
+    if case.get("topology") == "two_spark":
+        monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 155.4)
     return ac.recommend(model, mode=case.get("mode", "workflow_max"))
 
 
@@ -143,4 +169,10 @@ def test_corpus_case(monkeypatch, case_dir: Path):
     for frag in expect.get("forbidden") or []:
         assert frag not in cmd, (
             f"{case_dir.name}: {frag!r} must not appear in composed command:\n{cmd}"
+        )
+
+    if expect.get("image_contains"):
+        assert expect["image_contains"] in (cfg.get("image") or ""), (
+            f"{case_dir.name}: expected image containing {expect['image_contains']!r}, "
+            f"got {cfg.get('image')!r}"
         )

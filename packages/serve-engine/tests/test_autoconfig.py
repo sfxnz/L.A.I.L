@@ -1012,3 +1012,22 @@ def test_marlin_version_gate_pure_nvfp4():
     # Nemotron always keeps marlin
     det["family"] = "nemotron"
     assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.25.0") is False
+
+
+def test_analyze_config_detects_vl():
+    d = ac.analyze_config(
+        {"architectures": ["Qwen2_5_VLForConditionalGeneration"], "model_type": "qwen2_5_vl"},
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+    )
+    assert d["is_vl"] is True
+
+
+def test_vl_gets_language_model_only():
+    cfg = {"extra_flags": "--max-num-batched-tokens 8192", "moe_backend": ""}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_vl_spark_defaults(
+        cfg, {"is_vl": True}, warnings, rationale
+    )
+    assert "--language-model-only" in cfg["extra_flags"]
+    assert any("language-model-only" in r for r in rationale)

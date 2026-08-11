@@ -1678,6 +1678,29 @@ def _apply_checkpoint_safety(
         rationale.append("MoE (from config) → --max-num-seqs 4 when card omitted it")
 
 
+def _apply_vl_spark_defaults(
+    cfg: dict[str, Any],
+    detected: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """GB10 first boot: skip vision towers unless the card already configured MM limits."""
+    if not detected.get("is_vl"):
+        return
+    ex = cfg.get("extra_flags") or ""
+    if "--language-model-only" in ex or "--limit-mm-per-prompt" in ex:
+        return
+    cfg["extra_flags"] = (ex + " --language-model-only").strip()
+    rationale.append(
+        "VL/multimodal checkpoint on Spark → --language-model-only "
+        "(avoids vision-tower OOM on first boot; remove to enable images)"
+    )
+    warnings.append(
+        "Multimodal model: serving language-model-only on Spark for stable first boot. "
+        "Drop --language-model-only and set --limit-mm-per-prompt when you need vision."
+    )
+
+
 def _apply_first_boot_defaults(
     cfg: dict[str, Any],
     *,
@@ -1849,6 +1872,17 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         or cfg.get("num_experts")
         or text_cfg.get("num_experts")
     )
+    arch_blob = " ".join(str(a).lower() for a in architectures)
+    is_vl = bool(
+        "vl" in model_type
+        or "vision" in model_type
+        or re.search(r"(^|[_-])vl([_-]|$)", mid)
+        or "vl" in arch_blob
+        or "conditionalgeneration" in arch_blob and ("qwen3_5" in model_type or "qwen3.5" in mid or "qwen3.6" in mid)
+        or "llava" in mid
+        or "pixtral" in mid
+        or "internvl" in mid
+    )
     is_mixed = has_nvfp4 and has_fp8 and (
         quant_method in ("compressed-tensors", "compressed_tensors")
         or "mixed" in fmt_blob
@@ -1913,6 +1947,7 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         "has_fp8": has_fp8,
         "is_mixed_nvfp4_fp8": is_mixed,
         "is_moe": is_moe,
+        "is_vl": is_vl,
         "has_modelopt_layers": has_modelopt_layers,
         "max_position_embeddings": max_pos,
         "quant_flag": quant_flag,
@@ -2613,6 +2648,7 @@ def recommend(
             warnings=warnings,
             rationale=rationale,
         )
+        _apply_vl_spark_defaults(cfg, detected, warnings, rationale)
 
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
     # Overlay already encodes the correct backend, so only run for card-driven configs.

@@ -68,7 +68,7 @@ Side-by-side iframes + same task brief — “three models, one game prompt.”
 
 | Mode | Audience | Mechanism |
 |------|----------|-----------|
-| **Private** | You on Tailscale | `http://100.86.121.44:3000/lab/<id>` |
+| **Private** | You on Tailscale | `http://100.115.190.113:3000/lab/<id>` |
 | **LAN play** | Friends on home network | same host, optional auth off for `/lab/public/*` only |
 | **Public** | Internet | later: signed URL or Cloudflare tunnel to **static export only** (not full L.A.I.L) |
 

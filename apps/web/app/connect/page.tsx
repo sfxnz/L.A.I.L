@@ -5,8 +5,8 @@ import { api, type LabStatus } from "@/lib/api";
 import { Badge, Btn, Metric, Panel } from "@/components/ui";
 
 function hostFromBrowser(): string {
-  if (typeof window === "undefined") return "100.86.121.44";
-  return window.location.hostname || "100.86.121.44";
+  if (typeof window === "undefined") return "100.115.190.113";
+  return window.location.hostname || "100.115.190.113";
 }
 
 export default function ConnectPage() {

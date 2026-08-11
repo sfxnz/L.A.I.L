@@ -23,8 +23,8 @@ GOLDEN_TOOLS = HOME / "lab" / "bin" / "golden_tools.py"
 
 DEFAULT_BASE_URL = os.environ.get("LAB_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_PORT = int(os.environ.get("LAB_PORT", "8000"))
-DEFAULT_IMAGE_SAFE = os.environ.get("SPARK_VLLM_IMAGE", "vllm/vllm-openai:v0.26.0")
-DEFAULT_IMAGE_MAX = os.environ.get("LAB_VLLM_IMAGE_MAX", "vllm/vllm-openai:v0.26.0")
+DEFAULT_IMAGE_SAFE = os.environ.get("SPARK_VLLM_IMAGE", "vllm/vllm-openai:v0.27.1")
+DEFAULT_IMAGE_MAX = os.environ.get("LAB_VLLM_IMAGE_MAX", "vllm/vllm-openai:v0.27.1")
 
 # Lab Safe envelope (matches spark_envelope.sh)
 SAFE_UTIL = 0.4
@@ -100,7 +100,7 @@ SERVE_EXAMPLES: dict[str, dict] = {
         "docker_env": ["CUTE_DSL_ARCH=sm_121a"],
         "extra_flags": "",
         "mtp": False,
-        "notes": "Proven path on Spark (v0.25 smoke; default image now v0.26.0): quant=compressed-tensors, leave moe-backend empty (auto), CUTE_DSL_ARCH=sm_121a. MTP optional later.",
+        "notes": "Proven path on Spark (v0.25 smoke; default image now v0.27.1): quant=compressed-tensors, leave moe-backend empty (auto), CUTE_DSL_ARCH=sm_121a. MTP optional later.",
     },
     "nvidia-27b": {
         "label": "NVIDIA 27B NVFP4",

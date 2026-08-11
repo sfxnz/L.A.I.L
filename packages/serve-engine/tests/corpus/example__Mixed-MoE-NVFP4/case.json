@@ -1,0 +1,17 @@
+{
+  "model": "example/Mixed-MoE-NVFP4",
+  "mode": "workflow_max",
+  "note": "Offline fixture: compressed-tensors mixed FP8+NVFP4 must not keep flashinfer_b12x.",
+  "expect": {
+    "config": {
+      "quantization": "compressed-tensors",
+      "kv_cache_dtype": "fp8"
+    },
+    "forbidden": [
+      "flashinfer_b12x",
+      "humming",
+      "$",
+      "--model "
+    ]
+  }
+}

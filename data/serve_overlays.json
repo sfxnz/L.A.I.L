@@ -1,0 +1,71 @@
+[
+  {
+    "match": {
+      "all": ["minimax"],
+      "any": ["m2", "m2.1", "m2.5", "m2.7"],
+      "family": ["minimax_m2"]
+    },
+    "family_key": "minimax_m2",
+    "label": "MiniMax M2 NVFP4 (DGX Spark)",
+    "source": "https://huggingface.co/MiniMaxAI",
+    "config": {
+      "trust_remote_code": true,
+      "reasoning_parser": "minimax_m2",
+      "tool_call_parser": "minimax_m2",
+      "enable_auto_tool_choice": true,
+      "kv_cache_dtype": "fp8",
+      "docker_env": [
+        "SAFETENSORS_FAST_GPU=1",
+        "CUTE_DSL_ARCH=sm_121a",
+        "VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass"
+      ],
+      "extra_flags": "--compilation-config '{\"cudagraph_mode\":\"none\"}'"
+    },
+    "rationale": [
+      "MiniMax M2 on GB10: parsers + FP8 KV; cudagraph none avoids known NVFP4 compile stalls.",
+      "Prefer NVFP4 ~130 GiB across 2 Sparks (TP=2); placement sizes nodes from weights."
+    ]
+  },
+  {
+    "match": {
+      "all": ["minimax"],
+      "any": ["m3"],
+      "family": ["minimax_m3"]
+    },
+    "family_key": "minimax_m3",
+    "label": "MiniMax M3 (parsers + MSA block-size; weight-fit usually blocks 1–2 Sparks)",
+    "source": "https://huggingface.co/MiniMaxAI",
+    "config": {
+      "trust_remote_code": true,
+      "reasoning_parser": "minimax_m3",
+      "tool_call_parser": "minimax_m3",
+      "enable_auto_tool_choice": true,
+      "extra_flags": "--block-size 128 --language-model-only --default-chat-template-kwargs '{\"thinking_mode\":\"enabled\"}'"
+    },
+    "rationale": [
+      "M3 MSA requires --block-size 128; language-model-only keeps Spark off the VL tower.",
+      "Full M3 weights usually exceed 2× GB10 — serve_blocked / Start refuse via placement floors."
+    ]
+  },
+  {
+    "match": {
+      "all": ["mistral"],
+      "any": ["magistral", "devstral"],
+      "family": ["mistral"]
+    },
+    "family_key": "mistral_common",
+    "label": "Mistral / Magistral (mistral-common load path)",
+    "source": "https://docs.vllm.ai",
+    "config": {
+      "trust_remote_code": true,
+      "load_format": "mistral",
+      "tool_call_parser": "mistral",
+      "enable_auto_tool_choice": true,
+      "reasoning_parser": "mistral",
+      "extra_flags": "--tokenizer-mode mistral --config-format mistral"
+    },
+    "rationale": [
+      "Magistral/Devstral cards expect mistral-common tokenizer/config/load_format."
+    ]
+  }
+]

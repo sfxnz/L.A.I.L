@@ -1,0 +1,27 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "mode": "workflow_max",
+  "topology": "two_spark",
+  "note": "Family overlay owns Anemll image + nvfp4_ds_mla; 2-node TP pin.",
+  "expect": {
+    "label_contains": "DSpark",
+    "config": {
+      "kv_cache_dtype": "nvfp4_ds_mla",
+      "moe_backend": "flashinfer_b12x",
+      "reasoning_parser": "deepseek_v4",
+      "tool_call_parser": "deepseek_v4",
+      "quantization": ""
+    },
+    "extra_flags_contains": [
+      "--speculative-config",
+      "dspark"
+    ],
+    "forbidden": [
+      "humming",
+      "$",
+      "--model ",
+      "--data-parallel-size"
+    ],
+    "image_contains": "dspark-vllm-gx10"
+  }
+}

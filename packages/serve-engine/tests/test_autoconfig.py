@@ -115,6 +115,106 @@ def test_modelopt_card_recipe_sets_quantization():
     assert best.config.get("reasoning_parser") == "qwen3"
 
 
+
+def test_analyze_config_modelopt_mixed_precision():
+    """ModelOpt MIXED_PRECISION must not collapse to umbrella modelopt."""
+    cfg = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
+            "quantized_layers": {
+                "a": {"quant_algo": "FP8"},
+                "b": {"quant_algo": "W4A16_NVFP4"},
+            },
+        },
+    }
+    d = ac.analyze_config(cfg, "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
+    assert d["quant_flag"] == "modelopt_mixed"
+    assert d["quant_algo"] == "MIXED_PRECISION"
+    assert d["is_mixed_nvfp4_fp8"] is True
+    assert d["suggested_kv_cache_dtype"] == "fp8"
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d) is True
+    # Nemotron still keeps marlin despite mixed ModelOpt.
+    assert ac._marlin_unsafe_for_checkpoint(d) is False
+
+
+def test_analyze_config_modelopt_nvfp4_algo():
+    cfg = {
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        }
+    }
+    d = ac.analyze_config(cfg, "nvidia/Example-27B-NVFP4")
+    assert d["quant_flag"] == "modelopt_fp4"
+    assert d["has_nvfp4"] is True
+    assert d["is_mixed_nvfp4_fp8"] is False
+
+
+
+def test_merge_hf_quant_config_into_empty():
+    cfg = {"architectures": ["FooForCausalLM"]}
+    qc = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    out = ac._merge_hf_quant_config(cfg, qc)
+    assert out["quantization_config"]["quant_method"] == "modelopt"
+    d = ac.analyze_config(out, "nvidia/Example-NVFP4")
+    assert d["quant_flag"] in ("modelopt_fp4", "modelopt")
+
+
+def test_merge_hf_quant_does_not_clobber_existing_method():
+    cfg = {"quantization_config": {"quant_method": "compressed-tensors"}}
+    out = ac._merge_hf_quant_config(cfg, {"quant_method": "modelopt", "quant_algo": "FP8"})
+    assert out["quantization_config"]["quant_method"] == "compressed-tensors"
+
+
+def test_merge_hf_quant_normalizes_modelopt_sidecar():
+    """Real ModelOpt sidecars nest algo under quantization + producer.name."""
+    cfg = {"architectures": ["NemotronHForCausalLM"]}
+    sidecar = {
+        "producer": {"name": "modelopt", "version": "0.34.1"},
+        "quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": None},
+    }
+    out = ac._merge_hf_quant_config(cfg, sidecar)
+    assert out["quantization_config"]["quant_method"] == "modelopt"
+    assert out["quantization_config"]["quant_algo"] == "NVFP4"
+    d = ac.analyze_config(out, "nvidia/Example-NVFP4")
+    assert d["quant_flag"] == "modelopt_fp4"
+
+
+def test_load_local_fallback_merges_hf_quant_sidecar(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["FooForCausalLM"], "model_type": "foo"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {"name": "modelopt"},
+                "quantization": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    local = ac.load_local_fallback(str(tmp_path))
+    qc = (local.get("config") or {}).get("quantization_config") or {}
+    assert qc.get("quant_method") == "modelopt"
+    assert qc.get("quant_algo") == "NVFP4"
+
+
+def test_quant_flags_compatible_modelopt_siblings():
+    assert ac._quant_flags_compatible("modelopt_mixed", "modelopt_fp4")
+    assert ac._quant_flags_compatible("modelopt", "modelopt")
+    assert not ac._quant_flags_compatible("modelopt", "compressed-tensors")
+
+
+def test_card_prose_prefers_modelopt_fp4_over_umbrella():
+    hints = ac._card_prose_hints("run with --quantization modelopt_fp4 on Spark")
+    assert hints["quantization"] == "modelopt_fp4"
+
+
 def test_analyze_config_detects_mixed_formats():
     cfg = json.loads((FIX / "config_mixed_compressed_tensors.json").read_text())
     d = ac.analyze_config(cfg, "org/Model-A3B-NVFP4")
@@ -123,6 +223,138 @@ def test_analyze_config_detects_mixed_formats():
     assert d["has_fp8"] is True
     assert d["is_mixed_nvfp4_fp8"] is True
     assert d["quant_flag"] == "compressed-tensors"
+
+
+@pytest.mark.parametrize(
+    "model_id,arch,want",
+    [
+        ("MiniMaxAI/MiniMax-M2-NVFP4", ["MiniMaxM2ForCausalLM"], "minimax_m2"),
+        ("MiniMaxAI/MiniMax-M3", ["MiniMaxM3ForCausalLM"], "minimax_m3"),
+        ("mistralai/Magistral-Small-2507", ["MistralForCausalLM"], "mistral"),
+        ("deepseek-ai/DeepSeek-R1", ["DeepseekV3ForCausalLM"], "deepseek_r1"),
+        ("deepseek-ai/DeepSeek-V3.2", ["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        ("deepseek-ai/DeepSeek-V4-Flash", ["DeepseekV4ForCausalLM"], "deepseek_v4"),
+        ("THUDM/glm-4-9b-chat", ["ChatGLMModel"], "glm"),
+        ("moonshotai/Kimi-K2-Instruct", ["KimiK2ForCausalLM"], "kimi"),
+        ("meta-llama/Llama-3.3-70B-Instruct", ["LlamaForCausalLM"], "llama"),
+        ("meta-llama/Llama-4-Scout-17B-16E-Instruct", ["Llama4ForCausalLM"], "llama4"),
+        ("google/gemma-2-9b-it", ["Gemma2ForCausalLM"], "gemma"),
+        ("google/gemma-4-9b-it", ["Gemma4ForCausalLM"], "gemma4"),
+        ("microsoft/Phi-4-mini-instruct", ["Phi3ForCausalLM"], "phi"),
+        ("ibm-granite/granite-3.3-8b-instruct", ["GraniteForCausalLM"], "granite"),
+    ],
+)
+
+def test_analyze_config_family_detection(model_id, arch, want):
+    d = ac.analyze_config({"architectures": arch, "model_type": arch[0].lower()}, model_id)
+    assert d["family"] == want
+
+
+def test_qwen25_skips_qwen3_parsers():
+    cfg = ac._empty_config("Qwen/Qwen2.5-7B-Instruct")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {"family": "qwen", "quant_flag": "", "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2"},
+        rationale,
+    )
+    assert cfg.get("reasoning_parser") in ("", None)
+    assert cfg.get("tool_call_parser") in ("", None)
+    assert any("Qwen2.5" in r or "Qwen2" in r for r in rationale)
+
+
+def test_qwen3_still_gets_parsers():
+    cfg = ac._empty_config("Qwen/Qwen3-8B")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {"family": "qwen", "quant_flag": "", "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"},
+        rationale,
+    )
+    assert cfg["reasoning_parser"] == "qwen3"
+    assert cfg["tool_call_parser"] == "qwen3_coder"
+
+
+def test_strip_spark_unsafe_flags():
+    cfg = {
+        "extra_flags": "--enable-expert-parallel --data-parallel-size 8 --max-num-batched-tokens 8192",
+        "moe_backend": "humming",
+        "docker_env": ["VLLM_USE_DEEP_GEMM_MEGA_MOE=1", "CUTE_DSL_ARCH=sm_121a"],
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._strip_spark_unsafe_flags(cfg, warnings, rationale)
+    ex = cfg["extra_flags"]
+    assert "--enable-expert-parallel" not in ex
+    assert "--data-parallel-size" not in ex
+    assert "--max-num-batched-tokens" in ex
+    assert cfg["moe_backend"] == ""
+    assert not any(e.startswith("VLLM_USE_DEEP_GEMM_MEGA_MOE=") for e in cfg["docker_env"])
+    assert any(e.startswith("CUTE_DSL_ARCH=") for e in cfg["docker_env"])
+
+
+def test_fill_from_config_minimax_and_mistral_parsers():
+    rationale: list[str] = []
+    m2 = ac._empty_config("MiniMaxAI/MiniMax-M2")
+    ac._fill_from_config_detection(
+        m2, {"family": "minimax_m2", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert m2["reasoning_parser"] == "minimax_m2"
+    assert m2["tool_call_parser"] == "minimax_m2"
+    assert m2["enable_auto_tool_choice"] is True
+
+    m3 = ac._empty_config("MiniMaxAI/MiniMax-M3")
+    ac._fill_from_config_detection(
+        m3, {"family": "minimax_m3", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert m3["reasoning_parser"] == "minimax_m3"
+    assert "--block-size 128" in (m3.get("extra_flags") or "")
+
+    mis = ac._empty_config("mistralai/Magistral-Small")
+    ac._fill_from_config_detection(
+        mis,
+        {"family": "mistral", "quant_flag": "", "architectures": ["MagistralForCausalLM"], "model_type": "magistral"},
+        rationale,
+    )
+    assert mis["tool_call_parser"] == "mistral"
+    assert mis["reasoning_parser"] == "mistral"
+    assert mis["load_format"] == "mistral"
+    assert "--tokenizer-mode mistral" in (mis.get("extra_flags") or "")
+
+    llama = ac._empty_config("meta-llama/Llama-3.3-70B-Instruct")
+    ac._fill_from_config_detection(
+        llama, {"family": "llama", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert llama["tool_call_parser"] == "llama3_json"
+
+    llama4 = ac._empty_config("meta-llama/Llama-4-Scout")
+    ac._fill_from_config_detection(
+        llama4, {"family": "llama4", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert llama4["tool_call_parser"] == "llama4_pythonic"
+
+    gemma4 = ac._empty_config("google/gemma-4-9b")
+    ac._fill_from_config_detection(
+        gemma4, {"family": "gemma4", "quant_flag": "", "architectures": [], "model_type": ""}, rationale
+    )
+    assert gemma4["reasoning_parser"] == "gemma4"
+    assert gemma4["tool_call_parser"] == "gemma4"
+
+    phi = ac._empty_config("microsoft/Phi-4-mini-instruct")
+    ac._fill_from_config_detection(
+        phi,
+        {"family": "phi", "quant_flag": "", "architectures": ["Phi3ForCausalLM"], "model_type": "phi3"},
+        rationale,
+    )
+    assert phi["tool_call_parser"] == "phi4_mini_json"
+
+    gran = ac._empty_config("ibm-granite/granite-4.0-h-small")
+    ac._fill_from_config_detection(
+        gran,
+        {"family": "granite", "quant_flag": "", "architectures": ["GraniteMoeHybridForCausalLM"], "model_type": "granitemoehybrid"},
+        rationale,
+    )
+    assert gran["tool_call_parser"] == "granite4"
 
 
 # ─── Live hub recommend (real entry point) ───────────────────────────────────
@@ -299,6 +531,7 @@ def test_checkpoint_safety_strips_marlin_on_moe():
         "has_nvfp4": True,
         "quant_flag": "modelopt",
         "quant_method": "modelopt",
+        "family": "qwen",
     }
     serve_cfg = {
         "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
@@ -321,6 +554,59 @@ def test_checkpoint_safety_strips_marlin_on_moe():
     )
     assert serve_cfg["mtp"] is False
     assert "speculative-config" not in (serve_cfg.get("extra_flags") or "")
+
+
+def test_marlin_kept_for_nemotron_family():
+    detected = {
+        "is_moe": True,
+        "has_nvfp4": True,
+        "quant_flag": "modelopt",
+        "quant_method": "modelopt",
+        "family": "nemotron",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(detected) is False
+    cfg = {"moe_backend": "marlin", "mtp": False, "extra_flags": "", "docker_env": []}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_checkpoint_safety(cfg, detected, warnings, rationale)
+    assert cfg["moe_backend"] == "marlin"
+    ac._apply_first_boot_defaults(
+        cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+    )
+    assert cfg["moe_backend"] == "marlin"
+
+
+def test_scrub_unexpanded_shell_vars():
+    warnings: list[str] = []
+    out = ac._scrub_unexpanded_shell_vars(
+        "--mamba-backend flashinfer --speculative_config.model $DSPARK_CKPT --speculative_config.method dspark",
+        warnings,
+    )
+    assert "$" not in out
+    assert "--speculative_config.method dspark" in out
+    assert "--mamba-backend flashinfer" in out
+    assert any("DSPARK" in w or "$" in w for w in warnings)
+
+
+def test_resolve_stock_image_raises_never_downgrades():
+    rat: list[str] = []
+    assert (
+        ac._resolve_stock_image("vllm/vllm-openai:v0.27.0", "vllm/vllm-openai:v0.27.1", rat)
+        == "vllm/vllm-openai:v0.27.1"
+    )
+    rat.clear()
+    assert (
+        ac._resolve_stock_image("vllm/vllm-openai:v0.27.1", "vllm/vllm-openai:v0.26.0", rat)
+        == "vllm/vllm-openai:v0.27.1"
+    )
+    assert any("downgrade" in r.lower() or "older" in r.lower() for r in rat)
+    # Anemll overlay image never replaced by stock card pin
+    assert (
+        ac._resolve_stock_image(
+            "ghcr.io/anemll/dspark-vllm-gx10:0.1.1", "vllm/vllm-openai:v0.27.1", []
+        )
+        == "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    )
 
 
 def test_recommend_requires_model():
@@ -538,6 +824,35 @@ def test_placement_too_big_warns_no_fit():
     assert p["fits"] is False  # 200 GiB/node won't fit
 
 
+def test_weight_floor_blocks_deepseek_r1_without_blobs(monkeypatch):
+    """P0.4: known oversized families must not claim fit when Hub blobs are empty."""
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    w = ac.estimate_weights_gib("deepseek-ai/DeepSeek-R1", None)
+    assert w is not None and w >= 700
+    p = ac.plan_placement(w, _topo(2), mode="workflow_max", overlay=None)
+    assert p["fits"] is False
+
+
+def test_weight_floor_spares_deepseek_v4_flash():
+    """V4-Flash has a Spark overlay; floor must not force-block it."""
+    assert ac._weight_floor_gib("deepseek-ai/DeepSeek-V4-Flash") is None
+    assert ac._weight_floor_gib("deepseek-ai/DeepSeek-V4-Pro") == 900.0
+
+
+def test_moe_config_estimate_not_near_zero(monkeypatch):
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    cfg = {
+        "hidden_size": 7168,
+        "num_hidden_layers": 61,
+        "n_routed_experts": 32,  # below floor threshold; forces MoE-aware formula
+        "moe_intermediate_size": 2048,
+        "quantization_config": {"config_groups": {"g0": {"weights": {"num_bits": 8}}}},
+    }
+    w = ac.estimate_weights_gib("org/Custom-MoE-Offline", cfg)
+    dense_only = round(12 * 61 * 7168 * 7168 * 1.0 / (1024**3), 1)
+    assert w is not None and w > dense_only * 1.5
+
+
 def test_placement_future_4node_minimal_and_full():
     # DSv4 on 4 nodes still uses only the 2 it needs (no waste)
     p = ac.plan_placement(155.4, _topo(4), mode="workflow_max", overlay=None)
@@ -643,3 +958,172 @@ def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
     assert ov is not None and ov["family_key"] == "future_x"
     # built-in still present
     assert ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash-0731", {}) is not None
+
+
+def test_shipped_serve_overlays_json_loads_minimax():
+    """Repo data/serve_overlays.json must be valid and match MiniMax families."""
+    from app.config import DATA_DIR
+
+    f = DATA_DIR / "serve_overlays.json"
+    assert f.is_file(), f"missing shipped overlays at {f}"
+    ov = ac._family_overlay(
+        "MiniMaxAI/MiniMax-M2-NVFP4",
+        {"family": "minimax_m2"},
+    )
+    assert ov is not None and ov["family_key"] == "minimax_m2"
+    assert ov["config"].get("reasoning_parser") == "minimax_m2"
+    ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
+    assert ov3 is not None and ov3["family_key"] == "minimax_m3"
+    assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+
+
+def test_family_overlay_matches_detected_family_without_id_hint():
+    """match.family alone can select when id substrings are also satisfied loosely."""
+    ov = ac._family_overlay(
+        "org/Some-MiniMax-Checkpoint-M2",
+        {"family": "minimax_m2"},
+    )
+    assert ov is not None and ov["family_key"] == "minimax_m2"
+
+def test_size_memory_clamps_huge_context_single_node():
+    cfg = {
+        "max_model_len": 1048576,
+        "util": 0.85,
+        "max_num_seqs": 4,
+        "kv_cache_dtype": "fp8",
+        "tensor_parallel_size": 1,
+    }
+    hf = {
+        "num_hidden_layers": 48,
+        "num_key_value_heads": 8,
+        "num_attention_heads": 32,
+        "hidden_size": 4096,
+        "head_dim": 128,
+    }
+    rationale: list[str] = []
+    warnings: list[str] = []
+    ac._size_memory_for_spark(
+        cfg,
+        hf_config=hf,
+        detected={"family": "qwen"},
+        weights_gib=40.0,
+        node_ram_gib=121.7,
+        mode="workflow_max",
+        rationale=rationale,
+        warnings=warnings,
+    )
+    assert cfg["max_model_len"] < 1048576
+    assert cfg["max_model_len"] in ac._CONTEXT_LADDER
+    assert any("MEMORY:" in r for r in rationale)
+
+
+def test_size_memory_skips_multinode_tp():
+    cfg = {
+        "max_model_len": 1048576,
+        "util": 0.8,
+        "max_num_seqs": 6,
+        "kv_cache_dtype": "nvfp4_ds_mla",
+        "tensor_parallel_size": 2,
+    }
+    rationale: list[str] = []
+    warnings: list[str] = []
+    ac._size_memory_for_spark(
+        cfg,
+        hf_config={"num_hidden_layers": 60},
+        detected={"family": "deepseek_v4"},
+        weights_gib=155.4,
+        node_ram_gib=121.7,
+        mode="workflow_max",
+        rationale=rationale,
+        warnings=warnings,
+    )
+    assert cfg["max_model_len"] == 1048576
+
+
+def test_stock_image_semver_and_at_least():
+    assert ac._stock_image_semver("vllm/vllm-openai:v0.27.1") == (0, 27, 1)
+    assert ac._stock_image_semver("ghcr.io/anemll/dspark-vllm-gx10:0.1.1") is None
+    assert ac._image_at_least("vllm/vllm-openai:v0.27.1", 0, 27, 0) is True
+    assert ac._image_at_least("vllm/vllm-openai:v0.25.0", 0, 27, 0) is False
+
+
+def test_marlin_version_gate_pure_nvfp4():
+    det = {
+        "family": "unknown",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": False,
+        "quant_flag": "modelopt_fp4",
+    }
+    # Old stock image: strip marlin for non-Nemotron pure NVFP4
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.25.0") is True
+    # Current lab image: keep marlin
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.27.1") is False
+    # Nemotron always keeps marlin
+    det["family"] = "nemotron"
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.25.0") is False
+
+
+def test_analyze_config_detects_vl():
+    d = ac.analyze_config(
+        {"architectures": ["Qwen2_5_VLForConditionalGeneration"], "model_type": "qwen2_5_vl"},
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+    )
+    assert d["is_vl"] is True
+
+
+def test_vl_gets_language_model_only():
+    cfg = {"extra_flags": "--max-num-batched-tokens 8192", "moe_backend": ""}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_vl_spark_defaults(
+        cfg, {"is_vl": True}, warnings, rationale
+    )
+    assert "--language-model-only" in cfg["extra_flags"]
+    assert any("language-model-only" in r for r in rationale)
+
+
+def test_resolve_dspark_draft_from_card():
+    readme = "export DSPARK_CKPT=nvidia/Foo-DSpark\nvllm serve x --speculative_config.method dspark"
+    assert ac._resolve_dspark_draft_model(readme) == "nvidia/Foo-DSpark"
+
+
+def test_ensure_dspark_fills_missing_draft():
+    cfg = {
+        "image": "vllm/vllm-openai:v0.27.1",
+        "extra_flags": "--speculative_config.method dspark --speculative_config.num_speculative_tokens 3",
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(
+        cfg,
+        "export DSPARK_CKPT=nvidia/Bar-DSpark",
+        warnings,
+        rationale,
+    )
+    assert "--speculative_config.model nvidia/Bar-DSpark" in cfg["extra_flags"]
+    assert any("DSpark draft" in r for r in rationale)
+
+
+def test_ensure_dspark_strips_when_no_draft():
+    cfg = {
+        "image": "vllm/vllm-openai:v0.27.1",
+        "extra_flags": "--mamba-backend flashinfer --speculative_config.method dspark",
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(cfg, "no draft here", warnings, rationale)
+    assert "dspark" not in (cfg["extra_flags"] or "").lower()
+    assert "--mamba-backend flashinfer" in cfg["extra_flags"]
+
+
+def test_ensure_dspark_skips_anemll_image():
+    cfg = {
+        "image": "ghcr.io/anemll/dspark-vllm-gx10:0.1.1",
+        "extra_flags": "--speculative-config " + json.dumps({"method": "dspark", "num_speculative_tokens": 5}),
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(cfg, "", warnings, rationale)
+    assert "dspark" in cfg["extra_flags"]
+

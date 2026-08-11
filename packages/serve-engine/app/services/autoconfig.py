@@ -156,6 +156,64 @@ def _http_get(url: str, timeout: float = 20.0) -> tuple[Optional[str], Optional[
     return _http_get_raw(url, timeout=timeout, token=tok or None, allow_retry_without_auth=True)
 
 
+
+def _quant_config_is_thin(qc: Any) -> bool:
+    """True when transformers quantization_config lacks usable method/algo metadata."""
+    if not isinstance(qc, dict) or not qc:
+        return True
+    method = str(qc.get("quant_method") or "").strip()
+    algo = str(qc.get("quant_algo") or "").strip()
+    if method or algo:
+        return False
+    if qc.get("quantized_layers") or qc.get("config_groups"):
+        return False
+    return True
+
+
+def _normalize_hf_quant_blob(hf_quant: dict[str, Any]) -> dict[str, Any]:
+    """Flatten ModelOpt hf_quant_config.json into transformers-style quantization_config."""
+    if not isinstance(hf_quant, dict) or not hf_quant:
+        return {}
+    # Already transformers-shaped (or test fixture).
+    if any(k in hf_quant for k in ("quant_method", "quant_algo", "config_groups", "quantized_layers")):
+        out = dict(hf_quant)
+    elif isinstance(hf_quant.get("quantization"), dict):
+        out = dict(hf_quant["quantization"])
+    else:
+        out = dict(hf_quant)
+    producer = hf_quant.get("producer")
+    if isinstance(producer, dict):
+        pname = str(producer.get("name") or "").lower()
+        if pname == "modelopt" and not str(out.get("quant_method") or "").strip():
+            out["quant_method"] = "modelopt"
+    return out
+
+
+def _merge_hf_quant_config(
+    cfg: dict[str, Any], hf_quant: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """Merge hf_quant_config into config.json, preferring existing quantization_config keys."""
+    if not isinstance(cfg, dict):
+        return cfg
+    out = dict(cfg)
+    if not isinstance(hf_quant, dict) or not hf_quant:
+        return out
+    incoming = _normalize_hf_quant_blob(hf_quant)
+    if not incoming:
+        return out
+    existing = out.get("quantization_config")
+    if not isinstance(existing, dict) or not existing:
+        out["quantization_config"] = incoming
+        return out
+    merged = dict(incoming)
+    for k, v in existing.items():
+        if v is None or v == "":
+            continue
+        merged[k] = v
+    out["quantization_config"] = merged
+    return out
+
+
 def fetch_hf_card(model_id: str, timeout: float = 20.0) -> dict[str, Any]:
     """Pull README + config + model API metadata from huggingface.co."""
     model_id = model_id.strip().rstrip("/")
@@ -218,6 +276,32 @@ def fetch_hf_card(model_id: str, timeout: float = 20.0) -> dict[str, Any]:
     elif err:
         out["errors"].append(err)
 
+    # ModelOpt checkpoints often ship quant metadata only in hf_quant_config.json.
+    if isinstance(out.get("config"), dict) and _quant_config_is_thin(
+        out["config"].get("quantization_config")
+    ):
+        quant_urls = [
+            f"https://huggingface.co/{model_id}/raw/main/hf_quant_config.json",
+            f"https://huggingface.co/{model_id}/resolve/main/hf_quant_config.json",
+            f"https://huggingface.co/{model_id}/raw/main/quantization_config.json",
+            f"https://huggingface.co/{model_id}/resolve/main/quantization_config.json",
+        ]
+        for url in quant_urls:
+            body, err = _http_get(url, timeout=timeout)
+            if body:
+                try:
+                    blob = json.loads(body)
+                except json.JSONDecodeError:
+                    out["errors"].append(f"invalid JSON from {url}")
+                    continue
+                if isinstance(blob, dict) and blob:
+                    out["config"] = _merge_hf_quant_config(out["config"], blob)
+                    out["fetched"].append(url)
+                    out["hf_quant_config"] = blob
+                    break
+            elif err:
+                out["errors"].append(err)
+
     return out
 
 
@@ -230,6 +314,12 @@ def load_local_fallback(model_id: str) -> dict[str, Any]:
         readme = None
         if (p / "README.md").is_file():
             readme = (p / "README.md").read_text(encoding="utf-8", errors="replace")
+        if isinstance(cfg, dict) and _quant_config_is_thin(cfg.get("quantization_config")):
+            for name in ("hf_quant_config.json", "quantization_config.json"):
+                side = p / name
+                if side.is_file():
+                    cfg = _merge_hf_quant_config(cfg, _read_json(side))
+                    break
         return {"config": cfg, "readme": readme, "notes": [f"local path {p}"]}
 
     parts = model_id.replace("\\", "/").split("/")
@@ -246,6 +336,13 @@ def load_local_fallback(model_id: str) -> dict[str, Any]:
     if not snap:
         return {"config": None, "readme": None, "notes": ["cache incomplete"]}
     cfg = _read_json(snap / "config.json") if (snap / "config.json").is_file() else None
+    if isinstance(cfg, dict) and _quant_config_is_thin(cfg.get("quantization_config")):
+        for name in ("hf_quant_config.json", "quantization_config.json"):
+            side = snap / name
+            if side.is_file():
+                cfg = _merge_hf_quant_config(cfg, _read_json(side))
+                notes.append(f"merged {name} from local cache")
+                break
     readme = None
     if (snap / "README.md").is_file():
         readme = (snap / "README.md").read_text(encoding="utf-8", errors="replace")
@@ -576,14 +673,28 @@ def _load_overlays() -> list[dict[str, Any]]:
 
 
 def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Match a model id against the overlay registry. Returns None when the card is
-    authoritative (normal models). Data-driven so future models need no code change."""
+    """Match a model id (+ optional detected family) against the overlay registry.
+
+    Returns None when the card is authoritative (normal models). Data-driven so
+    future models need no code change — drop entries into data/serve_overlays.json.
+    """
     mid = (model or "").lower()
+    fam = str((detected or {}).get("family") or "").lower()
     for ov in _load_overlays():
         m = ov.get("match") or {}
         all_terms = [str(t).lower() for t in (m.get("all") or [])]
         any_terms = [str(t).lower() for t in (m.get("any") or [])]
-        if all(t in mid for t in all_terms) and (not any_terms or any(t in mid for t in any_terms)):
+        fam_raw = m.get("family") or []
+        if isinstance(fam_raw, str):
+            fam_raw = [fam_raw]
+        fam_terms = [str(t).lower() for t in fam_raw]
+        if not (all_terms or any_terms or fam_terms):
+            continue
+        all_ok = all(t in mid for t in all_terms)
+        any_ok = (not any_terms) or any(t in mid for t in any_terms)
+        # If detected.family is unknown, fall back to id substrings alone.
+        fam_ok = (not fam_terms) or (not fam) or (fam in fam_terms)
+        if all_ok and any_ok and fam_ok:
             return ov
     return None
 
@@ -631,9 +742,43 @@ _SKU_ARCH = {
 _DEFAULT_NODE_RAM_GIB = 121.7  # GB10 UMA when a node has not been probed yet
 
 
+def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[float]:
+    """Conservative minimum GiB for families that never fit 1–2× GB10 UMA.
+
+    Used when Hub blobs are missing/under-reported so placement cannot claim
+    fits=True for DeepSeek-V3/R1/Pro-class checkpoints.
+    """
+    mid = (model or "").lower()
+    # DeepSeek V4 Flash has a Spark overlay (~155 GiB) — do not floor that path.
+    if "deepseek" in mid and "v4" in mid and "pro" in mid:
+        return 900.0
+    if "deepseek" in mid and ("r1" in mid or re.search(r"v3(\.|$|-)", mid)) and "v4" not in mid:
+        return 700.0
+    if "minimax" in mid and re.search(r"(^|[^a-z])m3([^0-9]|$)", mid):
+        return 800.0
+    if ("kimi" in mid or "moonshot" in mid) and re.search(r"k[23]", mid):
+        return 800.0
+    if "llama" in mid and ("405b" in mid or "maverick" in mid):
+        return 400.0
+    # Full GLM 4.5/4.6/4.7 MoE (not 9b / edge / air distillations).
+    if re.search(r"glm-?4\.[567]", mid) and not re.search(r"(9b|air|edge|flash)", mid):
+        return 500.0
+    cfg = hf_config or {}
+    experts = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
+    try:
+        if experts and int(experts) >= 64:
+            # Huge MoE without a Hub blob sum — refuse optimistic single-node fit.
+            return 400.0
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[float]:
-    """Best-effort weight size for ANY model. Order: exact HF blob sum → config param
-    estimate → None. Used by the placement engine to decide nodes_needed + util."""
+    """Best-effort weight size for ANY model. Order: exact HF blob sum → safetensors
+    index total_size → config param estimate → known-family floor → None.
+    Used by the placement engine to decide nodes_needed + util."""
+    measured: Optional[float] = None
     # 1) Exact: sum safetensors/bin blobs from the HF API (most accurate).
     try:
         body, err = _http_get(f"https://huggingface.co/api/models/{model}?blobs=true", timeout=20.0)
@@ -645,29 +790,58 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                 if n.endswith((".safetensors", ".bin", ".gguf")):
                     tot += f.get("size") or 0
             if tot > 0:
-                return round(tot / (1024**3), 1)
+                measured = round(tot / (1024**3), 1)
     except Exception:
         pass
-    # 2) Estimate from config: params × bytes/param (quant-aware).
-    try:
-        qc = (hf_config or {}).get("quantization_config") or {}
-        nbits = 0
-        for g in (qc.get("config_groups") or {}).values():
-            if isinstance(g, dict):
-                w = g.get("weights") or {}
-                if isinstance(w, dict) and w.get("num_bits"):
-                    nbits = int(w["num_bits"])
-                    break
-        hidden = (hf_config or {}).get("hidden_size")
-        layers = (hf_config or {}).get("num_hidden_layers")
-        if hidden and layers:
-            # rough param count for dense-ish models: ~12 * layers * hidden^2 (+emb)
-            params = 12 * layers * hidden * hidden
-            bpp = (nbits / 8.0) if nbits in (4, 8) else 2.0  # fp4/fp8/bf16
-            return round(params * bpp / (1024**3), 1)
-    except Exception:
-        pass
-    return None
+    # 2) Safetensors index metadata.total_size (when blob sizes are missing).
+    if measured is None:
+        try:
+            body, err = _http_get(
+                f"https://huggingface.co/{model}/resolve/main/model.safetensors.index.json",
+                timeout=20.0,
+            )
+            if body and not err:
+                d = json.loads(body)
+                tot = (d.get("metadata") or {}).get("total_size")
+                if isinstance(tot, (int, float)) and tot > 0:
+                    measured = round(float(tot) / (1024**3), 1)
+        except Exception:
+            pass
+    # 3) Estimate from config: params × bytes/param (quant-aware; MoE-aware).
+    if measured is None:
+        try:
+            qc = (hf_config or {}).get("quantization_config") or {}
+            nbits = 0
+            for g in (qc.get("config_groups") or {}).values():
+                if isinstance(g, dict):
+                    w = g.get("weights") or {}
+                    if isinstance(w, dict) and w.get("num_bits"):
+                        nbits = int(w["num_bits"])
+                        break
+            hidden = (hf_config or {}).get("hidden_size")
+            layers = (hf_config or {}).get("num_hidden_layers")
+            if hidden and layers:
+                # Dense-ish: ~12 * layers * hidden^2 (+emb)
+                params = 12 * layers * hidden * hidden
+                experts = (
+                    (hf_config or {}).get("n_routed_experts")
+                    or (hf_config or {}).get("num_experts")
+                    or (hf_config or {}).get("num_local_experts")
+                )
+                moe_inter = (hf_config or {}).get("moe_intermediate_size") or (
+                    hf_config or {}
+                ).get("intermediate_size")
+                if experts and moe_inter:
+                    # MoE FFN dominates; dense formula alone under-reports ~0 GiB-class misses.
+                    params += int(experts) * layers * 3 * hidden * int(moe_inter)
+                bpp = (nbits / 8.0) if nbits in (4, 8) else 2.0  # fp4/fp8/bf16
+                measured = round(params * bpp / (1024**3), 1)
+        except Exception:
+            pass
+    floor = _weight_floor_gib(model, hf_config)
+    if measured is not None and floor is not None:
+        return max(measured, floor)
+    return measured if measured is not None else floor
 
 
 def _node_ram_gib(node: Optional[dict]) -> float:
@@ -795,6 +969,12 @@ def _apply_topology(
     # does not apply to a 1/2-GB10 UMA cluster (tensor-parallel is the correct split).
     if cfg.get("extra_flags"):
         cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--data-parallel-size")
+
+    # Cards write the model into their own recipe, often as an unexpanded shell var
+    # (`--model $MODEL_CKPT`). serve.py passes the model positionally, so carrying
+    # --model through would serve a checkpoint literally named "$MODEL_CKPT".
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--model")
 
     # GPU arch compile-target env for the detected sku (only when unset).
     arch_env = _gpu_arch_env(topology.get("node_list") or [])
@@ -938,6 +1118,281 @@ def _strip_flag_from_extra(extra: str, flag: str) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+def _resolve_dspark_draft_model(readme: str | None) -> str | None:
+    """Best-effort draft checkpoint id from card exports / prose."""
+    if not readme:
+        return None
+    m = re.search(r"(?:export\s+)?DSPARK_CKPT=(\S+)", readme)
+    if m:
+        val = m.group(1).strip().rstrip("\\")
+        if val and not val.startswith("$"):
+            return val
+    m = re.search(r"(nvidia/[A-Za-z0-9._/-]+DSpark[A-Za-z0-9._/-]*)", readme)
+    if m:
+        return m.group(1).rstrip("/")
+    return None
+
+
+def _dspark_spec_present(extra: str) -> bool:
+    ex = (extra or "").lower()
+    if "dspark" not in ex:
+        return False
+    return "speculative_config" in ex or "speculative-config" in ex
+
+
+def _spec_has_draft_model(extra: str) -> bool:
+    ex = extra or ""
+    if re.search(r"--speculative_config\.model\s+[^\s$]+", ex):
+        return True
+    # JSON --speculative-config {"method":"dspark","model":"org/name",...}
+    low = ex.lower()
+    if "speculative-config" in low and '"model"' in low:
+        # reject leftover shell vars
+        if "$" in ex[ex.lower().find("speculative-config") : ex.lower().find("speculative-config") + 200]:
+            return False
+        return True
+    return False
+
+
+def _strip_dspark_speculative(extra: str) -> str:
+    """Remove DSpark / speculative_config.* tokens after a failed draft resolve."""
+    s = (extra or "").strip()
+    if not s:
+        return s
+    s = _strip_flag_from_extra(s, "--speculative-config")
+    for flag in (
+        "--speculative_config.method",
+        "--speculative_config.model",
+        "--speculative_config.num_speculative_tokens",
+        "--speculative_config.draft_sample_method",
+    ):
+        s = _strip_flag_from_extra(s, flag)
+    return s.strip()
+
+
+def _ensure_dspark_draft_or_strip(
+    cfg: dict[str, Any],
+    readme: str | None,
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """P0.6: DSpark speculative needs a draft model — resolve from card or strip.
+
+    Anemll/DSpark runtime images run method=dspark natively without a separate
+    HF draft id — do not strip those overlays.
+    """
+    img = (cfg.get("image") or "").lower()
+    if "anemll" in img or "dspark-vllm" in img or "gx10" in img:
+        return
+    ex = cfg.get("extra_flags") or ""
+    if not _dspark_spec_present(ex):
+        return
+    if _spec_has_draft_model(ex):
+        return
+    draft = _resolve_dspark_draft_model(readme)
+    if draft:
+        cfg["extra_flags"] = (ex + f" --speculative_config.model {draft}").strip()
+        rationale.append(f"DSpark draft from card → --speculative_config.model {draft}")
+        return
+    cfg["extra_flags"] = _strip_dspark_speculative(ex)
+    warnings.append(
+        "Stripped DSpark speculative decode — no draft model path on the card "
+        "(stable first boot). Re-add --speculative_config.model after downloading the draft."
+    )
+    rationale.append("FIRST BOOT: DSpark speculative stripped (missing draft model)")
+
+
+def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
+    """Drop argv tokens that still contain ``$VAR`` after card parsing.
+
+    Cards write ``--model $MODEL_CKPT`` / ``--speculative_config.model $DSPARK_CKPT``.
+    Leaving those through would make vLLM try to load a literal ``$…`` path.
+    """
+    s = (extra or "").strip()
+    if not s or "$" not in s:
+        return s
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        parts = s.split()
+    out: list[str] = []
+    dropped: list[str] = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        # Flag whose *value* is a shell var — drop both.
+        if (
+            p.startswith("--")
+            and i + 1 < len(parts)
+            and "$" in parts[i + 1]
+            and not parts[i + 1].startswith("-")
+        ):
+            dropped.append(f"{p} {parts[i + 1]}")
+            i += 2
+            continue
+        if "$" in p:
+            dropped.append(p)
+            i += 1
+            continue
+        out.append(p)
+        i += 1
+    if dropped:
+        warnings.append(
+            "Stripped unexpanded shell variables from card flags: "
+            + ", ".join(dropped)
+            + " (fill the real path or re-run after exporting them)."
+        )
+    return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
+
+
+# Flags / env that crash or noop-wrong on 1–2× GB10 UMA Spark serves.
+_SPARK_UNSAFE_FLAGS = (
+    "--enable-expert-parallel",
+    "--data-parallel-size",
+    "--data-parallel-address",
+    "--data-parallel-rpc-port",
+    "--data-parallel-backend",
+)
+_SPARK_UNSAFE_ENV_PREFIXES = (
+    "VLLM_USE_DEEP_GEMM_MEGA_MOE=",
+    "VLLM_ALL2ALL_BACKEND=",
+)
+
+
+def _strip_spark_unsafe_flags(
+    cfg: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """Drop card multi-GPU / mega-MoE knobs that do not apply on this cluster."""
+    dropped: list[str] = []
+    ex = cfg.get("extra_flags") or ""
+    for flag in _SPARK_UNSAFE_FLAGS:
+        if flag in ex:
+            ex = _strip_flag_from_extra(ex, flag)
+            dropped.append(flag)
+    if dropped:
+        cfg["extra_flags"] = ex
+        warnings.append(
+            "Stripped Spark-unsafe card flags: " + ", ".join(dropped)
+            + " (expert/DP parallelism is not the 1–2× GB10 path)."
+        )
+        rationale.append("SAFETY: removed Spark-unsafe multi-GPU flags from extras")
+
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    if moe == "humming":
+        cfg["moe_backend"] = ""
+        warnings.append(
+            "Cleared --moe-backend humming (Ampere / non-GB10 recipe; leave auto on Spark)."
+        )
+        rationale.append("SAFETY: humming moe-backend → empty (auto) on GB10")
+
+    env = list(cfg.get("docker_env") or [])
+    kept = []
+    env_drop = []
+    for e in env:
+        if any(e.startswith(p) for p in _SPARK_UNSAFE_ENV_PREFIXES):
+            env_drop.append(e.split("=", 1)[0])
+            continue
+        # Mega MoE deep_gemm toggle often appears as VLLM_USE_DEEP_GEMM=1 with mega notes;
+        # only strip the explicit mega env keys above.
+        kept.append(e)
+    if env_drop:
+        cfg["docker_env"] = kept
+        warnings.append("Stripped Spark-unsafe docker env: " + ", ".join(env_drop))
+        rationale.append("SAFETY: removed mega-MoE / all2all env knobs")
+
+
+_CARD_IMAGE_RE = re.compile(
+    r"(?:vllm/vllm-openai|ghcr\.io/anemll/dspark-vllm-gx10)(?::[vV]?\d[\w.\-]*)?",
+    re.I,
+)
+
+
+def _parse_card_image_requirement(readme: str | None) -> str | None:
+    """First concrete image pin mentioned on the card (bare tag preferred)."""
+    if not readme:
+        return None
+    # Prefer Spark-section hits: walk near "DGX Spark" / "GB10" first.
+    spark_hits: list[str] = []
+    other: list[str] = []
+    for m in _CARD_IMAGE_RE.finditer(readme):
+        ref = m.group(0)
+        if ":" not in ref:
+            continue  # untagged — useless as a pin
+        tag = ref.split(":", 1)[1].lower()
+        if tag in ("latest", "nightly") or tag.startswith("nightly"):
+            continue
+        window = readme[max(0, m.start() - 400) : m.start()].lower()
+        if "dgx spark" in window or "gb10" in window:
+            spark_hits.append(ref)
+        else:
+            other.append(ref)
+    return (spark_hits or other or [None])[0]
+
+
+def _semver_tuple(tag: str) -> tuple[int, ...]:
+    t = tag.lstrip("vV")
+    nums = re.findall(r"\d+", t)
+    return tuple(int(x) for x in nums[:4]) if nums else (0,)
+
+
+def _stock_image_semver(image: str | None) -> tuple[int, ...] | None:
+    """Parse vLLM openai image tag; None for Anemll/custom/non-semver pins."""
+    if not image:
+        return None
+    s = image.strip()
+    if "anemll" in s.lower() or "dspark-vllm" in s.lower():
+        return None  # independent version lineage
+    if "vllm/vllm-openai:" not in s and not s.startswith("vllm-openai:"):
+        # bare tag or other repo — try last :tag
+        if ":" not in s:
+            return None
+    tag = s.rsplit(":", 1)[-1]
+    if not tag or tag in ("latest", "nightly") or tag.startswith("nightly"):
+        return None
+    # strip arch/cuda suffixes: v0.27.1-aarch64 → 0.27.1
+    tag = tag.split("-")[0]
+    ver = _semver_tuple(tag)
+    return ver if ver != (0,) else None
+
+
+def _image_at_least(image: str | None, major: int, minor: int, patch: int = 0) -> bool:
+    ver = _stock_image_semver(image)
+    if ver is None:
+        # Unknown/custom: assume current lab default capability (≥0.27).
+        return True
+    target = (major, minor, patch)
+    # pad compare
+    a = ver + (0,) * (3 - len(ver))
+    b = target + (0,) * (3 - len(target))
+    return a[:3] >= b[:3]
+
+
+def _resolve_stock_image(default: str, card_image: str | None, rationale: list[str]) -> str:
+    """Raise the lab default to the card's min stock tag; never downgrade; never replace Anemll."""
+    if not card_image:
+        return default
+    if "anemll" in (default or "").lower() or "dspark-vllm" in (default or "").lower():
+        return default
+    if not card_image.startswith("vllm/vllm-openai:"):
+        return default
+    d_tag = default.split(":")[-1] if ":" in default else ""
+    c_tag = card_image.split(":")[-1]
+    if _semver_tuple(c_tag) > _semver_tuple(d_tag):
+        rationale.append(
+            f"Card requires newer stock image {card_image} than lab default {default} → using card pin"
+        )
+        return card_image
+    if card_image != default and _semver_tuple(c_tag) == _semver_tuple(d_tag):
+        return default
+    if _semver_tuple(c_tag) < _semver_tuple(d_tag):
+        rationale.append(
+            f"Card pin {card_image} is older than lab default {default} — keeping lab default (no downgrade)"
+        )
+    return default
+
+
 def extract_serve_candidates(
     readme: str,
     *,
@@ -1031,16 +1486,26 @@ def score_candidate(
         score += 15
         reasons.append(f"in section «{c.section}»")
 
+    # Cards ship per-GPU recipes. One headed for other silicon is the wrong path on a
+    # Spark even when its flag list scores well (NVFP4 cards carry a W4A16 Ampere
+    # fallback whose flags out-score the real GB10 recipe).
+    spark_section = any(k in sec for k in ("dgx spark", "gb10"))
+    if not spark_section and any(
+        k in sec for k in ("ampere", "a100", "h100", "h200", "gb200", "b200", "rtx", "l40")
+    ):
+        score -= 30
+        reasons.append(f"section «{c.section}» targets non-Spark hardware")
+
     # Performance / Spark-relevant flags from the card
     moe = (cfg.get("moe_backend") or "").strip()
     flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det)
-    marlin_unsafe = _marlin_unsafe_for_checkpoint(det)
+    marlin_unsafe = _marlin_unsafe_for_checkpoint(det, cfg.get("image"))
     if moe:
         if moe == "flashinfer_b12x" and flashinfer_unsafe:
             reasons.append(f"--moe-backend {moe} (will be stripped — unsafe for checkpoint)")
         elif moe == "marlin" and marlin_unsafe:
             reasons.append(
-                f"--moe-backend {moe} (will be stripped — unsupported for this MoE on vLLM 0.25)"
+                f"--moe-backend {moe} (will be stripped — unsupported for this MoE on selected image)"
             )
         else:
             score += 25
@@ -1115,7 +1580,7 @@ def score_candidate(
         score += 5
 
     # Prefer recipes that already set quantization for ModelOpt / NVFP4 MoE
-    if det.get("quant_flag") and cfg.get("quantization") == det.get("quant_flag"):
+    if _quant_flags_compatible(str(det.get("quant_flag") or ""), str(cfg.get("quantization") or "")):
         score += 15
         reasons.append(f"quantization matches config.json ({det.get('quant_flag')})")
 
@@ -1139,15 +1604,22 @@ def score_candidate(
     if marlin_unsafe and moe == "marlin":
         score -= 80
         reasons.append(
-            "PENALTY: moe_backend=marlin unsupported for this MoE on vLLM 0.25 "
+            "PENALTY: moe_backend=marlin unsupported for this MoE on selected image "
             "(ValueError: not supported for unquantized MoE)"
         )
+        # Salvage mirrors the flashinfer_b12x case above: the rest of a vendor GB10
+        # recipe is still the right path once marlin is stripped to auto.
+        if has_cute or spark_section:
+            score += 55
+            reasons.append(
+                "salvage: Spark recipe kept after stripping unsupported marlin"
+            )
 
     return score, reasons
 
 
 def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when forcing flashinfer_b12x will crash (FP8 MoE path on compressed-tensors)."""
+    """True when forcing flashinfer_b12x will crash (FP8 MoE path on mixed checkpoints)."""
     if not detected:
         return False
     if detected.get("is_mixed_nvfp4_fp8"):
@@ -1162,23 +1634,84 @@ def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
     formats = " ".join(detected.get("quant_formats") or [])
     if detected.get("is_moe") and "float-quantized" in formats and "nvfp4" in formats:
         return True
+    # ModelOpt MIXED_PRECISION / dual-algo layers also route FP8 MoE experts.
+    qf = (detected.get("quant_flag") or "").lower()
+    if detected.get("is_moe") and detected.get("has_fp8") and qf.startswith("modelopt"):
+        return True
     return False
 
 
-def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when --moe-backend marlin crashes on this checkpoint (vLLM 0.25.x).
+def _modelopt_quant_flag(
+    quant_method: str,
+    quant_algo: str,
+    *,
+    has_nvfp4: bool,
+    has_fp8: bool,
+    has_modelopt_layers: bool,
+) -> str:
+    """Map umbrella ModelOpt metadata to the vLLM override sibling (0.27+)."""
+    method = (quant_method or "").lower()
+    algo = (quant_algo or "").upper()
+    if method in ("modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"):
+        return method
+    if "MIXED" in algo:
+        return "modelopt_mixed"
+    if any(tok in algo for tok in ("NVFP4", "FP4", "W4A16")):
+        return "modelopt_fp4"
+    if algo == "FP8" or algo.startswith("FP8"):
+        return "modelopt"
+    if has_nvfp4 and has_fp8 and has_modelopt_layers:
+        return "modelopt_mixed"
+    if has_nvfp4 and not has_fp8:
+        return "modelopt_fp4"
+    if method.startswith("modelopt"):
+        return "modelopt"
+    return "modelopt"
 
-    Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE):
+
+def _quant_flags_compatible(detected_flag: str, candidate_flag: str) -> bool:
+    """True when candidate --quantization matches (or is a ModelOpt sibling of) detected."""
+    a = (detected_flag or "").lower()
+    b = (candidate_flag or "").lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    modelopt = {"modelopt", "modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"}
+    return a in modelopt and b in modelopt
+
+
+def _marlin_unsafe_for_checkpoint(
+    detected: dict[str, Any],
+    image: str | None = None,
+) -> bool:
+    """True when --moe-backend marlin will crash on this checkpoint×image.
+
+    Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
-      Expected one of ['triton', 'flashinfer_trtllm', 'flashinfer_cutlass', 'aiter'].
-    Cards still ship marlin recipes; leave moe-backend empty (auto).
+
+    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE is
+    generally fine on ≥0.27; on older images treat non-Nemotron marlin as unsafe.
+    Qwen MoE still rejects marlin. Mixed FP8+NVFP4 should leave moe auto.
     """
     if not detected:
-        # MoE/NVFP4 cards are the risk class — if unknown, still treat marlin as unsafe
+        return True
+    family = detected.get("family") or ""
+    if family == "nemotron":
+        return False
+    if family == "qwen":
+        return True
+    if detected.get("is_mixed_nvfp4_fp8"):
+        return True
+    # Pure NVFP4 MoE: keep marlin on ≥0.27 (SM121); strip on older stock images.
+    if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
+        if _image_at_least(image, 0, 27, 0):
+            return False
         return True
     if detected.get("is_moe"):
         return True
-    if detected.get("has_nvfp4") or detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
+    qf = (detected.get("quant_flag") or "").lower()
+    if qf.startswith("modelopt") or qf == "compressed-tensors":
         return True
     return False
 
@@ -1198,12 +1731,12 @@ def _sanitize_moe_backend_on_candidate(
             c.reasons.append(
                 "cleared moe_backend=flashinfer_b12x on this recipe (unsafe for checkpoint)"
             )
-    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det):
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det, c.config.get("image")):
         c.config["moe_backend"] = ""
         if not any("cleared moe_backend" in r for r in c.reasons):
             c.reasons.append(
                 "cleared moe_backend=marlin on this recipe "
-                "(vLLM 0.25: marlin unsupported for this MoE path — use auto)"
+                "(unsupported for this MoE path on the selected image — use auto)"
             )
 
 
@@ -1300,15 +1833,15 @@ def _apply_checkpoint_safety(
             rationale.append("Kept/added CUTE_DSL_ARCH=sm_121a from card Spark guidance")
 
     moe = (cfg.get("moe_backend") or "").strip()
-    if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected):
+    if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, cfg.get("image")):
         cfg["moe_backend"] = ""
         warnings.append(
-            "Card recipe used --moe-backend marlin, but vLLM 0.25 rejects marlin on this MoE "
+            "Card recipe used --moe-backend marlin, but this image rejects marlin on this MoE "
             "path (ValueError: moe_backend='marlin' is not supported for unquantized MoE). "
             "Cleared moe-backend so vLLM auto-selects a supported backend."
         )
         rationale.append(
-            "SAFETY (vLLM 0.25 > card flag): removed marlin MoE backend — use auto"
+            "SAFETY (image capability > card flag): removed marlin MoE backend — use auto"
         )
 
     # Lab-friendly KV for large NVFP4/MoE when card is silent
@@ -1324,6 +1857,29 @@ def _apply_checkpoint_safety(
     if detected.get("is_moe") and (cfg.get("max_num_seqs") is None):
         cfg["max_num_seqs"] = 4
         rationale.append("MoE (from config) → --max-num-seqs 4 when card omitted it")
+
+
+def _apply_vl_spark_defaults(
+    cfg: dict[str, Any],
+    detected: dict[str, Any],
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """GB10 first boot: skip vision towers unless the card already configured MM limits."""
+    if not detected.get("is_vl"):
+        return
+    ex = cfg.get("extra_flags") or ""
+    if "--language-model-only" in ex or "--limit-mm-per-prompt" in ex:
+        return
+    cfg["extra_flags"] = (ex + " --language-model-only").strip()
+    rationale.append(
+        "VL/multimodal checkpoint on Spark → --language-model-only "
+        "(avoids vision-tower OOM on first boot; remove to enable images)"
+    )
+    warnings.append(
+        "Multimodal model: serving language-model-only on Spark for stable first boot. "
+        "Drop --language-model-only and set --limit-mm-per-prompt when you need vision."
+    )
 
 
 def _apply_first_boot_defaults(
@@ -1351,32 +1907,30 @@ def _apply_first_boot_defaults(
         )
         rationale.append("FIRST BOOT: MTP off (stable serve; re-enable later if needed)")
 
-    # Empty moe = vLLM auto — preferred on Spark unless user forces a known-good backend
+    # Empty moe = vLLM auto — preferred on Spark unless user/card forces a known-good backend
     moe = (cfg.get("moe_backend") or "").strip().lower()
-    if moe in ("marlin",) or (moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected)):
-        # already handled by checkpoint safety; ensure empty
+    img = cfg.get("image")
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected):
+        cfg["moe_backend"] = ""
+    elif moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, img):
         cfg["moe_backend"] = ""
 
-    # Prefer empty moe for MoE first boot even if card set something exotic we didn't list
-    if detected.get("is_moe") and moe and moe not in ("", "auto", "triton"):
-        # Keep triton if card set it; clear unknown/risky backends
-        if moe not in ("triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"):
-            cfg["moe_backend"] = ""
-            if moe not in ("marlin", "flashinfer_b12x"):  # already warned
-                warnings.append(
-                    f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
-                )
-                rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
-
-    # Lab Safe: don't carry card util=0.85 into lab_safe form without clamp (envelope handles)
-    # Workflow Max first boot on 35B MoE: 262k ctx is OK only with enough util headroom —
-    # leave card max-len but note memory risk.
-    if mode == "workflow_max" and isinstance(cfg.get("max_model_len"), int):
-        if cfg["max_model_len"] >= 200000 and detected.get("is_moe"):
-            rationale.append(
-                f"Card max-model-len={cfg['max_model_len']} kept for Workflow Max — "
-                "watch free UMA; drop to 65536 if load OOMs"
+    # Prefer empty moe for MoE first boot even if card set something exotic we didn't list.
+    # Keep backends that are known-safe for this checkpoint×image (incl. Nemotron marlin).
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    allowed = {"", "auto", "triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"}
+    if not _marlin_unsafe_for_checkpoint(detected, img):
+        allowed.add("marlin")
+    if detected.get("is_moe") and moe and moe not in allowed:
+        cfg["moe_backend"] = ""
+        if moe not in ("marlin", "flashinfer_b12x"):
+            warnings.append(
+                f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
             )
+            rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
+
+    # Long card contexts are clamped by _apply_mode_envelope on single-node Spark.
+    # Multi-node overlays (TP>=2) keep their pin.
 
 
 # ─── config.json analysis (fills gaps the card left empty) ────────────────────
@@ -1402,6 +1956,7 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         qc = {}
 
     quant_method = (qc.get("quant_method") or "").lower()
+    quant_algo = str(qc.get("quant_algo") or "")
     formats: set[str] = set()
     if qc.get("format"):
         formats.add(str(qc["format"]).lower())
@@ -1433,6 +1988,13 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
             if "FP8" in algo:
                 has_fp8 = True
 
+    # Top-level ModelOpt algo (even with empty quantized_layers).
+    algo_u = quant_algo.upper()
+    if any(tok in algo_u for tok in ("NVFP4", "FP4", "W4A16")):
+        has_nvfp4 = True
+    if algo_u == "FP8" or algo_u.startswith("FP8") or "MIXED" in algo_u:
+        has_fp8 = True
+
     tag_blob = " ".join(tags)
     if "nvfp4" in mid or "fp4" in mid or "fp4" in tag_blob or "nvfp4" in tag_blob:
         has_nvfp4 = True
@@ -1442,7 +2004,8 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
     if "compressed-tensors" in tag_blob or "compressed-tensors" in tags:
         if not quant_method:
             quant_method = "compressed-tensors"
-    if quant_method == "fp8" or "fp8" in mid:
+    # Prefer token boundaries over substring "fp8" (avoids odd id false positives).
+    if quant_method == "fp8" or re.search(r"(^|[-_/])fp8($|[-_/])", mid):
         has_fp8 = True
 
     fmt_blob = " ".join(formats)
@@ -1453,15 +2016,29 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
 
     if quant_method in ("compressed-tensors", "compressed_tensors"):
         quant_flag = "compressed-tensors"
-    elif quant_method in ("modelopt", "modelopt_fp4"):
-        quant_flag = "modelopt"
+    elif quant_method.startswith("modelopt") or (
+        has_modelopt_layers and (has_nvfp4 or has_fp8 or quant_algo)
+    ):
+        quant_flag = _modelopt_quant_flag(
+            quant_method or "modelopt",
+            quant_algo,
+            has_nvfp4=has_nvfp4,
+            has_fp8=has_fp8,
+            has_modelopt_layers=has_modelopt_layers,
+        )
     elif quant_method == "fp8":
         quant_flag = "fp8"
-    elif has_modelopt_layers and has_nvfp4:
-        quant_flag = "modelopt"
     elif "modelopt" in tags:
-        quant_flag = "modelopt"
+        quant_flag = _modelopt_quant_flag(
+            "modelopt",
+            quant_algo,
+            has_nvfp4=has_nvfp4,
+            has_fp8=has_fp8,
+            has_modelopt_layers=has_modelopt_layers,
+        )
     elif "compressed-tensors" in tags:
+        quant_flag = "compressed-tensors"
+    elif has_nvfp4 and "nvfp4-pack" in fmt_blob:
         quant_flag = "compressed-tensors"
     elif has_nvfp4:
         quant_flag = ""
@@ -1476,35 +2053,86 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         or cfg.get("num_experts")
         or text_cfg.get("num_experts")
     )
+    arch_blob = " ".join(str(a).lower() for a in architectures)
+    is_vl = bool(
+        "vl" in model_type
+        or "vision" in model_type
+        or re.search(r"(^|[_-])vl([_-]|$)", mid)
+        or "vl" in arch_blob
+        or "conditionalgeneration" in arch_blob and ("qwen3_5" in model_type or "qwen3.5" in mid or "qwen3.6" in mid)
+        or "llava" in mid
+        or "pixtral" in mid
+        or "internvl" in mid
+    )
     is_mixed = has_nvfp4 and has_fp8 and (
         quant_method in ("compressed-tensors", "compressed_tensors")
         or "mixed" in fmt_blob
         or ("nvfp4-pack" in fmt_blob and "float-quantized" in fmt_blob)
+        or "MIXED" in algo_u
+        or (has_modelopt_layers and has_nvfp4 and has_fp8)
+        or quant_flag == "modelopt_mixed"
     )
+
+    # Checkpoint-declared KV preference (ModelOpt kv_cache_scheme / kv_cache_quant_algo).
+    suggested_kv = None
+    kv_scheme = qc.get("kv_cache_scheme")
+    kv_algo = str(qc.get("kv_cache_quant_algo") or "").upper()
+    if isinstance(kv_scheme, dict):
+        bits = kv_scheme.get("num_bits")
+        typ = str(kv_scheme.get("type") or "").lower()
+        if bits == 8 or "float" in typ or "fp8" in typ:
+            suggested_kv = "fp8"
+    if "FP8" in kv_algo:
+        suggested_kv = "fp8"
 
     family = "unknown"
     blob = f"{model_type} {' '.join(str(a) for a in architectures)} {model_id}".lower()
+    # Most-specific first — MiniMax M3 / DeepSeek V4 must not collapse into siblings.
     if "nemotron" in blob:
         family = "nemotron"
+    elif "minimax" in blob and ("m3" in blob or "minimaxm3" in blob):
+        family = "minimax_m3"
+    elif "minimax" in blob:
+        family = "minimax_m2"
+    elif "deepseek" in blob and ("v4" in blob or "dspark" in blob):
+        family = "deepseek_v4"
+    elif "deepseek" in blob and "r1" in blob:
+        family = "deepseek_r1"
+    elif "deepseek" in blob:
+        family = "deepseek_v3"
     elif "qwen" in blob:
         family = "qwen"
+    elif "mistral" in blob or "mixtral" in blob or "magistral" in blob or "devstral" in blob or "pixtral" in blob:
+        family = "mistral"
+    elif "glm" in blob or "chatglm" in blob:
+        family = "glm"
+    elif "kimi" in blob or "moonshot" in blob:
+        family = "kimi"
+    elif "granite" in blob:
+        family = "granite"
+    elif "phi" in blob or model_type.startswith("phi"):
+        family = "phi"
     elif "llama" in blob:
-        family = "llama"
+        # Llama 4 Scout/Maverick vs 3.x — tool parsers differ.
+        family = "llama4" if ("llama4" in blob or "llama-4" in mid or "scout" in mid or "maverick" in mid) else "llama"
     elif "gemma" in blob:
-        family = "gemma"
+        family = "gemma4" if ("gemma4" in blob or "gemma-4" in mid or "gemma_4" in mid) else "gemma"
 
     return {
         "model_type": model_type or None,
         "architectures": architectures,
         "quant_method": quant_method or None,
+        "quant_algo": quant_algo or None,
         "quant_formats": sorted(formats),
         "has_nvfp4": has_nvfp4,
         "has_fp8": has_fp8,
         "is_mixed_nvfp4_fp8": is_mixed,
         "is_moe": is_moe,
+        "is_vl": is_vl,
         "has_modelopt_layers": has_modelopt_layers,
         "max_position_embeddings": max_pos,
         "quant_flag": quant_flag,
+        "suggested_kv_cache_dtype": suggested_kv,
         "family": family,
     }
 
@@ -1604,10 +2232,16 @@ def _card_prose_hints(readme: str) -> dict[str, Any]:
     if re.search(r"tool.?call.?parser\s+qwen3_coder", readme, re.I):
         hints["tool_call_parser"] = "qwen3_coder"
         hints["enable_auto_tool_choice"] = True
-    if re.search(r"--quantization\s+modelopt", readme):
+    if re.search(r"--quantization\s+modelopt_mixed\b", readme):
+        hints["quantization"] = "modelopt_mixed"
+    elif re.search(r"--quantization\s+modelopt_fp4\b", readme):
+        hints["quantization"] = "modelopt_fp4"
+    elif re.search(r"--quantization\s+modelopt\b", readme):
         hints["quantization"] = "modelopt"
     if re.search(r"--quantization\s+compressed-tensors", readme):
         hints["quantization"] = "compressed-tensors"
+    if re.search(r"--quantization\s+fp8\b", readme):
+        hints["quantization"] = "fp8"
     return hints
 
 
@@ -1623,19 +2257,43 @@ def _fill_from_config_detection(
             f"HF config/tags → --quantization {detected['quant_flag']} "
             f"(card serve line had no --quantization)"
         )
+    if not base.get("kv_cache_dtype") and detected.get("suggested_kv_cache_dtype"):
+        base["kv_cache_dtype"] = detected["suggested_kv_cache_dtype"]
+        rationale.append(
+            f"HF quantization_config → --kv-cache-dtype {detected['suggested_kv_cache_dtype']}"
+        )
 
     family = detected.get("family")
     if family == "qwen":
-        if not base.get("reasoning_parser"):
-            base["reasoning_parser"] = "qwen3"
-            rationale.append("Qwen architecture (from HF config) → --reasoning-parser qwen3")
-        if not base.get("tool_call_parser"):
-            base["tool_call_parser"] = "qwen3_coder"
-            base["enable_auto_tool_choice"] = True
-            rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
-        if not base.get("trust_remote_code"):
-            base["trust_remote_code"] = True
-    if family == "nemotron":
+        mid = (
+            str(base.get("model") or "")
+            + " "
+            + str(detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+        ).lower()
+        # qwen3 parsers break Qwen2.5 / classic Qwen2 chat templates.
+        is_qwen25_or_2 = bool(
+            re.search(r"qwen2\.5|qwen2_5|qwen25", mid)
+            or ("qwen2" in mid and "qwen3" not in mid and "qwen2.5" not in mid)
+        )
+        if is_qwen25_or_2:
+            if not base.get("trust_remote_code"):
+                base["trust_remote_code"] = True
+            rationale.append(
+                "Qwen2.5/Qwen2 checkpoint → skipping qwen3 reasoning/tool parsers (card may still set them)"
+            )
+        else:
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "qwen3"
+                rationale.append("Qwen architecture (from HF config) → --reasoning-parser qwen3")
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "qwen3_coder"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
+            if not base.get("trust_remote_code"):
+                base["trust_remote_code"] = True
+    elif family == "nemotron":
         if not base.get("reasoning_parser"):
             base["reasoning_parser"] = "nemotron_v3"
             rationale.append("Nemotron (from HF) → --reasoning-parser nemotron_v3")
@@ -1643,6 +2301,293 @@ def _fill_from_config_detection(
         if not base.get("tool_call_parser"):
             base["tool_call_parser"] = "qwen3_coder"
         base["trust_remote_code"] = True
+    elif family == "minimax_m2":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "minimax_m2"
+            rationale.append("MiniMax M2 → --reasoning-parser minimax_m2")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "minimax_m2"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("MiniMax M2 → tool-call-parser minimax_m2 + auto tool choice")
+        base["trust_remote_code"] = True
+    elif family == "minimax_m3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "minimax_m3"
+            rationale.append("MiniMax M3 → --reasoning-parser minimax_m3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "minimax_m3"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("MiniMax M3 → tool-call-parser minimax_m3 + auto tool choice")
+        base["trust_remote_code"] = True
+        # MSA sparse attention requires block-size 128; refuse is a placement concern.
+        ex = base.get("extra_flags") or ""
+        if "--block-size" not in ex:
+            base["extra_flags"] = (ex + " --block-size 128").strip()
+            rationale.append("MiniMax M3 MSA → --block-size 128")
+    elif family == "mistral":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "mistral"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Mistral family → tool-call-parser mistral + auto tool choice")
+        mid = (detected.get("model_type") or "") + " " + " ".join(
+            str(a) for a in (detected.get("architectures") or [])
+        )
+        # Magistral / reasoning variants use the mistral reasoning parser.
+        if "magistral" in mid.lower() or "reasoning" in mid.lower():
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "mistral"
+                rationale.append("Mistral reasoning variant → --reasoning-parser mistral")
+        if not base.get("load_format"):
+            base["load_format"] = "mistral"
+            rationale.append("Mistral family → --load-format mistral")
+        ex = base.get("extra_flags") or ""
+        if "--tokenizer-mode" not in ex:
+            base["extra_flags"] = (ex + " --tokenizer-mode mistral --config-format mistral").strip()
+    elif family == "deepseek_r1":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_r1"
+            rationale.append("DeepSeek-R1 → --reasoning-parser deepseek_r1")
+        base["trust_remote_code"] = True
+    elif family == "deepseek_v3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_v3"
+            rationale.append("DeepSeek-V3 → --reasoning-parser deepseek_v3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "deepseek_v3"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "deepseek_v4":
+        # Overlay usually owns this; fill gaps if card/overlay missed parsers.
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "deepseek_v4"
+            rationale.append("DeepSeek-V4 → --reasoning-parser deepseek_v4")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "deepseek_v4"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "glm":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+            + " "
+            + str(base.get("model") or "")
+        ).lower()
+        # Reasoning always glm45 for MoE 4.x; tools split by generation.
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "glm45"
+            rationale.append("GLM family → --reasoning-parser glm45")
+        tool = "glm47" if ("4.7" in mid or "glm47" in mid or "flash" in mid) else "glm45"
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = tool
+            base["enable_auto_tool_choice"] = True
+            rationale.append(f"GLM family → tool-call-parser {tool}")
+        base["trust_remote_code"] = True
+    elif family == "kimi":
+        # Prefer K3 parser when the id/arch says so; else K2.
+        mid = (detected.get("model_type") or "") + " " + " ".join(
+            str(a) for a in (detected.get("architectures") or [])
+        )
+        kimi = "kimi_k3" if "k3" in mid.lower() else "kimi_k2"
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = kimi
+            rationale.append(f"Kimi → --reasoning-parser {kimi}")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = kimi
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "llama4":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "llama4_pythonic"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Llama 4 → tool-call-parser llama4_pythonic + auto tool choice")
+        # No Meta Llama reasoning parser.
+    elif family == "llama":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "llama3_json"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Llama 3.x → tool-call-parser llama3_json + auto tool choice")
+    elif family == "gemma4":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "gemma4"
+            rationale.append("Gemma 4 → --reasoning-parser gemma4")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "gemma4"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("Gemma 4 → tool-call-parser gemma4 + auto tool choice")
+    elif family == "gemma":
+        # Gemma 2/3: no gemma4 parsers; leave empty unless the card set them.
+        pass
+    elif family == "phi":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+        ).lower()
+        # Prefer model id when present on the empty config.
+        mid += " " + str(base.get("model") or "").lower()
+        base["trust_remote_code"] = True
+        if "mini" in mid and "instruct" in mid:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "phi4_mini_json"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Phi-4-mini-instruct → tool-call-parser phi4_mini_json")
+        elif "reasoning" in mid and "mini" not in mid:
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "deepseek_r1"
+                rationale.append("Phi-4-reasoning → --reasoning-parser deepseek_r1")
+        # Strip obsolete --enable-reasoning if a card left it in extras.
+        if base.get("extra_flags") and "--enable-reasoning" in base["extra_flags"]:
+            base["extra_flags"] = _strip_flag_from_extra(base["extra_flags"], "--enable-reasoning")
+            rationale.append("Stripped obsolete --enable-reasoning (removed in vLLM ≥0.10)")
+    elif family == "granite":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+            + " "
+            + str(base.get("model") or "")
+        ).lower()
+        if "granite-4" in mid or "granite4" in mid or "granite_4" in mid:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "granite4"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Granite 4 → tool-call-parser granite4")
+        else:
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "granite"
+                base["enable_auto_tool_choice"] = True
+                rationale.append("Granite 3.x → tool-call-parser granite")
+            # Reasoning parser only for 3.2 prose markers — not 3.3 <think>.
+            if "3.2" in mid or "granite-3.2" in mid:
+                if not base.get("reasoning_parser"):
+                    base["reasoning_parser"] = "granite"
+                    rationale.append("Granite 3.2 → --reasoning-parser granite")
+
+
+_CONTEXT_LADDER = (1048576, 524288, 262144, 131072, 65536, 32768, 16384)
+
+
+def _kv_bytes_per_token(
+    hf_config: Optional[dict],
+    *,
+    kv_cache_dtype: str,
+    family: str,
+) -> float:
+    """Conservative bytes/token for residual KV budget (GQA / MLA / mamba-hybrid)."""
+    cfg = hf_config or {}
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+
+    def g(k: str, default: Any = None) -> Any:
+        return cfg.get(k, text.get(k, default))
+
+    dtype = (kv_cache_dtype or "fp8").lower()
+    if "nvfp4" in dtype:
+        b = 0.5
+    elif "fp8" in dtype:
+        b = 1.0
+    else:
+        b = 2.0
+
+    # MLA / DeepSeek latent path (KV is typically replicated across TP ranks).
+    if "nvfp4_ds_mla" in dtype or "fp8_ds_mla" in dtype or (family or "").startswith("deepseek"):
+        layers = int(g("num_hidden_layers") or 60)
+        per_layer = 320.0 if "nvfp4" in dtype else 584.0
+        return float(layers * per_layer)
+
+    layers = int(g("num_hidden_layers") or 32)
+    n_kv = int(g("num_key_value_heads") or g("num_attention_heads") or 8)
+    n_heads = int(g("num_attention_heads") or n_kv)
+    hidden = int(g("hidden_size") or 4096)
+    head_dim = int(g("head_dim") or (hidden // max(n_heads, 1)))
+
+    # Nemotron hybrid: only attention layers grow with context length.
+    block_types = g("layers_block_type") or g("layer_types") or []
+    if isinstance(block_types, list) and block_types:
+        n_attn = sum(
+            1
+            for t in block_types
+            if "attention" in str(t).lower() or str(t).lower() in ("attn", "a")
+        )
+        if n_attn > 0:
+            layers = n_attn
+
+    return float(layers * 2 * n_kv * head_dim * b)
+
+
+def _size_memory_for_spark(
+    cfg: dict[str, Any],
+    *,
+    hf_config: Optional[dict],
+    detected: dict[str, Any],
+    weights_gib: Optional[float],
+    node_ram_gib: float,
+    mode: str,
+    rationale: list[str],
+    warnings: list[str],
+) -> None:
+    """Clamp max_model_len (and max_num_seqs as last resort) to residual KV budget.
+
+    Multi-node TP>=2 overlays keep their pinned context for now (envelope already
+    owns the single-node 1M→262k clamp).
+    """
+    if int(cfg.get("tensor_parallel_size") or 1) >= 2:
+        return
+    ml = cfg.get("max_model_len")
+    if not isinstance(ml, int) or ml <= 0:
+        return
+    util = float(cfg.get("util") or (0.4 if mode == "lab_safe" else 0.85))
+    seqs = int(cfg.get("max_num_seqs") or 4)
+    per_node_w = float(weights_gib) if weights_gib and weights_gib > 0 else 0.0
+    runtime_pad = 4.0
+    budget = node_ram_gib * util - per_node_w - runtime_pad
+    if budget < 8.0:
+        return
+
+    bpt = _kv_bytes_per_token(
+        hf_config,
+        kv_cache_dtype=str(cfg.get("kv_cache_dtype") or "fp8"),
+        family=str((detected or {}).get("family") or ""),
+    )
+    if bpt <= 0:
+        return
+
+    def need_gib(length: int, nseq: int) -> float:
+        return (bpt * length * nseq / (1024**3)) * 1.10
+
+    chosen: Optional[int] = None
+    chosen_seqs = seqs
+    for nseq in (seqs, 4, 2, 1):
+        if nseq > seqs:
+            continue
+        for length in _CONTEXT_LADDER:
+            if length > ml:
+                continue
+            if need_gib(length, nseq) <= budget:
+                chosen = length
+                chosen_seqs = nseq
+                break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        chosen = 16384
+        chosen_seqs = 1
+        warnings.append(
+            f"MEMORY: even 16k×1 seq may be tight (budget≈{budget:.0f} GiB after weights); "
+            "consider more nodes or a smaller checkpoint."
+        )
+
+    if chosen < ml or chosen_seqs < seqs:
+        rationale.append(
+            f"MEMORY: max-model-len {ml} → {chosen}"
+            + (f", max-num-seqs {seqs} → {chosen_seqs}" if chosen_seqs != seqs else "")
+            + f" (kv≈{need_gib(chosen, chosen_seqs):.1f} GiB ≤ budget {budget:.1f} GiB "
+            f"at util={util}, weights≈{per_node_w:.1f} GiB)"
+        )
+        cfg["max_model_len"] = chosen
+        if chosen_seqs != seqs:
+            cfg["max_num_seqs"] = chosen_seqs
 
 
 def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], card_set_max_len: bool, card_set_util: bool = False) -> None:
@@ -1673,9 +2618,30 @@ def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], c
 
     # Lab Safe clamps util, but never below a card/overlay-specified floor (large NVFP4 /
     # DSpark weights need the card's util just to load — clamping to 0.4 would brick the boot).
-    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9 and not card_set_util:
+    # Exception: Lab Safe Start hard-fails above SAFE_UTIL, so always clamp for that mode and
+    # tell the user to switch to Workflow Max when the recipe needed more.
+    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9:
+        prev = cfg["util"]
         cfg["util"] = SAFE_UTIL
-        rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
+        if card_set_util:
+            rationale.append(
+                f"clamped util {prev} → {SAFE_UTIL} for Lab Safe "
+                "(card/overlay needs more — use Workflow Max to load this checkpoint)"
+            )
+        else:
+            rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
+
+    # Single-node Spark: card/demo 1M contexts OOMs under realistic util. Multi-node
+    # overlays (TP>=2) that intentionally pin a huge window keep it.
+    ceiling = SAFE_MAX_LEN if mode == "lab_safe" else WORKFLOW_MAX_LEN
+    ml = cfg.get("max_model_len")
+    tp = int(cfg.get("tensor_parallel_size") or 1)
+    if isinstance(ml, int) and ml > ceiling and tp < 2:
+        cfg["max_model_len"] = ceiling
+        rationale.append(
+            f"clamped max-model-len {ml} → {ceiling} "
+            f"({mode} envelope on single-node Spark; raise TP or edit form for longer ctx)"
+        )
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -1863,6 +2829,7 @@ def recommend(
             warnings=warnings,
             rationale=rationale,
         )
+        _apply_vl_spark_defaults(cfg, detected, warnings, rationale)
 
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
     # Overlay already encodes the correct backend, so only run for card-driven configs.
@@ -1878,15 +2845,46 @@ def recommend(
 
     # Mode envelope for util / defaults when card silent. util/max-len set by the card OR a
     # family overlay are authoritative — the envelope only fills gaps, never overrides them.
+    # Lab Safe still clamps util ≤ SAFE_UTIL so Start cannot hard-fail the contract.
     card_set_util = cfg.get("util") is not None
     card_set_max_len = cfg.get("max_model_len") is not None
     _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
+
+    # Card image pin: raise stock default when the card asks for a newer tag; never downgrade;
+    # never replace an Anemll/DSpark overlay image.
+    card_image = _parse_card_image_requirement(readme)
+    if cfg.get("image"):
+        cfg["image"] = _resolve_stock_image(cfg["image"], card_image, rationale)
+
+    # Unexpanded $VARS from card recipes must never reach docker.
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
+
+    # DSpark speculative without a draft model path will fail at load — fill or strip.
+    _ensure_dspark_draft_or_strip(cfg, readme, warnings, rationale)
+
+    # Card multi-GPU / mega-MoE knobs crash or mis-route on 1–2× GB10.
+    _strip_spark_unsafe_flags(cfg, warnings, rationale)
 
     max_pos = detected.get("max_position_embeddings")
     if isinstance(max_pos, int) and max_pos > 0 and cfg.get("max_model_len"):
         if cfg["max_model_len"] > max_pos:
             cfg["max_model_len"] = max_pos
             rationale.append(f"Capped max-model-len to config max_position_embeddings={max_pos}")
+
+    plan = cfg.get("topology_plan") or {}
+    node_ram = float(plan.get("node_ram_gib") or _DEFAULT_NODE_RAM_GIB)
+    _size_memory_for_spark(
+        cfg,
+        hf_config=hf_config,
+        detected=detected,
+        weights_gib=weights_gib,
+        node_ram_gib=node_ram,
+        mode=mode,
+        rationale=rationale,
+        warnings=warnings,
+    )
+
 
     # Normalize env (dedupe keys; last wins)
     env_out: list[str] = []
@@ -1963,6 +2961,14 @@ def recommend(
         notes = "Live HF card was not available; result may be incomplete."
 
     plan = cfg.get("topology_plan") or {}
+    fits = bool(plan.get("fits", True))
+    serve_blocked = not fits
+    if serve_blocked:
+        confidence = "low"
+        warnings.append(
+            "SERVE BLOCKED: weights do not fit the online cluster — Start will refuse until "
+            "you add nodes or pick a smaller checkpoint."
+        )
     topology_out = {
         "nodes": topology.get("nodes", 1),
         "nodes_used": plan.get("nodes_needed", 1),
@@ -1974,7 +2980,7 @@ def recommend(
         "weights_gib": weights_gib,
         "per_node_weights_gib": plan.get("per_node_weights_gib"),
         "util_computed": plan.get("util_computed"),
-        "fits": plan.get("fits", True),
+        "fits": fits,
         "node_ram_gib": plan.get("node_ram_gib"),
         "overlay": overlay["family_key"] if overlay else None,
     }
@@ -1999,6 +3005,7 @@ def recommend(
         "card_url": card_url,
         "from_website": from_website,
         "hf_token_ok": token_ok,
+        "serve_blocked": serve_blocked,
         "detected": detected,
         "config": cfg,
         "topology": topology_out,

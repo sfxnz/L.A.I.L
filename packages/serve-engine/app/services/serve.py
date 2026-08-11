@@ -159,6 +159,38 @@ def _redact(parts: list[str]) -> str:
     return " ".join(out)
 
 
+def _ensure_image_present(
+    image: str,
+    *,
+    log: Any = None,
+    progress: Callable | None = None,
+) -> None:
+    """Pull the serve image if it is not already present locally."""
+    image = (image or "").strip()
+    if not image:
+        return
+
+    def w(msg: str, p: float = 0.12) -> None:
+        if log:
+            log.write(msg)
+        if progress:
+            progress(p, msg)
+
+    probe = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return
+    w(f"Image {image} not local — pulling…", 0.12)
+    pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True)
+    if pull.returncode != 0:
+        err = (pull.stderr or pull.stdout or "").strip()[-800:]
+        raise RuntimeError(f"Failed to pull required image {image}: {err}")
+    w(f"Pulled {image}", 0.18)
+
+
 def _launch_multi_node(
     launch: dict[str, Any],
     *,
@@ -176,6 +208,26 @@ def _launch_multi_node(
             progress(p, msg)
 
     nnodes = launch["nnodes"]
+    image = (launch.get("image") or "").strip()
+    # Ensure image on head + each worker before docker run (common DSpark failure mode).
+    if image:
+        _ensure_image_present(image, log=log, progress=progress)
+        for wc in launch["workers"]:
+            host = wc.get("ssh_host")
+            if not host:
+                continue
+            w(f"Ensuring image on worker {wc.get('node')} ({host})…", 0.22)
+            probe = subprocess.run(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                    f"docker image inspect {image} >/dev/null 2>&1 || docker pull {image}",
+                ],
+                capture_output=True, text=True, timeout=600,
+            )
+            if probe.returncode != 0:
+                err = (probe.stderr or probe.stdout or "").strip()[-800:]
+                raise RuntimeError(f"Failed to pull {image} on {host}: {err}")
+
     # 1) workers first (headless ranks), each over SSH
     for wc in launch["workers"]:
         host = wc["ssh_host"]
@@ -533,8 +585,10 @@ def _build_vllm_args(
         extras = _strip_flag(extras, "--reasoning-parser")
     if load_format.strip():
         extras = _strip_flag(extras, "--load-format")
-    # Lab envelope owns host/port/tp/util/max-len
+    # Launcher owns the model (passed positionally) and the lab envelope owns
+    # host/port/tp/util/max-len.
     for f in (
+        "--model",
         "--host",
         "--port",
         "--tensor-parallel-size",
@@ -597,6 +651,38 @@ def serve_model(
     else:
         raise ValueError(f"Unknown mode {mode}; use lab_safe or workflow_max")
 
+    # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
+    # Mirrors recommend()'s serve_blocked so a manual form cannot bypass the UI.
+    try:
+        from .autoconfig import (
+            _cluster_topology,
+            estimate_weights_gib,
+            load_local_fallback,
+            plan_placement,
+        )
+
+        topo = _cluster_topology()
+        local = load_local_fallback(model)
+        weights = estimate_weights_gib(model, local.get("config"))
+        plan = plan_placement(weights, topo, mode=mode, overlay=None)
+        tp_req = int(tensor_parallel_size or plan.get("tensor_parallel_size") or 1)
+        n_avail = int(plan.get("nodes_available") or 1)
+        n_use = min(max(tp_req, int(plan.get("nodes_needed") or 1)), n_avail)
+        node_ram = float(plan.get("node_ram_gib") or 121.7)
+        reserve = float(plan.get("reserve_gib") or 15.0)
+        if weights and weights > 0:
+            fits = (weights / n_use) <= (node_ram * 0.85 - reserve)
+            if not fits:
+                raise RuntimeError(
+                    f"SERVE BLOCKED: weights (~{weights} GiB) do not fit "
+                    f"{n_avail} Spark(s) even at TP={n_use}. "
+                    "Add nodes or pick a smaller checkpoint."
+                )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # topology/HF probe failure must not brick Start for small local models
+
     env_list = _normalize_docker_env(docker_env)
 
     # Guard: flashinfer_b12x crashes on mixed FP8+NVFP4 compressed-tensors MoE (e.g. Unsloth 35B).
@@ -651,6 +737,8 @@ def serve_model(
                 0.15,
             )
             moe_backend = ""
+
+    _ensure_image_present(image or "", log=log, progress=progress)
 
     vllm_args = _build_vllm_args(
         util=util,
@@ -745,11 +833,30 @@ def serve_model(
             "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
             0.28,
         )
-    cmd += [
-        image,
-        model,
-        *vllm_args,
-    ]
+
+    # Custom Spark images (Anemll dspark-vllm-gx10) ship ENTRYPOINT=vllm. Clear it so our
+    # argv is not appended as unrecognized vllm flags (exit 2). Stock vllm-openai is fine.
+    img_l = (image or "").lower()
+    needs_entrypoint = "anemll" in img_l or "dspark-vllm" in img_l or "gx10" in img_l
+    if needs_entrypoint:
+        cmd += [
+            "--entrypoint",
+            "bash",
+            image,
+            "-lc",
+            'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"',
+            "--",
+            "vllm",
+            "serve",
+            model,
+            *vllm_args,
+        ]
+    else:
+        cmd += [
+            image,
+            model,
+            *vllm_args,
+        ]
 
     def _redact_cmd(parts: list[str]) -> str:
         """Never log HF tokens / secrets in job logs."""

@@ -631,9 +631,43 @@ _SKU_ARCH = {
 _DEFAULT_NODE_RAM_GIB = 121.7  # GB10 UMA when a node has not been probed yet
 
 
+def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[float]:
+    """Conservative minimum GiB for families that never fit 1–2× GB10 UMA.
+
+    Used when Hub blobs are missing/under-reported so placement cannot claim
+    fits=True for DeepSeek-V3/R1/Pro-class checkpoints.
+    """
+    mid = (model or "").lower()
+    # DeepSeek V4 Flash has a Spark overlay (~155 GiB) — do not floor that path.
+    if "deepseek" in mid and "v4" in mid and "pro" in mid:
+        return 900.0
+    if "deepseek" in mid and ("r1" in mid or re.search(r"v3(\.|$|-)", mid)) and "v4" not in mid:
+        return 700.0
+    if "minimax" in mid and re.search(r"(^|[^a-z])m3([^0-9]|$)", mid):
+        return 800.0
+    if ("kimi" in mid or "moonshot" in mid) and re.search(r"k[23]", mid):
+        return 800.0
+    if "llama" in mid and ("405b" in mid or "maverick" in mid):
+        return 400.0
+    # Full GLM 4.5/4.6/4.7 MoE (not 9b / edge / air distillations).
+    if re.search(r"glm-?4\.[567]", mid) and not re.search(r"(9b|air|edge|flash)", mid):
+        return 500.0
+    cfg = hf_config or {}
+    experts = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
+    try:
+        if experts and int(experts) >= 64:
+            # Huge MoE without a Hub blob sum — refuse optimistic single-node fit.
+            return 400.0
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[float]:
-    """Best-effort weight size for ANY model. Order: exact HF blob sum → config param
-    estimate → None. Used by the placement engine to decide nodes_needed + util."""
+    """Best-effort weight size for ANY model. Order: exact HF blob sum → safetensors
+    index total_size → config param estimate → known-family floor → None.
+    Used by the placement engine to decide nodes_needed + util."""
+    measured: Optional[float] = None
     # 1) Exact: sum safetensors/bin blobs from the HF API (most accurate).
     try:
         body, err = _http_get(f"https://huggingface.co/api/models/{model}?blobs=true", timeout=20.0)
@@ -645,29 +679,58 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                 if n.endswith((".safetensors", ".bin", ".gguf")):
                     tot += f.get("size") or 0
             if tot > 0:
-                return round(tot / (1024**3), 1)
+                measured = round(tot / (1024**3), 1)
     except Exception:
         pass
-    # 2) Estimate from config: params × bytes/param (quant-aware).
-    try:
-        qc = (hf_config or {}).get("quantization_config") or {}
-        nbits = 0
-        for g in (qc.get("config_groups") or {}).values():
-            if isinstance(g, dict):
-                w = g.get("weights") or {}
-                if isinstance(w, dict) and w.get("num_bits"):
-                    nbits = int(w["num_bits"])
-                    break
-        hidden = (hf_config or {}).get("hidden_size")
-        layers = (hf_config or {}).get("num_hidden_layers")
-        if hidden and layers:
-            # rough param count for dense-ish models: ~12 * layers * hidden^2 (+emb)
-            params = 12 * layers * hidden * hidden
-            bpp = (nbits / 8.0) if nbits in (4, 8) else 2.0  # fp4/fp8/bf16
-            return round(params * bpp / (1024**3), 1)
-    except Exception:
-        pass
-    return None
+    # 2) Safetensors index metadata.total_size (when blob sizes are missing).
+    if measured is None:
+        try:
+            body, err = _http_get(
+                f"https://huggingface.co/{model}/resolve/main/model.safetensors.index.json",
+                timeout=20.0,
+            )
+            if body and not err:
+                d = json.loads(body)
+                tot = (d.get("metadata") or {}).get("total_size")
+                if isinstance(tot, (int, float)) and tot > 0:
+                    measured = round(float(tot) / (1024**3), 1)
+        except Exception:
+            pass
+    # 3) Estimate from config: params × bytes/param (quant-aware; MoE-aware).
+    if measured is None:
+        try:
+            qc = (hf_config or {}).get("quantization_config") or {}
+            nbits = 0
+            for g in (qc.get("config_groups") or {}).values():
+                if isinstance(g, dict):
+                    w = g.get("weights") or {}
+                    if isinstance(w, dict) and w.get("num_bits"):
+                        nbits = int(w["num_bits"])
+                        break
+            hidden = (hf_config or {}).get("hidden_size")
+            layers = (hf_config or {}).get("num_hidden_layers")
+            if hidden and layers:
+                # Dense-ish: ~12 * layers * hidden^2 (+emb)
+                params = 12 * layers * hidden * hidden
+                experts = (
+                    (hf_config or {}).get("n_routed_experts")
+                    or (hf_config or {}).get("num_experts")
+                    or (hf_config or {}).get("num_local_experts")
+                )
+                moe_inter = (hf_config or {}).get("moe_intermediate_size") or (
+                    hf_config or {}
+                ).get("intermediate_size")
+                if experts and moe_inter:
+                    # MoE FFN dominates; dense formula alone under-reports ~0 GiB-class misses.
+                    params += int(experts) * layers * 3 * hidden * int(moe_inter)
+                bpp = (nbits / 8.0) if nbits in (4, 8) else 2.0  # fp4/fp8/bf16
+                measured = round(params * bpp / (1024**3), 1)
+        except Exception:
+            pass
+    floor = _weight_floor_gib(model, hf_config)
+    if measured is not None and floor is not None:
+        return max(measured, floor)
+    return measured if measured is not None else floor
 
 
 def _node_ram_gib(node: Optional[dict]) -> float:
@@ -2314,6 +2377,7 @@ def recommend(
     fits = bool(plan.get("fits", True))
     serve_blocked = not fits
     if serve_blocked:
+        confidence = "low"
         warnings.append(
             "SERVE BLOCKED: weights do not fit the online cluster — Start will refuse until "
             "you add nodes or pick a smaller checkpoint."

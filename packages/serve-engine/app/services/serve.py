@@ -599,6 +599,38 @@ def serve_model(
     else:
         raise ValueError(f"Unknown mode {mode}; use lab_safe or workflow_max")
 
+    # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
+    # Mirrors recommend()'s serve_blocked so a manual form cannot bypass the UI.
+    try:
+        from .autoconfig import (
+            _cluster_topology,
+            estimate_weights_gib,
+            load_local_fallback,
+            plan_placement,
+        )
+
+        topo = _cluster_topology()
+        local = load_local_fallback(model)
+        weights = estimate_weights_gib(model, local.get("config"))
+        plan = plan_placement(weights, topo, mode=mode, overlay=None)
+        tp_req = int(tensor_parallel_size or plan.get("tensor_parallel_size") or 1)
+        n_avail = int(plan.get("nodes_available") or 1)
+        n_use = min(max(tp_req, int(plan.get("nodes_needed") or 1)), n_avail)
+        node_ram = float(plan.get("node_ram_gib") or 121.7)
+        reserve = float(plan.get("reserve_gib") or 15.0)
+        if weights and weights > 0:
+            fits = (weights / n_use) <= (node_ram * 0.85 - reserve)
+            if not fits:
+                raise RuntimeError(
+                    f"SERVE BLOCKED: weights (~{weights} GiB) do not fit "
+                    f"{n_avail} Spark(s) even at TP={n_use}. "
+                    "Add nodes or pick a smaller checkpoint."
+                )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # topology/HF probe failure must not brick Start for small local models
+
     env_list = _normalize_docker_env(docker_env)
 
     # Guard: flashinfer_b12x crashes on mixed FP8+NVFP4 compressed-tensors MoE (e.g. Unsloth 35B).

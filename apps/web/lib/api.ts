@@ -217,6 +217,7 @@ export type ServeRecommend = {
   card_url?: string | null;
   from_website?: boolean;
   hf_token_ok?: boolean;
+  serve_blocked?: boolean;
   config: Record<string, unknown>;
   rationale: string[];
   warnings: string[];

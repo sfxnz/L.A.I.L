@@ -545,7 +545,9 @@ export default function ServerPage() {
     ? "Enter a model id first"
     : jobRunning
       ? "Wait for the current job to finish"
-      : null;
+      : rec?.serve_blocked
+        ? "Weights do not fit this cluster — add nodes or pick a smaller checkpoint"
+        : null;
 
   return (
     <div className="space-y-4 lab-fade-in">
@@ -1326,15 +1328,9 @@ export default function ServerPage() {
               <span title={startDisabledReason ?? undefined}>
                 <Btn
                   onClick={() => void start()}
-                  disabled={jobRunning || !model.trim()}
+                  disabled={!!startDisabledReason}
                   loading={startBusy}
-                  title={
-                    !model.trim()
-                      ? "Enter a model id first"
-                      : jobRunning
-                        ? "Wait for the current job to finish"
-                        : undefined
-                  }
+                  title={startDisabledReason ?? undefined}
                   className="h-11 px-7 text-[13px] tracking-[0.2em]"
                 >
                   Start serve

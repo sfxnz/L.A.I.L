@@ -680,6 +680,35 @@ def test_placement_too_big_warns_no_fit():
     assert p["fits"] is False  # 200 GiB/node won't fit
 
 
+def test_weight_floor_blocks_deepseek_r1_without_blobs(monkeypatch):
+    """P0.4: known oversized families must not claim fit when Hub blobs are empty."""
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    w = ac.estimate_weights_gib("deepseek-ai/DeepSeek-R1", None)
+    assert w is not None and w >= 700
+    p = ac.plan_placement(w, _topo(2), mode="workflow_max", overlay=None)
+    assert p["fits"] is False
+
+
+def test_weight_floor_spares_deepseek_v4_flash():
+    """V4-Flash has a Spark overlay; floor must not force-block it."""
+    assert ac._weight_floor_gib("deepseek-ai/DeepSeek-V4-Flash") is None
+    assert ac._weight_floor_gib("deepseek-ai/DeepSeek-V4-Pro") == 900.0
+
+
+def test_moe_config_estimate_not_near_zero(monkeypatch):
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    cfg = {
+        "hidden_size": 7168,
+        "num_hidden_layers": 61,
+        "n_routed_experts": 32,  # below floor threshold; forces MoE-aware formula
+        "moe_intermediate_size": 2048,
+        "quantization_config": {"config_groups": {"g0": {"weights": {"num_bits": 8}}}},
+    }
+    w = ac.estimate_weights_gib("org/Custom-MoE-Offline", cfg)
+    dense_only = round(12 * 61 * 7168 * 7168 * 1.0 / (1024**3), 1)
+    assert w is not None and w > dense_only * 1.5
+
+
 def test_placement_future_4node_minimal_and_full():
     # DSv4 on 4 nodes still uses only the 2 it needs (no waste)
     p = ac.plan_placement(155.4, _topo(4), mode="workflow_max", overlay=None)

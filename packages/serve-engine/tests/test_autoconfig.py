@@ -1031,3 +1031,48 @@ def test_vl_gets_language_model_only():
     )
     assert "--language-model-only" in cfg["extra_flags"]
     assert any("language-model-only" in r for r in rationale)
+
+
+def test_resolve_dspark_draft_from_card():
+    readme = "export DSPARK_CKPT=nvidia/Foo-DSpark\nvllm serve x --speculative_config.method dspark"
+    assert ac._resolve_dspark_draft_model(readme) == "nvidia/Foo-DSpark"
+
+
+def test_ensure_dspark_fills_missing_draft():
+    cfg = {
+        "image": "vllm/vllm-openai:v0.27.1",
+        "extra_flags": "--speculative_config.method dspark --speculative_config.num_speculative_tokens 3",
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(
+        cfg,
+        "export DSPARK_CKPT=nvidia/Bar-DSpark",
+        warnings,
+        rationale,
+    )
+    assert "--speculative_config.model nvidia/Bar-DSpark" in cfg["extra_flags"]
+    assert any("DSpark draft" in r for r in rationale)
+
+
+def test_ensure_dspark_strips_when_no_draft():
+    cfg = {
+        "image": "vllm/vllm-openai:v0.27.1",
+        "extra_flags": "--mamba-backend flashinfer --speculative_config.method dspark",
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(cfg, "no draft here", warnings, rationale)
+    assert "dspark" not in (cfg["extra_flags"] or "").lower()
+    assert "--mamba-backend flashinfer" in cfg["extra_flags"]
+
+
+def test_ensure_dspark_skips_anemll_image():
+    cfg = {
+        "image": "ghcr.io/anemll/dspark-vllm-gx10:0.1.1",
+        "extra_flags": "--speculative-config '{"method":"dspark","num_speculative_tokens":5}'",
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._ensure_dspark_draft_or_strip(cfg, "", warnings, rationale)
+    assert "dspark" in cfg["extra_flags"]

@@ -1021,6 +1021,90 @@ def _strip_flag_from_extra(extra: str, flag: str) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+def _resolve_dspark_draft_model(readme: str | None) -> str | None:
+    """Best-effort draft checkpoint id from card exports / prose."""
+    if not readme:
+        return None
+    m = re.search(r"(?:export\s+)?DSPARK_CKPT=(\S+)", readme)
+    if m:
+        val = m.group(1).strip().rstrip("\\")
+        if val and not val.startswith("$"):
+            return val
+    m = re.search(r"(nvidia/[A-Za-z0-9._/-]+DSpark[A-Za-z0-9._/-]*)", readme)
+    if m:
+        return m.group(1).rstrip("/")
+    return None
+
+
+def _dspark_spec_present(extra: str) -> bool:
+    ex = (extra or "").lower()
+    if "dspark" not in ex:
+        return False
+    return "speculative_config" in ex or "speculative-config" in ex
+
+
+def _spec_has_draft_model(extra: str) -> bool:
+    ex = extra or ""
+    if re.search(r"--speculative_config\.model\s+[^\s$]+", ex):
+        return True
+    # JSON --speculative-config {"method":"dspark","model":"org/name",...}
+    low = ex.lower()
+    if "speculative-config" in low and '"model"' in low:
+        # reject leftover shell vars
+        if "$" in ex[ex.lower().find("speculative-config") : ex.lower().find("speculative-config") + 200]:
+            return False
+        return True
+    return False
+
+
+def _strip_dspark_speculative(extra: str) -> str:
+    """Remove DSpark / speculative_config.* tokens after a failed draft resolve."""
+    s = (extra or "").strip()
+    if not s:
+        return s
+    s = _strip_flag_from_extra(s, "--speculative-config")
+    for flag in (
+        "--speculative_config.method",
+        "--speculative_config.model",
+        "--speculative_config.num_speculative_tokens",
+        "--speculative_config.draft_sample_method",
+    ):
+        s = _strip_flag_from_extra(s, flag)
+    return s.strip()
+
+
+def _ensure_dspark_draft_or_strip(
+    cfg: dict[str, Any],
+    readme: str | None,
+    warnings: list[str],
+    rationale: list[str],
+) -> None:
+    """P0.6: DSpark speculative needs a draft model — resolve from card or strip.
+
+    Anemll/DSpark runtime images run method=dspark natively without a separate
+    HF draft id — do not strip those overlays.
+    """
+    img = (cfg.get("image") or "").lower()
+    if "anemll" in img or "dspark-vllm" in img or "gx10" in img:
+        return
+    ex = cfg.get("extra_flags") or ""
+    if not _dspark_spec_present(ex):
+        return
+    if _spec_has_draft_model(ex):
+        return
+    draft = _resolve_dspark_draft_model(readme)
+    if draft:
+        cfg["extra_flags"] = (ex + f" --speculative_config.model {draft}").strip()
+        rationale.append(f"DSpark draft from card → --speculative_config.model {draft}")
+        return
+    cfg["extra_flags"] = _strip_dspark_speculative(ex)
+    warnings.append(
+        "Stripped DSpark speculative decode — no draft model path on the card "
+        "(stable first boot). Re-add --speculative_config.model after downloading the draft."
+    )
+    rationale.append("FIRST BOOT: DSpark speculative stripped (missing draft model)")
+
+
 def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
     """Drop argv tokens that still contain ``$VAR`` after card parsing.
 
@@ -2678,6 +2762,9 @@ def recommend(
     # Unexpanded $VARS from card recipes must never reach docker.
     if cfg.get("extra_flags"):
         cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
+
+    # DSpark speculative without a draft model path will fail at load — fill or strip.
+    _ensure_dspark_draft_or_strip(cfg, readme, warnings, rationale)
 
     # Card multi-GPU / mega-MoE knobs crash or mis-route on 1–2× GB10.
     _strip_spark_unsafe_flags(cfg, warnings, rationale)

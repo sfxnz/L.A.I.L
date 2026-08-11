@@ -154,6 +154,56 @@ def test_analyze_config_modelopt_nvfp4_algo():
     assert d["is_mixed_nvfp4_fp8"] is False
 
 
+
+def test_merge_hf_quant_config_into_empty():
+    cfg = {"architectures": ["FooForCausalLM"]}
+    qc = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    out = ac._merge_hf_quant_config(cfg, qc)
+    assert out["quantization_config"]["quant_method"] == "modelopt"
+    d = ac.analyze_config(out, "nvidia/Example-NVFP4")
+    assert d["quant_flag"] in ("modelopt_fp4", "modelopt")
+
+
+def test_merge_hf_quant_does_not_clobber_existing_method():
+    cfg = {"quantization_config": {"quant_method": "compressed-tensors"}}
+    out = ac._merge_hf_quant_config(cfg, {"quant_method": "modelopt", "quant_algo": "FP8"})
+    assert out["quantization_config"]["quant_method"] == "compressed-tensors"
+
+
+def test_merge_hf_quant_normalizes_modelopt_sidecar():
+    """Real ModelOpt sidecars nest algo under quantization + producer.name."""
+    cfg = {"architectures": ["NemotronHForCausalLM"]}
+    sidecar = {
+        "producer": {"name": "modelopt", "version": "0.34.1"},
+        "quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": None},
+    }
+    out = ac._merge_hf_quant_config(cfg, sidecar)
+    assert out["quantization_config"]["quant_method"] == "modelopt"
+    assert out["quantization_config"]["quant_algo"] == "NVFP4"
+    d = ac.analyze_config(out, "nvidia/Example-NVFP4")
+    assert d["quant_flag"] == "modelopt_fp4"
+
+
+def test_load_local_fallback_merges_hf_quant_sidecar(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["FooForCausalLM"], "model_type": "foo"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "producer": {"name": "modelopt"},
+                "quantization": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    local = ac.load_local_fallback(str(tmp_path))
+    qc = (local.get("config") or {}).get("quantization_config") or {}
+    assert qc.get("quant_method") == "modelopt"
+    assert qc.get("quant_algo") == "NVFP4"
+
+
 def test_quant_flags_compatible_modelopt_siblings():
     assert ac._quant_flags_compatible("modelopt_mixed", "modelopt_fp4")
     assert ac._quant_flags_compatible("modelopt", "modelopt")

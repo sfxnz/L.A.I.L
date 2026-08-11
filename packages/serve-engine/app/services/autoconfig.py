@@ -156,6 +156,64 @@ def _http_get(url: str, timeout: float = 20.0) -> tuple[Optional[str], Optional[
     return _http_get_raw(url, timeout=timeout, token=tok or None, allow_retry_without_auth=True)
 
 
+
+def _quant_config_is_thin(qc: Any) -> bool:
+    """True when transformers quantization_config lacks usable method/algo metadata."""
+    if not isinstance(qc, dict) or not qc:
+        return True
+    method = str(qc.get("quant_method") or "").strip()
+    algo = str(qc.get("quant_algo") or "").strip()
+    if method or algo:
+        return False
+    if qc.get("quantized_layers") or qc.get("config_groups"):
+        return False
+    return True
+
+
+def _normalize_hf_quant_blob(hf_quant: dict[str, Any]) -> dict[str, Any]:
+    """Flatten ModelOpt hf_quant_config.json into transformers-style quantization_config."""
+    if not isinstance(hf_quant, dict) or not hf_quant:
+        return {}
+    # Already transformers-shaped (or test fixture).
+    if any(k in hf_quant for k in ("quant_method", "quant_algo", "config_groups", "quantized_layers")):
+        out = dict(hf_quant)
+    elif isinstance(hf_quant.get("quantization"), dict):
+        out = dict(hf_quant["quantization"])
+    else:
+        out = dict(hf_quant)
+    producer = hf_quant.get("producer")
+    if isinstance(producer, dict):
+        pname = str(producer.get("name") or "").lower()
+        if pname == "modelopt" and not str(out.get("quant_method") or "").strip():
+            out["quant_method"] = "modelopt"
+    return out
+
+
+def _merge_hf_quant_config(
+    cfg: dict[str, Any], hf_quant: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """Merge hf_quant_config into config.json, preferring existing quantization_config keys."""
+    if not isinstance(cfg, dict):
+        return cfg
+    out = dict(cfg)
+    if not isinstance(hf_quant, dict) or not hf_quant:
+        return out
+    incoming = _normalize_hf_quant_blob(hf_quant)
+    if not incoming:
+        return out
+    existing = out.get("quantization_config")
+    if not isinstance(existing, dict) or not existing:
+        out["quantization_config"] = incoming
+        return out
+    merged = dict(incoming)
+    for k, v in existing.items():
+        if v is None or v == "":
+            continue
+        merged[k] = v
+    out["quantization_config"] = merged
+    return out
+
+
 def fetch_hf_card(model_id: str, timeout: float = 20.0) -> dict[str, Any]:
     """Pull README + config + model API metadata from huggingface.co."""
     model_id = model_id.strip().rstrip("/")
@@ -218,6 +276,32 @@ def fetch_hf_card(model_id: str, timeout: float = 20.0) -> dict[str, Any]:
     elif err:
         out["errors"].append(err)
 
+    # ModelOpt checkpoints often ship quant metadata only in hf_quant_config.json.
+    if isinstance(out.get("config"), dict) and _quant_config_is_thin(
+        out["config"].get("quantization_config")
+    ):
+        quant_urls = [
+            f"https://huggingface.co/{model_id}/raw/main/hf_quant_config.json",
+            f"https://huggingface.co/{model_id}/resolve/main/hf_quant_config.json",
+            f"https://huggingface.co/{model_id}/raw/main/quantization_config.json",
+            f"https://huggingface.co/{model_id}/resolve/main/quantization_config.json",
+        ]
+        for url in quant_urls:
+            body, err = _http_get(url, timeout=timeout)
+            if body:
+                try:
+                    blob = json.loads(body)
+                except json.JSONDecodeError:
+                    out["errors"].append(f"invalid JSON from {url}")
+                    continue
+                if isinstance(blob, dict) and blob:
+                    out["config"] = _merge_hf_quant_config(out["config"], blob)
+                    out["fetched"].append(url)
+                    out["hf_quant_config"] = blob
+                    break
+            elif err:
+                out["errors"].append(err)
+
     return out
 
 
@@ -230,6 +314,12 @@ def load_local_fallback(model_id: str) -> dict[str, Any]:
         readme = None
         if (p / "README.md").is_file():
             readme = (p / "README.md").read_text(encoding="utf-8", errors="replace")
+        if isinstance(cfg, dict) and _quant_config_is_thin(cfg.get("quantization_config")):
+            for name in ("hf_quant_config.json", "quantization_config.json"):
+                side = p / name
+                if side.is_file():
+                    cfg = _merge_hf_quant_config(cfg, _read_json(side))
+                    break
         return {"config": cfg, "readme": readme, "notes": [f"local path {p}"]}
 
     parts = model_id.replace("\\", "/").split("/")
@@ -246,6 +336,13 @@ def load_local_fallback(model_id: str) -> dict[str, Any]:
     if not snap:
         return {"config": None, "readme": None, "notes": ["cache incomplete"]}
     cfg = _read_json(snap / "config.json") if (snap / "config.json").is_file() else None
+    if isinstance(cfg, dict) and _quant_config_is_thin(cfg.get("quantization_config")):
+        for name in ("hf_quant_config.json", "quantization_config.json"):
+            side = snap / name
+            if side.is_file():
+                cfg = _merge_hf_quant_config(cfg, _read_json(side))
+                notes.append(f"merged {name} from local cache")
+                break
     readme = None
     if (snap / "README.md").is_file():
         readme = (snap / "README.md").read_text(encoding="utf-8", errors="replace")

@@ -1295,7 +1295,7 @@ def score_candidate(
         score += 5
 
     # Prefer recipes that already set quantization for ModelOpt / NVFP4 MoE
-    if det.get("quant_flag") and cfg.get("quantization") == det.get("quant_flag"):
+    if _quant_flags_compatible(str(det.get("quant_flag") or ""), str(cfg.get("quantization") or "")):
         score += 15
         reasons.append(f"quantization matches config.json ({det.get('quant_flag')})")
 
@@ -1334,7 +1334,7 @@ def score_candidate(
 
 
 def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when forcing flashinfer_b12x will crash (FP8 MoE path on compressed-tensors)."""
+    """True when forcing flashinfer_b12x will crash (FP8 MoE path on mixed checkpoints)."""
     if not detected:
         return False
     if detected.get("is_mixed_nvfp4_fp8"):
@@ -1349,7 +1349,51 @@ def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
     formats = " ".join(detected.get("quant_formats") or [])
     if detected.get("is_moe") and "float-quantized" in formats and "nvfp4" in formats:
         return True
+    # ModelOpt MIXED_PRECISION / dual-algo layers also route FP8 MoE experts.
+    qf = (detected.get("quant_flag") or "").lower()
+    if detected.get("is_moe") and detected.get("has_fp8") and qf.startswith("modelopt"):
+        return True
     return False
+
+
+def _modelopt_quant_flag(
+    quant_method: str,
+    quant_algo: str,
+    *,
+    has_nvfp4: bool,
+    has_fp8: bool,
+    has_modelopt_layers: bool,
+) -> str:
+    """Map umbrella ModelOpt metadata to the vLLM override sibling (0.27+)."""
+    method = (quant_method or "").lower()
+    algo = (quant_algo or "").upper()
+    if method in ("modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"):
+        return method
+    if "MIXED" in algo:
+        return "modelopt_mixed"
+    if any(tok in algo for tok in ("NVFP4", "FP4", "W4A16")):
+        return "modelopt_fp4"
+    if algo == "FP8" or algo.startswith("FP8"):
+        return "modelopt"
+    if has_nvfp4 and has_fp8 and has_modelopt_layers:
+        return "modelopt_mixed"
+    if has_nvfp4 and not has_fp8:
+        return "modelopt_fp4"
+    if method.startswith("modelopt"):
+        return "modelopt"
+    return "modelopt"
+
+
+def _quant_flags_compatible(detected_flag: str, candidate_flag: str) -> bool:
+    """True when candidate --quantization matches (or is a ModelOpt sibling of) detected."""
+    a = (detected_flag or "").lower()
+    b = (candidate_flag or "").lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    modelopt = {"modelopt", "modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"}
+    return a in modelopt and b in modelopt
 
 
 def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
@@ -1376,7 +1420,8 @@ def _marlin_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
         return False
     if detected.get("is_moe"):
         return True
-    if detected.get("quant_flag") in ("modelopt", "compressed-tensors"):
+    qf = (detected.get("quant_flag") or "").lower()
+    if qf.startswith("modelopt") or qf == "compressed-tensors":
         return True
     return False
 
@@ -1597,6 +1642,7 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         qc = {}
 
     quant_method = (qc.get("quant_method") or "").lower()
+    quant_algo = str(qc.get("quant_algo") or "")
     formats: set[str] = set()
     if qc.get("format"):
         formats.add(str(qc["format"]).lower())
@@ -1628,6 +1674,13 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
             if "FP8" in algo:
                 has_fp8 = True
 
+    # Top-level ModelOpt algo (even with empty quantized_layers).
+    algo_u = quant_algo.upper()
+    if any(tok in algo_u for tok in ("NVFP4", "FP4", "W4A16")):
+        has_nvfp4 = True
+    if algo_u == "FP8" or algo_u.startswith("FP8") or "MIXED" in algo_u:
+        has_fp8 = True
+
     tag_blob = " ".join(tags)
     if "nvfp4" in mid or "fp4" in mid or "fp4" in tag_blob or "nvfp4" in tag_blob:
         has_nvfp4 = True
@@ -1637,7 +1690,8 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
     if "compressed-tensors" in tag_blob or "compressed-tensors" in tags:
         if not quant_method:
             quant_method = "compressed-tensors"
-    if quant_method == "fp8" or "fp8" in mid:
+    # Prefer token boundaries over substring "fp8" (avoids odd id false positives).
+    if quant_method == "fp8" or re.search(r"(^|[-_/])fp8($|[-_/])", mid):
         has_fp8 = True
 
     fmt_blob = " ".join(formats)
@@ -1648,15 +1702,29 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
 
     if quant_method in ("compressed-tensors", "compressed_tensors"):
         quant_flag = "compressed-tensors"
-    elif quant_method in ("modelopt", "modelopt_fp4"):
-        quant_flag = "modelopt"
+    elif quant_method.startswith("modelopt") or (
+        has_modelopt_layers and (has_nvfp4 or has_fp8 or quant_algo)
+    ):
+        quant_flag = _modelopt_quant_flag(
+            quant_method or "modelopt",
+            quant_algo,
+            has_nvfp4=has_nvfp4,
+            has_fp8=has_fp8,
+            has_modelopt_layers=has_modelopt_layers,
+        )
     elif quant_method == "fp8":
         quant_flag = "fp8"
-    elif has_modelopt_layers and has_nvfp4:
-        quant_flag = "modelopt"
     elif "modelopt" in tags:
-        quant_flag = "modelopt"
+        quant_flag = _modelopt_quant_flag(
+            "modelopt",
+            quant_algo,
+            has_nvfp4=has_nvfp4,
+            has_fp8=has_fp8,
+            has_modelopt_layers=has_modelopt_layers,
+        )
     elif "compressed-tensors" in tags:
+        quant_flag = "compressed-tensors"
+    elif has_nvfp4 and "nvfp4-pack" in fmt_blob:
         quant_flag = "compressed-tensors"
     elif has_nvfp4:
         quant_flag = ""
@@ -1675,7 +1743,22 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         quant_method in ("compressed-tensors", "compressed_tensors")
         or "mixed" in fmt_blob
         or ("nvfp4-pack" in fmt_blob and "float-quantized" in fmt_blob)
+        or "MIXED" in algo_u
+        or (has_modelopt_layers and has_nvfp4 and has_fp8)
+        or quant_flag == "modelopt_mixed"
     )
+
+    # Checkpoint-declared KV preference (ModelOpt kv_cache_scheme / kv_cache_quant_algo).
+    suggested_kv = None
+    kv_scheme = qc.get("kv_cache_scheme")
+    kv_algo = str(qc.get("kv_cache_quant_algo") or "").upper()
+    if isinstance(kv_scheme, dict):
+        bits = kv_scheme.get("num_bits")
+        typ = str(kv_scheme.get("type") or "").lower()
+        if bits == 8 or "float" in typ or "fp8" in typ:
+            suggested_kv = "fp8"
+    if "FP8" in kv_algo:
+        suggested_kv = "fp8"
 
     family = "unknown"
     blob = f"{model_type} {' '.join(str(a) for a in architectures)} {model_id}".lower()
@@ -1714,6 +1797,7 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         "model_type": model_type or None,
         "architectures": architectures,
         "quant_method": quant_method or None,
+        "quant_algo": quant_algo or None,
         "quant_formats": sorted(formats),
         "has_nvfp4": has_nvfp4,
         "has_fp8": has_fp8,
@@ -1722,6 +1806,7 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         "has_modelopt_layers": has_modelopt_layers,
         "max_position_embeddings": max_pos,
         "quant_flag": quant_flag,
+        "suggested_kv_cache_dtype": suggested_kv,
         "family": family,
     }
 
@@ -1821,10 +1906,16 @@ def _card_prose_hints(readme: str) -> dict[str, Any]:
     if re.search(r"tool.?call.?parser\s+qwen3_coder", readme, re.I):
         hints["tool_call_parser"] = "qwen3_coder"
         hints["enable_auto_tool_choice"] = True
-    if re.search(r"--quantization\s+modelopt", readme):
+    if re.search(r"--quantization\s+modelopt_mixed\b", readme):
+        hints["quantization"] = "modelopt_mixed"
+    elif re.search(r"--quantization\s+modelopt_fp4\b", readme):
+        hints["quantization"] = "modelopt_fp4"
+    elif re.search(r"--quantization\s+modelopt\b", readme):
         hints["quantization"] = "modelopt"
     if re.search(r"--quantization\s+compressed-tensors", readme):
         hints["quantization"] = "compressed-tensors"
+    if re.search(r"--quantization\s+fp8\b", readme):
+        hints["quantization"] = "fp8"
     return hints
 
 
@@ -1839,6 +1930,11 @@ def _fill_from_config_detection(
         rationale.append(
             f"HF config/tags → --quantization {detected['quant_flag']} "
             f"(card serve line had no --quantization)"
+        )
+    if not base.get("kv_cache_dtype") and detected.get("suggested_kv_cache_dtype"):
+        base["kv_cache_dtype"] = detected["suggested_kv_cache_dtype"]
+        rationale.append(
+            f"HF quantization_config → --kv-cache-dtype {detected['suggested_kv_cache_dtype']}"
         )
 
     family = detected.get("family")

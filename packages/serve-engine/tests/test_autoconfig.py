@@ -115,6 +115,56 @@ def test_modelopt_card_recipe_sets_quantization():
     assert best.config.get("reasoning_parser") == "qwen3"
 
 
+
+def test_analyze_config_modelopt_mixed_precision():
+    """ModelOpt MIXED_PRECISION must not collapse to umbrella modelopt."""
+    cfg = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
+            "quantized_layers": {
+                "a": {"quant_algo": "FP8"},
+                "b": {"quant_algo": "W4A16_NVFP4"},
+            },
+        },
+    }
+    d = ac.analyze_config(cfg, "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
+    assert d["quant_flag"] == "modelopt_mixed"
+    assert d["quant_algo"] == "MIXED_PRECISION"
+    assert d["is_mixed_nvfp4_fp8"] is True
+    assert d["suggested_kv_cache_dtype"] == "fp8"
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d) is True
+    # Nemotron still keeps marlin despite mixed ModelOpt.
+    assert ac._marlin_unsafe_for_checkpoint(d) is False
+
+
+def test_analyze_config_modelopt_nvfp4_algo():
+    cfg = {
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        }
+    }
+    d = ac.analyze_config(cfg, "nvidia/Example-27B-NVFP4")
+    assert d["quant_flag"] == "modelopt_fp4"
+    assert d["has_nvfp4"] is True
+    assert d["is_mixed_nvfp4_fp8"] is False
+
+
+def test_quant_flags_compatible_modelopt_siblings():
+    assert ac._quant_flags_compatible("modelopt_mixed", "modelopt_fp4")
+    assert ac._quant_flags_compatible("modelopt", "modelopt")
+    assert not ac._quant_flags_compatible("modelopt", "compressed-tensors")
+
+
+def test_card_prose_prefers_modelopt_fp4_over_umbrella():
+    hints = ac._card_prose_hints("run with --quantization modelopt_fp4 on Spark")
+    assert hints["quantization"] == "modelopt_fp4"
+
+
 def test_analyze_config_detects_mixed_formats():
     cfg = json.loads((FIX / "config_mixed_compressed_tensors.json").read_text())
     d = ac.analyze_config(cfg, "org/Model-A3B-NVFP4")

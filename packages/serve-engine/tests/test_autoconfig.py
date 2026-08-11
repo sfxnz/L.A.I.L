@@ -1070,9 +1070,10 @@ def test_ensure_dspark_strips_when_no_draft():
 def test_ensure_dspark_skips_anemll_image():
     cfg = {
         "image": "ghcr.io/anemll/dspark-vllm-gx10:0.1.1",
-        "extra_flags": "--speculative-config '{"method":"dspark","num_speculative_tokens":5}'",
+        "extra_flags": "--speculative-config " + json.dumps({"method": "dspark", "num_speculative_tokens": 5}),
     }
     warnings: list[str] = []
     rationale: list[str] = []
     ac._ensure_dspark_draft_or_strip(cfg, "", warnings, rationale)
     assert "dspark" in cfg["extra_flags"]
+

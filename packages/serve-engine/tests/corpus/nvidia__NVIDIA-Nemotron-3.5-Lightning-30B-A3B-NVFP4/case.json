@@ -1,7 +1,7 @@
 {
   "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
   "mode": "workflow_max",
-  "note": "Vendor 1x DGX Spark (GB10) recipe. Nemotron hybrid keeps --moe-backend marlin (Qwen MoE still strips it). Single-node envelope clamps card 1M context to 262144. DSpark speculative decode kept when card provides it; $VARS scrubbed.",
+  "note": "Vendor 1x DGX Spark (GB10) recipe. Nemotron hybrid keeps --moe-backend marlin. Single-node envelope clamps card 1M context to 262144. DSpark draft model resolved from DSPARK_CKPT= on the card after $VARS are scrubbed.",
   "expect": {
     "label_contains": "DGX Spark",
     "config": {
@@ -17,7 +17,8 @@
     "extra_flags_contains": [
       "--mamba-backend flashinfer",
       "--mamba-cache-mode align",
-      "--speculative_config.method dspark"
+      "--speculative_config.method dspark",
+      "--speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark"
     ],
     "forbidden": [
       "humming",

@@ -1,0 +1,11 @@
+{
+  "model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+  "mode": "workflow_max",
+  "note": "TODO: what the vendor's published recipe requires",
+  "expect": {
+    "label_contains": "",
+    "config": {},
+    "extra_flags_contains": [],
+    "forbidden": []
+  }
+}

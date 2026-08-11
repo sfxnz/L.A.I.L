@@ -908,3 +908,29 @@ def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
     assert ov is not None and ov["family_key"] == "future_x"
     # built-in still present
     assert ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash-0731", {}) is not None
+
+
+def test_shipped_serve_overlays_json_loads_minimax():
+    """Repo data/serve_overlays.json must be valid and match MiniMax families."""
+    from app.config import DATA_DIR
+
+    f = DATA_DIR / "serve_overlays.json"
+    assert f.is_file(), f"missing shipped overlays at {f}"
+    ov = ac._family_overlay(
+        "MiniMaxAI/MiniMax-M2-NVFP4",
+        {"family": "minimax_m2"},
+    )
+    assert ov is not None and ov["family_key"] == "minimax_m2"
+    assert ov["config"].get("reasoning_parser") == "minimax_m2"
+    ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
+    assert ov3 is not None and ov3["family_key"] == "minimax_m3"
+    assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+
+
+def test_family_overlay_matches_detected_family_without_id_hint():
+    """match.family alone can select when id substrings are also satisfied loosely."""
+    ov = ac._family_overlay(
+        "org/Some-MiniMax-Checkpoint-M2",
+        {"family": "minimax_m2"},
+    )
+    assert ov is not None and ov["family_key"] == "minimax_m2"

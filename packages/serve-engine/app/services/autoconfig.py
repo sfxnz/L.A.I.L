@@ -576,14 +576,28 @@ def _load_overlays() -> list[dict[str, Any]]:
 
 
 def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Match a model id against the overlay registry. Returns None when the card is
-    authoritative (normal models). Data-driven so future models need no code change."""
+    """Match a model id (+ optional detected family) against the overlay registry.
+
+    Returns None when the card is authoritative (normal models). Data-driven so
+    future models need no code change — drop entries into data/serve_overlays.json.
+    """
     mid = (model or "").lower()
+    fam = str((detected or {}).get("family") or "").lower()
     for ov in _load_overlays():
         m = ov.get("match") or {}
         all_terms = [str(t).lower() for t in (m.get("all") or [])]
         any_terms = [str(t).lower() for t in (m.get("any") or [])]
-        if all(t in mid for t in all_terms) and (not any_terms or any(t in mid for t in any_terms)):
+        fam_raw = m.get("family") or []
+        if isinstance(fam_raw, str):
+            fam_raw = [fam_raw]
+        fam_terms = [str(t).lower() for t in fam_raw]
+        if not (all_terms or any_terms or fam_terms):
+            continue
+        all_ok = all(t in mid for t in all_terms)
+        any_ok = (not any_terms) or any(t in mid for t in any_terms)
+        # If detected.family is unknown, fall back to id substrings alone.
+        fam_ok = (not fam_terms) or (not fam) or (fam in fam_terms)
+        if all_ok and any_ok and fam_ok:
             return ov
     return None
 

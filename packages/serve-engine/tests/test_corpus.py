@@ -102,8 +102,12 @@ def _recommend_offline(monkeypatch, case: dict) -> dict:
     monkeypatch.setattr(ac, "fetch_hf_card", _fake_fetch)
     topo = _two_spark_topo if case.get("topology") == "two_spark" else _one_spark_topo
     monkeypatch.setattr(ac, "_cluster_topology", topo)
-    # Overlay placement needs weights; pin a known-fit DSv4-sized blob when fixtures omit Hub.
-    if case.get("topology") == "two_spark":
+    # Pin Hub weight size so offline corpus is deterministic (no live blob API).
+    if case.get("weights_gib") is not None:
+        w = float(case["weights_gib"])
+        monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: w)
+    elif case.get("topology") == "two_spark":
+        # Overlay placement needs weights; pin a known-fit DSv4-sized blob when fixtures omit Hub.
         monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 155.4)
     return ac.recommend(model, mode=case.get("mode", "workflow_max"))
 
@@ -153,6 +157,12 @@ def test_corpus_case(monkeypatch, case_dir: Path):
         assert expect["label_contains"].lower() in (result.get("label") or "").lower(), (
             f"{case_dir.name}: expected label containing {expect['label_contains']!r}, "
             f"got {result.get('label')!r}"
+        )
+
+    if "serve_blocked" in expect:
+        assert bool(result.get("serve_blocked")) is bool(expect["serve_blocked"]), (
+            f"{case_dir.name}: serve_blocked expected {expect['serve_blocked']!r}, "
+            f"got {result.get('serve_blocked')!r}; topology={result.get('topology')}"
         )
 
     for key, want in (expect.get("config") or {}).items():

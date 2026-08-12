@@ -745,8 +745,10 @@ _DEFAULT_NODE_RAM_GIB = 121.7  # GB10 UMA when a node has not been probed yet
 def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[float]:
     """Conservative minimum GiB for families that never fit 1–2× GB10 UMA.
 
-    Used when Hub blobs are missing/under-reported so placement cannot claim
-    fits=True for DeepSeek-V3/R1/Pro-class checkpoints.
+    Used **only** when Hub blobs / index / config heuristic all fail (or return
+    nothing) so placement cannot claim fits=True for DeepSeek-V3/R1/Pro-class
+    checkpoints. Never applied as max() over a real blob sum — compact MoEs like
+    Nemotron 30B-A3B NVFP4 (~20 GiB) have 128 experts and must not be floored to 400.
     """
     mid = (model or "").lower()
     # DeepSeek V4 Flash has a Spark overlay (~155 GiB) — do not floor that path.
@@ -766,19 +768,34 @@ def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[
     cfg = hf_config or {}
     experts = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
     try:
-        if experts and int(experts) >= 64:
-            # Huge MoE without a Hub blob sum — refuse optimistic single-node fit.
-            return 400.0
+        n_exp = int(experts) if experts is not None else 0
     except (TypeError, ValueError):
-        pass
+        n_exp = 0
+    if n_exp >= 64:
+        # Compact MoE naming: 30B-A3B / 35B-A3B / 8x7B — expert count alone is not size.
+        if re.search(r"\d+(\.\d+)?b-a\d+(\.\d+)?b", mid):
+            return None
+        if re.search(r"\d+x\d+b", mid):  # Mixtral-style 8x7B
+            return None
+        # Small total-param ids (≤40B class) even with many experts (NVFP4 fits 1 Spark).
+        m_tot = re.search(r"(^|[^0-9])(\d{1,2})b([^a-z0-9]|$)", mid)
+        if m_tot and int(m_tot.group(2)) <= 40:
+            return None
+        # Huge MoE without a Hub blob sum — refuse optimistic single-node fit.
+        return 400.0
     return None
 
 
 def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[float]:
     """Best-effort weight size for ANY model. Order: exact HF blob sum → safetensors
     index total_size → config param estimate → known-family floor → None.
-    Used by the placement engine to decide nodes_needed + util."""
+    Used by the placement engine to decide nodes_needed + util.
+
+    Hub blob / index measurements are authoritative — family floors only fill total
+    absence (never max'd over a real ~20 GiB NVFP4 sum).
+    """
     measured: Optional[float] = None
+    source: Optional[str] = None
     # 1) Exact: sum safetensors/bin blobs from the HF API (most accurate).
     try:
         body, err = _http_get(f"https://huggingface.co/api/models/{model}?blobs=true", timeout=20.0)
@@ -791,6 +808,7 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                     tot += f.get("size") or 0
             if tot > 0:
                 measured = round(tot / (1024**3), 1)
+                source = "blobs"
     except Exception:
         pass
     # 2) Safetensors index metadata.total_size (when blob sizes are missing).
@@ -805,23 +823,46 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                 tot = (d.get("metadata") or {}).get("total_size")
                 if isinstance(tot, (int, float)) and tot > 0:
                     measured = round(float(tot) / (1024**3), 1)
+                    source = "index"
         except Exception:
             pass
     # 3) Estimate from config: params × bytes/param (quant-aware; MoE-aware).
     if measured is None:
         try:
             qc = (hf_config or {}).get("quantization_config") or {}
-            nbits = 0
+            bit_widths: list[int] = []
             for g in (qc.get("config_groups") or {}).values():
                 if isinstance(g, dict):
                     w = g.get("weights") or {}
                     if isinstance(w, dict) and w.get("num_bits"):
-                        nbits = int(w["num_bits"])
-                        break
+                        bit_widths.append(int(w["num_bits"]))
+            # Mixed ModelOpt (FP8 + NVFP4): MoE expert weights dominate → prefer min bits.
+            nbits = min(bit_widths) if bit_widths else 0
+            mid = (model or "").lower()
+            if nbits not in (4, 8):
+                if "nvfp4" in mid or "fp4" in mid or "w4a16" in mid:
+                    nbits = 4
+                elif re.search(r"(^|[-_/])fp8($|[-_/])", mid):
+                    nbits = 8
             hidden = (hf_config or {}).get("hidden_size")
             layers = (hf_config or {}).get("num_hidden_layers")
             if hidden and layers:
-                # Dense-ish: ~12 * layers * hidden^2 (+emb)
+                # Hybrid (Nemotron): only MoE block types hold expert FFNs.
+                block_types = (
+                    (hf_config or {}).get("layers_block_type")
+                    or (hf_config or {}).get("layer_types")
+                    or []
+                )
+                moe_layers = layers
+                if isinstance(block_types, list) and block_types:
+                    n_moe = sum(
+                        1
+                        for t in block_types
+                        if "moe" in str(t).lower() or str(t).lower() in ("e", "expert")
+                    )
+                    if n_moe > 0:
+                        moe_layers = n_moe
+                # Dense-ish attention/mamba: ~12 * layers * hidden^2 (+emb)
                 params = 12 * layers * hidden * hidden
                 experts = (
                     (hf_config or {}).get("n_routed_experts")
@@ -833,15 +874,22 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                 ).get("intermediate_size")
                 if experts and moe_inter:
                     # MoE FFN dominates; dense formula alone under-reports ~0 GiB-class misses.
-                    params += int(experts) * layers * 3 * hidden * int(moe_inter)
+                    params += int(experts) * moe_layers * 3 * hidden * int(moe_inter)
                 bpp = (nbits / 8.0) if nbits in (4, 8) else 2.0  # fp4/fp8/bf16
                 measured = round(params * bpp / (1024**3), 1)
+                source = "heuristic"
         except Exception:
             pass
     floor = _weight_floor_gib(model, hf_config)
-    if measured is not None and floor is not None:
+    # Hub blobs / index are ground truth — never raise them to a family floor.
+    if measured is not None and source in ("blobs", "index"):
+        return measured
+    # Heuristic may under-report huge named families; floor only then.
+    if measured is not None and floor is not None and source == "heuristic":
         return max(measured, floor)
-    return measured if measured is not None else floor
+    if measured is not None:
+        return measured
+    return floor
 
 
 def _node_ram_gib(node: Optional[dict]) -> float:
@@ -875,9 +923,11 @@ def plan_placement(
 ) -> dict[str, Any]:
     """Decide nodes_needed / TP / PP / per-node util from real weights + probed hardware.
 
-    One rule (UMA): per-node util ≈ (per-node weights + 15 GiB headroom) / node RAM,
-    clamped to 0.40 … 0.85. Fits on minimal nodes; spreads (TP) only when a single node
-    can't hold the weights. Overlay may pin util (its recipe is authoritative).
+    One rule (UMA): fit weights on the fewest nodes that can hold them at the mode's
+    util ceiling. ``util_computed`` is set only when weights need *more* util than the
+    mode default (envelope fills Lab Safe 0.40 / Workflow Max 0.85 otherwise). That
+    stops small checkpoints from being pinned to 0.40 on Workflow Max (which starved
+    KV and looked like a broken Auto-configure). Overlay may still pin util later.
     """
     nodes = topology.get("node_list") or []
     n_avail = max(1, int(topology.get("nodes") or 1))
@@ -887,6 +937,7 @@ def plan_placement(
 
     # Usable weights capacity per node at the util ceiling.
     util_cap = 0.85 if mode == "workflow_max" else 0.40
+    mode_default_util = util_cap
     single_fit_gib = node_ram * util_cap - reserve
 
     if weights_gib and weights_gib > 0:
@@ -895,7 +946,12 @@ def plan_placement(
             nodes_needed += 1
         fits = (weights_gib / nodes_needed) <= (node_ram * 0.85 - reserve)
         per_node_weights = weights_gib / nodes_needed
-        util = per_node_weights and min(0.85, max(0.40, (per_node_weights + reserve) / node_ram))
+        min_to_load = (per_node_weights + reserve) / node_ram if node_ram > 0 else 0.0
+        # Only elevate util above the mode envelope when weights require it.
+        if min_to_load > mode_default_util + 1e-9:
+            util = min(0.85, min_to_load)
+        else:
+            util = None
     else:
         nodes_needed, fits, per_node_weights, util = 1, True, None, None
 
@@ -1124,7 +1180,7 @@ def _resolve_dspark_draft_model(readme: str | None) -> str | None:
         return None
     m = re.search(r"(?:export\s+)?DSPARK_CKPT=(\S+)", readme)
     if m:
-        val = m.group(1).strip().rstrip("\\")
+        val = m.group(1).strip().rstrip("\\").strip("'\"")
         if val and not val.startswith("$"):
             return val
     m = re.search(r"(nvidia/[A-Za-z0-9._/-]+DSpark[A-Za-z0-9._/-]*)", readme)
@@ -1133,11 +1189,56 @@ def _resolve_dspark_draft_model(readme: str | None) -> str | None:
     return None
 
 
+def _parse_card_exports(readme: str | None) -> dict[str, str]:
+    """Collect ``export FOO=bar`` / ``FOO=bar`` assignments from a model card."""
+    out: dict[str, str] = {}
+    if not readme:
+        return out
+    for m in re.finditer(
+        r"(?:^|\n)\s*(?:export\s+)?([A-Z][A-Z0-9_]{1,64})=([^\s\\#'\"]+)",
+        readme,
+    ):
+        key, val = m.group(1), m.group(2).strip().rstrip("\\")
+        if val and not val.startswith("$"):
+            out[key] = val
+    return out
+
+
+def _expand_card_exports(extra: str, readme: str | None) -> str:
+    """Substitute ``$VAR`` / ``${VAR}`` in extra_flags from card export lines.
+
+    NVIDIA cards write ``export DSPARK_CKPT=nvidia/…-DSpark`` then
+    ``--speculative_config.model $DSPARK_CKPT``. Expanding before scrub keeps
+    the draft path instead of dropping the only token that contains ``dspark``.
+    """
+    s = (extra or "").strip()
+    if not s or "$" not in s:
+        return s
+    exports = _parse_card_exports(readme)
+    if not exports:
+        return s
+
+    def repl(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(2)
+        return exports.get(name, m.group(0))
+
+    return re.sub(r"\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)", repl, s)
+
+
 def _dspark_spec_present(extra: str) -> bool:
+    """True when extras look like NVIDIA DSpark (or residual after $VAR scrub)."""
     ex = (extra or "").lower()
-    if "dspark" not in ex:
+    has_spec = "speculative_config" in ex or "speculative-config" in ex
+    if not has_spec:
         return False
-    return "speculative_config" in ex or "speculative-config" in ex
+    if "dspark" in ex:
+        return True
+    # Live Spark recipes often omit method=dspark; after scrubbing $DSPARK_CKPT
+    # only .num_speculative_tokens / empty .model remain — still DSpark intent
+    # when the card pairs them (caller also checks readme draft resolve).
+    if re.search(r"speculative_config\.(model|num_speculative_tokens|method)\b", ex):
+        return True
+    return False
 
 
 def _spec_has_draft_model(extra: str) -> bool:
@@ -1185,13 +1286,39 @@ def _ensure_dspark_draft_or_strip(
     if "anemll" in img or "dspark-vllm" in img or "gx10" in img:
         return
     ex = cfg.get("extra_flags") or ""
+    draft = _resolve_dspark_draft_model(readme)
+    # Residual speculative_config.* after $DSPARK_CKPT scrub still needs draft fill
+    # when the card declares a DSpark draft — even without the literal "dspark" token.
     if not _dspark_spec_present(ex):
         return
-    if _spec_has_draft_model(ex):
+    # If only dotted speculative remnants remain and the card has no DSpark draft,
+    # leave non-DSpark speculative (e.g. JSON MTP) alone unless method=dspark was set.
+    if "dspark" not in ex.lower() and not draft:
+        if "method" in ex.lower() and "dspark" not in ex.lower():
+            return
+        if not re.search(r"speculative_config\.(model|num_speculative_tokens)", ex.lower()):
+            return
+        # No draft on card for NVIDIA-style dotted form → strip unstable half-config.
+        cfg["extra_flags"] = _strip_dspark_speculative(ex)
+        warnings.append(
+            "Stripped incomplete speculative_config.* flags (no DSpark draft on card)."
+        )
         return
-    draft = _resolve_dspark_draft_model(readme)
+    if _spec_has_draft_model(ex):
+        # Ensure method=dspark when draft path is a DSpark id (card may omit method).
+        if draft and "dspark" in draft.lower() and "speculative_config.method" not in ex.lower():
+            cfg["extra_flags"] = (ex + " --speculative_config.method dspark").strip()
+            rationale.append("DSpark draft present → added --speculative_config.method dspark")
+        return
     if draft:
-        cfg["extra_flags"] = (ex + f" --speculative_config.model {draft}").strip()
+        bits = [ex]
+        if "speculative_config.method" not in ex.lower() and "method" not in (
+            ex.lower().split("speculative-config")[-1][:80] if "speculative-config" in ex.lower() else ""
+        ):
+            if "dspark" in draft.lower() or "dspark" in (readme or "").lower():
+                bits.append("--speculative_config.method dspark")
+        bits.append(f"--speculative_config.model {draft}")
+        cfg["extra_flags"] = " ".join(b for b in bits if b).strip()
         rationale.append(f"DSpark draft from card → --speculative_config.model {draft}")
         return
     cfg["extra_flags"] = _strip_dspark_speculative(ex)
@@ -1207,6 +1334,7 @@ def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
 
     Cards write ``--model $MODEL_CKPT`` / ``--speculative_config.model $DSPARK_CKPT``.
     Leaving those through would make vLLM try to load a literal ``$…`` path.
+    Prefer ``_expand_card_exports`` first so known card exports resolve.
     """
     s = (extra or "").strip()
     if not s or "$" not in s:
@@ -1391,6 +1519,80 @@ def _resolve_stock_image(default: str, card_image: str | None, rationale: list[s
             f"Card pin {card_image} is older than lab default {default} — keeping lab default (no downgrade)"
         )
     return default
+
+
+def _capability_min_stock_image(
+    cfg: dict[str, Any],
+    detected: dict[str, Any] | None,
+) -> str | None:
+    """Minimum stock vllm/vllm-openai tag required by selected features (not just card text).
+
+    Returns a full image ref or None when no stock floor applies (custom/Anemll path).
+    """
+    need = (0, 0, 0)
+    reasons: list[str] = []
+    quant = (cfg.get("quantization") or "").lower()
+    moe = (cfg.get("moe_backend") or "").lower()
+    parsers = " ".join(
+        [
+            str(cfg.get("reasoning_parser") or ""),
+            str(cfg.get("tool_call_parser") or ""),
+        ]
+    ).lower()
+    det = detected or {}
+
+    def raise_to(maj: int, minor: int, patch: int, why: str) -> None:
+        nonlocal need
+        t = (maj, minor, patch)
+        if t > need:
+            need = t
+            reasons.append(why)
+
+    if quant in ("modelopt_mixed", "modelopt_fp4", "modelopt_mxfp8"):
+        raise_to(0, 27, 0, f"quant={quant}")
+    if det.get("is_mixed_nvfp4_fp8") or det.get("has_nvfp4"):
+        raise_to(0, 27, 0, "NVFP4/ModelOpt mixed checkpoint")
+    if moe == "marlin" and (det.get("family") == "nemotron" or det.get("has_nvfp4")):
+        raise_to(0, 27, 0, "moe-backend marlin on Spark NVFP4")
+    if any(p in parsers for p in ("nemotron_v3", "nano_v3", "super_v3", "deepseek_v4", "minimax_m")):
+        raise_to(0, 27, 0, f"parser set needs recent vLLM ({parsers.strip() or 'n/a'})")
+    if need == (0, 0, 0):
+        return None
+    return f"vllm/vllm-openai:v{need[0]}.{need[1]}.{need[2]}"
+
+
+def check_serve_loadability(
+    *,
+    mode: str,
+    weights_gib: Optional[float],
+    node_ram_gib: float,
+    nodes_used: int,
+    util: float,
+    reserve_gib: float = 15.0,
+) -> tuple[bool, Optional[str]]:
+    """Shared Start/recommend gate: can weights load at final util on N nodes?
+
+    Returns (fits, warning_or_none). Absolute capacity uses 0.85; Lab Safe also
+    requires weights+reserve to fit under the requested util.
+    """
+    if not weights_gib or weights_gib <= 0:
+        return True, None
+    n = max(1, int(nodes_used or 1))
+    per = float(weights_gib) / n
+    ram = float(node_ram_gib or _DEFAULT_NODE_RAM_GIB)
+    reserve = float(reserve_gib)
+    if per > (ram * 0.85 - reserve):
+        return False, (
+            f"weights (~{weights_gib} GiB) do not fit {n} node(s) even at util=0.85"
+        )
+    if mode == "lab_safe":
+        u = float(util if util is not None else SAFE_UTIL)
+        if per + reserve > ram * u + 1e-6:
+            return False, (
+                f"Lab Safe util={u} cannot hold ~{per:.0f} GiB weights/node "
+                f"(need ≈{(per + reserve) / ram:.2f}). Switch to Workflow Max or add nodes."
+            )
+    return True, None
 
 
 def extract_serve_candidates(
@@ -2251,12 +2453,32 @@ def _fill_from_config_detection(
     rationale: list[str],
 ) -> None:
     """Only fill gaps using HF config.json / API tags — not lab override recipes."""
-    if not base.get("quantization") and detected.get("quant_flag"):
-        base["quantization"] = detected["quant_flag"]
-        rationale.append(
-            f"HF config/tags → --quantization {detected['quant_flag']} "
-            f"(card serve line had no --quantization)"
-        )
+    det_q = (detected.get("quant_flag") or "").strip()
+    cur_q = (base.get("quantization") or "").strip()
+    modelopt_sibs = {"modelopt", "modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"}
+    if det_q:
+        if not cur_q:
+            base["quantization"] = det_q
+            rationale.append(
+                f"HF config/tags → --quantization {det_q} "
+                f"(card serve line had no --quantization)"
+            )
+        elif (
+            cur_q.lower() in modelopt_sibs
+            and det_q.lower() in modelopt_sibs
+            and cur_q.lower() != det_q.lower()
+            and (
+                detected.get("quant_algo")
+                or detected.get("has_modelopt_layers")
+                or detected.get("is_mixed_nvfp4_fp8")
+            )
+        ):
+            # Card prose / Ampere section often mentions modelopt_fp4; config.json
+            # MIXED_PRECISION (or layered ModelOpt) is authoritative for the sibling.
+            base["quantization"] = det_q
+            rationale.append(
+                f"HF config.json overrides card/prose quant {cur_q} → {det_q}"
+            )
     if not base.get("kv_cache_dtype") and detected.get("suggested_kv_cache_dtype"):
         base["kv_cache_dtype"] = detected["suggested_kv_cache_dtype"]
         rationale.append(
@@ -2850,14 +3072,24 @@ def recommend(
     card_set_max_len = cfg.get("max_model_len") is not None
     _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
 
-    # Card image pin: raise stock default when the card asks for a newer tag; never downgrade;
+    # Card image pin + capability floor: raise stock default; never downgrade;
     # never replace an Anemll/DSpark overlay image.
     card_image = _parse_card_image_requirement(readme)
+    cap_image = _capability_min_stock_image(cfg, detected)
     if cfg.get("image"):
         cfg["image"] = _resolve_stock_image(cfg["image"], card_image, rationale)
+        if cap_image:
+            prev = cfg["image"]
+            cfg["image"] = _resolve_stock_image(prev, cap_image, rationale)
+            if cfg["image"] != prev and not any("capability" in r for r in rationale[-3:]):
+                rationale.append(
+                    f"Capability floor → stock image at least {cap_image} "
+                    f"(features: quant/moe/parsers on this config)"
+                )
 
-    # Unexpanded $VARS from card recipes must never reach docker.
+    # Resolve card exports ($DSPARK_CKPT → real HF id) before scrubbing leftovers.
     if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _expand_card_exports(cfg["extra_flags"], readme)
         cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
 
     # DSpark speculative without a draft model path will fail at load — fill or strip.
@@ -2962,6 +3194,18 @@ def recommend(
 
     plan = cfg.get("topology_plan") or {}
     fits = bool(plan.get("fits", True))
+    ok_load, load_msg = check_serve_loadability(
+        mode=mode,
+        weights_gib=weights_gib,
+        node_ram_gib=float(plan.get("node_ram_gib") or _DEFAULT_NODE_RAM_GIB),
+        nodes_used=int(plan.get("nodes_needed") or 1),
+        util=float(cfg.get("util") or (SAFE_UTIL if mode == "lab_safe" else WORKFLOW_UTIL)),
+        reserve_gib=float(plan.get("reserve_gib") or 15.0),
+    )
+    if fits and not ok_load:
+        fits = False
+        if load_msg:
+            warnings.append(load_msg)
     serve_blocked = not fits
     if serve_blocked:
         confidence = "low"

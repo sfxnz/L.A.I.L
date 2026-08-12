@@ -652,10 +652,11 @@ def serve_model(
         raise ValueError(f"Unknown mode {mode}; use lab_safe or workflow_max")
 
     # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
-    # Mirrors recommend()'s serve_blocked so a manual form cannot bypass the UI.
+    # Shares check_serve_loadability with recommend() so Lab Safe util is honored.
     try:
         from .autoconfig import (
             _cluster_topology,
+            check_serve_loadability,
             estimate_weights_gib,
             load_local_fallback,
             plan_placement,
@@ -670,14 +671,19 @@ def serve_model(
         n_use = min(max(tp_req, int(plan.get("nodes_needed") or 1)), n_avail)
         node_ram = float(plan.get("node_ram_gib") or 121.7)
         reserve = float(plan.get("reserve_gib") or 15.0)
-        if weights and weights > 0:
-            fits = (weights / n_use) <= (node_ram * 0.85 - reserve)
-            if not fits:
-                raise RuntimeError(
-                    f"SERVE BLOCKED: weights (~{weights} GiB) do not fit "
-                    f"{n_avail} Spark(s) even at TP={n_use}. "
-                    "Add nodes or pick a smaller checkpoint."
-                )
+        fits_ok, msg = check_serve_loadability(
+            mode=mode,
+            weights_gib=weights,
+            node_ram_gib=node_ram,
+            nodes_used=n_use,
+            util=float(util if util is not None else (0.4 if mode == "lab_safe" else 0.85)),
+            reserve_gib=reserve,
+        )
+        if not fits_ok:
+            raise RuntimeError(
+                f"SERVE BLOCKED: {msg or f'weights (~{weights} GiB) do not fit {n_avail} Spark(s)'}."
+                " Add nodes, switch mode, or pick a smaller checkpoint."
+            )
     except RuntimeError:
         raise
     except Exception:
@@ -716,24 +722,30 @@ def serve_model(
             )
             moe_backend = ""
 
-    # Guard: marlin crashes MoE on vLLM 0.25 (NVIDIA 35B-A3B-NVFP4 ModelOpt path)
+    # Guard: marlin crashes some MoE paths (Qwen ModelOpt on older vLLM). Nemotron
+    # hybrid Spark recipes *require* marlin — never drop based on "a3b" alone.
     if moe_backend.lower() == "marlin":
         drop_marlin = True
         try:
-            from .autoconfig import analyze_config, load_local_fallback, _marlin_unsafe_for_checkpoint
+            from .autoconfig import (
+                analyze_config,
+                load_local_fallback,
+                _marlin_unsafe_for_checkpoint,
+            )
 
             local = load_local_fallback(model)
-            if local.get("config"):
-                det = analyze_config(local["config"], model)
-                drop_marlin = _marlin_unsafe_for_checkpoint(det)
-            elif "a3b" in mid or "moe" in mid or quant_l in ("modelopt", "compressed-tensors"):
-                drop_marlin = True
+            # Family/id detection works with empty config (Nemotron keep without cache).
+            det = analyze_config(local.get("config") or {}, model)
+            drop_marlin = _marlin_unsafe_for_checkpoint(det, image)
         except Exception:
-            drop_marlin = True
+            # Fail closed for unknown MoE-ish ids only when family is not Nemotron.
+            drop_marlin = "nemotron" not in mid and (
+                "a3b" in mid or "moe" in mid or quant_l in ("modelopt", "compressed-tensors")
+            )
         if drop_marlin:
             w(
                 "SAFETY: dropping --moe-backend marlin "
-                "(vLLM 0.25: not supported for unquantized MoE on this checkpoint; leave auto)",
+                "(unsupported for this MoE path on the selected image; leave auto)",
                 0.15,
             )
             moe_backend = ""

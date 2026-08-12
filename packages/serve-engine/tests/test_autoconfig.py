@@ -398,7 +398,9 @@ def test_live_recommend_nvidia_27b_modelopt():
     r = ac.recommend(NVIDIA, mode="lab_safe", fetch_remote=True)
     assert r["from_website"] is True
     c = r["config"]
-    assert c.get("quantization") == "modelopt"
+    # Card may still say umbrella `modelopt`; config.json MIXED_PRECISION (FP8+NVFP4
+    # layers) correctly selects a ModelOpt sibling via quant detection.
+    assert (c.get("quantization") or "").startswith("modelopt"), c.get("quantization")
     assert c.get("reasoning_parser") == "qwen3"
     # Card includes max-model-len 262144
     assert c.get("max_model_len") in (262144, 65536) or c.get("max_model_len") is not None
@@ -556,6 +558,21 @@ def test_checkpoint_safety_strips_marlin_on_moe():
     assert "speculative-config" not in (serve_cfg.get("extra_flags") or "")
 
 
+def test_serve_keeps_marlin_for_nemotron_without_local_config():
+    """Start must not strip marlin for Nemotron when HF cache is empty (a3b trap).
+
+    Family detection from model id alone is enough for _marlin_unsafe_for_checkpoint
+    — serve.py now calls analyze_config({}, model) instead of dropping on 'a3b'.
+    """
+    det = ac.analyze_config({}, "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
+    assert det["family"] == "nemotron"
+    assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.27.1") is False
+    # Qwen A3B still drops marlin (old crash path).
+    q = ac.analyze_config({}, "nvidia/Qwen3.6-35B-A3B-NVFP4")
+    assert q["family"] == "qwen"
+    assert ac._marlin_unsafe_for_checkpoint(q, "vllm/vllm-openai:v0.27.1") is True
+
+
 def test_marlin_kept_for_nemotron_family():
     detected = {
         "is_moe": True,
@@ -586,6 +603,35 @@ def test_scrub_unexpanded_shell_vars():
     assert "--speculative_config.method dspark" in out
     assert "--mamba-backend flashinfer" in out
     assert any("DSPARK" in w or "$" in w for w in warnings)
+
+
+def test_capability_min_image_for_modelopt_mixed():
+    img = ac._capability_min_stock_image(
+        {"quantization": "modelopt_mixed", "moe_backend": "marlin", "reasoning_parser": "nemotron_v3"},
+        {"has_nvfp4": True, "family": "nemotron"},
+    )
+    assert img == "vllm/vllm-openai:v0.27.0"
+
+
+def test_check_serve_loadability_lab_safe_vs_absolute():
+    # 50 GiB on 122 GiB node fits at 0.85 but not at Lab Safe 0.4
+    ok85, _ = ac.check_serve_loadability(
+        mode="workflow_max",
+        weights_gib=50.0,
+        node_ram_gib=121.7,
+        nodes_used=1,
+        util=0.85,
+    )
+    assert ok85 is True
+    ok40, msg = ac.check_serve_loadability(
+        mode="lab_safe",
+        weights_gib=50.0,
+        node_ram_gib=121.7,
+        nodes_used=1,
+        util=0.4,
+    )
+    assert ok40 is False
+    assert msg and "Lab Safe" in msg
 
 
 def test_resolve_stock_image_raises_never_downgrades():
@@ -805,7 +851,8 @@ def test_placement_small_model_single_node():
     p = ac.plan_placement(21.0, _topo(2), mode="workflow_max", overlay=None)
     assert p["nodes_needed"] == 1
     assert p["tensor_parallel_size"] == 1
-    assert p["util_computed"] == 0.4  # (21+15)/121.7 = 0.30 -> clamped to 0.40 floor
+    # (21+15)/121.7 ≈ 0.30 < Workflow Max default 0.85 → leave util to the envelope
+    assert p["util_computed"] is None
     assert p["fits"] is True
 
 
@@ -814,8 +861,21 @@ def test_placement_dsv4_needs_two_nodes_computed_util():
     assert p["nodes_needed"] == 2
     assert p["tensor_parallel_size"] == 2
     assert p["per_node_weights_gib"] == 77.7
-    assert p["util_computed"] == 0.76  # (77.7+15)/121.7
+    # (77.7+15)/121.7 ≈ 0.76 still under 0.85 default → envelope owns util
+    assert p["util_computed"] is None
     assert p["fits"] is True
+
+
+def test_placement_elevates_util_only_when_weights_require_it():
+    # Lab Safe default 0.40; weights that need more should elevate util_computed
+    # so the envelope can clamp + warn / block rather than silently under-util.
+    # (40+15)/121.7 ≈ 0.45 > 0.40 → elevate.
+    p = ac.plan_placement(40.0, _topo(1), mode="lab_safe", overlay=None)
+    assert p["nodes_needed"] == 1
+    assert p["util_computed"] is not None and p["util_computed"] >= 0.45
+    # Workflow Max: only elevate when min_to_load exceeds the 0.85 default (rare).
+    p2 = ac.plan_placement(21.0, _topo(1), mode="workflow_max", overlay=None)
+    assert p2["util_computed"] is None
 
 
 def test_placement_too_big_warns_no_fit():
@@ -1126,4 +1186,117 @@ def test_ensure_dspark_skips_anemll_image():
     rationale: list[str] = []
     ac._ensure_dspark_draft_or_strip(cfg, "", warnings, rationale)
     assert "dspark" in cfg["extra_flags"]
+
+
+def test_blob_weights_not_overridden_by_expert_floor(monkeypatch):
+    """Hub blob sum (~20 GiB NVFP4) must win over n_routed_experts>=64 floor (400 GiB).
+
+    Lightning 30B-A3B has 128 experts but only ~20 GiB of NVFP4 weights. The blunt
+    expert floor was max()'d onto measured blobs and blocked single-Spark serve.
+    """
+    blob_bytes = int(20.08 * (1024**3))
+    api = json.dumps(
+        {
+            "siblings": [
+                {"rfilename": "model-00001-of-00002.safetensors", "size": blob_bytes // 2},
+                {"rfilename": "model-00002-of-00002.safetensors", "size": blob_bytes - blob_bytes // 2},
+                {"rfilename": "config.json", "size": 1000},
+            ]
+        }
+    )
+
+    def fake_http(url, timeout=20.0):
+        if "blobs=true" in url or "api/models" in url:
+            return api, None
+        return None, "skip"
+
+    monkeypatch.setattr(ac, "_http_get", fake_http)
+    cfg = {
+        "hidden_size": 2688,
+        "num_hidden_layers": 52,
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 1856,
+    }
+    w = ac.estimate_weights_gib(
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", cfg
+    )
+    assert w is not None
+    assert 15.0 <= w <= 30.0, f"expected ~20 GiB from blobs, got {w}"
+    # Floor alone would still be high for empty-blob refuse paths, but must not apply here.
+    floor = ac._weight_floor_gib(
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", cfg
+    )
+    assert floor is None or floor > w
+
+
+def test_weight_floor_not_for_compact_moe_in_name():
+    """30B-A3B / similar compact MoE ids must not get the 400 GiB expert refuse floor."""
+    cfg = {"n_routed_experts": 128}
+    assert (
+        ac._weight_floor_gib(
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", cfg
+        )
+        is None
+    )
+    assert ac._weight_floor_gib("org/Huge-MoE-NoSize", cfg) is not None
+
+
+def test_expand_card_exports_resolves_dspark_var():
+    extra = (
+        "--speculative_config.num_speculative_tokens 3 "
+        "--speculative_config.model $DSPARK_CKPT --mamba-backend flashinfer"
+    )
+    readme = (
+        "export MODEL_CKPT=nvidia/Foo\n"
+        "export DSPARK_CKPT=nvidia/Foo-DSpark\n"
+        "vllm serve --model $MODEL_CKPT\n"
+    )
+    out = ac._expand_card_exports(extra, readme)
+    assert "$" not in out
+    assert "--speculative_config.model nvidia/Foo-DSpark" in out
+    assert "--mamba-backend flashinfer" in out
+
+
+def test_ensure_dspark_after_scrub_without_method_token():
+    """Live NVIDIA Spark recipes often omit method=dspark; only $DSPARK_CKPT carries the name.
+
+    After scrubbing the unexpanded var, 'dspark' disappears from extra_flags and draft
+    re-resolve must still run from the card export.
+    """
+    warnings: list[str] = []
+    scrubbed = ac._scrub_unexpanded_shell_vars(
+        "--speculative_config.num_speculative_tokens 3 "
+        "--speculative_config.model $DSPARK_CKPT --mamba-backend flashinfer",
+        warnings,
+    )
+    assert "dspark" not in scrubbed.lower()
+    cfg = {"image": "vllm/vllm-openai:v0.27.1", "extra_flags": scrubbed}
+    rationale: list[str] = []
+    readme = "export DSPARK_CKPT=nvidia/Lightning-DSpark\n"
+    # Expand-before-scrub path (recommend): vars filled first.
+    expanded = ac._expand_card_exports(
+        "--speculative_config.num_speculative_tokens 3 "
+        "--speculative_config.model $DSPARK_CKPT --mamba-backend flashinfer",
+        readme,
+    )
+    cfg2 = {"image": "vllm/vllm-openai:v0.27.1", "extra_flags": expanded}
+    ac._ensure_dspark_draft_or_strip(cfg2, readme, warnings, rationale)
+    assert "--speculative_config.model nvidia/Lightning-DSpark" in cfg2["extra_flags"]
+    # Recover path when expand was skipped but speculative_config remnants remain.
+    ac._ensure_dspark_draft_or_strip(cfg, readme, warnings, rationale)
+    assert "--speculative_config.model nvidia/Lightning-DSpark" in cfg["extra_flags"]
+
+
+def test_config_quant_overrides_ampere_prose_modelopt_fp4():
+    """Card Ampere recipe mentions modelopt_fp4; config MIXED_PRECISION must win."""
+    base = {"quantization": "modelopt_fp4", "model": "nvidia/Nemotron-X-NVFP4"}
+    detected = {
+        "quant_flag": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "has_modelopt_layers": True,
+        "family": "nemotron",
+    }
+    rationale: list[str] = []
+    ac._fill_from_config_detection(base, detected, rationale)
+    assert base["quantization"] == "modelopt_mixed"
 

@@ -6,7 +6,7 @@
       "family": ["minimax_m2"]
     },
     "family_key": "minimax_m2",
-    "label": "MiniMax M2 NVFP4 (DGX Spark)",
+    "label": "MiniMax M2 (DGX Spark)",
     "source": "https://huggingface.co/MiniMaxAI",
     "config": {
       "trust_remote_code": true,
@@ -23,7 +23,7 @@
     },
     "rationale": [
       "MiniMax M2 on GB10: parsers + FP8 KV; cudagraph none avoids known NVFP4 compile stalls.",
-      "Prefer NVFP4 ~130 GiB across 2 Sparks (TP=2); placement sizes nodes from weights."
+      "Prefer NVFP4 ~130 GiB across 2 Sparks (TP=2); FP8 is heavier — placement sizes nodes from weights."
     ]
   },
   {

@@ -30,6 +30,11 @@ from .metadata import available_gib, list_vllm_containers
 
 # ─── Multi-node launcher ──────────────────────────────────────────────────────
 
+# In-container HF cache path shared by single-node and multi-node launches.
+# Host ~/.cache/huggingface is bind-mounted here; HF_HOME must match.
+HF_CACHE_IN_CONTAINER = "/cache/huggingface"
+
+
 def _strip_structured_flags(args: list[str]) -> list[str]:
     """Remove flags the launcher already sets explicitly, so a free-form extra_flags
     blob can be reused verbatim for both head and worker without duplicates."""
@@ -100,13 +105,13 @@ def build_multi_node_launch(
             # Clear it so our bash wrapper runs as the command instead of being
             # appended as arguments to vllm (=> "unrecognized arguments" exit 2).
             "--entrypoint", "bash",
-            "-v", f"{hf}:/cache/huggingface",
+            "-v", f"{hf}:{HF_CACHE_IN_CONTAINER}",
         ]
         for e in shared_env:
             cmd += ["-e", e]
         if node_ip:
             cmd += ["-e", f"VLLM_HOST_IP={node_ip}"]
-        cmd += ["-e", "HF_HOME=/cache/huggingface"]
+        cmd += ["-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}"]
         return cmd
 
     def serve_suffix(rank: int, is_head: bool) -> list[str]:
@@ -144,6 +149,62 @@ def build_multi_node_launch(
         worker_cmds.append({"node": wnode.get("id") or f"worker{idx}", "ssh_host": wnode.get("ssh_host") or wnode.get("id"), "rank": idx, "cmd": wc})
 
     return {"head": {"rank": 0, "cmd": head_cmd}, "workers": worker_cmds, "nnodes": nnodes, "port": port, "model": model, "image": image}
+
+
+def _needs_anemll_entrypoint(image: str) -> bool:
+    """Anemll / DSpark images ship ENTRYPOINT=vllm; clear it for our bash wrapper."""
+    img_l = (image or "").lower()
+    return "anemll" in img_l or "dspark-vllm" in img_l or "gx10" in img_l
+
+
+def build_single_node_docker_cmd(
+    *,
+    image: str,
+    model: str,
+    vllm_args: list[str],
+    env_list: list[str],
+    container: str,
+    port: int,
+    hf_token: str | None = None,
+) -> list[str]:
+    """Build docker run argv for single-node serve. Pure (no subprocess) for tests.
+
+    HF cache mount + HF_HOME match multi-node (/cache/huggingface) so Anemll and
+    stock images resolve hub weights the same way on 1-node and N-node launches.
+    """
+    hf = str(Path.home() / ".cache" / "huggingface")
+    cmd: list[str] = [
+        "docker", "run", "-d",
+        "--name", container,
+        "--restart", "no",
+        "--gpus", "all",
+        "--shm-size=4g",
+        "-p", f"127.0.0.1:{port}:{port}",
+        "-v", f"{hf}:{HF_CACHE_IN_CONTAINER}",
+        "-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}",
+    ]
+    for e in env_list:
+        cmd += ["-e", e]
+    if hf_token:
+        cmd += [
+            "-e", f"HF_TOKEN={hf_token}",
+            "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}",
+        ]
+    if _needs_anemll_entrypoint(image):
+        # --entrypoint bash; wrapper is bash's own flags (no second "bash" token).
+        cmd += [
+            "--entrypoint", "bash",
+            image,
+            "-lc",
+            'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"',
+            "--",
+            "vllm", "serve", model,
+            *vllm_args,
+        ]
+    else:
+        # Stock vllm-openai: image ENTRYPOINT already is vllm serve.
+        cmd += [image, model, *vllm_args]
+    return cmd
 
 
 _MULTINODE_STATE = DATA_DIR / "multinode_serve.json"
@@ -217,10 +278,12 @@ def _launch_multi_node(
             if not host:
                 continue
             w(f"Ensuring image on worker {wc.get('node')} ({host})…", 0.22)
+            # Quote image so tags/repos with special shell chars are safe over SSH.
+            iq = shlex.quote(image)
             probe = subprocess.run(
                 [
                     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
-                    f"docker image inspect {image} >/dev/null 2>&1 || docker pull {image}",
+                    f"docker image inspect {iq} >/dev/null 2>&1 || docker pull {iq}",
                 ],
                 capture_output=True, text=True, timeout=600,
             )
@@ -651,6 +714,11 @@ def serve_model(
     else:
         raise ValueError(f"Unknown mode {mode}; use lab_safe or workflow_max")
 
+    # Resolve TP once — fits gate and launch must use the same value (no plan
+    # fallback only in the gate, which previously greenlit multi-node fit while
+    # launch still ran single-node).
+    tp_n = max(1, int(tensor_parallel_size or 1))
+
     # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
     # Shares check_serve_loadability with recommend() so Lab Safe util is honored.
     try:
@@ -666,9 +734,8 @@ def serve_model(
         local = load_local_fallback(model)
         weights = estimate_weights_gib(model, local.get("config"))
         plan = plan_placement(weights, topo, mode=mode, overlay=None)
-        tp_req = int(tensor_parallel_size or plan.get("tensor_parallel_size") or 1)
         n_avail = int(plan.get("nodes_available") or 1)
-        n_use = min(max(tp_req, int(plan.get("nodes_needed") or 1)), n_avail)
+        n_use = min(tp_n, n_avail)
         node_ram = float(plan.get("node_ram_gib") or 121.7)
         reserve = float(plan.get("reserve_gib") or 15.0)
         fits_ok, msg = check_serve_loadability(
@@ -770,11 +837,10 @@ def serve_model(
         enable_chunked_prefill=enable_chunked_prefill,
         enable_prefix_caching=enable_prefix_caching,
         extra_flags=extra_flags,
-        tensor_parallel_size=int(tensor_parallel_size or 1),
+        tensor_parallel_size=tp_n,
     )
 
     # Multi-node (TP across Sparks): build per-node launch + orchestrate head/workers.
-    tp_n = int(tensor_parallel_size or 1)
     if tp_n >= 2:
         from .autoconfig import _cluster_topology, plan_placement, estimate_weights_gib
 
@@ -813,62 +879,21 @@ def serve_model(
 
     w("Launching docker vLLM (manual config)…", 0.2)
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-    hf = str(Path.home() / ".cache" / "huggingface")
-    cmd = [
-        "docker",
-        "run",
-        "-d",
-        "--name",
-        container,
-        "--restart",
-        "no",
-        "--gpus",
-        "all",
-        "--shm-size=4g",
-        "-p",
-        f"127.0.0.1:{port}:{port}",
-        "-v",
-        f"{hf}:/root/.cache/huggingface",
-    ]
-    for e in env_list:
-        cmd += ["-e", e]
     hf_token = _resolve_hf_token_for_container()
-    if hf_token:
-        cmd += [
-            "-e",
-            f"HF_TOKEN={hf_token}",
-            "-e",
-            f"HUGGING_FACE_HUB_TOKEN={hf_token}",
-        ]
-    else:
+    if not hf_token:
         w(
             "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
             0.28,
         )
-
-    # Custom Spark images (Anemll dspark-vllm-gx10) ship ENTRYPOINT=vllm. Clear it so our
-    # argv is not appended as unrecognized vllm flags (exit 2). Stock vllm-openai is fine.
-    img_l = (image or "").lower()
-    needs_entrypoint = "anemll" in img_l or "dspark-vllm" in img_l or "gx10" in img_l
-    if needs_entrypoint:
-        cmd += [
-            "--entrypoint",
-            "bash",
-            image,
-            "-lc",
-            'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"',
-            "--",
-            "vllm",
-            "serve",
-            model,
-            *vllm_args,
-        ]
-    else:
-        cmd += [
-            image,
-            model,
-            *vllm_args,
-        ]
+    cmd = build_single_node_docker_cmd(
+        image=image or "",
+        model=model,
+        vllm_args=vllm_args,
+        env_list=env_list,
+        container=container,
+        port=port,
+        hf_token=hf_token,
+    )
 
     def _redact_cmd(parts: list[str]) -> str:
         """Never log HF tokens / secrets in job logs."""

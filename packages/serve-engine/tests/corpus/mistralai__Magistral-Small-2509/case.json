@@ -1,0 +1,35 @@
+{
+  "model": "mistralai/Magistral-Small-2509",
+  "mode": "workflow_max",
+  "note": "Offline fixture: Magistral reasoning + mistral-common load path via family overlay. Tokenizer/config-format flags must appear once (no fill+overlay duplicate).",
+  "weights_gib": 45.0,
+  "weights_source": "fixture_pin",
+  "expect": {
+    "label_contains": "Magistral",
+    "serve_blocked": false,
+    "weights_gib_min": 20.0,
+    "weights_gib_max": 80.0,
+    "config": {
+      "load_format": "mistral",
+      "reasoning_parser": "mistral",
+      "tool_call_parser": "mistral",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "extra_flags_contains": [
+      "--tokenizer-mode mistral",
+      "--config-format mistral"
+    ],
+    "unique_flags": [
+      "--tokenizer-mode",
+      "--config-format",
+      "--load-format"
+    ],
+    "forbidden": [
+      "humming",
+      "$",
+      "--model ",
+      "flashinfer_b12x"
+    ]
+  }
+}

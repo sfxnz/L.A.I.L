@@ -1,0 +1,34 @@
+{
+  "model": "MiniMaxAI/MiniMax-M2-NVFP4",
+  "mode": "workflow_max",
+  "topology": "two_spark",
+  "note": "Offline fixture: MiniMax M2 NVFP4 ~130 GiB needs TP=2. Family overlay owns parsers + cudagraph none + Spark NVFP4 env.",
+  "weights_gib": 130.0,
+  "weights_source": "fixture_pin",
+  "expect": {
+    "label_contains": "MiniMax M2",
+    "serve_blocked": false,
+    "weights_gib_min": 100.0,
+    "weights_gib_max": 160.0,
+    "config": {
+      "reasoning_parser": "minimax_m2",
+      "tool_call_parser": "minimax_m2",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true,
+      "kv_cache_dtype": "fp8",
+      "tensor_parallel_size": 2
+    },
+    "extra_flags_contains": [
+      "--compilation-config",
+      "cudagraph_mode"
+    ],
+    "forbidden": [
+      "humming",
+      "$",
+      "--model ",
+      "--enable-expert-parallel",
+      "--data-parallel-size",
+      "flashinfer_b12x"
+    ]
+  }
+}

@@ -109,6 +109,7 @@ def _http_get_raw(
     timeout: float = 20.0,
     token: Optional[str] = None,
     allow_retry_without_auth: bool = True,
+    max_bytes: Optional[int] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """GET text body. Follows redirects. Returns (body, error)."""
     headers = {"User-Agent": HF_UA, "Accept": "*/*"}
@@ -117,7 +118,12 @@ def _http_get_raw(
     try:
         req = Request(url, headers=headers)
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            if max_bytes is not None:
+                raw = resp.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    return None, f"response exceeds {max_bytes} bytes for {url}"
+            else:
+                raw = resp.read()
             ctype = resp.headers.get("Content-Type", "")
             charset = "utf-8"
             if "charset=" in ctype:
@@ -138,6 +144,7 @@ def _http_get_raw(
                 timeout=timeout,
                 token=None,
                 allow_retry_without_auth=False,
+                max_bytes=max_bytes,
             )
         return None, f"HTTP {e.code} for {url}"
     except (URLError, TimeoutError, OSError) as e:
@@ -423,17 +430,23 @@ def _parse_one_serve_command(text: str) -> Optional[ServeCandidate]:
     for m in re.finditer(r"(?:^|\s)([A-Z][A-Z0-9_]*)=([^\s]+)\s+(?=vllm\b)", text):
         env.append(f"{m.group(1)}={m.group(2).strip().strip(chr(39)+chr(34))}")
 
-    # docker run … image model args  → recover model + args after image
+    # docker run … image model args  → recover image + model + args after image
     docker_m = re.search(
-        r"docker\s+run\b[^\n]*?\s(?:vllm/vllm-openai[^\s]*|nvcr\.io/[^\s]+)\s+(.+)",
+        r"docker\s+run\b[^\n]*?\s("
+        r"vllm/vllm-openai[^\s]*|"
+        r"ghcr\.io/anemll/dspark-vllm-gx10[^\s]*|"
+        r"eugr/spark-vllm[^\s]*|"
+        r"nvcr\.io/[^\s]+"
+        r")\s+(.+)",
         text,
         re.I | re.S,
     )
     if docker_m and "vllm serve" not in text.lower():
+        image_ref = docker_m.group(1).strip().strip("'\"")
         try:
-            tokens = shlex.split(docker_m.group(1), posix=True)
+            tokens = shlex.split(docker_m.group(2), posix=True)
         except ValueError:
-            tokens = docker_m.group(1).split()
+            tokens = docker_m.group(2).split()
         # skip leading "serve" if present (vllm-openai entrypoint is the model)
         if tokens and tokens[0] == "serve":
             tokens = tokens[1:]
@@ -443,6 +456,8 @@ def _parse_one_serve_command(text: str) -> Optional[ServeCandidate]:
         if args and args[0] == "serve":
             args = args[1:]
         cfg = _args_to_config(args, env)
+        if image_ref:
+            cfg["image"] = image_ref
         return ServeCandidate(raw=text.strip()[:500], env=env, model=model, args=args, config=cfg)
 
     # Find vllm serve
@@ -695,8 +710,21 @@ def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, 
         # If detected.family is unknown, fall back to id substrings alone.
         fam_ok = (not fam_terms) or (not fam) or (fam in fam_terms)
         if all_ok and any_ok and fam_ok:
-            return ov
+            out = dict(ov)
+            # MiniMax M2 ships FP8 and NVFP4 weights; label must not always claim NVFP4.
+            if out.get("family_key") == "minimax_m2":
+                out["label"] = _minimax_m2_overlay_label(mid)
+            return out
     return None
+
+
+def _minimax_m2_overlay_label(mid: str) -> str:
+    """Quant-aware MiniMax M2 overlay label (mid already lowercased)."""
+    if "nvfp4" in mid:
+        return "MiniMax M2 NVFP4 (DGX Spark)"
+    if re.search(r"(^|[^a-z0-9])fp8([^a-z0-9]|$)", mid):
+        return "MiniMax M2 FP8 (DGX Spark)"
+    return "MiniMax M2 (DGX Spark)"
 
 
 def _cluster_topology() -> dict[str, Any]:
@@ -1174,6 +1202,66 @@ def _strip_flag_from_extra(extra: str, flag: str) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+def _merge_extra_flags(existing: str, add: str) -> str:
+    """Append ``add`` onto ``existing``, dropping any flag already present (first wins).
+
+    Used when family overlays merge onto card/fill extras so tokenizer/config-format
+    (and any other flag) never appear twice in composed argv.
+    """
+    existing = (existing or "").strip()
+    add = (add or "").strip()
+    if not add:
+        return existing
+    if not existing:
+        return add
+    try:
+        exist_parts = shlex.split(existing)
+    except ValueError:
+        exist_parts = existing.split()
+    try:
+        add_parts = shlex.split(add)
+    except ValueError:
+        add_parts = add.split()
+
+    def _consume(parts: list[str], i: int) -> tuple[str, list[str], int]:
+        """Return (flag_key, tokens_for_this_flag, next_index)."""
+        p = parts[i]
+        key = p.split("=", 1)[0]
+        if "=" in p:
+            return key, [p], i + 1
+        if i + 1 < len(parts) and not str(parts[i + 1]).startswith("-"):
+            return key, [p, parts[i + 1]], i + 2
+        return key, [p], i + 1
+
+    seen: set[str] = set()
+    out: list[str] = []
+    i = 0
+    while i < len(exist_parts):
+        p = exist_parts[i]
+        if p.startswith("-"):
+            key, toks, i = _consume(exist_parts, i)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.extend(toks)
+        else:
+            out.append(p)
+            i += 1
+    i = 0
+    while i < len(add_parts):
+        p = add_parts[i]
+        if p.startswith("-"):
+            key, toks, i = _consume(add_parts, i)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.extend(toks)
+        else:
+            out.append(p)
+            i += 1
+    return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
+
+
 def _resolve_dspark_draft_model(readme: str | None) -> str | None:
     """Best-effort draft checkpoint id from card exports / prose."""
     if not readme:
@@ -1432,7 +1520,13 @@ def _strip_spark_unsafe_flags(
 
 
 _CARD_IMAGE_RE = re.compile(
-    r"(?:vllm/vllm-openai|ghcr\.io/anemll/dspark-vllm-gx10)(?::[vV]?\d[\w.\-]*)?",
+    r"(?:"
+    r"vllm/vllm-openai|"
+    r"ghcr\.io/anemll/dspark-vllm-gx10|"
+    r"eugr/spark-vllm|"
+    r"nvcr\.io/nvidia/vllm|"
+    r"nvcr\.io/[^\s:`'\"/]+/vllm(?:/[^\s:`'\"]+)?"
+    r")(?::[vV]?[\w.\-]+)?",
     re.I,
 )
 
@@ -1521,6 +1615,107 @@ def _resolve_stock_image(default: str, card_image: str | None, rationale: list[s
     return default
 
 
+def _is_anemll_image(image: str | None) -> bool:
+    s = (image or "").lower()
+    return "anemll" in s or "dspark-vllm" in s
+
+
+def _lab_default_image(mode: str) -> str:
+    return DEFAULT_IMAGE_SAFE if mode == "lab_safe" else DEFAULT_IMAGE_MAX
+
+
+def _resolve_image_for_gates(
+    cfg: dict[str, Any],
+    *,
+    mode: str,
+    candidate_image: str | None,
+    card_image: str | None,
+    detected: dict[str, Any] | None,
+    rationale: list[str],
+    warnings: list[str] | None = None,
+) -> str:
+    """Resolve cfg['image'] before marlin/safety gates.
+
+    Floor is the lab default for ``mode``. Stock card/docker pins and capability
+    floors may only *raise*. Anemll/DSpark images are never replaced.
+    Non-stock alternate pins (nvcr, eugr, …) are recorded, not auto-selected.
+    """
+    warnings = warnings if warnings is not None else []
+    lab = _lab_default_image(mode)
+    cur = (cfg.get("image") or "").strip()
+
+    if _is_anemll_image(cur):
+        return cur
+
+    # Never sit below the lab stock default (candidate may have applied an older pin).
+    if not cur:
+        cur = lab
+    else:
+        cv = _stock_image_semver(cur)
+        lv = _stock_image_semver(lab)
+        if cv is not None and lv is not None and cv < lv:
+            rationale.append(
+                f"Card/docker pin {cur} is older than lab default {lab} — keeping lab default (no downgrade)"
+            )
+            cur = lab
+        elif cv is None and not cur.startswith("vllm/vllm-openai"):
+            # Non-stock already on cfg (e.g. blind apply) — note and fall back to lab.
+            warnings.append(
+                f"Card image {cur} is not a stock vllm-openai pin; keeping lab default {lab}"
+            )
+            rationale.append(f"Card image {cur} noted (not auto-selected)")
+            cur = lab
+    cfg["image"] = cur
+
+    def _note_alt(ref: str) -> None:
+        msg = (
+            f"Card mentions image {ref}; keeping lab stock/Anemll path "
+            "(alternate image not auto-selected)"
+        )
+        if msg not in warnings:
+            warnings.append(msg)
+        note = f"Card image {ref} noted (not auto-selected)"
+        if note not in rationale:
+            rationale.append(note)
+
+    def _raise_stock(pin: str | None, *, via: str) -> None:
+        nonlocal cur
+        if not pin:
+            return
+        if _is_anemll_image(pin):
+            # Anemll selection is overlay-owned; do not swap stock → Anemll from prose/docker alone.
+            rationale.append(f"Card mentions {pin} (overlay owns Anemll image selection)")
+            return
+        if pin.startswith("vllm/vllm-openai:"):
+            new = _resolve_stock_image(cur, pin, rationale)
+            if new != cur and via == "candidate" and not any(
+                "card" in r.lower() and pin in r for r in rationale[-2:]
+            ):
+                # _resolve_stock_image already rationale'd raises; ensure docker path is clear
+                pass
+            cur = new
+            cfg["image"] = cur
+            return
+        _note_alt(pin)
+
+    _raise_stock(candidate_image, via="candidate")
+    if card_image and card_image != candidate_image:
+        _raise_stock(card_image, via="card")
+
+    cap = _capability_min_stock_image(cfg, detected)
+    if cap and not _is_anemll_image(cur):
+        prev = cur
+        cur = _resolve_stock_image(cur, cap, rationale)
+        if cur != prev and not any("capability" in r for r in rationale[-3:]):
+            rationale.append(
+                f"Capability floor → stock image at least {cap} "
+                f"(features: quant/moe/parsers on this config)"
+            )
+        cfg["image"] = cur
+
+    return cfg.get("image") or lab
+
+
 def _capability_min_stock_image(
     cfg: dict[str, Any],
     detected: dict[str, Any] | None,
@@ -1595,6 +1790,207 @@ def check_serve_loadability(
     return True, None
 
 
+# ─── Optional GitHub cookbook fetch (card recipe-poor) ───────────────────────
+
+COOKBOOK_FETCH_TIMEOUT = 12.0
+COOKBOOK_MAX_BYTES = 1_500_000  # ~1.5 MiB hard cap
+COOKBOOK_MAX_URLS = 3
+
+_GITHUB_BLOB_OR_RAW_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/(?:blob|raw)/[^\s\)\]\"'<>]+",
+    re.I,
+)
+_GITHUB_RAW_HOST_RE = re.compile(
+    r"https?://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[^\s\)\]\"'<>]+",
+    re.I,
+)
+_COOKBOOK_DOC_EXTS = (".md", ".markdown", ".ipynb", ".txt", ".rst")
+
+
+def github_blob_to_raw_url(url: str) -> Optional[str]:
+    """Map github.com/{owner}/{repo}/blob|{raw}/{ref}/{path} → raw.githubusercontent.com."""
+    if not url:
+        return None
+    u = url.strip()
+    if u.startswith("https://raw.githubusercontent.com/") or u.startswith(
+        "http://raw.githubusercontent.com/"
+    ):
+        return u.split("?", 1)[0].split("#", 1)[0]
+    m = re.match(
+        r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)/(?:blob|raw)/([^/]+)/(.+)$",
+        u.split("?", 1)[0].split("#", 1)[0],
+        re.I,
+    )
+    if not m:
+        return None
+    owner, repo, ref, path = m.group(1), m.group(2), m.group(3), m.group(4)
+    path = path.rstrip("/")
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+
+
+def _looks_like_vllm_cookbook(url: str) -> bool:
+    """True for public GitHub docs that look like a vLLM cookbook (not TRT/SGLang)."""
+    path = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
+    if not any(path.endswith(ext) for ext in _COOKBOOK_DOC_EXTS):
+        return False
+    # Skip other-framework cookbooks unless the path also says vllm.
+    if any(x in path for x in ("trtllm", "tensorrt", "sglang", "trt-llm")) and "vllm" not in path:
+        return False
+    name = path.rsplit("/", 1)[-1]
+    return "cookbook" in path or "vllm" in name or "/vllm" in path or "vllm_" in path
+
+
+def find_cookbook_urls(readme: str) -> list[str]:
+    """Scan README for public GitHub blob/raw cookbook URLs (vLLM-oriented)."""
+    if not readme:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for cre in (_GITHUB_BLOB_OR_RAW_RE, _GITHUB_RAW_HOST_RE):
+        for m in cre.finditer(readme):
+            url = m.group(0).rstrip(".,;:")
+            if not _looks_like_vllm_cookbook(url):
+                continue
+            raw = github_blob_to_raw_url(url) or url
+            key = raw.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(url)
+    return found
+
+
+def notebook_source_text(body: str) -> str:
+    """Flatten Jupyter notebook JSON cell sources; plain text returned as-is."""
+    if not body:
+        return body
+    stripped = body.lstrip()
+    if not (stripped.startswith("{") and '"cells"' in stripped[:4000]):
+        return body
+    try:
+        nb = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
+        return body
+    parts: list[str] = []
+    for cell in nb["cells"]:
+        if not isinstance(cell, dict):
+            continue
+        src = cell.get("source")
+        if isinstance(src, list):
+            parts.append("".join(str(x) for x in src))
+        elif isinstance(src, str):
+            parts.append(src)
+    return "\n\n".join(parts) if parts else body
+
+
+def fetch_cookbook_text(
+    url: str,
+    *,
+    timeout: float = COOKBOOK_FETCH_TIMEOUT,
+    max_bytes: int = COOKBOOK_MAX_BYTES,
+) -> tuple[Optional[str], Optional[str]]:
+    """Fetch a public GitHub cookbook URL. Returns (text, error). Never raises."""
+    if not url:
+        return None, "empty cookbook URL"
+    raw_url = github_blob_to_raw_url(url)
+    if not raw_url:
+        return None, f"not a public GitHub blob/raw URL: {url}"
+    if not raw_url.startswith("https://raw.githubusercontent.com/"):
+        return None, f"refusing non-raw GitHub host: {raw_url}"
+    # Public cookbooks only — never send HF tokens to githubusercontent.
+    body, err = _http_get_raw(
+        raw_url,
+        timeout=timeout,
+        token=None,
+        allow_retry_without_auth=False,
+        max_bytes=max_bytes,
+    )
+    if err or not body:
+        return None, err or "empty cookbook body"
+    if body.lstrip().startswith("<!"):
+        return None, f"HTML response (not raw content) for {raw_url}"
+    return notebook_source_text(body), None
+
+
+def candidates_recipe_poor(candidates: list[ServeCandidate]) -> bool:
+    """True when card recipes are missing or only bare/demo-level."""
+    if not candidates:
+        return True
+    best = candidates[0]
+    cfg = best.config or {}
+    rich = bool(
+        cfg.get("quantization")
+        or cfg.get("moe_backend")
+        or cfg.get("docker_env")
+        or cfg.get("kv_cache_dtype")
+        or cfg.get("tool_call_parser")
+        or cfg.get("reasoning_parser")
+        or cfg.get("load_format")
+        or cfg.get("image")
+        or (cfg.get("extra_flags") or "").strip()
+    )
+    if rich and best.score >= 20:
+        return False
+    return (not rich) or best.score < 20
+
+
+def _augment_candidates_from_cookbooks(
+    readme: str,
+    *,
+    candidates: list[ServeCandidate],
+    detected: dict[str, Any] | None,
+    sources: list[dict[str, str]],
+    rationale: list[str],
+    warnings: list[str],
+) -> list[ServeCandidate]:
+    """If card recipes are empty/weak, fetch linked vLLM cookbooks and re-extract."""
+    if not readme or not candidates_recipe_poor(candidates):
+        return candidates
+    urls = find_cookbook_urls(readme)
+    if not urls:
+        return candidates
+    rationale.append(
+        f"Card recipes empty/weak — trying {min(len(urls), COOKBOOK_MAX_URLS)} GitHub cookbook URL(s)"
+    )
+    merged = list(candidates)
+    seen_raw = {re.sub(r"\s+", " ", c.raw)[:200] for c in merged}
+    for url in urls[:COOKBOOK_MAX_URLS]:
+        try:
+            text, err = fetch_cookbook_text(url)
+        except Exception as e:  # never brick recommend
+            warnings.append(f"Cookbook fetch error for {url}: {type(e).__name__}: {e}")
+            continue
+        if err or not text:
+            warnings.append(f"Cookbook fetch skipped: {url} ({err or 'empty'})")
+            continue
+        sources.append(
+            {
+                "kind": "github_cookbook",
+                "ref": url,
+                "notes": "fetched vendor vLLM cookbook (card recipe-poor)",
+            }
+        )
+        extra = extract_serve_candidates(text, detected=detected)
+        added = 0
+        for c in extra:
+            if not c.section:
+                c.section = "github cookbook"
+            key = re.sub(r"\s+", " ", c.raw)[:200]
+            if key in seen_raw:
+                continue
+            seen_raw.add(key)
+            merged.append(c)
+            added += 1
+        if added:
+            rationale.append(f"Cookbook {url}: added {added} vllm serve recipe(s)")
+        else:
+            rationale.append(f"Cookbook {url}: fetched but no parseable vllm serve")
+    merged.sort(key=lambda c: c.score, reverse=True)
+    return merged
+
+
 def extract_serve_candidates(
     readme: str,
     *,
@@ -1639,6 +2035,19 @@ def extract_serve_candidates(
             continue
         seen_raw.add(key)
         cand.section = _section_at(heads, m.start())
+        candidates.append(cand)
+
+    # 3) Notebook-style shell lines (`!vllm serve …`) after cell flatten
+    for m in re.finditer(r"(?m)^!\s*vllm\s+serve\b[^\n]*(?:\n[^\n]*\\[^\n]*)*", readme):
+        frag = m.group(0).lstrip("!").strip()
+        cand = _parse_one_serve_command(frag)
+        if not cand:
+            continue
+        key = re.sub(r"\s+", " ", cand.raw)[:200]
+        if key in seen_raw:
+            continue
+        seen_raw.add(key)
+        cand.section = _section_at(heads, m.start()) or "notebook"
         candidates.append(cand)
 
     for c in candidates:
@@ -2396,10 +2805,17 @@ def _merge_fill(base: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
 
 
 def _apply_card_candidate(base: dict[str, Any], cand: ServeCandidate) -> list[str]:
-    """Apply winning card recipe onto base (card wins for set fields)."""
+    """Apply winning card recipe onto base (card wins for set fields).
+
+    Image is *not* copied here — it is resolved via ``_resolve_image_for_gates``
+    (lab floor + stock raise only; Anemll never replaced) before safety/marlin.
+    """
     applied: list[str] = []
     cfg = cand.config
     for k, v in cfg.items():
+        if k == "image":
+            # Keep on candidate.config for scoring/UI; resolve into base separately.
+            continue
         if k == "docker_env":
             if v:
                 base["docker_env"] = list(v)
@@ -2417,6 +2833,88 @@ def _apply_card_candidate(base: dict[str, Any], cand: ServeCandidate) -> list[st
     return applied
 
 
+def _harvest_tool_flags_from_candidates(
+    cfg: dict[str, Any],
+    candidates: list[ServeCandidate],
+    rationale: list[str],
+) -> None:
+    """If the winning recipe omitted tools, pull tool parser from a tool-focused alt.
+
+    Nano-9B-v2 cards ship a bare serve line (high score) and a separate tool-calling
+    block with ``nemotron_json`` + ``--tool-parser-plugin`` — prefer those when present.
+    """
+    if (cfg.get("tool_call_parser") or "").strip():
+        return
+    if not candidates:
+        return
+    ranked: list[tuple[int, int, float, ServeCandidate]] = []
+    for c in candidates:
+        tcp = str((c.config or {}).get("tool_call_parser") or "").strip()
+        if not tcp:
+            continue
+        sec = (c.section or "").lower()
+        raw_l = (c.raw or "").lower()
+        toolish = (
+            "tool" in sec
+            or "tool" in raw_l
+            or bool((c.config or {}).get("enable_auto_tool_choice"))
+            or tcp in ("nemotron_json", "llama_nemotron_json")
+        )
+        ranked.append(
+            (
+                1 if tcp == "nemotron_json" else 0,
+                1 if toolish else 0,
+                float(c.score or 0.0),
+                c,
+            )
+        )
+    if not ranked:
+        return
+    ranked.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    pick = ranked[0][3]
+    tcp = str(pick.config.get("tool_call_parser") or "").strip()
+    if not tcp:
+        return
+    cfg["tool_call_parser"] = tcp
+    if pick.config.get("enable_auto_tool_choice"):
+        cfg["enable_auto_tool_choice"] = True
+    # Keep --tool-parser-plugin when the card recipe provides it.
+    add_ex = (pick.config.get("extra_flags") or "").strip()
+    if "--tool-parser-plugin" in add_ex:
+        try:
+            parts = shlex.split(add_ex)
+        except ValueError:
+            parts = add_ex.split()
+        plugin_bits: list[str] = []
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--tool-parser-plugin" or parts[i].startswith(
+                "--tool-parser-plugin="
+            ):
+                if parts[i].startswith("--tool-parser-plugin="):
+                    plugin_bits.append(parts[i])
+                    i += 1
+                else:
+                    plugin_bits.append(parts[i])
+                    if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                        plugin_bits.append(parts[i + 1])
+                        i += 2
+                    else:
+                        i += 1
+            else:
+                i += 1
+        if plugin_bits:
+            plugin_s = " ".join(
+                shlex.quote(x) if (" " in x or "{" in x) else x for x in plugin_bits
+            )
+            cfg["extra_flags"] = _merge_extra_flags(cfg.get("extra_flags") or "", plugin_s)
+    rationale.append(
+        f"Tool parser from card alt recipe (score {pick.score:.0f}"
+        + (f", «{pick.section}»" if pick.section else "")
+        + f"): {tcp}"
+    )
+
+
 def _card_prose_hints(readme: str) -> dict[str, Any]:
     """Pull extra hints from card prose outside code blocks."""
     hints: dict[str, Any] = {"docker_env": [], "notes": []}
@@ -2431,7 +2929,11 @@ def _card_prose_hints(readme: str) -> dict[str, Any]:
         hints["notes"].append("Card: do NOT use Marlin MoE backend")
     if re.search(r"reasoning.?parser\s+qwen3", readme, re.I):
         hints["reasoning_parser"] = "qwen3"
-    if re.search(r"tool.?call.?parser\s+qwen3_coder", readme, re.I):
+    # Prefer more-specific Nano tool parser when both appear on a card.
+    if re.search(r"tool.?call.?parser\s+[\"']?nemotron_json", readme, re.I):
+        hints["tool_call_parser"] = "nemotron_json"
+        hints["enable_auto_tool_choice"] = True
+    elif re.search(r"tool.?call.?parser\s+qwen3_coder", readme, re.I):
         hints["tool_call_parser"] = "qwen3_coder"
         hints["enable_auto_tool_choice"] = True
     if re.search(r"--quantization\s+modelopt_mixed\b", readme):
@@ -2516,12 +3018,31 @@ def _fill_from_config_detection(
             if not base.get("trust_remote_code"):
                 base["trust_remote_code"] = True
     elif family == "nemotron":
-        if not base.get("reasoning_parser"):
+        mid = (
+            str(base.get("model") or "")
+            + " "
+            + str(detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+        ).lower()
+        # Nano-9B/12B-v2: card uses nemotron_json (+ plugin); not Lightning's qwen3_coder.
+        is_nano_v2 = bool(
+            re.search(r"nano[-_]?(9|12)b[-_]?v2", mid)
+            or re.search(r"nano[-_]?v2", mid)
+        )
+        if not base.get("reasoning_parser") and not is_nano_v2:
             base["reasoning_parser"] = "nemotron_v3"
             rationale.append("Nemotron (from HF) → --reasoning-parser nemotron_v3")
         base["enable_auto_tool_choice"] = True
         if not base.get("tool_call_parser"):
-            base["tool_call_parser"] = "qwen3_coder"
+            if is_nano_v2:
+                base["tool_call_parser"] = "nemotron_json"
+                rationale.append(
+                    "Nemotron Nano-v2 → tool-call-parser nemotron_json "
+                    "(card plugin path optional via --tool-parser-plugin)"
+                )
+            else:
+                base["tool_call_parser"] = "qwen3_coder"
         base["trust_remote_code"] = True
     elif family == "minimax_m2":
         if not base.get("reasoning_parser"):
@@ -2968,9 +3489,19 @@ def recommend(
     # ── Parse card for best vllm serve (scored with config.json knowledge) ──
     # When a family overlay matches, the card's generic recipe is wrong for this
     # checkpoint — skip card-candidate fill entirely and let the overlay drive.
+    # Never fetch cookbooks under an overlay either (overlay owns the serve path).
     candidates: list[ServeCandidate] = []
     if readme and not overlay:
         candidates = extract_serve_candidates(readme, detected=detected)
+        # Card empty/weak → optional public GitHub cookbook fetch (timeout/size capped).
+        candidates = _augment_candidates_from_cookbooks(
+            readme,
+            candidates=candidates,
+            detected=detected,
+            sources=sources,
+            rationale=rationale,
+            warnings=warnings,
+        )
         if candidates:
             best = candidates[0]
             applied = _apply_card_candidate(cfg, best)
@@ -2983,6 +3514,8 @@ def recommend(
                 rationale.append(f"  · {r}")
             if applied:
                 rationale.append(f"Applied from card: {', '.join(applied)}")
+            # Winning recipe may omit tools; harvest from tool-focused alts (e.g. Nano nemotron_json).
+            _harvest_tool_flags_from_candidates(cfg, candidates, rationale)
             sources.insert(
                 0,
                 {
@@ -3008,6 +3541,22 @@ def recommend(
     # Gaps only: HF config.json / tags (still from the model on the hub)
     _fill_from_config_detection(cfg, detected, rationale)
 
+    # Image pin (docker recipe + card prose + capability) *before* marlin/safety so
+    # gates see the intended stock tag. Overlay Anemll applied below still wins.
+    cand_image = None
+    if candidates:
+        cand_image = (candidates[0].config or {}).get("image") or None
+    card_image_pin = _parse_card_image_requirement(readme)
+    _resolve_image_for_gates(
+        cfg,
+        mode=mode,
+        candidate_image=cand_image,
+        card_image=card_image_pin,
+        detected=detected,
+        rationale=rationale,
+        warnings=warnings,
+    )
+
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)
 
@@ -3019,7 +3568,10 @@ def recommend(
             if k == "docker_env":
                 cfg["docker_env"] = _dedupe_env(list(cfg.get("docker_env") or []) + list(v))
             elif k == "extra_flags":
-                cfg["extra_flags"] = ((cfg.get("extra_flags") or "") + " " + v).strip()
+                # Fill/card may already own tokenizer/config-format; never emit twice.
+                cfg["extra_flags"] = _merge_extra_flags(
+                    cfg.get("extra_flags") or "", v or ""
+                )
             else:
                 cfg[k] = v
         for r in overlay["rationale"]:
@@ -3072,20 +3624,17 @@ def recommend(
     card_set_max_len = cfg.get("max_model_len") is not None
     _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
 
-    # Card image pin + capability floor: raise stock default; never downgrade;
-    # never replace an Anemll/DSpark overlay image.
-    card_image = _parse_card_image_requirement(readme)
-    cap_image = _capability_min_stock_image(cfg, detected)
-    if cfg.get("image"):
-        cfg["image"] = _resolve_stock_image(cfg["image"], card_image, rationale)
-        if cap_image:
-            prev = cfg["image"]
-            cfg["image"] = _resolve_stock_image(prev, cap_image, rationale)
-            if cfg["image"] != prev and not any("capability" in r for r in rationale[-3:]):
-                rationale.append(
-                    f"Capability floor → stock image at least {cap_image} "
-                    f"(features: quant/moe/parsers on this config)"
-                )
+    # Final image pass after overlay/mode envelope: re-apply capability floor on the
+    # fully filled cfg. Anemll overlay image is preserved (never replaced).
+    _resolve_image_for_gates(
+        cfg,
+        mode=mode,
+        candidate_image=cand_image if not overlay else None,
+        card_image=card_image_pin if not overlay else None,
+        detected=detected,
+        rationale=rationale,
+        warnings=warnings,
+    )
 
     # Resolve card exports ($DSPARK_CKPT → real HF id) before scrubbing leftovers.
     if cfg.get("extra_flags"):

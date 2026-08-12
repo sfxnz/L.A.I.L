@@ -1,0 +1,7 @@
+{
+  "model_id": "nvidia/Qwen3.6-27B-NVFP4",
+  "source": "index",
+  "index_total_size": 21921428072,
+  "weights_gib": 20.4,
+  "note": "Pinned from local HF cache model.safetensors.index.json metadata.total_size (offline capture)."
+}

@@ -12,6 +12,7 @@ Add a case with::
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,11 @@ def _final_command(model: str, cfg: dict) -> str:
     return "vllm serve " + model + " " + " ".join(args)
 
 
+def _flag_occurrences(cmd: str, flag: str) -> int:
+    """Count how many times ``flag`` appears as a CLI token (not a substring of another flag)."""
+    return len(re.findall(rf"(?:^|\s){re.escape(flag)}(?:=|\s|$)", cmd))
+
+
 if not _case_dirs():
     pytest.skip("no corpus cases captured yet", allow_module_level=True)
 
@@ -165,6 +171,30 @@ def test_corpus_case(monkeypatch, case_dir: Path):
             f"got {result.get('serve_blocked')!r}; topology={result.get('topology')}"
         )
 
+    # Pinned Hub weight size (case.json) drives placement offline; assert bounds so a
+    # bad pin / floor regression cannot silently claim a 400 GiB MoE fits one Spark.
+    topo_w = (result.get("topology") or {}).get("weights_gib")
+    pin_w = case.get("weights_gib")
+    w_for_bounds = topo_w if topo_w is not None else pin_w
+    if expect.get("weights_gib_min") is not None:
+        assert w_for_bounds is not None, (
+            f"{case_dir.name}: expected weights_gib_min but topology/case weights are missing"
+        )
+        assert float(w_for_bounds) >= float(expect["weights_gib_min"]), (
+            f"{case_dir.name}: weights_gib {w_for_bounds!r} < min {expect['weights_gib_min']!r}"
+        )
+    if expect.get("weights_gib_max") is not None:
+        assert w_for_bounds is not None, (
+            f"{case_dir.name}: expected weights_gib_max but topology/case weights are missing"
+        )
+        assert float(w_for_bounds) <= float(expect["weights_gib_max"]), (
+            f"{case_dir.name}: weights_gib {w_for_bounds!r} > max {expect['weights_gib_max']!r}"
+        )
+    if pin_w is not None and topo_w is not None:
+        assert abs(float(topo_w) - float(pin_w)) < 0.05, (
+            f"{case_dir.name}: topology weights_gib {topo_w!r} != case pin {pin_w!r}"
+        )
+
     for key, want in (expect.get("config") or {}).items():
         assert cfg.get(key) == want, (
             f"{case_dir.name}: config[{key!r}] expected {want!r}, got {cfg.get(key)!r}"
@@ -179,6 +209,13 @@ def test_corpus_case(monkeypatch, case_dir: Path):
     for frag in expect.get("forbidden") or []:
         assert frag not in cmd, (
             f"{case_dir.name}: {frag!r} must not appear in composed command:\n{cmd}"
+        )
+
+    for flag in expect.get("unique_flags") or []:
+        n = _flag_occurrences(cmd, flag)
+        assert n == 1, (
+            f"{case_dir.name}: expected exactly one {flag!r} in composed command, "
+            f"got {n}:\n{cmd}"
         )
 
     if expect.get("image_contains"):

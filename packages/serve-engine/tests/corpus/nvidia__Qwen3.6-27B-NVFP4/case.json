@@ -1,0 +1,29 @@
+{
+  "model": "nvidia/Qwen3.6-27B-NVFP4",
+  "mode": "workflow_max",
+  "note": "Dense ModelOpt NVFP4. Card says --quantization modelopt; config.json MIXED_PRECISION → modelopt_mixed. Hub index ~20.4 GiB — single Spark fit.",
+  "weights_gib": 20.4,
+  "weights_source": "index",
+  "expect": {
+    "label_contains": "Usage",
+    "serve_blocked": false,
+    "weights_gib_min": 15.0,
+    "weights_gib_max": 35.0,
+    "config": {
+      "quantization": "modelopt_mixed",
+      "kv_cache_dtype": "fp8",
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_coder",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "extra_flags_contains": [],
+    "forbidden": [
+      "flashinfer_b12x",
+      "humming",
+      "$",
+      "--model ",
+      "compressed-tensors"
+    ]
+  }
+}

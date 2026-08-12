@@ -1,0 +1,29 @@
+{
+  "model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+  "mode": "workflow_max",
+  "note": "Unsloth mixed FP8+NVFP4 MoE (compressed-tensors). Card recommends flashinfer_b12x — must be stripped. Proven single-Spark path. Hub index total_size ~24.7 GiB.",
+  "weights_gib": 24.7,
+  "weights_source": "index",
+  "expect": {
+    "label_contains": "DGX Spark",
+    "serve_blocked": false,
+    "weights_gib_min": 20.0,
+    "weights_gib_max": 40.0,
+    "config": {
+      "quantization": "compressed-tensors",
+      "kv_cache_dtype": "fp8",
+      "moe_backend": "",
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_coder",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "extra_flags_contains": [],
+    "forbidden": [
+      "flashinfer_b12x",
+      "humming",
+      "$",
+      "--model "
+    ]
+  }
+}

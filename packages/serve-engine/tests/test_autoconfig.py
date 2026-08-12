@@ -655,6 +655,140 @@ def test_resolve_stock_image_raises_never_downgrades():
     )
 
 
+def test_parse_docker_run_puts_image_on_candidate():
+    """Winning docker run image lands on ServeCandidate.config['image']."""
+    text = (
+        "docker run --gpus all -p 8000:8000 vllm/vllm-openai:v0.28.0 "
+        "org/Model-NVFP4 --quantization modelopt_fp4 --moe-backend marlin"
+    )
+    c = ac._parse_one_serve_command(text)
+    assert c is not None
+    assert c.config.get("image") == "vllm/vllm-openai:v0.28.0"
+    assert c.model == "org/Model-NVFP4"
+    assert c.config.get("quantization") == "modelopt_fp4"
+    assert c.config.get("moe_backend") == "marlin"
+
+
+def test_card_image_re_matches_nvcr_and_eugr():
+    """_CARD_IMAGE_RE recognizes stock, Anemll, nvcr vLLM, and eugr Spark pins."""
+    text = (
+        "images: vllm/vllm-openai:v0.27.1 "
+        "ghcr.io/anemll/dspark-vllm-gx10:0.1.1 "
+        "nvcr.io/nvidia/vllm:25.01-py3 "
+        "eugr/spark-vllm:0.2.0 "
+        "and untagged vllm/vllm-openai alone"
+    )
+    hits = ac._CARD_IMAGE_RE.findall(text)
+    joined = " ".join(hits).lower()
+    assert "vllm/vllm-openai:v0.27.1" in joined
+    assert "ghcr.io/anemll/dspark-vllm-gx10:0.1.1" in joined
+    assert "nvcr.io/nvidia/vllm:25.01-py3" in joined
+    assert "eugr/spark-vllm:0.2.0" in joined
+
+
+def test_docker_recipe_image_applied_before_marlin_gates(monkeypatch):
+    """Fixture docker recipe image appears in applied config when no overlay.
+
+    Image must be resolved early enough that marlin/capability see the intended pin
+    (not only late _parse_card_image_requirement after safety).
+    """
+    readme = """## DGX Spark
+
+```bash
+docker run --gpus all -p 8000:8000 vllm/vllm-openai:v0.28.0 \\
+  example/Docker-Image-Model --quantization modelopt_fp4 --moe-backend marlin
+```
+"""
+    hf_config = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        },
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "intermediate_size": 2048,
+        "vocab_size": 32000,
+        "max_position_embeddings": 8192,
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+
+    monkeypatch.setattr(ac, "fetch_hf_card", lambda m: {
+        "readme": readme,
+        "config": hf_config,
+        "api": {"tags": ["nvfp4"]},
+        "fetched": [],
+        "errors": [],
+    })
+    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 12.0)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: {
+            "nodes": 1,
+            "node_list": [{"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True}],
+            "head": {"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True},
+            "workers": [],
+            "fabric_ok": False,
+            "available": True,
+        },
+    )
+
+    rec = ac.recommend("example/Docker-Image-Model", mode="workflow_max", fetch_remote=True)
+    cfg = rec["config"]
+    assert cfg["image"] == "vllm/vllm-openai:v0.28.0", (
+        f"docker pin must land on config.image early; got {cfg.get('image')!r}"
+    )
+    # Candidate extraction also surfaces image for scoring / Apply recipe UI
+    cands = rec.get("card_recipes") or []
+    assert cands, "expected card_recipes from docker snippet"
+    assert any((c.get("config") or {}).get("image") == "vllm/vllm-openai:v0.28.0" for c in cands) or any(
+        "v0.28.0" in (c.get("raw") or "") for c in cands
+    )
+
+
+def test_early_image_resolve_never_replaces_anemll():
+    """Stock card pin + capability must not replace Anemll/DSpark image."""
+    cfg = {"image": "ghcr.io/anemll/dspark-vllm-gx10:0.1.1", "quantization": "modelopt_mixed"}
+    rat: list[str] = []
+    out = ac._resolve_image_for_gates(
+        cfg,
+        mode="workflow_max",
+        candidate_image="vllm/vllm-openai:v0.28.0",
+        card_image="vllm/vllm-openai:v0.28.0",
+        detected={"has_nvfp4": True, "family": "nemotron"},
+        rationale=rat,
+        warnings=[],
+    )
+    assert out == "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    assert cfg["image"] == out
+
+
+def test_early_image_resolve_never_downgrades_lab_default():
+    """Older card docker pin must not pull lab default down."""
+    cfg: dict = {"image": "", "quantization": "modelopt_fp4", "moe_backend": "marlin"}
+    rat: list[str] = []
+    out = ac._resolve_image_for_gates(
+        cfg,
+        mode="workflow_max",
+        candidate_image="vllm/vllm-openai:v0.25.0",
+        card_image="vllm/vllm-openai:v0.25.0",
+        detected={"has_nvfp4": True},
+        rationale=rat,
+        warnings=[],
+    )
+    # lab default is ≥0.27.1; capability floor also ≥0.27.0
+    assert out.startswith("vllm/vllm-openai:")
+    ver = ac._stock_image_semver(out)
+    assert ver is not None and ver >= (0, 27, 0)
+    assert "v0.25" not in out
+
+
 def test_recommend_requires_model():
     with pytest.raises(ValueError, match="model"):
         ac.recommend("", fetch_remote=False)
@@ -966,6 +1100,132 @@ def test_multi_node_launch_clears_image_entrypoint():
         assert cmd[img_i + 1 : img_i + 2] != ["bash"]
         # the real serve command still reaches vllm
         assert "vllm" in cmd and "serve" in cmd
+        # multi-node HF cache mount + HF_HOME parity target
+        assert f":{serve.HF_CACHE_IN_CONTAINER}" in " ".join(cmd)
+        assert f"HF_HOME={serve.HF_CACHE_IN_CONTAINER}" in cmd
+
+
+def test_single_node_anemll_hf_home_and_entrypoint_parity():
+    """P0.HF_HOME_PARITY: single-node Anemll mounts host HF cache at the same
+    in-container path as multi-node and sets HF_HOME; clears ENTRYPOINT like multi-node."""
+    from app.services import serve
+    from pathlib import Path
+
+    image = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    args = serve._build_vllm_args(util=0.4, max_model_len=8192, port=8000, tensor_parallel_size=1)
+    cmd = serve.build_single_node_docker_cmd(
+        image=image,
+        model="nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        vllm_args=args,
+        env_list=["NCCL_DEBUG=WARN"],
+        container="vllm-lab-safe",
+        port=8000,
+        hf_token=None,
+    )
+    joined = " ".join(cmd)
+    host_hf = str(Path.home() / ".cache" / "huggingface")
+    assert f"{host_hf}:{serve.HF_CACHE_IN_CONTAINER}" in joined
+    assert f"HF_HOME={serve.HF_CACHE_IN_CONTAINER}" in cmd
+    # Must NOT use the old /root/.cache path (diverged from multi-node).
+    assert "/root/.cache/huggingface" not in joined
+    # Anemll entrypoint clear + bash wrapper (same pattern as multi-node).
+    assert "--entrypoint" in cmd and cmd[cmd.index("--entrypoint") + 1] == "bash"
+    img_i = cmd.index(image)
+    assert cmd[img_i + 1] == "-lc"
+    assert "vllm" in cmd and "serve" in cmd
+    assert "NCCL_DEBUG=WARN" in cmd
+
+
+def test_single_node_stock_vllm_openai_no_entrypoint_override():
+    """Stock vllm-openai keeps image ENTRYPOINT; still gets HF_HOME mount parity."""
+    from app.services import serve
+    from pathlib import Path
+
+    image = "vllm/vllm-openai:v0.27.1"
+    args = serve._build_vllm_args(util=0.4, max_model_len=4096, port=8000)
+    cmd = serve.build_single_node_docker_cmd(
+        image=image,
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        vllm_args=args,
+        env_list=[],
+        container="vllm-lab-safe",
+        port=8000,
+    )
+    joined = " ".join(cmd)
+    host_hf = str(Path.home() / ".cache" / "huggingface")
+    assert f"{host_hf}:{serve.HF_CACHE_IN_CONTAINER}" in joined
+    assert f"HF_HOME={serve.HF_CACHE_IN_CONTAINER}" in cmd
+    assert "--entrypoint" not in cmd
+    # Stock: image then model (ENTRYPOINT already vllm serve).
+    assert cmd[cmd.index(image) + 1] == "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def test_worker_docker_pull_quotes_image(monkeypatch):
+    """Worker SSH pull must shell-quote the image ref (tags/repos safe over remote sh)."""
+    from app.services import serve
+    import shlex
+
+    image = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        class R:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(serve.subprocess, "run", fake_run)
+    # Minimal launch with one worker so _launch_multi_node hits the pull path.
+    launch = {
+        "nnodes": 2,
+        "image": image,
+        "model": "m",
+        "port": 8000,
+        "head": {"rank": 0, "cmd": ["echo", "head"]},
+        "workers": [
+            {
+                "node": "spark2",
+                "ssh_host": "spark2",
+                "rank": 1,
+                "cmd": ["echo", "worker"],
+            }
+        ],
+    }
+    # Short-circuit readiness wait by making urlopen succeed immediately.
+    monkeypatch.setattr(serve.urllib.request, "urlopen", lambda *a, **k: True)
+    # Avoid writing multinode state under data/
+    monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/tmp/lail-test-mn-state.json"))
+    # _ensure_image_present first: image inspect fails → pull on head
+    calls_n = {"n": 0}
+    real_fake = fake_run
+
+    def sequenced(cmd, **kwargs):
+        calls_n["n"] += 1
+        # First call is head docker image inspect — force "not local"
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            class R:
+                returncode = 1
+                stdout = ""
+                stderr = "not found"
+            captured.append(list(cmd))
+            return R()
+        return real_fake(cmd, **kwargs)
+
+    monkeypatch.setattr(serve.subprocess, "run", sequenced)
+    serve._launch_multi_node(launch, port=8000)
+
+    ssh_pulls = [
+        c for c in captured
+        if c and c[0] == "ssh" and any("docker pull" in str(x) for x in c)
+    ]
+    assert ssh_pulls, f"expected ssh docker pull, got {captured}"
+    remote = ssh_pulls[0][-1]
+    quoted = shlex.quote(image)
+    assert quoted in remote or image in remote
+    # Image must appear as a single shell-safe token (shlex.quote form).
+    assert f"docker pull {quoted}" in remote
 
 
 def test_stop_all_kills_remote_worker_without_state_file(monkeypatch):
@@ -1044,6 +1304,179 @@ def test_family_overlay_matches_detected_family_without_id_hint():
         {"family": "minimax_m2"},
     )
     assert ov is not None and ov["family_key"] == "minimax_m2"
+
+
+def test_merge_extra_flags_dedupes_by_flag_name():
+    """Overlay merge must not emit tokenizer/config-format (or any flag) twice."""
+    merged = ac._merge_extra_flags(
+        "--tokenizer-mode mistral --config-format mistral --foo 1",
+        "--tokenizer-mode mistral --config-format mistral --block-size 128",
+    )
+    assert merged.count("--tokenizer-mode") == 1
+    assert merged.count("--config-format") == 1
+    assert "--block-size 128" in merged or "--block-size" in merged
+    assert "--foo" in merged
+
+
+def test_overlay_extra_flags_merge_no_duplicate_mistral(monkeypatch):
+    """Fill + Magistral overlay: composed extra_flags keep tokenizer/config once."""
+    ov = ac._family_overlay(
+        "mistralai/Magistral-Small-2509",
+        {"family": "mistral"},
+    )
+    assert ov is not None
+    cfg = ac._empty_config("mistralai/Magistral-Small-2509")
+    rationale: list[str] = []
+    # Simulate family fill first (adds tokenizer/config-format extras).
+    ac._fill_from_config_detection(
+        cfg,
+        {
+            "family": "mistral",
+            "quant_flag": "",
+            "architectures": ["MagistralForCausalLM"],
+            "model_type": "magistral",
+        },
+        rationale,
+    )
+    assert "--tokenizer-mode" in (cfg.get("extra_flags") or "")
+    # Overlay merge path (same as recommend).
+    overlay_cfg = ov["config"]
+    for k, v in overlay_cfg.items():
+        if k == "docker_env":
+            cfg["docker_env"] = ac._dedupe_env(list(cfg.get("docker_env") or []) + list(v))
+        elif k == "extra_flags":
+            cfg["extra_flags"] = ac._merge_extra_flags(cfg.get("extra_flags") or "", v or "")
+        else:
+            cfg[k] = v
+    ex = cfg.get("extra_flags") or ""
+    assert ex.count("--tokenizer-mode") == 1
+    assert ex.count("--config-format") == 1
+    # docker_env: same key twice collapses
+    env = ac._dedupe_env(["FOO=1", "BAR=2"] + ["FOO=3", "BAZ=9"])
+    assert env.count("FOO=3") == 1
+    assert not any(e == "FOO=1" for e in env)
+
+
+def test_minimax_overlay_label_fp8_vs_nvfp4():
+    """MiniMax M2 overlay label reflects quant suffix (not always NVFP4)."""
+    nv = ac._family_overlay("MiniMaxAI/MiniMax-M2-NVFP4", {"family": "minimax_m2"})
+    fp = ac._family_overlay("MiniMaxAI/MiniMax-M2-FP8", {"family": "minimax_m2"})
+    plain = ac._family_overlay("MiniMaxAI/MiniMax-M2", {"family": "minimax_m2"})
+    assert nv is not None and "NVFP4" in nv["label"]
+    assert fp is not None and "FP8" in fp["label"] and "NVFP4" not in fp["label"]
+    assert plain is not None and "NVFP4" not in plain["label"]
+
+
+def test_nano_9b_v2_fill_prefers_nemotron_json():
+    """Nemotron Nano-9B-v2 default tool parser is nemotron_json (not qwen3_coder)."""
+    cfg = ac._empty_config("nvidia/NVIDIA-Nemotron-Nano-9B-v2")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {
+            "family": "nemotron",
+            "quant_flag": "",
+            "architectures": ["NemotronHForCausalLM"],
+            "model_type": "nemotron_h",
+        },
+        rationale,
+    )
+    assert cfg["tool_call_parser"] == "nemotron_json"
+    assert cfg.get("enable_auto_tool_choice") is True
+    # Nano-v2 cards usually omit reasoning_parser; do not force nemotron_v3.
+    assert cfg.get("reasoning_parser") in ("", None)
+
+
+def test_nano_9b_v2_nvfp4_fill_prefers_nemotron_json():
+    cfg = ac._empty_config("nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {"family": "nemotron", "quant_flag": "modelopt_fp4", "architectures": [], "model_type": ""},
+        rationale,
+    )
+    assert cfg["tool_call_parser"] == "nemotron_json"
+
+
+def test_lightning_nemotron_keeps_qwen3_coder():
+    """Lightning / Nemotron-3.x path still defaults to qwen3_coder."""
+    cfg = ac._empty_config("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {
+            "family": "nemotron",
+            "quant_flag": "modelopt_mixed",
+            "architectures": [],
+            "model_type": "nemotron_h",
+        },
+        rationale,
+    )
+    assert cfg["tool_call_parser"] == "qwen3_coder"
+    assert cfg["reasoning_parser"] == "nemotron_v3"
+
+
+def test_harvest_nemotron_json_from_tool_focused_card_recipe():
+    """When winning recipe lacks tools, harvest nemotron_json from a tool-focused alt."""
+    from app.services.autoconfig import ServeCandidate
+
+    cfg = ac._empty_config("nvidia/NVIDIA-Nemotron-Nano-9B-v2")
+    # Winning bare recipe (no tool parser)
+    bare = ServeCandidate(
+        raw="vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 --trust-remote-code",
+        env=[],
+        model="nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        args=["--trust-remote-code"],
+        config={"trust_remote_code": True, "docker_env": []},
+        score=80.0,
+        section="vLLM Run",
+        reasons=[],
+    )
+    tool = ServeCandidate(
+        raw=(
+            "vllm serve nvidia/NVIDIA-Nemotron-Nano-9B-v2 "
+            "--enable-auto-tool-choice "
+            '--tool-parser-plugin "NVIDIA-Nemotron-Nano-9B-v2/nemotron_toolcall_parser_no_streaming.py" '
+            '--tool-call-parser "nemotron_json"'
+        ),
+        env=[],
+        model="nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        args=[
+            "--enable-auto-tool-choice",
+            "--tool-parser-plugin",
+            "NVIDIA-Nemotron-Nano-9B-v2/nemotron_toolcall_parser_no_streaming.py",
+            "--tool-call-parser",
+            "nemotron_json",
+        ],
+        config={
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "nemotron_json",
+            "extra_flags": (
+                "--tool-parser-plugin "
+                "NVIDIA-Nemotron-Nano-9B-v2/nemotron_toolcall_parser_no_streaming.py"
+            ),
+            "docker_env": [],
+        },
+        score=40.0,
+        section="Using Tool-Calling with a vLLM Server",
+        reasons=[],
+    )
+    ac._apply_card_candidate(cfg, bare)
+    rationale: list[str] = []
+    ac._harvest_tool_flags_from_candidates(cfg, [bare, tool], rationale)
+    assert cfg["tool_call_parser"] == "nemotron_json"
+    assert cfg.get("enable_auto_tool_choice") is True
+    assert "--tool-parser-plugin" in (cfg.get("extra_flags") or "")
+    assert any("nemotron_json" in r for r in rationale)
+
+
+def test_card_prose_hints_nemotron_json():
+    prose = ac._card_prose_hints(
+        "Start with --enable-auto-tool-choice and --tool-call-parser nemotron_json for tools."
+    )
+    assert prose.get("tool_call_parser") == "nemotron_json"
+    assert prose.get("enable_auto_tool_choice") is True
+
 
 def test_size_memory_clamps_huge_context_single_node():
     cfg = {
@@ -1299,4 +1732,254 @@ def test_config_quant_overrides_ampere_prose_modelopt_fp4():
     rationale: list[str] = []
     ac._fill_from_config_detection(base, detected, rationale)
     assert base["quantization"] == "modelopt_mixed"
+
+
+# ─── GitHub cookbook fetch when card is recipe-poor ──────────────────────────
+
+
+def test_find_cookbook_urls_prefers_vllm_skips_other_frameworks():
+    readme = (FIX / "card_recipe_poor.md").read_text()
+    urls = ac.find_cookbook_urls(readme)
+    assert urls, "expected at least one vLLM cookbook URL"
+    joined = " ".join(urls).lower()
+    assert "vllm_cookbook" in joined or "spark_vllm" in joined
+    assert "trtllm" not in joined
+    assert "sglang" not in joined
+
+
+def test_github_blob_to_raw_url():
+    blob = (
+        "https://github.com/NVIDIA-NeMo/Nemotron/blob/main/"
+        "usage-cookbook/Example/vllm_cookbook.ipynb"
+    )
+    raw = ac.github_blob_to_raw_url(blob)
+    assert raw == (
+        "https://raw.githubusercontent.com/NVIDIA-NeMo/Nemotron/main/"
+        "usage-cookbook/Example/vllm_cookbook.ipynb"
+    )
+    # already-raw stays stable
+    assert ac.github_blob_to_raw_url(raw) == raw
+
+
+def test_notebook_source_text_extracts_vllm_serve():
+    nb = (FIX / "cookbook_vllm_body.ipynb").read_text()
+    text = ac.notebook_source_text(nb)
+    assert "vllm serve" in text.lower()
+    assert "modelopt" in text
+    # plain markdown is returned unchanged
+    md = "# hi\nvllm serve x\n"
+    assert ac.notebook_source_text(md) == md
+
+
+def test_candidates_recipe_poor_empty_and_bare():
+    assert ac.candidates_recipe_poor([]) is True
+    bare = ac.ServeCandidate(
+        raw="vllm serve org/model",
+        args=[],
+        config=ac._empty_config("org/model"),
+        section="usage",
+        score=1.0,
+        reasons=[],
+    )
+    assert ac.candidates_recipe_poor([bare]) is True
+    rich_cfg = ac._empty_config("org/model")
+    rich_cfg["quantization"] = "modelopt"
+    rich_cfg["moe_backend"] = "marlin"
+    rich = ac.ServeCandidate(
+        raw="vllm serve org/model --quantization modelopt --moe-backend marlin",
+        args=["--quantization", "modelopt", "--moe-backend", "marlin"],
+        config=rich_cfg,
+        section="DGX Spark",
+        score=80.0,
+        reasons=["quant"],
+    )
+    assert ac.candidates_recipe_poor([rich]) is False
+
+
+def test_recommend_fetches_cookbook_when_card_recipe_poor(monkeypatch):
+    """README has no vllm serve; linked cookbook body supplies the recipe offline."""
+    readme = (FIX / "card_recipe_poor.md").read_text()
+    cookbook_md = (FIX / "cookbook_vllm_body.md").read_text()
+    cookbook_nb = (FIX / "cookbook_vllm_body.ipynb").read_text()
+    hf_config = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "intermediate_size": 2048,
+        "vocab_size": 32000,
+        "max_position_embeddings": 65536,
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+
+    def fake_fetch(model_id: str, timeout: float = 20.0):
+        return {
+            "model_id": model_id,
+            "readme": readme,
+            "config": hf_config,
+            "api": {"tags": ["nvfp4"]},
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [f"https://huggingface.co/{model_id}/raw/main/README.md"],
+        }
+
+    def fake_cookbook(url: str, *, timeout: float = 12.0, max_bytes: int = 1_500_000):
+        # Mirror real fetch_cookbook_text: flatten notebooks to cell source text.
+        u = url.lower()
+        if u.endswith(".ipynb") or "vllm_cookbook" in u:
+            return ac.notebook_source_text(cookbook_nb), None
+        if u.endswith(".md") or "spark_vllm" in u:
+            return cookbook_md, None
+        return None, f"unmocked cookbook URL: {url}"
+
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 18.0)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: {
+            "nodes": 1,
+            "node_list": [{"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True}],
+            "head": {"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True},
+            "workers": [],
+            "fabric_ok": False,
+            "available": True,
+        },
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend("example/Cookbook-Model-NVFP4", mode="lab_safe", fetch_remote=True)
+    assert rec["from_website"] is True
+    cfg = rec["config"]
+    assert cfg.get("quantization") in ("modelopt", "modelopt_fp4", "modelopt_mixed") or (
+        cfg.get("quantization") or ""
+    ).startswith("modelopt")
+    assert cfg.get("kv_cache_dtype") == "fp8" or cfg.get("reasoning_parser")
+    # Cookbook must appear in sources
+    kinds = {s.get("kind") for s in (rec.get("sources") or [])}
+    refs = " ".join(s.get("ref") or "" for s in (rec.get("sources") or []))
+    assert "github_cookbook" in kinds, rec.get("sources")
+    assert "cookbook" in refs.lower() or "vllm" in refs.lower()
+    # Parsed recipes must surface for UI
+    assert rec.get("card_recipes"), "expected cookbook-derived card_recipes"
+    assert any(
+        "modelopt" in (c.get("raw") or "").lower()
+        or (c.get("config") or {}).get("quantization")
+        for c in rec["card_recipes"]
+    )
+
+
+def test_cookbook_fetch_failure_does_not_brick_recommend(monkeypatch):
+    """Timeout/offline cookbook must not raise; recommend still returns."""
+    readme = (FIX / "card_recipe_poor.md").read_text()
+    hf_config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        "num_hidden_layers": 2,
+        "hidden_size": 512,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "intermediate_size": 1024,
+        "vocab_size": 32000,
+        "max_position_embeddings": 8192,
+    }
+
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda m, timeout=20.0: {
+            "model_id": m,
+            "readme": readme,
+            "config": hf_config,
+            "api": {},
+            "card_url": f"https://huggingface.co/{m}",
+            "errors": [],
+            "fetched": [],
+        },
+    )
+    monkeypatch.setattr(
+        ac,
+        "fetch_cookbook_text",
+        lambda url, **kw: (None, "TimeoutError: forced"),
+    )
+    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 8.0)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: {
+            "nodes": 1,
+            "node_list": [{"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True}],
+            "head": {"name": "spark-1", "ram_gib": 121.7, "online": True, "local": True},
+            "workers": [],
+            "fabric_ok": False,
+            "available": True,
+        },
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend("example/Offline-Cookbook", mode="lab_safe", fetch_remote=True)
+    assert "config" in rec
+    assert rec["config"].get("model") == "example/Offline-Cookbook"
+    # Soft warning, not a hard failure
+    assert any("cookbook" in (w or "").lower() for w in (rec.get("warnings") or [])) or any(
+        "cookbook" in (r or "").lower() for r in (rec.get("rationale") or [])
+    )
+
+
+def test_family_overlay_not_overridden_by_cookbook(monkeypatch):
+    """Even with cookbook recipes available, family overlay still owns config."""
+    readme = (FIX / "card_recipe_poor.md").read_text()
+    cookbook_md = (FIX / "cookbook_vllm_body.md").read_text()
+
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda m, timeout=20.0: {
+            "model_id": m,
+            "readme": readme,
+            "config": {"architectures": ["DeepseekV3ForCausalLM"], "model_type": "deepseek_v3"},
+            "api": {},
+            "card_url": f"https://huggingface.co/{m}",
+            "errors": [],
+            "fetched": [],
+        },
+    )
+    called = {"n": 0}
+
+    def fake_cookbook(url: str, **kw):
+        called["n"] += 1
+        return cookbook_md, None
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    # Real DSv4 overlay path
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 40.0)
+    monkeypatch.setattr(ac, "_cluster_topology", _two_spark_topo)
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend(DSV4, mode="workflow_max", fetch_remote=True)
+    # Overlay path skips card/cookbook candidate fill entirely
+    assert called["n"] == 0, "must not fetch cookbooks when family overlay matches"
+    assert any(s.get("kind") == "family_overlay" for s in (rec.get("sources") or []))
+    assert (rec["config"].get("image") or "").startswith("ghcr.io/anemll/dspark-vllm-gx10")
+    assert rec["config"].get("kv_cache_dtype") == "nvfp4_ds_mla"
 

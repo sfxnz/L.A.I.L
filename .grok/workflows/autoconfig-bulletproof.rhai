@@ -12,18 +12,22 @@ let meta = #{
 };
 
 // ── args ────────────────────────────────────────────────────────────────────
-// args.repo   — absolute path to the lail worktree (required)
-// args.loop   — max harden rounds after first implement+verify (default 3)
-// args.skip_live — if true, skip Hub-live recommend matrix (default false)
+// args.repo       — absolute path to the lail worktree (required)
+// args.rounds     — max harden rounds after first implement+verify (default 3)
+// args.skip_live  — if true, skip Hub-live recommend matrix (default false)
 
 let repo = if args == () { () } else { args.repo };
 if repo == () {
     pause("verification", "Pass args.repo — absolute path to the auto-config-bug (or lail) worktree.");
 }
 
-let max_loops = 3;
-if args != () && args.loop != () {
-    max_loops = args.loop;
+let max_rounds = 3;
+if args != () && args.rounds != () {
+    // Coerce JSON number safely for dry-run / live.
+    max_rounds = args.rounds;
+    if max_rounds < 1 {
+        max_rounds = 1;
+    }
 }
 let skip_live = false;
 if args != () && args.skip_live == true {
@@ -151,11 +155,15 @@ let inv = agent(inv_prompt, #{
     output_schema: gaps_schema,
 });
 
-if inv == () || !inv.success || inv.output == () {
+if inv == () || inv.success != true || inv.output == () {
     pause("infra", "Inventory agent failed — resume to retry or inspect /workflows.");
 }
 
-log("Inventory: P0=" + inv.output.p0.len().to_string() + " P1=" + inv.output.p1.len().to_string());
+let p0_n = 0;
+let p1_n = 0;
+if inv.output.p0 != () { p0_n = inv.output.p0.len(); }
+if inv.output.p1 != () { p1_n = inv.output.p1.len(); }
+log("Inventory: P0=" + p0_n.to_string() + " P1=" + p1_n.to_string());
 
 // Fixed workstream list — script owns scope; inventory informs prompts but cannot expand forever.
 let streams = [
@@ -222,8 +230,12 @@ for s in streams {
         output_schema: impl_schema,
     });
 
-    if r != () && r.success && r.output != () {
-        let line = s.id + ": done=" + r.output.done.to_string() + " — " + r.output.summary;
+    if r != () && r.success == true && r.output != () {
+        let done_s = "false";
+        if r.output.done == true { done_s = "true"; }
+        let sum = "";
+        if r.output.summary != () { sum = r.output.summary; }
+        let line = s.id + ": done=" + done_s + " — " + sum;
         stream_summaries.push(line);
         log(line);
     } else {
@@ -253,7 +265,7 @@ let merge = agent(integ_prompt, #{
     output_schema: impl_schema,
 });
 
-if merge != () && merge.success {
+if merge != () && merge.success == true && merge.output != () && merge.output.summary != () {
     log("Integration: " + merge.output.summary);
 } else {
     log("Integration agent failed — verify phase will expose gaps");
@@ -267,15 +279,15 @@ let verify_prompt = "";
 verify_prompt += "Verify auto-config bulletproof progress in " + repo + "\n\n";
 verify_prompt += "1. Run: " + se_cd + "python -m pytest tests/ -q --tb=short\n";
 verify_prompt += "2. Confirm corpus cases under tests/corpus/ (list dirs + case.json expects for serve_blocked/weights where relevant)\n";
-if !skip_live {
+if skip_live == true {
+    verify_prompt += "3. skip_live=true — do not hit Hub; mark live_ok=true only if offline corpus covers Nemotron+others\n";
+} else {
     verify_prompt += "3. Live recommend matrix (workflow_max) for:\n";
     verify_prompt += "   - nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 (must: weights~20, blocked=false, marlin, DSpark draft, modelopt_mixed)\n";
     verify_prompt += "   - unsloth/Qwen3.6-35B-A3B-NVFP4 (no flashinfer_b12x, compressed-tensors)\n";
     verify_prompt += "   - nvidia/Qwen3.6-27B-NVFP4\n";
     verify_prompt += "   - deepseek-ai/DeepSeek-V4-Flash (Anemll overlay TP=2 if 2 nodes)\n";
     verify_prompt += "   Report weights_gib, serve_blocked, quant, moe, image, $ in extra_flags\n";
-} else {
-    verify_prompt += "3. skip_live=true — do not hit Hub; mark live_ok=true only if offline corpus covers Nemotron+others\n";
 }
 verify_prompt += "4. Set pytest_pass from real pytest exit code. List concrete failures.\n";
 verify_prompt += "5. live_ok=false if any critical model is wrongly blocked or has $VARS or missing DSpark on Lightning.\n";
@@ -290,9 +302,9 @@ let ver = agent(verify_prompt, #{
 let pytest_pass = false;
 let live_ok = false;
 let failures = [];
-if ver != () && ver.success && ver.output != () {
-    pytest_pass = ver.output.pytest_pass;
-    live_ok = ver.output.live_ok;
+if ver != () && ver.success == true && ver.output != () {
+    if ver.output.pytest_pass == true { pytest_pass = true; }
+    if ver.output.live_ok == true { live_ok = true; }
     if ver.output.failures != () {
         failures = ver.output.failures;
     }
@@ -307,23 +319,30 @@ phase("Harden");
 // ═══════════════════════════════════════════════════════════════════════════
 
 let round = 0;
-while round < max_loops {
-    if pytest_pass && live_ok {
+while round < max_rounds {
+    // Explicit bool compares — dry-run canned outputs can leave () on schema fields.
+    let both_green = false;
+    if pytest_pass == true {
+        if live_ok == true {
+            both_green = true;
+        }
+    }
+    if both_green == true {
         log("All green — skipping further harden rounds");
         break;
     }
     round += 1;
-    log("Harden round " + round.to_string() + "/" + max_loops.to_string());
+    log("Harden round " + round.to_string() + "/" + max_rounds.to_string());
 
     let fail_blob = json_encode(failures);
     let fix_prompt = "";
     fix_prompt += "Fix remaining auto-config failures in " + repo + "\n";
-    fix_prompt += "Round " + round.to_string() + " of " + max_loops.to_string() + "\n";
+    fix_prompt += "Round " + round.to_string() + " of " + max_rounds.to_string() + "\n";
     fix_prompt += "pytest_pass=" + pytest_pass.to_string() + " live_ok=" + live_ok.to_string() + "\n";
     fix_prompt += "Failures JSON: " + fail_blob + "\n\n";
     fix_prompt += "Rules: surgical fixes only; run pytest after; preserve Nemotron 20GiB/DSpark/marlin fixes.\n";
     fix_prompt += "Commands: " + se_cd + "python -m pytest tests/ -q --tb=short\n";
-    if !skip_live {
+    if skip_live != true {
         fix_prompt += "Re-check live Lightning recommend after fixes.\n";
     }
 
@@ -338,10 +357,10 @@ while round < max_loops {
     let re_prompt = "";
     re_prompt += "Re-verify after harden round " + round.to_string() + " in " + repo + "\n";
     re_prompt += "Run: " + se_cd + "python -m pytest tests/ -q --tb=line\n";
-    if !skip_live {
-        re_prompt += "Live: recommend Lightning 30B workflow_max — blocked=false, weights 15-30, marlin, DSpark model present, no $ in extras.\n";
-    } else {
+    if skip_live == true {
         re_prompt += "skip_live: set live_ok from corpus Nemotron case only.\n";
+    } else {
+        re_prompt += "Live: recommend Lightning 30B workflow_max — blocked=false, weights 15-30, marlin, DSpark model present, no $ in extras.\n";
     }
     re_prompt += "Return accurate pytest_pass/live_ok/failures.\n";
 
@@ -352,9 +371,11 @@ while round < max_loops {
         output_schema: verify_schema,
     });
 
-    if re != () && re.success && re.output != () {
-        pytest_pass = re.output.pytest_pass;
-        live_ok = re.output.live_ok;
+    if re != () && re.success == true && re.output != () {
+        pytest_pass = false;
+        live_ok = false;
+        if re.output.pytest_pass == true { pytest_pass = true; }
+        if re.output.live_ok == true { live_ok = true; }
         failures = [];
         if re.output.failures != () {
             failures = re.output.failures;
@@ -364,7 +385,7 @@ while round < max_loops {
         failures.push("reverify failed round " + round.to_string());
     }
 
-    if fix != () && fix.success && fix.output != () {
+    if fix != () && fix.success == true && fix.output != () && fix.output.summary != () {
         log("Harden summary: " + fix.output.summary);
     }
 }
@@ -399,13 +420,19 @@ if inv.output.p0 != () {
 }
 report += "\n## Next steps if not green\n";
 report += "- Re-run: /workflow autoconfig-bulletproof with higher agent_budget\n";
-report += "- Or set args.loop higher and resume with raised budget\n";
+report += "- Or set args.rounds higher and resume with raised budget\n";
 report += "- Manual: " + se_cd + "python -m pytest tests/ -q\n";
 
 let report_path = write_scratch_file("autoconfig-bulletproof-report.md", report);
 log("Report written: " + report_path);
 
-if pytest_pass && live_ok {
+let final_green = false;
+if pytest_pass == true {
+    if live_ok == true {
+        final_green = true;
+    }
+}
+if final_green == true {
     complete(#{
         status: "green",
         pytest_pass: true,

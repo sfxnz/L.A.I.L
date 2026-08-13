@@ -772,7 +772,9 @@ def serve_model(
     except RuntimeError:
         raise
     except Exception as e:
-        w(f"fit-gate probe failed ({e}); continuing Start", 0.12)
+        raise RuntimeError(
+            f"SERVE BLOCKED: fit-gate probe failed ({e}). Refusing Start."
+        ) from e
 
     env_list = _normalize_docker_env(docker_env)
 
@@ -860,10 +862,16 @@ def serve_model(
 
     # Multi-node (TP across Sparks): build per-node launch + orchestrate head/workers.
     if tp_n >= 2:
-        from .autoconfig import _cluster_topology, plan_placement, estimate_weights_gib
+        from .autoconfig import (
+            _cluster_topology,
+            estimate_weights_gib,
+            load_local_fallback,
+            plan_placement,
+        )
 
         topo = _cluster_topology()
-        weights = estimate_weights_gib(model, None)
+        local = load_local_fallback(model)
+        weights = estimate_weights_gib(model, local.get("config"))
         plan = plan_placement(weights, topo, mode=mode, overlay=None)
         if plan["nodes_available"] < tp_n:
             raise RuntimeError(

@@ -1,5 +1,7 @@
 "use client";
 
+import { tokenQuery } from "./auth-token";
+
 type Handler = (event: Record<string, unknown>, channel: string) => void;
 
 let socket: WebSocket | null = null;
@@ -42,7 +44,8 @@ export function connectWs() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
     return socket;
   }
-  const url = wsUrl();
+  let url = wsUrl();
+  if (url) url = tokenQuery(url);
   socket = new WebSocket(url);
   socket.onmessage = (ev) => {
     try {

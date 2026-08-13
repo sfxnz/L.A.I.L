@@ -19,10 +19,12 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 |------|------|------|
 | **Status** | `/status` | Health, headroom, containers, recent runs |
 | **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
+| **Models** | `/models` | Hugging Face search + local `/v1/models` |
 | **Evals** | `/evals` | Smoke + perf jobs + run history |
+| **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
 | **Configure** | `/configure` | Default backend / model |
 
-`/` redirects to **Status** (`apps/web/app/page.tsx`). After a model is up, open **`/connect`** for Hermes / OpenAI base URL snippets (not in the top nav). `/workbench` is a retirement notice — Hermes is the agent.
+`/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench` is a retirement notice — Hermes is the agent. `/integrations` is not shipped.
 
 ## Architecture
 
@@ -177,6 +179,9 @@ See [`.env.example`](./.env.example).
 | `LAIL_DATA_DIR` / `LAIL_WORKSPACES_DIR` | Data + project roots |
 | `HF_TOKEN` | Optional gated HF access |
 | `LAIL_CLUSTER_JSON` | Optional. Unset = one local node. See `.env.example` for a 2-node EXAMPLE |
+| `LAIL_HOST` | Bind address. Default `127.0.0.1`. Off-loopback requires `LAIL_TOKEN` |
+| `LAIL_TOKEN` | Shared secret when bound off-loopback (`Authorization: Bearer` or `X-Lail-Token`) |
+| `LAIL_CORS_ORIGINS` | Extra CORS origins when the UI is not on localhost |
 | `LAIL_DEV_ORIGINS` | Optional extra Next.js `allowedDevOrigins` (loopback is already allowed) |
 
 ## Retired: Workbench
@@ -224,16 +229,25 @@ python3 -m pytest packages/serve-engine/tests -q
 - `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), shell source, mentions
 - `packages/backend` tests — agent runtime, patches, context packer
 - `packages/serve-engine` pytest — auto-config, cluster, captured corpus
+- Python runtime pins: `packages/serve-engine/requirements.txt` (`uv pip compile packages/serve-engine/pyproject.toml -o packages/serve-engine/requirements.txt`)
 
 Those tests do **not** assert a `/` → Workbench redirect. `/` redirects to `/status`.
 
-## Docker Compose
+## Docker Compose (console only)
+
+`docker compose up` starts the **web + controller + serve-engine API**. It does **not** serve a model:
+
+- the serve-engine image has no Docker CLI and no NVIDIA runtime
+- there is no GPU vLLM service in the compose file
+- **Serve → Start** will not launch a container from inside compose
+
+Use this stack to browse Status / Connect and to talk to a vLLM you already run on the host (`LAIL_VLLM_URL`, default `host.docker.internal:8000`). To Start a model from the UI, run `bun run dev` on a Linux+NVIDIA host with Docker and the NVIDIA Container Toolkit.
+
+Host ports are published on `127.0.0.1` only. Remapping them to `0.0.0.0` without `LAIL_TOKEN` exposes start/stop Docker and shell tools on the LAN.
 
 ```bash
 docker compose up --build
 ```
-
-Run vLLM or llama.cpp on the host; set `LAIL_VLLM_URL` / `LAIL_LLAMACPP_URL` (compose uses `host.docker.internal` by default).
 
 ## License
 

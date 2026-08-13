@@ -1,9 +1,16 @@
 import { createApp } from "./app";
+import { assertSafeBind, tokenMatches } from "./bind";
 import { config } from "./config";
 import { getDb } from "./db/schema";
 import { ensureDefaultWorkspace } from "./controller/workspaces";
 import { wsHub } from "./ws/hub";
 import { mkdirSync } from "fs";
+
+assertSafeBind({
+  host: config.host,
+  token: config.token,
+  allowInsecure: config.allowInsecureBind,
+});
 
 mkdirSync(config.dataDir, { recursive: true });
 mkdirSync(config.workspacesDir, { recursive: true });
@@ -20,6 +27,9 @@ const server = Bun.serve<WsData>({
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === "/ws") {
+      if (config.token && !tokenMatches(req, config.token)) {
+        return new Response("unauthorized", { status: 401 });
+      }
       const ok = server.upgrade(req, { data: { id: crypto.randomUUID() } });
       if (ok) return undefined as unknown as Response;
       return new Response("WebSocket upgrade failed", { status: 400 });

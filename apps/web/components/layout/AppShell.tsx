@@ -4,13 +4,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Activity,
+  Boxes,
   FlaskConical,
   LayoutDashboard,
+  Plug,
   Server,
   Settings2,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { setClientToken } from "@/lib/auth-token";
 import { useLabStore } from "@/lib/store";
 import { WORKSPACE_NAV } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
@@ -21,7 +24,9 @@ import { ThemeToggle } from "@/components/animus/ThemeToggle";
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   Status: LayoutDashboard,
   Serve: Server,
+  Models: Boxes,
   Evals: FlaskConical,
+  Connect: Plug,
   Configure: Settings2,
 };
 
@@ -32,6 +37,7 @@ const PAGE_TITLES: Array<{ match: (p: string) => boolean; title: string }> = [
   { match: (p) => p.startsWith("/configure"), title: "Configure" },
   { match: (p) => p.startsWith("/status") || p === "/", title: "Status" },
   { match: (p) => p.startsWith("/connect"), title: "Connect" },
+  { match: (p) => p.startsWith("/models"), title: "Models" },
   { match: (p) => p.startsWith("/lab"), title: "Lab" },
   { match: (p) => p.startsWith("/workbench"), title: "Workbench" },
 ];
@@ -56,6 +62,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [serveOk, setServeOk] = useState<boolean | null>(null);
   const [avail, setAvail] = useState<string | null>(null);
   const [probeNote, setProbeNote] = useState("Checking lab…");
+  const [needToken, setNeedToken] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState("");
 
   useEffect(() => {
     const hit = PAGE_TITLES.find((t) => t.match(pathname || "/"));
@@ -67,6 +75,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       api
         .labStatus()
         .then((s) => {
+          setNeedToken(false);
           setHealthy(true);
           const ok = !!(s.serve && !s.serve.unreachable && s.serve.healthy);
           setServeOk(ok);
@@ -87,11 +96,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               : "Controller up · no vLLM serve",
           );
         })
-        .catch(() => {
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          const unauthorized = /401|unauthorized|LAIL_TOKEN/i.test(msg);
           setHealthy(false);
           setServeOk(false);
           setAvail(null);
-          setProbeNote("Controller offline — start bun run dev");
+          setNeedToken(unauthorized);
+          setProbeNote(
+            unauthorized
+              ? "LAIL_TOKEN required — enter it below"
+              : "Controller offline — start bun run dev",
+          );
         });
     };
     tick();
@@ -169,7 +185,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     </>
                   )}
                   <Icon className="relative h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden />
-                  <span className="relative">{label}</span>
+                  <span className="relative hidden lg:inline">{label}</span>
                 </Link>
               );
             })}
@@ -249,6 +265,36 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <ThemeToggle />
         </div>
       </header>
+
+      {needToken && (
+        <form
+          className="relative z-20 flex shrink-0 items-center gap-2 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] px-4 py-2 md:px-6"
+          onSubmit={(e) => {
+            e.preventDefault();
+            setClientToken(tokenDraft);
+            setNeedToken(false);
+            window.location.reload();
+          }}
+        >
+          <label className="font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-lab-muted">
+            Token
+          </label>
+          <input
+            type="password"
+            autoComplete="off"
+            value={tokenDraft}
+            onChange={(e) => setTokenDraft(e.target.value)}
+            placeholder="LAIL_TOKEN"
+            className="min-w-0 flex-1 border border-[color:var(--animus-hairline)] bg-transparent px-2 py-1 font-mono text-[12px]"
+          />
+          <button
+            type="submit"
+            className="shrink-0 bg-lab-accent px-2 py-1 font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-white"
+          >
+            Store
+          </button>
+        </form>
+      )}
 
       <main id="main" className="relative z-10 min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
         <div className="mx-auto max-w-6xl px-4 py-5 md:px-6 md:py-6">{children}</div>

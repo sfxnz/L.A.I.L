@@ -1,3 +1,10 @@
+# Console only. This stack does NOT start a GPU vLLM container.
+# The serve-engine image has no Docker CLI and no NVIDIA runtime.
+# Use `bun run dev` on a Linux+NVIDIA host to Start a model, or point
+# LAIL_VLLM_URL at a vLLM you already run on the host.
+#
+# Host ports are published on 127.0.0.1. Remapping to 0.0.0.0:PORT:PORT
+# without LAIL_TOKEN exposes start/stop Docker and shell tools on the LAN.
 services:
   api:
     build:
@@ -5,9 +12,11 @@ services:
       dockerfile: Dockerfile
       target: api
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     environment:
       LAIL_HOST: 0.0.0.0
+      LAIL_INSECURE_BIND: "1"
+      LAIL_TOKEN: ${LAIL_TOKEN:-}
       LAIL_API_PORT: 8787
       LAIL_SERVE_ENGINE_URL: http://serve-engine:8765
       LAIL_DEFAULT_BACKEND: vllm
@@ -29,11 +38,15 @@ services:
       dockerfile: Dockerfile
       target: serve-engine
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
     environment:
       LOCAL_AI_LAB_ROOT: /app
       LAIL_DATA_DIR: /data
       LAB_API_PORT: 8765
+      LAB_HOST: 0.0.0.0
+      LAIL_HOST: 0.0.0.0
+      LAIL_INSECURE_BIND: "1"
+      LAIL_TOKEN: ${LAIL_TOKEN:-}
       LAB_BASE_URL: http://host.docker.internal:8000
     volumes:
       - lail-data:/data
@@ -47,7 +60,7 @@ services:
       dockerfile: Dockerfile
       target: web
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       LAIL_API_URL: http://api:8787
       NEXT_PUBLIC_LAIL_API: http://localhost:8787

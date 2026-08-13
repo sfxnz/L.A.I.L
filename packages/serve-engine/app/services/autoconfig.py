@@ -1651,6 +1651,36 @@ def _parse_card_image_requirement(readme: str | None) -> str | None:
     return (spark_hits or other or [None])[0]
 
 
+def _card_has_only_floating_image(readme: str | None) -> bool:
+    """True when the card mentions a vLLM image but every tag is nightly/latest."""
+    if not readme:
+        return False
+    tagged = 0
+    floating = 0
+    for m in _CARD_IMAGE_RE.finditer(readme):
+        ref = m.group(0)
+        if ":" not in ref:
+            continue
+        tagged += 1
+        tag = ref.split(":", 1)[1].lower()
+        if tag in ("latest", "nightly") or tag.startswith("nightly"):
+            floating += 1
+    return tagged > 0 and floating == tagged
+
+
+def _warn_floating_card_image(
+    readme: str | None, lab_default: str, warnings: list[str]
+) -> None:
+    if not _card_has_only_floating_image(readme):
+        return
+    msg = (
+        f"Card only pins vllm/vllm-openai:nightly (or :latest); staying on lab default "
+        f"{lab_default}. New architectures on that card may fail to load until a dated tag exists."
+    )
+    if msg not in warnings:
+        warnings.append(msg)
+
+
 def _semver_tuple(tag: str) -> tuple[int, ...]:
     t = tag.lstrip("vV")
     nums = re.findall(r"\d+", t)
@@ -2399,23 +2429,24 @@ def _marlin_unsafe_for_checkpoint(
     Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
 
-    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE is
-    generally fine on ≥0.27; on older images treat non-Nemotron marlin as unsafe.
-    Qwen MoE still rejects marlin. Mixed FP8+NVFP4 should leave moe auto.
+    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE
+    (including Qwen) is legal on ≥0.27; on older images treat non-Nemotron
+    marlin as unsafe. Mixed FP8+NVFP4 should leave moe auto. Qwen MoE
+    without a proven NVFP4 layout still rejects marlin.
     """
     if not detected:
         return True
     family = detected.get("family") or ""
     if family == "nemotron":
         return False
-    if family == "qwen":
-        return True
     if detected.get("is_mixed_nvfp4_fp8"):
         return True
-    # Pure NVFP4 MoE: keep marlin on ≥0.27 (SM121); strip on older stock images.
+    # Pure NVFP4 MoE (including Qwen): keep marlin on ≥0.27 (SM121).
     if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
         if _image_at_least(image, 0, 27, 0):
             return False
+        return True
+    if family == "qwen":
         return True
     if detected.get("is_moe"):
         return True
@@ -3058,7 +3089,6 @@ def _fill_from_config_detection(
     """Only fill gaps using HF config.json / API tags — not lab override recipes."""
     det_q = (detected.get("quant_flag") or "").strip()
     cur_q = (base.get("quantization") or "").strip()
-    modelopt_sibs = {"modelopt", "modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"}
     if det_q:
         if not cur_q:
             base["quantization"] = det_q
@@ -3066,18 +3096,14 @@ def _fill_from_config_detection(
                 f"HF config/tags → --quantization {det_q} "
                 f"(card serve line had no --quantization)"
             )
-        elif (
-            cur_q.lower() in modelopt_sibs
-            and det_q.lower() in modelopt_sibs
-            and cur_q.lower() != det_q.lower()
-            and (
-                detected.get("quant_algo")
-                or detected.get("has_modelopt_layers")
-                or detected.get("is_mixed_nvfp4_fp8")
-            )
+        elif cur_q.lower() != det_q.lower() and (
+            detected.get("quant_algo")
+            or detected.get("has_modelopt_layers")
+            or detected.get("is_mixed_nvfp4_fp8")
+            or detected.get("quant_method")
         ):
-            # Card prose / Ampere section often mentions modelopt_fp4; config.json
-            # MIXED_PRECISION (or layered ModelOpt) is authoritative for the sibling.
+            # config.json is ground truth for layout: ModelOpt siblings, and
+            # card compressed-tensors vs config modelopt_* (or the reverse).
             base["quantization"] = det_q
             rationale.append(
                 f"HF config.json overrides card/prose quant {cur_q} → {det_q}"
@@ -3657,6 +3683,7 @@ def recommend(
         rationale=rationale,
         warnings=warnings,
     )
+    _warn_floating_card_image(readme, _lab_default_image(mode), warnings)
 
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)

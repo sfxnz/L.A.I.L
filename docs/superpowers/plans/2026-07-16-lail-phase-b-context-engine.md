@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md`
 
-**Always:** `export PATH="$HOME/.bun/bin:$PATH"` before bun commands. Work from `/home/sfxnz/projects/ai-lab/local-ai-lab` on branch `feat/phase-a-agent-platform` (or a new `feat/phase-b-context` branched from it).
+**Always:** `export PATH="$HOME/.bun/bin:$PATH"` before bun commands. Work from `<repo-root>` on branch `feat/phase-a-agent-platform` (or a new `feat/phase-b-context` branched from it).
 
 ---
 
@@ -613,9 +613,9 @@ Selection optional enhancement: if `taRef` has selectionStart/End and active fil
 
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend && bun test
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/apps/web && bun test
-cd /home/sfxnz/projects/ai-lab/local-ai-lab && bun run typecheck
+cd <repo-root>/packages/backend && bun test
+cd <repo-root>/apps/web && bun test
+cd <repo-root> && bun run typecheck
 ```
 
 Expected: all PASS.

@@ -104,7 +104,7 @@ Keep existing non-agent exports (`Workspace`, `LabSettings`, etc.) unchanged.
 Run:
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab
+cd <repo-root>
 bun run --filter @lail/backend typecheck
 ```
 
@@ -113,7 +113,7 @@ Expected: PASS (or only pre-existing errors unrelated to AgentEvent consumers �
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab
+cd <repo-root>
 git add packages/shared/src/index.ts
 git commit -m "feat(shared): AgentMode, Patch, and streaming AgentEvent types"
 ```
@@ -171,7 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON agent_runs(session_id);
 Run:
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun -e "import { getDb } from './src/db/schema.ts'; getDb(); console.log('ok')"
 ```
 
@@ -283,7 +283,7 @@ describe("assertWorkspaceRelativePath", () => {
 - [ ] **Step 2: Run tests — expect FAIL**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun test src/agent/tool-policy.test.ts
 ```
 
@@ -353,7 +353,7 @@ export function assertWorkspaceRelativePath(path: string): string {
 - [ ] **Step 4: Run tests — expect PASS**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun test src/agent/tool-policy.test.ts
 ```
 
@@ -460,7 +460,7 @@ describe("PatchStore accept", () => {
 - [ ] **Step 2: Run — expect FAIL**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun test src/agent/patch-store.test.ts
 ```
 
@@ -663,7 +663,7 @@ In `schema.ts` patch table definition, use **no foreign keys** on `patches` and 
 - [ ] **Step 5: Run tests — PASS**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun test src/agent/patch-store.test.ts
 ```
 
@@ -811,7 +811,7 @@ Runtime-owned shell policy is cleaner:
 - [ ] **Step 3: Manual sanity**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun -e "
 import { toolDefinitions } from './src/tools/index.ts';
 console.log(toolDefinitions.map(t => t.function.name).join(','))
@@ -987,7 +987,7 @@ Delete inlined old loop from `agent.ts` once runtime covers behavior (keep file 
 - [ ] **Step 5: Run all backend agent tests**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun test src/agent
 ```
 
@@ -1100,7 +1100,7 @@ Keep legacy path `POST /api/agent/run` (already exists) — do not break old cli
 
 ```bash
 # with API running OR app.request:
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend
+cd <repo-root>/packages/backend
 bun -e "
 import { createApp } from './src/app.ts';
 const app = createApp();
@@ -1268,7 +1268,7 @@ When `shellApproval` non-null, show command + Allow / Deny → `api.shellApprova
 - [ ] **Step 5: Visual smoke**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab
+cd <repo-root>
 bun run dev
 # open /workbench — mode toggle visible, placeholder still "Ask for follow-up changes"
 ```
@@ -1323,9 +1323,9 @@ Update Workbench section:
 - [ ] **Step 1: Automated**
 
 ```bash
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/packages/backend && bun test
-cd /home/sfxnz/projects/ai-lab/local-ai-lab/apps/web && bun test
-cd /home/sfxnz/projects/ai-lab/local-ai-lab && bun run typecheck
+cd <repo-root>/packages/backend && bun test
+cd <repo-root>/apps/web && bun test
+cd <repo-root> && bun run typecheck
 ```
 
 Expected: all PASS.

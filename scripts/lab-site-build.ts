@@ -177,7 +177,7 @@ function build(): Entry[] {
   writeFileSync(join(outDir, "index.html"), renderIndex(all), "utf8");
   writeFileSync(
     join(outDir, "CNAME.example"),
-    "# Rename to CNAME and put your domain, e.g.\n# lab.sfxnz.com\n",
+    "# Rename to CNAME and put your domain, e.g.\n# lab.example.com\n",
     "utf8",
   );
   writeFileSync(

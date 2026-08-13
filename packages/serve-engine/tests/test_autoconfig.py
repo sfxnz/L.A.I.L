@@ -528,11 +528,13 @@ def test_mixed_checkpoint_prefers_spark_salvage_over_bare():
 
 
 def test_checkpoint_safety_strips_marlin_on_moe():
+    """Mixed FP8+NVFP4 Qwen MoE still drops marlin; MTP first-boot defaults still apply."""
     detected = {
         "is_moe": True,
         "has_nvfp4": True,
-        "quant_flag": "modelopt",
-        "quant_method": "modelopt",
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "compressed-tensors",
+        "quant_method": "compressed-tensors",
         "family": "qwen",
     }
     serve_cfg = {
@@ -567,10 +569,11 @@ def test_serve_keeps_marlin_for_nemotron_without_local_config():
     det = ac.analyze_config({}, "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
     assert det["family"] == "nemotron"
     assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.27.1") is False
-    # Qwen A3B still drops marlin (old crash path).
+    # Id-only Qwen A3B-NVFP4 is treated as pure NVFP4 → marlin legal on ≥0.27.
     q = ac.analyze_config({}, "nvidia/Qwen3.6-35B-A3B-NVFP4")
     assert q["family"] == "qwen"
-    assert ac._marlin_unsafe_for_checkpoint(q, "vllm/vllm-openai:v0.27.1") is True
+    assert q["has_nvfp4"] is True
+    assert ac._marlin_unsafe_for_checkpoint(q, "vllm/vllm-openai:v0.27.1") is False
 
 
 def test_marlin_kept_for_nemotron_family():
@@ -914,7 +917,9 @@ def test_family_overlay_ignores_deepseek_v3_flash():
     assert ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash", {}) is not None
 
 
-def test_topology_two_sparks_sets_tp2_and_fabric():
+def test_topology_two_sparks_sets_tp2_and_fabric(monkeypatch):
+    """Fabric-ok two-node plan must not depend on the runner having a RoCE NIC."""
+    monkeypatch.setattr(ac, "_ib_hca_for_iface", lambda iface: "rocep1s0f1")
     cfg = ac._empty_config(DSV4)
     warnings, rationale = [], []
     ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
@@ -925,6 +930,7 @@ def test_topology_two_sparks_sets_tp2_and_fabric():
     assert any(e == "VLLM_HOST_IP=10.100.8.1" for e in env)
     assert any(e == "WORKER_VLLM_HOST_IP=10.100.8.2" for e in env)
     assert any(e.startswith("NCCL_SOCKET_IFNAME=enp1s0f1np1") for e in env)
+    assert any(e == "NCCL_IB_HCA=rocep1s0f1" for e in env)
     assert not warnings, f"fabric ok → no warnings, got {warnings}"
 
 
@@ -2275,6 +2281,115 @@ def test_serve_model_does_not_refuse_when_recommend_fits(monkeypatch):
     monkeypatch.setattr(sv, "_ensure_image_present", past_gate)
     with pytest.raises(RuntimeError, match="PAST_FIT_GATE"):
         sv.serve_model(model=QWEN38, mode="workflow_max")
+
+
+def test_config_modelopt_mixed_overrides_card_compressed_tensors():
+    """HF config.json modelopt_mixed must win over a card --quantization compressed-tensors."""
+    base = {"quantization": "compressed-tensors", "model": "Qwen/Qwen3.8-27B"}
+    detected = {
+        "quant_flag": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "has_modelopt_layers": True,
+        "family": "qwen",
+    }
+    rationale: list[str] = []
+    ac._fill_from_config_detection(base, detected, rationale)
+    assert base["quantization"] == "modelopt_mixed"
+    assert any("compressed-tensors" in r and "modelopt_mixed" in r for r in rationale)
+
+
+def test_marlin_kept_for_pure_nvfp4_qwen_on_027():
+    """Pure NVFP4 Qwen may use marlin on ≥0.27; mixed / old images still drop it."""
+    pure = {
+        "family": "qwen",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": False,
+        "quant_flag": "modelopt_fp4",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(pure, "vllm/vllm-openai:v0.27.1") is False
+    assert ac._marlin_unsafe_for_checkpoint(pure, "vllm/vllm-openai:v0.25.0") is True
+    mixed = {
+        "family": "qwen",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "compressed-tensors",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(mixed, "vllm/vllm-openai:v0.27.1") is True
+
+
+def test_parse_card_image_skips_nightly_but_flags_floating_only():
+    readme = (
+        "To serve this checkpoint start docker `vllm/vllm-openai:nightly` "
+        "and run vllm serve org/New-Arch-27B"
+    )
+    assert ac._parse_card_image_requirement(readme) is None
+    assert ac._card_has_only_floating_image(readme) is True
+    warnings: list[str] = []
+    ac._warn_floating_card_image(readme, "vllm/vllm-openai:v0.27.1", warnings)
+    blob = " ".join(warnings).lower()
+    assert "nightly" in blob
+    assert "v0.27.1" in blob
+
+
+def test_serve_model_refuses_when_fit_gate_probe_raises(monkeypatch):
+    """Start must fail closed if the fit-gate probe itself throws."""
+    from app.services import serve as sv
+
+    topo = _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10")
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": {"hidden_size": 1}, "readme": None, "notes": []})
+
+    def boom(*a, **k):
+        raise OSError("hub down")
+
+    monkeypatch.setattr(ac, "estimate_weights_gib", boom)
+    monkeypatch.setattr(
+        sv,
+        "_ensure_image_present",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("PAST_FIT_GATE")),
+    )
+    with pytest.raises(RuntimeError, match="SERVE BLOCKED"):
+        sv.serve_model(model=QWEN38, mode="lab_safe")
+
+
+def test_multinode_weight_estimate_uses_hf_config(monkeypatch):
+    """TP>=2 placement must pass local hf_config into estimate_weights_gib, not None."""
+    from app.services import serve as sv
+
+    seen: dict = {}
+
+    def fake_est(model, cfg):
+        seen.setdefault("cfgs", []).append(cfg)
+        return 20.0
+
+    cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "architectures": ["Qwen3ForCausalLM"]}
+    topo = {
+        "nodes": 2,
+        "node_list": [
+            {"id": "n0", "local": True, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.1"},
+            {"id": "n1", "local": False, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.2"},
+        ],
+        "head": {"id": "n0", "local": True, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.1"},
+        "workers": [{"id": "n1", "local": False, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.2"}],
+        "fabric_ok": True,
+        "available": True,
+    }
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "estimate_weights_gib", fake_est)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": cfg, "readme": None, "notes": []})
+    monkeypatch.setattr(sv, "_ensure_image_present", lambda *a, **k: None)
+
+    def past_launch(*a, **k):
+        raise RuntimeError("PAST_MULTINODE_ESTIMATE")
+
+    monkeypatch.setattr(sv, "build_multi_node_launch", past_launch)
+    with pytest.raises(RuntimeError, match="PAST_MULTINODE_ESTIMATE"):
+        sv.serve_model(model=QWEN38, mode="workflow_max", tensor_parallel_size=2)
+    assert seen.get("cfgs"), "estimate_weights_gib was never called"
+    assert all(c == cfg for c in seen["cfgs"]), f"hf_config skipped on a call; got {seen['cfgs']!r}"
 
 
 def test_lab_safe_headroom_abort_only_on_large_uma():

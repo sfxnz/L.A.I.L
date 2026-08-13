@@ -1,8 +1,19 @@
+import { getClientToken, tokenQuery } from "./auth-token";
+
 const BASE = "";
+
+function lailTokenHeader(): Record<string, string> {
+  const t = getClientToken();
+  return t ? { "X-Lail-Token": t } : {};
+}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...lailTokenHeader(),
+      ...(init?.headers || {}),
+    },
     ...init,
   });
   if (!r.ok) {
@@ -458,7 +469,7 @@ export function watchJob(
   onStatus: (s: { status: string; progress: number; message: string }) => void,
   onResult?: (r: unknown) => void,
 ): () => void {
-  const es = new EventSource(`/api/jobs/${jobId}/logs`);
+  const es = new EventSource(tokenQuery(`/api/jobs/${jobId}/logs`));
   let closed = false;
   let errorTicks = 0;
 

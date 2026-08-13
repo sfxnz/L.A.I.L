@@ -10,6 +10,7 @@ async function forward(c: { req: { raw: Request; url: string; method: string; he
   if (ct) headers.set("content-type", ct);
   const accept = c.req.header("accept");
   if (accept) headers.set("accept", accept);
+  if (config.token) headers.set("x-lail-token", config.token);
 
   const init: RequestInit = { method: c.req.method, headers };
   if (c.req.method !== "GET" && c.req.method !== "HEAD") {

@@ -5,12 +5,12 @@ The Spark never needs to be on the internet.
 
 ## One-time setup
 
-1. Create a **public** GitHub repo, e.g. `sfxnz/dgx-lab` (empty is fine).
+1. Create a **public** GitHub repo, e.g. `YOU/your-lab-site` (empty is fine).
 2. Enable **Settings → Pages → Deploy from branch `gh-pages` / root**.
-3. On Spark:
+3. On the lab host:
 
 ```bash
-cd ~/projects/ai-lab/local-ai-lab
+cd <repo-root>
 
 # SSH deploy key or gh auth must be able to push to that repo
 export LAIL_SITE_REPO=git@github.com:YOU/dgx-lab.git

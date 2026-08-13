@@ -617,7 +617,7 @@ DSPARK_IMAGE = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
 # (same shape as a list entry). File entries override built-ins on key collision.
 _BUILTIN_OVERLAYS: list[dict[str, Any]] = [
     {
-        "match": {"all": ["deepseek"], "any": ["v4", "dspark", "flash"]},
+        "match": {"all": ["deepseek"], "any": ["v4", "dspark"]},
         "family_key": "deepseek_v4_dspark",
         "label": "DeepSeek V4 Flash DSpark (2-node DGX Spark recipe)",
         "source": "https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark",
@@ -728,15 +728,18 @@ def _minimax_m2_overlay_label(mid: str) -> str:
 
 
 def _cluster_topology() -> dict[str, Any]:
-    """Live cluster shape for serve planning. Never raises — falls back to single-node."""
-    fallback = {
-        "nodes": 1,
-        "node_list": [],
-        "head": None,
-        "workers": [],
-        "fabric_ok": False,
-        "available": False,
-    }
+    """Live cluster shape for serve planning. Never raises — falls back to probed local host."""
+    def fallback() -> dict[str, Any]:
+        local = _local_hw_fallback_node()
+        return {
+            "nodes": 1,
+            "node_list": [local],
+            "head": local,
+            "workers": [],
+            "fabric_ok": False,
+            "available": False,
+        }
+
     try:
         from . import cluster as _cluster
 
@@ -744,7 +747,7 @@ def _cluster_topology() -> dict[str, Any]:
         nodes = data.get("nodes") or []
         online = [n for n in nodes if n.get("state") != "offline" and (n.get("online") or n.get("local"))]
         if not online:
-            return fallback
+            return fallback()
         head = next((n for n in online if n.get("local")), online[0])
         workers = [n for n in online if n is not head]
         return {
@@ -756,18 +759,20 @@ def _cluster_topology() -> dict[str, Any]:
             "available": True,
         }
     except Exception:
-        return fallback
+        return fallback()
 
 
 # ─── Placement engine (hardware-aware, N-node, model-agnostic) ────────────────
 
-# Per-GPU arch hints for compile targets. Unknown skus fall back to GB10 (current lab).
+# Per-GPU arch hints for compile targets. Unknown / empty skus omit arch env.
 _SKU_ARCH = {
     "gb10": {"cute_dsl_arch": "sm_121a", "torch_arch": "12.1a"},
+    "spark": {"cute_dsl_arch": "sm_121a", "torch_arch": "12.1a"},
     "gb200": {"cute_dsl_arch": "sm_100a", "torch_arch": "12.0a"},
     "gb300": {"cute_dsl_arch": "sm_103a", "torch_arch": "12.0a"},
 }
-_DEFAULT_NODE_RAM_GIB = 121.7  # GB10 UMA when a node has not been probed yet
+# Laptop-scale only when collect_hardware() fails — never assume GB10 121.7 UMA.
+_CONSERVATIVE_NODE_RAM_GIB = 32.0
 
 
 def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[float]:
@@ -857,14 +862,33 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
     # 3) Estimate from config: params × bytes/param (quant-aware; MoE-aware).
     if measured is None:
         try:
-            qc = (hf_config or {}).get("quantization_config") or {}
+            cfg0 = hf_config or {}
+            text = cfg0.get("text_config") if isinstance(cfg0.get("text_config"), dict) else {}
+            qc = cfg0.get("quantization_config") or {}
+            if not isinstance(qc, dict):
+                qc = {}
             bit_widths: list[int] = []
             for g in (qc.get("config_groups") or {}).values():
                 if isinstance(g, dict):
                     w = g.get("weights") or {}
                     if isinstance(w, dict) and w.get("num_bits"):
                         bit_widths.append(int(w["num_bits"]))
-            # Mixed ModelOpt (FP8 + NVFP4): MoE expert weights dominate → prefer min bits.
+            qlayers = qc.get("quantized_layers") or {}
+            if isinstance(qlayers, dict):
+                for meta in qlayers.values():
+                    if not isinstance(meta, dict):
+                        continue
+                    algo = str(meta.get("quant_algo") or "").upper()
+                    if any(t in algo for t in ("NVFP4", "FP4", "W4A16")):
+                        bit_widths.append(4)
+                    elif "FP8" in algo:
+                        bit_widths.append(8)
+            algo_u = str(qc.get("quant_algo") or "").upper()
+            if any(t in algo_u for t in ("NVFP4", "FP4", "W4A16", "MIXED")):
+                bit_widths.append(4)
+            elif algo_u == "FP8" or algo_u.startswith("FP8"):
+                bit_widths.append(8)
+            # Mixed ModelOpt (FP8 + NVFP4): expert / NVFP4 weights dominate → min bits.
             nbits = min(bit_widths) if bit_widths else 0
             mid = (model or "").lower()
             if nbits not in (4, 8):
@@ -872,8 +896,8 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                     nbits = 4
                 elif re.search(r"(^|[-_/])fp8($|[-_/])", mid):
                     nbits = 8
-            hidden = (hf_config or {}).get("hidden_size")
-            layers = (hf_config or {}).get("num_hidden_layers")
+            hidden = cfg0.get("hidden_size") or text.get("hidden_size")
+            layers = cfg0.get("num_hidden_layers") or text.get("num_hidden_layers")
             if hidden and layers:
                 # Hybrid (Nemotron): only MoE block types hold expert FFNs.
                 block_types = (
@@ -893,13 +917,19 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
                 # Dense-ish attention/mamba: ~12 * layers * hidden^2 (+emb)
                 params = 12 * layers * hidden * hidden
                 experts = (
-                    (hf_config or {}).get("n_routed_experts")
-                    or (hf_config or {}).get("num_experts")
-                    or (hf_config or {}).get("num_local_experts")
+                    cfg0.get("n_routed_experts")
+                    or cfg0.get("num_experts")
+                    or cfg0.get("num_local_experts")
+                    or text.get("n_routed_experts")
+                    or text.get("num_experts")
+                    or text.get("num_local_experts")
                 )
-                moe_inter = (hf_config or {}).get("moe_intermediate_size") or (
-                    hf_config or {}
-                ).get("intermediate_size")
+                moe_inter = (
+                    cfg0.get("moe_intermediate_size")
+                    or cfg0.get("intermediate_size")
+                    or text.get("moe_intermediate_size")
+                    or text.get("intermediate_size")
+                )
                 if experts and moe_inter:
                     # MoE FFN dominates; dense formula alone under-reports ~0 GiB-class misses.
                     params += int(experts) * moe_layers * 3 * hidden * int(moe_inter)
@@ -920,20 +950,69 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
     return floor
 
 
+def _probed_local_hardware() -> dict[str, Any]:
+    """Live host probe. Never invents GB10 UMA — empty dict on failure."""
+    try:
+        from . import metadata as _metadata
+
+        hw = _metadata.collect_hardware() or {}
+        return hw if isinstance(hw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolved_node_ram_gib(value: Any = None) -> float:
+    """Explicit ram_gib → live MemTotal → conservative laptop-scale. Never 121.7."""
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    hw = _probed_local_hardware()
+    for key in ("ram_gib", "memory_capacity_gib"):
+        ram = hw.get(key)
+        if isinstance(ram, (int, float)) and ram > 0:
+            return float(ram)
+    return _CONSERVATIVE_NODE_RAM_GIB
+
+
 def _node_ram_gib(node: Optional[dict]) -> float:
-    if node and isinstance(node.get("ram_gib"), (int, float)) and node["ram_gib"]:
-        return float(node["ram_gib"])
-    return _DEFAULT_NODE_RAM_GIB
+    ram = node.get("ram_gib") if node else None
+    return _resolved_node_ram_gib(ram)
+
+
+def _local_hw_fallback_node() -> dict[str, Any]:
+    """Single local node from collect_hardware() when cluster topology is unavailable."""
+    hw = _probed_local_hardware()
+    ram = hw.get("ram_gib")
+    if not (isinstance(ram, (int, float)) and ram > 0):
+        ram = hw.get("memory_capacity_gib")
+    if not (isinstance(ram, (int, float)) and ram > 0):
+        ram = None
+    sku = hw.get("gpu_sku")
+    if sku and str(sku).lower() == "unknown":
+        sku = None
+    host = hw.get("hostname")
+    return {
+        "id": "local",
+        "name": host or "local",
+        "local": True,
+        "online": True,
+        "ram_gib": float(ram) if isinstance(ram, (int, float)) and ram > 0 else None,
+        "gpu_sku": sku,
+        "hostname": host,
+    }
 
 
 def _gpu_arch_env(nodes: list[dict]) -> dict[str, str]:
-    """Compile-target env for the cluster's GPU sku (future hardware: extend _SKU_ARCH)."""
+    """Compile-target env only when a probed sku matches _SKU_ARCH. Unknown → {}."""
     sku = ""
     for n in nodes:
         sku = (n.get("gpu_sku") or "").lower()
         if sku:
             break
-    key = next((k for k in _SKU_ARCH if k in sku), "gb10")
+    if not sku:
+        return {}
+    key = next((k for k in _SKU_ARCH if k in sku), None)
+    if key is None:
+        return {}
     a = _SKU_ARCH[key]
     return {
         "CUTE_DSL_ARCH": a["cute_dsl_arch"],
@@ -1461,6 +1540,25 @@ def _scrub_unexpanded_shell_vars(extra: str, warnings: list[str]) -> str:
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
+def _scrub_unexpanded_docker_env(env: list[str], warnings: list[str]) -> list[str]:
+    """Drop docker_env entries whose value still contains ``$VAR``."""
+    out: list[str] = []
+    dropped: list[str] = []
+    for item in env or []:
+        if not item or "=" not in item:
+            continue
+        _k, v = item.split("=", 1)
+        if "$" in v:
+            dropped.append(item)
+            continue
+        out.append(item)
+    if dropped:
+        warnings.append(
+            "Dropped unexpanded shell vars from docker_env: " + ", ".join(dropped)
+        )
+    return out
+
+
 # Flags / env that crash or noop-wrong on 1–2× GB10 UMA Spark serves.
 _SPARK_UNSAFE_FLAGS = (
     "--enable-expert-parallel",
@@ -1551,6 +1649,36 @@ def _parse_card_image_requirement(readme: str | None) -> str | None:
         else:
             other.append(ref)
     return (spark_hits or other or [None])[0]
+
+
+def _card_has_only_floating_image(readme: str | None) -> bool:
+    """True when the card mentions a vLLM image but every tag is nightly/latest."""
+    if not readme:
+        return False
+    tagged = 0
+    floating = 0
+    for m in _CARD_IMAGE_RE.finditer(readme):
+        ref = m.group(0)
+        if ":" not in ref:
+            continue
+        tagged += 1
+        tag = ref.split(":", 1)[1].lower()
+        if tag in ("latest", "nightly") or tag.startswith("nightly"):
+            floating += 1
+    return tagged > 0 and floating == tagged
+
+
+def _warn_floating_card_image(
+    readme: str | None, lab_default: str, warnings: list[str]
+) -> None:
+    if not _card_has_only_floating_image(readme):
+        return
+    msg = (
+        f"Card only pins vllm/vllm-openai:nightly (or :latest); staying on lab default "
+        f"{lab_default}. New architectures on that card may fail to load until a dated tag exists."
+    )
+    if msg not in warnings:
+        warnings.append(msg)
 
 
 def _semver_tuple(tag: str) -> tuple[int, ...]:
@@ -1774,7 +1902,7 @@ def check_serve_loadability(
         return True, None
     n = max(1, int(nodes_used or 1))
     per = float(weights_gib) / n
-    ram = float(node_ram_gib or _DEFAULT_NODE_RAM_GIB)
+    ram = _resolved_node_ram_gib(node_ram_gib)
     reserve = float(reserve_gib)
     if per > (ram * 0.85 - reserve):
         return False, (
@@ -2301,23 +2429,24 @@ def _marlin_unsafe_for_checkpoint(
     Observed on NVIDIA Qwen3.6-35B-A3B-NVFP4 (ModelOpt MoE) under vLLM 0.25:
       ValueError: moe_backend='marlin' is not supported for unquantized MoE.
 
-    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE is
-    generally fine on ≥0.27; on older images treat non-Nemotron marlin as unsafe.
-    Qwen MoE still rejects marlin. Mixed FP8+NVFP4 should leave moe auto.
+    Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE
+    (including Qwen) is legal on ≥0.27; on older images treat non-Nemotron
+    marlin as unsafe. Mixed FP8+NVFP4 should leave moe auto. Qwen MoE
+    without a proven NVFP4 layout still rejects marlin.
     """
     if not detected:
         return True
     family = detected.get("family") or ""
     if family == "nemotron":
         return False
-    if family == "qwen":
-        return True
     if detected.get("is_mixed_nvfp4_fp8"):
         return True
-    # Pure NVFP4 MoE: keep marlin on ≥0.27 (SM121); strip on older stock images.
+    # Pure NVFP4 MoE (including Qwen): keep marlin on ≥0.27 (SM121).
     if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
         if _image_at_least(image, 0, 27, 0):
             return False
+        return True
+    if family == "qwen":
         return True
     if detected.get("is_moe"):
         return True
@@ -2670,7 +2799,10 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
         or "vision" in model_type
         or re.search(r"(^|[_-])vl([_-]|$)", mid)
         or "vl" in arch_blob
-        or "conditionalgeneration" in arch_blob and ("qwen3_5" in model_type or "qwen3.5" in mid or "qwen3.6" in mid)
+        or (
+            "conditionalgeneration" in arch_blob
+            and ("qwen3" in model_type or "qwen3" in mid or "qwen3" in arch_blob)
+        )
         or "llava" in mid
         or "pixtral" in mid
         or "internvl" in mid
@@ -2957,7 +3089,6 @@ def _fill_from_config_detection(
     """Only fill gaps using HF config.json / API tags — not lab override recipes."""
     det_q = (detected.get("quant_flag") or "").strip()
     cur_q = (base.get("quantization") or "").strip()
-    modelopt_sibs = {"modelopt", "modelopt_fp4", "modelopt_mixed", "modelopt_mxfp8"}
     if det_q:
         if not cur_q:
             base["quantization"] = det_q
@@ -2965,18 +3096,14 @@ def _fill_from_config_detection(
                 f"HF config/tags → --quantization {det_q} "
                 f"(card serve line had no --quantization)"
             )
-        elif (
-            cur_q.lower() in modelopt_sibs
-            and det_q.lower() in modelopt_sibs
-            and cur_q.lower() != det_q.lower()
-            and (
-                detected.get("quant_algo")
-                or detected.get("has_modelopt_layers")
-                or detected.get("is_mixed_nvfp4_fp8")
-            )
+        elif cur_q.lower() != det_q.lower() and (
+            detected.get("quant_algo")
+            or detected.get("has_modelopt_layers")
+            or detected.get("is_mixed_nvfp4_fp8")
+            or detected.get("quant_method")
         ):
-            # Card prose / Ampere section often mentions modelopt_fp4; config.json
-            # MIXED_PRECISION (or layered ModelOpt) is authoritative for the sibling.
+            # config.json is ground truth for layout: ModelOpt siblings, and
+            # card compressed-tensors vs config modelopt_* (or the reverse).
             base["quantization"] = det_q
             rationale.append(
                 f"HF config.json overrides card/prose quant {cur_q} → {det_q}"
@@ -3556,6 +3683,7 @@ def recommend(
         rationale=rationale,
         warnings=warnings,
     )
+    _warn_floating_card_image(readme, _lab_default_image(mode), warnings)
 
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)
@@ -3654,7 +3782,7 @@ def recommend(
             rationale.append(f"Capped max-model-len to config max_position_embeddings={max_pos}")
 
     plan = cfg.get("topology_plan") or {}
-    node_ram = float(plan.get("node_ram_gib") or _DEFAULT_NODE_RAM_GIB)
+    node_ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
     _size_memory_for_spark(
         cfg,
         hf_config=hf_config,
@@ -3681,7 +3809,7 @@ def recommend(
             env_out = [x for x in env_out if not x.startswith(k + "=")]
         seen.add(k)
         env_out.append(f"{k}={v}")
-    cfg["docker_env"] = env_out
+    cfg["docker_env"] = _scrub_unexpanded_docker_env(env_out, warnings)
 
     # If MTP structured flag is on, strip duplicate --speculative-config from extras
     if cfg.get("mtp") and cfg.get("extra_flags"):
@@ -3746,7 +3874,7 @@ def recommend(
     ok_load, load_msg = check_serve_loadability(
         mode=mode,
         weights_gib=weights_gib,
-        node_ram_gib=float(plan.get("node_ram_gib") or _DEFAULT_NODE_RAM_GIB),
+        node_ram_gib=_resolved_node_ram_gib(plan.get("node_ram_gib")),
         nodes_used=int(plan.get("nodes_needed") or 1),
         util=float(cfg.get("util") or (SAFE_UTIL if mode == "lab_safe" else WORKFLOW_UTIL)),
         reserve_gib=float(plan.get("reserve_gib") or 15.0),

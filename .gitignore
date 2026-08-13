@@ -29,10 +29,14 @@ data/*.sqlite-wal
 data/runs/
 data/benchmarks.sqlite*
 data/multinode_serve.json
+data/cluster.json
 
 # agent / editor scratch
 .hermes/
 .worktrees/
+.research-scratch/
+.research-tmp/
+.vllm-research-tmp/
 data/lab-runs/
 data/lab-public/
 site/dist/

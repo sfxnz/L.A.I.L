@@ -1,8 +1,13 @@
 {
   "name": "lail",
-  "private": true,
+  "private": false,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "L.A.I.L — Local AI Lab",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sfxnz/L.A.I.L.git"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -14,6 +19,7 @@
     "build": "bun run --filter @lail/web build && bun run --filter @lail/backend build",
     "start": "bun run --filter @lail/backend start",
     "typecheck": "bun run --filter @lail/backend typecheck && bun run --filter @lail/web typecheck",
+    "test": "bun test apps/web packages/backend",
     "lab:publish": "bun run scripts/lail-lab-publish.ts",
     "lab:share-server": "bun run scripts/lab-public-server.ts",
     "lab:funnel": "bash scripts/lab-share-funnel.sh",

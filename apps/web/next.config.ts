@@ -3,14 +3,11 @@ import type { NextConfig } from "next";
 const api = process.env.LAIL_API_URL || process.env.NEXT_PUBLIC_LAIL_API || "http://127.0.0.1:8787";
 
 // Next 16 blocks cross-origin access to dev resources (HMR / turbopack) unless listed.
-// L.A.I.L is opened via localhost, 127.0.0.1, Tailscale IP, and hostname from Mac.
+// Defaults are loopback only. Extra hosts (LAN / Tailscale / hostname) via LAIL_DEV_ORIGINS.
 const allowedDevOrigins = [
   "127.0.0.1",
   "localhost",
   "0.0.0.0",
-  "spark1",
-  "spark1.home",
-  "100.115.190.113",
   ...(process.env.LAIL_DEV_ORIGINS
     ? process.env.LAIL_DEV_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
     : []),

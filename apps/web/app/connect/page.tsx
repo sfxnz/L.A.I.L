@@ -5,8 +5,8 @@ import { api, type LabStatus } from "@/lib/api";
 import { Badge, Btn, Metric, Panel } from "@/components/ui";
 
 function hostFromBrowser(): string {
-  if (typeof window === "undefined") return "100.115.190.113";
-  return window.location.hostname || "100.115.190.113";
+  if (typeof window === "undefined") return "127.0.0.1";
+  return window.location.hostname || "127.0.0.1";
 }
 
 export default function ConnectPage() {
@@ -96,7 +96,7 @@ export default function ConnectPage() {
         </div>
       </div>
 
-      <Panel title="Hermes on spark1 (same machine)">
+      <Panel title="Hermes on this host (same machine)">
         <div className="space-y-3 p-4">
           <p className="text-[13px] text-lab-muted">
             When Hermes runs on Spark, bind to loopback so traffic never leaves the box.

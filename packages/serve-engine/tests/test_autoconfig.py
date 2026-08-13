@@ -528,11 +528,13 @@ def test_mixed_checkpoint_prefers_spark_salvage_over_bare():
 
 
 def test_checkpoint_safety_strips_marlin_on_moe():
+    """Mixed FP8+NVFP4 Qwen MoE still drops marlin; MTP first-boot defaults still apply."""
     detected = {
         "is_moe": True,
         "has_nvfp4": True,
-        "quant_flag": "modelopt",
-        "quant_method": "modelopt",
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "compressed-tensors",
+        "quant_method": "compressed-tensors",
         "family": "qwen",
     }
     serve_cfg = {
@@ -567,10 +569,11 @@ def test_serve_keeps_marlin_for_nemotron_without_local_config():
     det = ac.analyze_config({}, "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4")
     assert det["family"] == "nemotron"
     assert ac._marlin_unsafe_for_checkpoint(det, "vllm/vllm-openai:v0.27.1") is False
-    # Qwen A3B still drops marlin (old crash path).
+    # Id-only Qwen A3B-NVFP4 is treated as pure NVFP4 → marlin legal on ≥0.27.
     q = ac.analyze_config({}, "nvidia/Qwen3.6-35B-A3B-NVFP4")
     assert q["family"] == "qwen"
-    assert ac._marlin_unsafe_for_checkpoint(q, "vllm/vllm-openai:v0.27.1") is True
+    assert q["has_nvfp4"] is True
+    assert ac._marlin_unsafe_for_checkpoint(q, "vllm/vllm-openai:v0.27.1") is False
 
 
 def test_marlin_kept_for_nemotron_family():
@@ -603,6 +606,16 @@ def test_scrub_unexpanded_shell_vars():
     assert "--speculative_config.method dspark" in out
     assert "--mamba-backend flashinfer" in out
     assert any("DSPARK" in w or "$" in w for w in warnings)
+
+
+def test_scrub_unexpanded_docker_env():
+    warnings: list[str] = []
+    out = ac._scrub_unexpanded_docker_env(
+        ["FOO=bar", "CKPT=$MODEL_CKPT", "BAZ=ok"],
+        warnings,
+    )
+    assert out == ["FOO=bar", "BAZ=ok"]
+    assert any("MODEL_CKPT" in w or "$" in w for w in warnings)
 
 
 def test_capability_min_image_for_modelopt_mixed():
@@ -898,7 +911,15 @@ def test_family_overlay_ignores_normal_models():
     assert ac._family_overlay("meta-llama/Llama-4-Scout", {}) is None
 
 
-def test_topology_two_sparks_sets_tp2_and_fabric():
+def test_family_overlay_ignores_deepseek_v3_flash():
+    """`flash` alone must not select the V4 DSpark overlay."""
+    assert ac._family_overlay("deepseek-ai/DeepSeek-V3-Flash", {}) is None
+    assert ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash", {}) is not None
+
+
+def test_topology_two_sparks_sets_tp2_and_fabric(monkeypatch):
+    """Fabric-ok two-node plan must not depend on the runner having a RoCE NIC."""
+    monkeypatch.setattr(ac, "_ib_hca_for_iface", lambda iface: "rocep1s0f1")
     cfg = ac._empty_config(DSV4)
     warnings, rationale = [], []
     ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
@@ -909,6 +930,7 @@ def test_topology_two_sparks_sets_tp2_and_fabric():
     assert any(e == "VLLM_HOST_IP=10.100.8.1" for e in env)
     assert any(e == "WORKER_VLLM_HOST_IP=10.100.8.2" for e in env)
     assert any(e.startswith("NCCL_SOCKET_IFNAME=enp1s0f1np1") for e in env)
+    assert any(e == "NCCL_IB_HCA=rocep1s0f1" for e in env)
     assert not warnings, f"fabric ok → no warnings, got {warnings}"
 
 
@@ -1233,6 +1255,18 @@ def test_stop_all_kills_remote_worker_without_state_file(monkeypatch):
     multinode_serve.json was missing, leaving spark2 TP worker up (~100 GiB)."""
     from app.services import serve
 
+    monkeypatch.setenv(
+        "LAIL_CLUSTER_JSON",
+        json.dumps(
+            {
+                "name": "lab",
+                "nodes": [
+                    {"id": "head", "local": True, "vllm_url": "http://127.0.0.1:8000"},
+                    {"id": "spark2", "local": False, "ssh_host": "spark2", "vllm_url": "http://127.0.0.1:8000"},
+                ],
+            }
+        ),
+    )
     monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/no/such/multinode_serve.json"))
     monkeypatch.setattr(serve, "SPARK_LAB", type(serve.SPARK_LAB)("/no/such/spark_lab.sh"))
     monkeypatch.setattr(serve, "list_vllm_containers", lambda: [])
@@ -1561,6 +1595,14 @@ def test_analyze_config_detects_vl():
     d = ac.analyze_config(
         {"architectures": ["Qwen2_5_VLForConditionalGeneration"], "model_type": "qwen2_5_vl"},
         "Qwen/Qwen2.5-VL-7B-Instruct",
+    )
+    assert d["is_vl"] is True
+
+
+def test_analyze_config_qwen38_conditional_generation_is_vl():
+    d = ac.analyze_config(
+        {"architectures": ["Qwen3_8ForConditionalGeneration"], "model_type": "qwen3_8"},
+        "Qwen/Qwen3.8-27B",
     )
     assert d["is_vl"] is True
 
@@ -1982,4 +2024,381 @@ def test_family_overlay_not_overridden_by_cookbook(monkeypatch):
     assert any(s.get("kind") == "family_overlay" for s in (rec.get("sources") or []))
     assert (rec["config"].get("image") or "").startswith("ghcr.io/anemll/dspark-vllm-gx10")
     assert rec["config"].get("kv_cache_dtype") == "nvfp4_ds_mla"
+
+
+# ─── Any-hardware placement (SKU arch + unprobed RAM + unknown dense Qwen) ───
+
+QWEN38_DIR = Path(__file__).resolve().parent / "corpus" / "example__Qwen3.8-27B"
+QWEN38 = "Qwen/Qwen3.8-27B"
+
+
+def _one_node_topo(*, ram_gib=None, gpu_sku=None, available=True):
+    node = {"id": "n0", "local": True, "online": True}
+    if ram_gib is not None:
+        node["ram_gib"] = ram_gib
+    if gpu_sku is not None:
+        node["gpu_sku"] = gpu_sku
+    return {
+        "nodes": 1,
+        "node_list": [node],
+        "head": node,
+        "workers": [],
+        "fabric_ok": False,
+        "available": available,
+    }
+
+
+def _env_blob(cfg_or_env) -> str:
+    if isinstance(cfg_or_env, dict):
+        env = cfg_or_env.get("docker_env") or []
+    else:
+        env = cfg_or_env or []
+    if isinstance(env, dict):
+        return " ".join(f"{k}={v}" for k, v in env.items())
+    return " ".join(str(e) for e in env)
+
+
+def test_gpu_arch_env_unknown_sku_omits_gb10_pin():
+    """Unknown / empty / RTX must not inherit GB10 CUTE_DSL / 12.1a compile flags."""
+    empty = ac._gpu_arch_env([])
+    rtx = ac._gpu_arch_env([{"gpu_sku": "NVIDIA GeForce RTX 4090"}])
+    unknown = ac._gpu_arch_env([{"gpu_sku": "unknown"}])
+    missing = ac._gpu_arch_env([{"name": "local"}])
+    for env in (empty, rtx, unknown, missing):
+        blob = _env_blob(env)
+        assert "sm_121a" not in blob
+        assert "12.1a" not in blob
+        assert "CUTE_DSL_ARCH" not in blob
+        assert "TORCH_CUDA_ARCH_LIST" not in blob
+        assert env == {}
+
+
+def test_gpu_arch_env_only_when_sku_matches():
+    gb10 = ac._gpu_arch_env([{"gpu_sku": "NVIDIA GB10"}])
+    assert gb10.get("CUTE_DSL_ARCH") == "sm_121a"
+    assert gb10.get("TORCH_CUDA_ARCH_LIST") == "12.1a"
+    spark = ac._gpu_arch_env([{"gpu_sku": "NVIDIA GB10 [Spark]"}])
+    assert spark.get("CUTE_DSL_ARCH") == "sm_121a"
+    gb200 = ac._gpu_arch_env([{"gpu_sku": "NVIDIA GB200"}])
+    assert gb200.get("CUTE_DSL_ARCH") == "sm_100a"
+    assert "sm_121a" not in _env_blob(gb200)
+
+
+def test_apply_topology_rtx_has_no_gb10_arch():
+    cfg = ac._empty_config("org/Model")
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_topology(
+        cfg,
+        overlay=None,
+        topology=_one_node_topo(ram_gib=24.0, gpu_sku="NVIDIA GeForce RTX 4090"),
+        weights_gib=8.0,
+        mode="lab_safe",
+        warnings=warnings,
+        rationale=rationale,
+    )
+    blob = _env_blob(cfg)
+    assert "sm_121a" not in blob
+    assert "12.1a" not in blob
+
+
+def test_apply_topology_gb10_sets_arch():
+    cfg = ac._empty_config("org/Model")
+    ac._apply_topology(
+        cfg,
+        overlay=None,
+        topology=_one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+        weights_gib=20.0,
+        mode="workflow_max",
+        warnings=[],
+        rationale=[],
+    )
+    blob = _env_blob(cfg)
+    assert "CUTE_DSL_ARCH=sm_121a" in blob
+
+
+def test_missing_ram_probes_collect_hardware(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.metadata.collect_hardware",
+        lambda: {"ram_gib": 32.0, "gpu_sku": "NVIDIA GeForce RTX 4090", "hostname": "devbox"},
+    )
+    assert ac._node_ram_gib(None) == 32.0
+    assert ac._node_ram_gib({"local": True, "online": True}) == 32.0
+    assert ac._node_ram_gib({"ram_gib": 121.7}) == 121.7
+    p = ac.plan_placement(
+        20.0, _one_node_topo(), mode="lab_safe", overlay=None
+    )
+    assert p["node_ram_gib"] == 32.0
+    # 20 GiB + 15 reserve cannot load on 32 GiB even at util=0.85
+    assert p["fits"] is False
+    ok, msg = ac.check_serve_loadability(
+        mode="lab_safe",
+        weights_gib=20.0,
+        node_ram_gib=p["node_ram_gib"],
+        nodes_used=1,
+        util=0.4,
+    )
+    assert ok is False
+    assert msg
+
+
+def test_unprobed_ram_is_not_gb10_uma(monkeypatch):
+    """Probe failure must not fall back to 121.7 GiB Spark UMA."""
+    def boom():
+        raise OSError("no /proc/meminfo")
+
+    monkeypatch.setattr("app.services.metadata.collect_hardware", boom)
+    ram = ac._node_ram_gib({})
+    assert ram != 121.7
+    assert ram <= 32.0
+    p = ac.plan_placement(20.0, _one_node_topo(), mode="lab_safe", overlay=None)
+    assert p["node_ram_gib"] != 121.7
+    assert p["fits"] is False
+
+
+def test_unavailable_topology_probes_local_hardware(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("cluster down")
+
+    monkeypatch.setattr("app.services.cluster.collect_cluster", boom)
+    monkeypatch.setattr(
+        "app.services.metadata.collect_hardware",
+        lambda: {
+            "ram_gib": 64.0,
+            "memory_capacity_gib": 64.0,
+            "gpu_sku": "NVIDIA GeForce RTX 4090",
+            "hostname": "devbox",
+        },
+    )
+    t = ac._cluster_topology()
+    assert t["available"] is False
+    assert t["nodes"] == 1
+    head = t.get("head") or {}
+    assert head.get("ram_gib") == 64.0
+    assert head.get("gpu_sku") == "NVIDIA GeForce RTX 4090"
+    p = ac.plan_placement(20.0, t, mode="lab_safe", overlay=None)
+    assert p["node_ram_gib"] == 64.0
+
+
+def test_estimate_weights_honors_modelopt_algo_without_nvfp4_in_id(monkeypatch):
+    """Offline heuristic must use quant_algo / quantized_layers, not the repo id."""
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    cfg = json.loads((QWEN38_DIR / "config.json").read_text())
+    w = ac.estimate_weights_gib(QWEN38, cfg)
+    assert w is not None
+    # 4-bit 27B-class dense is well under bf16 (~37 GiB from the 12 L H^2 formula).
+    text = cfg["text_config"]
+    bf16 = 12 * text["num_hidden_layers"] * text["hidden_size"] * text["hidden_size"] * 2.0 / (1024**3)
+    assert 5.0 <= w <= 25.0
+    assert w < bf16 * 0.6
+
+
+def test_recommend_unknown_dense_qwen38_offline(monkeypatch):
+    """Brand-new Qwen3.x id: card+config only, no overlay, single-node TP=1, fits."""
+    readme = (QWEN38_DIR / "card.md").read_text()
+    hf_config = json.loads((QWEN38_DIR / "config.json").read_text())
+
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda model_id, timeout=20.0: {
+            "model_id": model_id,
+            "readme": readme,
+            "config": hf_config,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [f"fixture://{model_id}"],
+        },
+    )
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GeForce RTX 4090"),
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend(QWEN38, mode="workflow_max", fetch_remote=True)
+    cfg = rec["config"]
+    assert ac._family_overlay(QWEN38, rec.get("detected") or {}) is None
+    assert rec.get("topology", {}).get("overlay") is None
+    assert rec["serve_blocked"] is False
+    assert (rec.get("topology") or {}).get("tensor_parallel_size") == 1
+    assert cfg.get("tensor_parallel_size") in (None, 1)
+    assert cfg.get("quantization") == "modelopt_mixed"
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert cfg.get("tool_call_parser") == "qwen3_coder"
+    assert (cfg.get("moe_backend") or "") != "flashinfer_b12x"
+    blob = json.dumps(cfg) + " ".join(str(x) for x in (cfg.get("docker_env") or []))
+    assert "$" not in blob
+    assert "flashinfer_b12x" not in blob
+    # RTX / non-GB10 sku: recommend must not inject Spark compile pins.
+    env = _env_blob(cfg)
+    assert "sm_121a" not in env
+    assert "12.1a" not in env
+
+    rec_safe = ac.recommend(QWEN38, mode="lab_safe", fetch_remote=True)
+    assert rec_safe["serve_blocked"] is False
+
+
+def test_serve_model_refuses_when_recommend_would_block(monkeypatch):
+    """Start must raise SERVE BLOCKED when the shared fit gate fails."""
+    from app.services import serve as sv
+
+    topo = _one_node_topo(ram_gib=32.0, gpu_sku="NVIDIA GeForce RTX 4090")
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.0)
+    monkeypatch.setattr(
+        ac, "load_local_fallback", lambda m: {"config": {}, "readme": None, "notes": []}
+    )
+    rec = ac.recommend(QWEN38, mode="lab_safe", fetch_remote=False)
+    assert rec["serve_blocked"] is True
+    with pytest.raises(RuntimeError, match="SERVE BLOCKED"):
+        sv.serve_model(model=QWEN38, mode="lab_safe")
+
+
+def test_serve_model_does_not_refuse_when_recommend_fits(monkeypatch):
+    """Start must not raise SERVE BLOCKED when recommend.serve_blocked is false."""
+    from app.services import serve as sv
+
+    topo = _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10")
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.0)
+    monkeypatch.setattr(
+        ac, "load_local_fallback", lambda m: {"config": {}, "readme": None, "notes": []}
+    )
+    rec = ac.recommend(QWEN38, mode="workflow_max", fetch_remote=False)
+    assert rec["serve_blocked"] is False
+
+    def past_gate(*a, **k):
+        raise RuntimeError("PAST_FIT_GATE")
+
+    monkeypatch.setattr(sv, "_ensure_image_present", past_gate)
+    with pytest.raises(RuntimeError, match="PAST_FIT_GATE"):
+        sv.serve_model(model=QWEN38, mode="workflow_max")
+
+
+def test_config_modelopt_mixed_overrides_card_compressed_tensors():
+    """HF config.json modelopt_mixed must win over a card --quantization compressed-tensors."""
+    base = {"quantization": "compressed-tensors", "model": "Qwen/Qwen3.8-27B"}
+    detected = {
+        "quant_flag": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "has_modelopt_layers": True,
+        "family": "qwen",
+    }
+    rationale: list[str] = []
+    ac._fill_from_config_detection(base, detected, rationale)
+    assert base["quantization"] == "modelopt_mixed"
+    assert any("compressed-tensors" in r and "modelopt_mixed" in r for r in rationale)
+
+
+def test_marlin_kept_for_pure_nvfp4_qwen_on_027():
+    """Pure NVFP4 Qwen may use marlin on ≥0.27; mixed / old images still drop it."""
+    pure = {
+        "family": "qwen",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": False,
+        "quant_flag": "modelopt_fp4",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(pure, "vllm/vllm-openai:v0.27.1") is False
+    assert ac._marlin_unsafe_for_checkpoint(pure, "vllm/vllm-openai:v0.25.0") is True
+    mixed = {
+        "family": "qwen",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "compressed-tensors",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(mixed, "vllm/vllm-openai:v0.27.1") is True
+
+
+def test_parse_card_image_skips_nightly_but_flags_floating_only():
+    readme = (
+        "To serve this checkpoint start docker `vllm/vllm-openai:nightly` "
+        "and run vllm serve org/New-Arch-27B"
+    )
+    assert ac._parse_card_image_requirement(readme) is None
+    assert ac._card_has_only_floating_image(readme) is True
+    warnings: list[str] = []
+    ac._warn_floating_card_image(readme, "vllm/vllm-openai:v0.27.1", warnings)
+    blob = " ".join(warnings).lower()
+    assert "nightly" in blob
+    assert "v0.27.1" in blob
+
+
+def test_serve_model_refuses_when_fit_gate_probe_raises(monkeypatch):
+    """Start must fail closed if the fit-gate probe itself throws."""
+    from app.services import serve as sv
+
+    topo = _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10")
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": {"hidden_size": 1}, "readme": None, "notes": []})
+
+    def boom(*a, **k):
+        raise OSError("hub down")
+
+    monkeypatch.setattr(ac, "estimate_weights_gib", boom)
+    monkeypatch.setattr(
+        sv,
+        "_ensure_image_present",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("PAST_FIT_GATE")),
+    )
+    with pytest.raises(RuntimeError, match="SERVE BLOCKED"):
+        sv.serve_model(model=QWEN38, mode="lab_safe")
+
+
+def test_multinode_weight_estimate_uses_hf_config(monkeypatch):
+    """TP>=2 placement must pass local hf_config into estimate_weights_gib, not None."""
+    from app.services import serve as sv
+
+    seen: dict = {}
+
+    def fake_est(model, cfg):
+        seen.setdefault("cfgs", []).append(cfg)
+        return 20.0
+
+    cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "architectures": ["Qwen3ForCausalLM"]}
+    topo = {
+        "nodes": 2,
+        "node_list": [
+            {"id": "n0", "local": True, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.1"},
+            {"id": "n1", "local": False, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.2"},
+        ],
+        "head": {"id": "n0", "local": True, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.1"},
+        "workers": [{"id": "n1", "local": False, "online": True, "ram_gib": 121.7, "qsfp_ip": "10.0.0.2"}],
+        "fabric_ok": True,
+        "available": True,
+    }
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: topo)
+    monkeypatch.setattr(ac, "estimate_weights_gib", fake_est)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": cfg, "readme": None, "notes": []})
+    monkeypatch.setattr(sv, "_ensure_image_present", lambda *a, **k: None)
+
+    def past_launch(*a, **k):
+        raise RuntimeError("PAST_MULTINODE_ESTIMATE")
+
+    monkeypatch.setattr(sv, "build_multi_node_launch", past_launch)
+    with pytest.raises(RuntimeError, match="PAST_MULTINODE_ESTIMATE"):
+        sv.serve_model(model=QWEN38, mode="workflow_max", tensor_parallel_size=2)
+    assert seen.get("cfgs"), "estimate_weights_gib was never called"
+    assert all(c == cfg for c in seen["cfgs"]), f"hf_config skipped on a call; got {seen['cfgs']!r}"
+
+
+def test_lab_safe_headroom_abort_only_on_large_uma():
+    from app.services import serve as sv
+
+    assert sv._lab_safe_headroom_abort(avail=20.0, ram_total=32.0) is None
+    assert sv._lab_safe_headroom_abort(avail=20.0, ram_total=None) is None
+    msg = sv._lab_safe_headroom_abort(avail=20.0, ram_total=121.7)
+    assert msg is not None and "ABORT" in msg and "60" in msg
+    assert sv._lab_safe_headroom_abort(avail=80.0, ram_total=121.7) is None
+
 

@@ -6,9 +6,14 @@ import { mkdirSync } from "fs";
 import { join } from "path";
 import { config } from "../config";
 
+export function hfSearchQuery(raw: string | undefined | null): string {
+  const q = String(raw ?? "").trim();
+  return q || "safetensors";
+}
+
 export async function searchHuggingFace(q: string, limit = 24): Promise<ModelCard[]> {
   const url = new URL("https://huggingface.co/api/models");
-  url.searchParams.set("search", q || "gguf");
+  url.searchParams.set("search", hfSearchQuery(q));
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("full", "false");
   url.searchParams.set("config", "false");

@@ -559,7 +559,7 @@ export default function ServerPage() {
           </div>
           <h1 className="page-title">Serve</h1>
           <p className="page-sub">
-            Arm a vLLM container on Spark. Auto-configure reads the live model card, the
+            Arm a vLLM container on this host. Auto-configure reads the live model card, the
             envelope caps memory, advanced flags stay folded until you need them.
           </p>
         </div>
@@ -1682,7 +1682,7 @@ function AgenticTab({
             <Callout tone="warn" title="Not installed">
               <div className="space-y-2">
                 <span>
-                  Install on spark1, then restart{" "}
+                  Install on this host, then restart{" "}
                   <code className="font-mono text-[10.5px]">bun run dev</code>:
                 </span>
                 <pre className="overflow-x-auto rounded-[2px] border border-l-2 border-lab-border border-l-lab-warn bg-lab-editor p-2.5 font-mono text-[11px] text-lab-text-dim">
@@ -1731,7 +1731,7 @@ function AgenticTab({
                     !healthy
                       ? "Start a model first"
                       : !available
-                        ? "Install tool-eval-bench on spark1 first"
+                        ? "Install tool-eval-bench on this host first"
                         : undefined
                   }
                 >

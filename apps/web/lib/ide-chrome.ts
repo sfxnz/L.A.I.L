@@ -7,14 +7,18 @@ export const SIDEBAR_SECTION_LABELS = ["Lab"] as const;
 export const WORKSPACE_NAV_LABELS = [
   "Status",
   "Serve",
+  "Models",
   "Evals",
+  "Connect",
   "Configure",
 ] as const;
 
 export const WORKSPACE_NAV = [
   { href: "/status", label: "Status" as const },
   { href: "/server", label: "Serve" as const },
+  { href: "/models", label: "Models" as const },
   { href: "/evals", label: "Evals" as const },
+  { href: "/connect", label: "Connect" as const },
   { href: "/configure", label: "Configure" as const },
 ];
 

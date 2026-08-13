@@ -1,4 +1,7 @@
-"""Dual-Spark cluster health for L.A.I.L Status (source of truth).
+"""Cluster health for L.A.I.L Status (source of truth).
+
+Default topology is a single local node. Remotes are opt-in via
+LAIL_CLUSTER_JSON or gitignored data/cluster.json.
 
 Probes:
   - local node (this host) via existing metadata helpers
@@ -9,6 +12,7 @@ Probes:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -17,32 +21,17 @@ from typing import Any
 
 from . import metadata
 
-# Default lab topology (sfxnz dual GB10). Override with LAIL_CLUSTER_JSON.
+log = logging.getLogger(__name__)
+
+# Clone default: this host only. Dual-node labs set LAIL_CLUSTER_JSON or data/cluster.json.
 _DEFAULT_CLUSTER = {
-    "name": "sfxnz-lab",
+    "name": "local",
     "nodes": [
         {
-            "id": "spark1",
-            "label": "spark1",
+            "id": "local",
+            "label": "this host",
             "role": "head",
             "local": True,
-            "ssh_host": "spark1",
-            "lan_ip": "10.20.20.48",
-            "tailscale_ip": "100.115.190.113",
-            "qsfp_ip": "10.100.8.1",
-            "qsfp_if": "enp1s0f1np1",
-            "vllm_url": "http://127.0.0.1:8000",
-        },
-        {
-            "id": "spark2",
-            "label": "spark2",
-            "role": "worker",
-            "local": False,
-            "ssh_host": "spark2",
-            "lan_ip": "10.20.20.195",
-            "tailscale_ip": "100.101.109.7",
-            "qsfp_ip": "10.100.8.2",
-            "qsfp_if": "enp1s0f1np1",
             "vllm_url": "http://127.0.0.1:8000",
         },
     ],
@@ -124,16 +113,17 @@ for c in containers:
     if m:
         tp = int(m.group(1))
 
-# fabric carrier/speed for preferred if
-qsfp_if = "enp1s0f1np1"
+# fabric carrier/speed for the node-configured iface (injected as qsfp_if)
 carrier = None
 speed = None
 try:
-    carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
+    if qsfp_if:
+        carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
 except Exception:
     pass
 try:
-    speed = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
+    if qsfp_if:
+        speed = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
 except Exception:
     pass
 
@@ -181,17 +171,57 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
+def _default_cluster() -> dict[str, Any]:
+    return json.loads(json.dumps(_DEFAULT_CLUSTER))
+
+
+def _parse_cluster_dict(data: Any, *, source: str) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        log.warning("%s is not a JSON object; using single local node", source)
+        return None
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        log.warning("%s missing nodes; using single local node", source)
+        return None
+    return data
+
+
+def _cluster_file_path():
+    from ..config import DATA_DIR
+
+    return DATA_DIR / "cluster.json"
+
+
 def _load_cluster_config() -> dict[str, Any]:
     raw = os.environ.get("LAIL_CLUSTER_JSON", "").strip()
     if raw:
         try:
-            data = json.loads(raw)
-            if isinstance(data, dict) and data.get("nodes"):
-                return data
-        except json.JSONDecodeError:
-            pass
-    # shallow copy defaults
-    return json.loads(json.dumps(_DEFAULT_CLUSTER))
+            parsed = _parse_cluster_dict(json.loads(raw), source="LAIL_CLUSTER_JSON")
+        except json.JSONDecodeError as e:
+            log.warning("LAIL_CLUSTER_JSON is invalid JSON (%s); using single local node", e)
+            return _default_cluster()
+        return parsed if parsed else _default_cluster()
+    try:
+        path = _cluster_file_path()
+        if path.is_file():
+            parsed = _parse_cluster_dict(json.loads(path.read_text()), source=str(path))
+            if parsed:
+                return parsed
+    except Exception as e:
+        log.warning("cluster.json unreadable (%s); using single local node", e)
+    return _default_cluster()
+
+
+def _node_is_local(node: dict[str, Any], n_cfg: int) -> bool:
+    """Honor explicit local flags only. Hostname must not steal a remote's IPs."""
+    if "local" in node:
+        return bool(node.get("local"))
+    return n_cfg == 1 and not node.get("ssh_host")
+
+
+def _remote_probe_script(node: dict[str, Any]) -> str:
+    prefix = f"qsfp_if = {json.dumps(str(node.get('qsfp_if') or ''))}\n"
+    return prefix + _REMOTE_PROBE_PY
 
 
 def _ping_ok(ip: str, timeout_s: float = 1.0) -> dict[str, Any]:
@@ -260,19 +290,20 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         if m:
             tp = int(m.group(1))
 
-    qsfp_if = node.get("qsfp_if") or "enp1s0f1np1"
+    qsfp_if = node.get("qsfp_if") or None
     carrier = None
     speed = None
-    try:
-        carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
-    except Exception:
-        pass
-    try:
-        sp = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
-        if sp > 0:
-            speed = sp
-    except Exception:
-        pass
+    if qsfp_if:
+        try:
+            carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
+        except Exception:
+            pass
+        try:
+            sp = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
+            if sp > 0:
+                speed = sp
+        except Exception:
+            pass
 
     code, ib, _ = _run(["ibdev2netdev"], timeout=5)
     up_ifs: list[str] = []
@@ -371,7 +402,7 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
     try:
         p = subprocess.run(
             cmd,
-            input=_REMOTE_PROBE_PY,
+            input=_remote_probe_script(node),
             text=True,
             capture_output=True,
             timeout=18,
@@ -525,7 +556,7 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
 
     cluster_reachable = online == len(nodes)
     fabric_ok = bool(fabric.get("ok"))
-    # Cluster "healthy" = both hosts reachable + fabric OK (serve state is separate)
+    # Single-node: healthy if this host is up. Fabric is required only when links were checked.
     return {
         "nodes_total": len(nodes),
         "nodes_online": online,
@@ -537,24 +568,54 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
     }
 
 
+def _fabric_link(a: dict[str, Any], b: dict[str, Any], target: str) -> dict[str, Any]:
+    link = {
+        "from": a["id"],
+        "to": b["id"],
+        "via": "qsfp",
+        "target_ip": target,
+        **_ping_ok(target, 1.0),
+    }
+    link["from_carrier"] = a.get("qsfp_carrier")
+    link["to_carrier"] = b.get("qsfp_carrier")
+    link["from_speed_mbps"] = a.get("qsfp_speed_mbps")
+    link["to_speed_mbps"] = b.get("qsfp_speed_mbps")
+    return link
+
+
+def _fabric_note(fabric_links: list[dict[str, Any]], probed: list[dict[str, Any]]) -> str:
+    if not fabric_links:
+        return "No multi-node fabric"
+    parts: list[str] = []
+    seen: set[str] = set()
+    for n in probed:
+        iface = n.get("qsfp_if")
+        if iface and iface not in seen:
+            seen.add(iface)
+            parts.append(str(iface))
+    for lnk in fabric_links:
+        ip = lnk.get("target_ip")
+        if ip and ip not in seen:
+            seen.add(ip)
+            parts.append(str(ip))
+    if parts:
+        return "QSFP RoCE path (" + " / ".join(parts) + ")"
+    return "configured interconnect"
+
+
 def collect_cluster() -> dict[str, Any]:
     cfg = _load_cluster_config()
-    nodes_cfg = cfg.get("nodes") or []
+    nodes_cfg = [n for n in (cfg.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
     probed: list[dict[str, Any]] = []
+    n_cfg = len(nodes_cfg)
 
     for node in nodes_cfg:
-        is_local = bool(node.get("local"))
-        # also treat matching hostname as local
-        if not is_local:
-            hn = platform.node().split(".")[0].lower()
-            if hn == str(node.get("id", "")).lower() or hn == str(node.get("label", "")).lower():
-                is_local = True
-        if is_local:
+        if _node_is_local(node, n_cfg):
             probed.append(_probe_local(node))
         else:
             probed.append(_probe_remote_ssh(node))
 
-    # Fabric: ping each remote qsfp from local, and local qsfp self
+    # Fabric: ping configured remote qsfp IPs only — never invent lab interconnects.
     fabric_links: list[dict[str, Any]] = []
     local_nodes = [n for n in probed if n.get("local")]
     remote_nodes = [n for n in probed if not n.get("local")]
@@ -563,40 +624,24 @@ def collect_cluster() -> dict[str, Any]:
         for a in local_nodes:
             for b in remote_nodes:
                 target = b.get("qsfp_ip")
-                link = {
-                    "from": a["id"],
-                    "to": b["id"],
-                    "via": "qsfp",
-                    "target_ip": target,
-                    **_ping_ok(target or "", 1.0),
-                }
-                # also record interface carrier on each side
-                link["from_carrier"] = a.get("qsfp_carrier")
-                link["to_carrier"] = b.get("qsfp_carrier")
-                link["from_speed_mbps"] = a.get("qsfp_speed_mbps")
-                link["to_speed_mbps"] = b.get("qsfp_speed_mbps")
+                if not target:
+                    continue
+                link = _fabric_link(a, b, str(target))
                 fabric_links.append(link)
                 if not link.get("ok"):
                     fabric_ok = False
     elif len(probed) >= 2:
-        # no clear local — try first→second qsfp
         a, b = probed[0], probed[1]
-        link = {
-            "from": a["id"],
-            "to": b["id"],
-            "via": "qsfp",
-            "target_ip": b.get("qsfp_ip"),
-            **_ping_ok(b.get("qsfp_ip") or "", 1.0),
-        }
-        fabric_links.append(link)
-        fabric_ok = bool(link.get("ok"))
-    else:
-        fabric_ok = True  # single-node cluster
+        target = b.get("qsfp_ip")
+        if target:
+            link = _fabric_link(a, b, str(target))
+            fabric_links.append(link)
+            fabric_ok = bool(link.get("ok"))
 
     fabric = {
         "ok": fabric_ok,
         "links": fabric_links,
-        "note": "QSFP RoCE path (enp1s0f1np1 / 10.100.8.x)" if fabric_links else "No multi-node fabric configured",
+        "note": _fabric_note(fabric_links, probed),
     }
 
     summary = _summarize(probed, fabric)

@@ -3,9 +3,17 @@ import { resolve, join } from "path";
 const root = resolve(process.env.LAIL_ROOT || join(import.meta.dir, "../../.."));
 
 export const config = {
-  host: process.env.LAIL_HOST || "0.0.0.0",
+  host: process.env.LAIL_HOST || "127.0.0.1",
   port: Number(process.env.LAIL_API_PORT || 8787),
   webPort: Number(process.env.LAIL_WEB_PORT || 3000),
+  token: (process.env.LAIL_TOKEN || "").trim(),
+  allowInsecureBind: ["1", "true", "yes"].includes(
+    (process.env.LAIL_INSECURE_BIND || "").trim().toLowerCase(),
+  ),
+  corsOrigins: (process.env.LAIL_CORS_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   serveEngineUrl: process.env.LAIL_SERVE_ENGINE_URL || `http://127.0.0.1:${process.env.LAIL_SERVE_ENGINE_PORT || 8765}`,
   root,
   dataDir: resolve(process.env.LAIL_DATA_DIR || join(root, "data")),

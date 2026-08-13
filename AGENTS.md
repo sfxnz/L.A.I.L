@@ -16,7 +16,7 @@ Load the `karpathy-coding-guidelines` skill. Four defaults:
 `bun` is not on the default tmux PATH — export it once per shell session:
 
 ```bash
-export PATH="/home/sfxnz/.bun/bin:$PATH"
+export PATH="$HOME/.bun/bin:$PATH"
 bun run typecheck                              # web + backend
 bun run build                                  # production build
 python3 -m pytest packages/serve-engine/tests/ -q

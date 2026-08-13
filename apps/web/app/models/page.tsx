@@ -8,7 +8,7 @@ import { Badge, Btn, Panel, inputCls } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 export default function ModelsPage() {
-  const [q, setQ] = useState("gguf");
+  const [q, setQ] = useState("");
   const [results, setResults] = useState<ModelCard[]>([]);
   const [local, setLocal] = useState<ModelCard[]>([]);
   const [busy, setBusy] = useState(false);
@@ -20,7 +20,6 @@ export default function ModelsPage() {
 
   useEffect(() => {
     loadLocal();
-    search();
   }, []);
 
   useEffect(() => {
@@ -99,7 +98,7 @@ export default function ModelsPage() {
                   value={q}
                   onChange={(e) => setQ(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && search()}
-                  placeholder="Search Hugging Face models"
+                  placeholder="Search Hugging Face (safetensors, NVFP4, …)"
                 />
               </div>
               <Btn size="sm" onClick={search} disabled={busy}>

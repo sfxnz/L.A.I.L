@@ -2,9 +2,9 @@
 # Publish L.A.I.L lab artifacts the Wesche way: static site → GitHub Pages.
 #
 # First time:
-#   1. Create empty public repo (e.g. sfxnz/dgx-lab) with Pages from gh-pages branch
-#   2. export LAIL_SITE_REPO=git@github.com:YOU/dgx-lab.git
-#   3. export LAIL_SITE_BASE=https://YOU.github.io/dgx-lab   # or custom domain
+#   1. Create empty public repo (e.g. YOU/your-lab-site) with Pages from gh-pages branch
+#   2. export LAIL_SITE_REPO=git@github.com:YOU/your-lab-site.git
+#   3. export LAIL_SITE_BASE=https://YOU.github.io/your-lab-site   # or custom domain
 #   4. bun run lab:site-deploy
 #
 # After that, each deploy rebuilds site/dist and force-pushes gh-pages.
@@ -20,8 +20,8 @@ OUT="${LAIL_SITE_OUT:-$ROOT/site/dist}"
 
 if [[ -z "$SITE_REPO" ]]; then
   echo "Set LAIL_SITE_REPO to your GitHub Pages repo, e.g.:" >&2
-  echo "  export LAIL_SITE_REPO=git@github.com:sfxnz/dgx-lab.git" >&2
-  echo "  export LAIL_SITE_BASE=https://sfxnz.github.io/dgx-lab" >&2
+  echo "  export LAIL_SITE_REPO=git@github.com:YOU/your-lab-site.git" >&2
+  echo "  export LAIL_SITE_BASE=https://YOU.github.io/your-lab-site" >&2
   echo "  # optional custom domain: LAIL_SITE_BASE=https://lab.example.com" >&2
   exit 2
 fi

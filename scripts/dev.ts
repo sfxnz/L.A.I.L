@@ -7,7 +7,7 @@ import { existsSync, mkdirSync } from "fs";
 import { resolve, join } from "path";
 
 const root = resolve(import.meta.dir, "..");
-const host = process.env.LAIL_HOST || "0.0.0.0";
+const host = process.env.LAIL_HOST || "127.0.0.1";
 const apiPort = process.env.LAIL_API_PORT || "8787";
 const webPort = process.env.LAIL_WEB_PORT || "3000";
 const servePort = process.env.LAIL_SERVE_ENGINE_PORT || "8765";
@@ -76,6 +76,10 @@ run(
     LOCAL_AI_LAB_ROOT: root,
     LAIL_DATA_DIR: dataDir,
     LAB_API_PORT: servePort,
+    LAB_HOST: host,
+    LAIL_HOST: host,
+    LAIL_TOKEN: process.env.LAIL_TOKEN || "",
+    LAIL_INSECURE_BIND: process.env.LAIL_INSECURE_BIND || "",
     // uv tool install puts CLI here — needed for tool-eval-bench jobs
     PATH: `${process.env.HOME || ""}/.local/bin:${process.env.PATH || ""}`,
   },
@@ -89,6 +93,9 @@ run(
   {
     LAIL_HOST: host,
     LAIL_API_PORT: apiPort,
+    LAIL_TOKEN: process.env.LAIL_TOKEN || "",
+    LAIL_INSECURE_BIND: process.env.LAIL_INSECURE_BIND || "",
+    LAIL_CORS_ORIGINS: process.env.LAIL_CORS_ORIGINS || "",
     LAIL_SERVE_ENGINE_URL: `http://127.0.0.1:${servePort}`,
     LAIL_ROOT: root,
     LAIL_DATA_DIR: dataDir,
@@ -124,6 +131,7 @@ run(
     // from window.location.hostname in apps/web/lib/ws.ts.
     LAIL_API_URL: `http://127.0.0.1:${apiPort}`,
     NEXT_PUBLIC_LAIL_API: `http://127.0.0.1:${apiPort}`,
+    LAIL_TOKEN: process.env.LAIL_TOKEN || "",
   },
 );
 

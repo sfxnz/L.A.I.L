@@ -26,9 +26,10 @@ import {
 } from "./controller/patches";
 import { approvalHub } from "./agent/approvals";
 import { getUsageSummary } from "./controller/usage";
-import { searchHuggingFace, listLocalModels, pullModel, getPullJob } from "./controller/models";
+import { searchHuggingFace, hfSearchQuery, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
 import { config } from "./config";
+import { allowQueryToken, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
   ensureDemoLabRuns,
   compareLabRuns,
@@ -54,14 +55,35 @@ export function createApp() {
     /* */
   }
 
+  const corsAllow = [
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    `http://127.0.0.1:${config.webPort}`,
+    `http://localhost:${config.webPort}`,
+    ...config.corsOrigins,
+  ];
   app.use(
     "*",
     cors({
-      origin: "*",
+      origin: (origin) => resolveCorsOrigin(origin, corsAllow),
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowHeaders: ["Content-Type", "Authorization"],
+      allowHeaders: ["Content-Type", "Authorization", "X-Lail-Token"],
     }),
   );
+
+  app.use("*", async (c, next) => {
+    if (!config.token) return next();
+    if (c.req.method === "OPTIONS") return next();
+    const path = new URL(c.req.url).pathname;
+    if (isPublicUnauthedPath(path, c.req.method)) return next();
+    if (tokenMatches(c.req.raw, config.token, { allowQuery: allowQueryToken(path) })) {
+      return next();
+    }
+    return c.json(
+      { error: "unauthorized", message: "LAIL_TOKEN required (Authorization: Bearer or X-Lail-Token)" },
+      401,
+    );
+  });
 
   app.get("/api/health", (c) =>
     c.json({ status: "ok", service: "lail-controller", version: "0.1.0" }),
@@ -234,7 +256,7 @@ export function createApp() {
     return c.json({ local });
   });
   app.get("/api/models/search", async (c) => {
-    const q = c.req.query("q") || "gguf";
+    const q = hfSearchQuery(c.req.query("q"));
     try {
       const results = await searchHuggingFace(q);
       return c.json({ results });
@@ -278,6 +300,7 @@ export function createApp() {
     try {
       const r = await fetch(`${config.serveEngineUrl}/api/status`, {
         signal: AbortSignal.timeout(3000),
+        headers: config.token ? { "x-lail-token": config.token } : undefined,
       });
       if (r.ok) serve = await r.json();
       else serve = { error: `serve-engine ${r.status}` };

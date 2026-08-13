@@ -130,7 +130,7 @@ export default function ConfigurePage() {
             id="cfg-model"
             value={settings.defaultModel}
             onChange={(e) => setSettings({ ...settings, defaultModel: e.target.value })}
-            placeholder="auto — or leave and Workbench follows Server"
+            placeholder="auto — or the first live /v1/models id"
           />
         </Field>
         <Field

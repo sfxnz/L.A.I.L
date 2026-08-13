@@ -71,7 +71,7 @@ GOLDEN_TOOLS_DEF = [
 
 # (prompt, allowed tool names or None for no-tool)
 GOLDEN_CASES: list[tuple[str, set[str] | None]] = [
-    ("List the files in /home/sfxnz", {"run_command"}),
+    ("List the files in /tmp", {"run_command"}),
     ("What's inside /etc/hostname?", {"read_file", "run_command"}),
     ("Create a file at /tmp/hello.txt containing the word hi", {"write_file", "run_command"}),
     ("How much disk space is free?", {"run_command"}),

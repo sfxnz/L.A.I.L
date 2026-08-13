@@ -134,6 +134,8 @@ export default function StatusPage() {
   const multiMode = cluster?.summary?.multi?.mode;
   const backendCount = status ? Object.keys(status.backends || {}).length : null;
   const containers = serve?.containers || [];
+  const nodeCount = cluster?.summary?.nodes_total ?? cluster?.nodes?.length ?? 0;
+  const fabricMeta = loading ? "probing" : nodeCount >= 2 ? `${nodeCount} nodes` : "this host";
 
   return (
     <div className="lab-fade-in space-y-4">
@@ -202,7 +204,7 @@ export default function StatusPage() {
           </div>
           <h1 className="page-title">Status</h1>
           <p className="page-sub">
-            Dual-Spark cluster health, model load map, hardware headroom, and recent runs.
+            Cluster health, model load map, hardware headroom, and recent runs.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -232,7 +234,7 @@ export default function StatusPage() {
           }
           onDismiss={() => setErr(null)}
         >
-          {err}. Check that <code className="text-lab-text">bun run dev</code> is up on spark1
+          {err}. Check that <code className="text-lab-text">bun run dev</code> is up on this host
           (ports 3000 / 8787 / 8765).
         </Callout>
       )}
@@ -253,7 +255,7 @@ export default function StatusPage() {
       )}
 
       <section className="space-y-2.5">
-        <Band index="01" label="Fabric" meta="dual spark" />
+        <Band index="01" label="Fabric" meta={fabricMeta} />
         <div className="lab-rise">
           <ClusterPanel cluster={cluster} loading={loading} />
         </div>

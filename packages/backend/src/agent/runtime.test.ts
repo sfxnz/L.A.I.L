@@ -81,10 +81,10 @@ describe("AgentRuntime", () => {
     const ws = createWorkspace(`runtime-test-${process.pid}`, TMP);
     workspaceId = ws.id;
     rootPath = ws.rootPath;
-    // Snapshot production settings — tests must not leave mock-model stuck in lab DB
+    // Snapshot production settings — tests must not leave a placeholder stuck in lab DB
     savedModel = getSettings().defaultModel;
-    // Prefer a real served id when available; mock-model is treated as auto-resolve
-    putSettings({ defaultModel: "auto" });
+    // "auto" / "mock-model" resolve via live /v1/models and fail on a clean clone
+    putSettings({ defaultModel: "ci-test-model" });
   });
 
   afterAll(() => {

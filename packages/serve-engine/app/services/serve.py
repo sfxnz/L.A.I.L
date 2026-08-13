@@ -25,7 +25,24 @@ from ..config import (
     WORKFLOW_MAX_LEN,
     WORKFLOW_UTIL,
 )
-from .metadata import available_gib, list_vllm_containers
+from .metadata import available_gib, collect_hardware, list_vllm_containers
+
+
+# Lab Safe 60 GiB free-RAM abort is a Spark UMA contract (~128 GiB hosts).
+_LAB_SAFE_HEADROOM_MIN_RAM_GIB = 100.0
+
+
+def _lab_safe_headroom_abort(avail: float | None, ram_total: float | None) -> str | None:
+    """Return an abort message only on large-UMA hosts that can actually keep 60 GiB free."""
+    if avail is None:
+        return None
+    if ram_total is None or ram_total < _LAB_SAFE_HEADROOM_MIN_RAM_GIB:
+        return None
+    if avail < SAFE_MIN_AVAIL_GIB:
+        return (
+            f"ABORT: available {avail} GiB < {SAFE_MIN_AVAIL_GIB} GiB — container stopped"
+        )
+    return None
 
 
 # ─── Multi-node launcher ──────────────────────────────────────────────────────
@@ -724,6 +741,7 @@ def serve_model(
     try:
         from .autoconfig import (
             _cluster_topology,
+            _resolved_node_ram_gib,
             check_serve_loadability,
             estimate_weights_gib,
             load_local_fallback,
@@ -736,7 +754,7 @@ def serve_model(
         plan = plan_placement(weights, topo, mode=mode, overlay=None)
         n_avail = int(plan.get("nodes_available") or 1)
         n_use = min(tp_n, n_avail)
-        node_ram = float(plan.get("node_ram_gib") or 121.7)
+        node_ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
         reserve = float(plan.get("reserve_gib") or 15.0)
         fits_ok, msg = check_serve_loadability(
             mode=mode,
@@ -753,8 +771,8 @@ def serve_model(
             )
     except RuntimeError:
         raise
-    except Exception:
-        pass  # topology/HF probe failure must not brick Start for small local models
+    except Exception as e:
+        w(f"fit-gate probe failed ({e}); continuing Start", 0.12)
 
     env_list = _normalize_docker_env(docker_env)
 
@@ -969,11 +987,15 @@ def serve_model(
         raise RuntimeError(f"Timeout waiting for /v1/models\n--- docker logs ---\n{logs[-4000:]}")
 
     avail = available_gib()
-    if mode == "lab_safe" and avail is not None and avail < SAFE_MIN_AVAIL_GIB:
+    ram_total = None
+    try:
+        ram_total = collect_hardware().get("ram_gib")
+    except Exception:
+        ram_total = None
+    abort = _lab_safe_headroom_abort(avail, ram_total if isinstance(ram_total, (int, float)) else None)
+    if mode == "lab_safe" and abort:
         subprocess.run(["docker", "stop", container], capture_output=True)
-        raise RuntimeError(
-            f"ABORT: available {avail} GiB < {SAFE_MIN_AVAIL_GIB} GiB — container stopped"
-        )
+        raise RuntimeError(abort)
     w(f"API ready. available_gib={avail}", 1.0)
     return {
         "ok": True,

@@ -29,11 +29,12 @@ describe("shipped AppShell source labels", () => {
 describe("shipped Workbench retirement page", () => {
   const wb = readFileSync(join(webRoot, "app/workbench/page.tsx"), "utf8");
 
-  test("points users to Hermes / Serve / Evals / public site", () => {
+  test("points users to Hermes / Serve / Evals / Connect", () => {
     expect(wb).toContain("Hermes");
     expect(wb).toContain("/server");
     expect(wb).toContain("/evals");
-    expect(wb).toContain("sfxnz.github.io/dgx-lab");
+    expect(wb).toContain("/connect");
+    expect(wb).not.toContain("sfxnz.github.io");
     expect(wb).not.toContain('href="/lab"');
   });
 });

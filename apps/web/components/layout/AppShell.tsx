@@ -257,16 +257,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <footer className="relative z-10 shrink-0 border-t border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-md">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6">
           <span className="font-[family-name:var(--font-display)] text-[10px] font-medium uppercase leading-none tracking-[0.18em] text-lab-muted">
-            Serve · eval · Hermes builds · public on GitHub Pages
+            Serve · eval · Hermes
           </span>
-          <a
-            href="https://sfxnz.github.io/dgx-lab/"
-            target="_blank"
-            rel="noreferrer"
-            className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-accent-bright transition-colors hover:text-lab-accent"
-          >
-            Public site →
-          </a>
         </div>
       </footer>
     </div>

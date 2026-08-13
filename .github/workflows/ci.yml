@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test web and backend
+        run: bun test apps/web packages/backend
+
+      - name: Install serve-engine
+        run: python3 -m pip install -e "packages/serve-engine[dev]"
+
+      - name: Test serve-engine
+        run: python3 -m pytest packages/serve-engine/tests -q

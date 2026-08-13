@@ -61,7 +61,7 @@ async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
 
 @router.get("/cluster")
 async def cluster_status() -> dict[str, Any]:
-    """Dual-Spark fabric + per-node serve health (L.A.I.L cluster SoT)."""
+    """Cluster fabric + per-node serve health (L.A.I.L cluster SoT)."""
     try:
         return cluster.collect_cluster()
     except Exception as e:

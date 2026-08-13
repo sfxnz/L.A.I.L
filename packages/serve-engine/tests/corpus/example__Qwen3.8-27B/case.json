@@ -1,0 +1,25 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "mode": "workflow_max",
+  "note": "Unknown dense Qwen3.x (no overlay, no nvfp4 in id). Card+config modeled on nvidia/Qwen3.6-27B. Heuristic must treat ModelOpt MIXED as ~4-bit so a 27B fits one node.",
+  "expect": {
+    "serve_blocked": false,
+    "weights_gib_min": 5.0,
+    "weights_gib_max": 25.0,
+    "config": {
+      "quantization": "modelopt_mixed",
+      "kv_cache_dtype": "fp8",
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_coder",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "forbidden": [
+      "flashinfer_b12x",
+      "humming",
+      "$",
+      "--model ",
+      "compressed-tensors"
+    ]
+  }
+}

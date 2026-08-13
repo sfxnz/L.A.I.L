@@ -1,8 +1,8 @@
 # L.A.I.L — Local AI Lab
 
-**Serve & eval console for DGX Spark** — clean white UI to start/stop vLLM, run smoke/perf evals, and copy OpenAI-compatible endpoints for **Hermes** (and other clients).
+**Serve & eval console** — start/stop vLLM, run smoke/perf evals, and copy OpenAI-compatible endpoints for **Hermes** (and other clients).
 
-Agentic coding/chat is **not** the primary surface anymore: wire Hermes to the live `:8000` endpoint after Serve.
+Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to the live `:8000` endpoint.
 
 | Layer | Stack |
 |-------|--------|
@@ -13,18 +13,16 @@ Agentic coding/chat is **not** the primary surface anymore: wire Hermes to the l
 
 ## Product surface
 
-Top nav:
+Top nav (`apps/web/lib/ide-chrome.ts`):
 
 | Page | Path | Role |
 |------|------|------|
 | **Status** | `/status` | Health, headroom, containers, recent runs |
 | **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
 | **Evals** | `/evals` | Smoke + perf jobs + run history |
-| **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
-| **Models** | `/models` | HF search / download |
 | **Configure** | `/configure` | Default backend / model |
 
-`/` redirects to **Status**. `/workbench` shows a retirement notice → Hermes.
+`/` redirects to **Status** (`apps/web/app/page.tsx`). After a model is up, open **`/connect`** for Hermes / OpenAI base URL snippets (not in the top nav). `/workbench` is a retirement notice — Hermes is the agent.
 
 ## Architecture
 
@@ -44,66 +42,75 @@ Top nav:
      (OpenAI /v1)                      (Python: docker serve,
                                         smoke, perf, history)
                │
-               └──────────▶ Hermes / Mac clients
+               └──────────▶ Hermes / laptop clients
 ```
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the Spark/vLLM serve path (Lab Safe util ≤ 0.4, Workflow Max, stop, agent-restore, benches, envelopes). Composer agent remains in the backend for now but is **out of the primary UI**.
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (Lab Safe util ≤ 0.4, Workflow Max, stop, agent-restore, benches, envelopes). Composer agent remains in the backend for now but is **out of the primary UI**.
 
 ### Model resolution
 
-Configure default model, or use `auto`. If the name is `default` / `auto` / empty, the controller probes `/v1/models` and uses the first served id. Prefer setting the real id after serve (e.g. `laguna`).
+Configure default model, or use `auto`. If the name is `default` / `auto` / empty, the controller probes `/v1/models` and uses the first served id. Prefer setting the real HF id after serve.
 
 ## Quick start
 
+A new clone is **one local node** (this host). Multi-node is opt-in via `LAIL_CLUSTER_JSON` — see [`.env.example`](./.env.example).
+
 ### Prerequisites
 
-- [Bun](https://bun.sh) ≥ 1.1  
-- Python 3.11+ (serve-engine)  
-- Optional: Docker + NVIDIA for vLLM; llama.cpp server for GGUF  
+- [Bun](https://bun.sh) ≥ 1.1
+- Python **3.12** (3.11+ works; 3.12 matches CI and the Docker image)
+- **Linux + NVIDIA (required to Start vLLM):** NVIDIA driver, [Docker](https://docs.docker.com/engine/install/), and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) so `docker run --gpus` works. Serve **Start** is docker-only.
+- **Apple Silicon:** llama.cpp on `:8080`, or an SSH tunnel to a remote NVIDIA host that runs vLLM.
 
 ```bash
-# Install Bun if needed
+# 1. Clone, then stay at the repo root
+git clone <this-repo> lail
+cd lail
+
+# 2. Bun (skip if `bun --version` already works)
 curl -fsSL https://bun.sh/install | bash
-source ~/.bashrc   # or reopen the shell
+# reopen the shell, or: export PATH="$HOME/.bun/bin:$PATH"
 
-cd ~/projects/ai-lab/local-ai-lab
-
-python3 -m venv .venv
+# 3. Python deps from packages/serve-engine/pyproject.toml
+python3.12 -m venv .venv   # or: python3 -m venv .venv
 source .venv/bin/activate
-pip install fastapi 'uvicorn[standard]' httpx pydantic aiosqlite python-multipart sse-starlette
+pip install -e "packages/serve-engine[dev]"
 
+# 4. App env + JS deps
 cp .env.example .env
-# Edit LAIL_DEFAULT_MODEL to a real served id when vLLM is up
+# Optional: set HF_TOKEN for gated models.
+# Leave LAIL_CLUSTER_JSON unset for a single local node.
+
 bun install
 bun run dev
 ```
 
+Open http://127.0.0.1:3000 — **`/` redirects to Status**.
+
 | Service | URL |
 |---------|-----|
-| Web (Workbench) | http://127.0.0.1:3000 |
+| Web (Status) | http://127.0.0.1:3000 |
 | Controller | http://127.0.0.1:8787 |
 | Serve-engine | http://127.0.0.1:8765 |
-| WebSocket | ws://127.0.0.1:8787/ws |
-
-Default route `/` redirects to **`/workbench`**.
-
-### From a Mac (SSH tunnel)
-
-L.A.I.L binds on the lab host (e.g. spark1). On the Mac:
-
-```bash
-ssh -L 3000:127.0.0.1:3000 -L 8787:127.0.0.1:8787 sfxnz@spark1
-```
-
-Then open http://127.0.0.1:3000 on the Mac.
+| WebSocket | derived from the page host (controller `/ws`) |
 
 ### Linux + NVIDIA / DGX Spark
 
-1. Drivers + Docker GPU for vLLM.  
-2. **Server → Lab Safe** for comparable benches (util ≤ 0.4).  
-3. **Workflow Max** for agent / long context (util ~0.7–0.85; keep ≳15–20 GiB free).  
+GPU + Docker check (do this once before Serve):
+
+```bash
+nvidia-smi && docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi
+```
+
+Then in the UI:
+
+1. **Status** — controller up; one local node unless you set `LAIL_CLUSTER_JSON`.
+2. **Serve** — paste an HF model id.
+3. **Auto-configure from HF** — fills Lab Safe / Workflow Max flags from the live card.
+4. **Start** — launches the vLLM container. Watch the job dock.
+5. **`/connect`** — copy the Hermes / OpenAI base URL.
 
 | Intent | When | Defaults |
 |--------|------|----------|
@@ -111,57 +118,50 @@ Then open http://127.0.0.1:3000 on the Mac.
 | `workflow_max` | Real agent / long ctx | util **0.7–0.85** |
 | `attach` | Already-served model | Probe only |
 
+**Lab Safe** keeps headroom for the OS / Hermes. **Workflow Max** is for large weights / long context (keep ≳15–20 GiB free on Spark-class UMA).
+
 ### Apple Silicon
 
-1. Prefer **llama.cpp** on `:8080`.  
-2. **Configure** → backend **llama.cpp**.  
-3. Use **Server** when talking to a remote NVIDIA/Spark vLLM endpoint.  
+1. Prefer **llama.cpp** on `:8080`.
+2. **Configure** → backend **llama.cpp**.
+3. Use **Serve** when the vLLM container runs on a remote NVIDIA/Spark host (tunnel or LAN).
 
-## Workbench (agentic IDE)
+### From another machine (SSH tunnel)
 
-**Phase A** delivers a Cursor-style agent platform (modes, review-first patches, cancel, shell approval). **Phase B** adds a **context engine**: open tabs + `@` mentions packed into each agent run under a configurable character budget. Specs: [Phase A design](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B design](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md). Later phases (Monaco, terminal panel, etc.) are still planned.
+L.A.I.L binds on the lab host. From a laptop:
 
-1. Open **Workbench** (or `/`).  
-2. Ensure vLLM or llama.cpp is healthy (**Status** / **Server**).  
-3. Set **Configure → Default model** to the served model id (or leave auto).  
-4. Pick a mode, then prompt the agent:
+```bash
+ssh -L 3000:127.0.0.1:3000 -L 8787:127.0.0.1:8787 -L 8765:127.0.0.1:8765 "$USER@<lab-host>"
+```
 
-| Mode | Behavior |
-|------|----------|
-| **Plan** | Design / outline only — no file edits or patches |
-| **Ask** | Read-only tools (explore, answer) — no writes |
-| **Agent** | Full tools; edits land as **pending patches** until you Accept |
+Then open http://127.0.0.1:3000. Replace `$USER@<lab-host>` with your SSH login.
 
-5. **Patches**: Accept / Reject per change (or Accept all). Disk and editor tabs update only after Accept.  
-6. **Cancel** stops an in-flight run; **risky shell** commands pause for Allow / Deny.  
-7. Use **Save** after manual edits in editor tabs.  
-8. **Context (Phase B)**: open editor tabs are auto-included; type `@` in Composer for a path popup (`@file path`), or use `@folder`, `@search "query"`, `@code`. Context chips show mentions + open tab count. Adjust **Configure → Context budget (chars)** (default 32000).
+## Connect (Hermes)
 
-**Composer stream labels** (inspo-style):
+On **`/connect`**, copy the snippets for the live OpenAI-compatible endpoint.
 
-| UI | Meaning |
-|----|---------|
-| **Thought** | Model reasoning step |
-| **Ran N command(s)** | Completed tool calls (counts **tool_end** only) |
-| **Creating path** | File write / patch proposal; may open editor tab |
-| **Working** | In-progress turn |
+**Hermes on the same host** (loopback):
 
-Bottom placeholder: **Ask for follow-up changes**.
+```bash
+OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+OPENAI_API_KEY=local
+OPENAI_MODEL=<served-model-id>
+```
 
-## Server (vLLM serve & evals)
+**Hermes / clients on another machine:** use that page’s host (`http://<page-host>:8000/v1`) or the SSH tunnel above. If localhost works on the lab host but a remote client fails, vLLM is likely published on `127.0.0.1:8000` only — tunnel or re-serve with an intentional LAN bind.
 
-Full parity with the previous lab GUI:
+## Serve (vLLM serve & evals)
 
-- Lab Safe / Workflow Max start · stop · agent-restore  
-- HF auto-configure · live job logs  
-- Smoke · perf · golden tools · run history envelopes  
+- Lab Safe / Workflow Max start · stop · agent-restore
+- HF auto-configure · live job logs
+- Smoke · perf · golden tools · run history envelopes
 
 Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first**, then bench.
 
 ## Models & Usage
 
-- **Models**: HF search, local list from vLLM/llama.cpp `/v1/models`, HF download jobs (not Ollama pull).  
-- **Usage**: lifetime tokens, heatmap, mix, top models (metered from proxy + agent).  
+- **`/models`**: HF search, local list from vLLM/llama.cpp `/v1/models`, HF download jobs (not Ollama pull).
+- **`/usage`**: lifetime tokens, heatmap, mix, top models (metered from proxy + agent).
 
 ## Environment
 
@@ -176,18 +176,24 @@ See [`.env.example`](./.env.example).
 | `LAIL_API_PORT` / `LAIL_WEB_PORT` / `LAIL_SERVE_ENGINE_PORT` | Ports |
 | `LAIL_DATA_DIR` / `LAIL_WORKSPACES_DIR` | Data + project roots |
 | `HF_TOKEN` | Optional gated HF access |
+| `LAIL_CLUSTER_JSON` | Optional. Unset = one local node. See `.env.example` for a 2-node EXAMPLE |
+| `LAIL_DEV_ORIGINS` | Optional extra Next.js `allowedDevOrigins` (loopback is already allowed) |
+
+## Retired: Workbench
+
+`/workbench` is not the landing page. It shows a retirement notice pointing at Hermes. Plan / Ask / Agent live in Hermes against the served `:8000` endpoint, not in this console.
 
 ## Monorepo layout
 
 ```text
-local-ai-lab/
-  apps/web/                 Next.js UI (shell, Workbench, Models, Server, …)
-    lib/ide-chrome.ts       Sidebar + stream chrome contract (tested)
+lail/
+  apps/web/                 Next.js UI (Status, Serve, Evals, Connect, …)
+    lib/ide-chrome.ts       Top-nav + stream chrome contract (tested)
   packages/backend/         Bun LabController + agent + proxy
-  packages/serve-engine/    Python vLLM serve/bench API
+  packages/serve-engine/    Python vLLM serve/bench API (install from pyproject.toml)
   packages/shared/          Shared TS types
-  workspaces/demo/          Default Composer workspace
-  data/                     lail.sqlite, lab.sqlite, runs/, models/
+  workspaces/demo/          Default workspace root
+  data/                     sqlite, runs/, models/ (gitignored runtime state)
   scripts/dev.ts            One-command: serve-engine + API + web
   docker-compose.yml
   .env.example
@@ -206,12 +212,20 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Tests
 
+From the repo root (Bun on `PATH`, venv activated if you use one):
+
 ```bash
-cd apps/web
-bun test lib/ide-chrome.test.ts lib/shell-source.test.ts
+bun run typecheck
+bun test apps/web packages/backend
+python3 -m pytest packages/serve-engine/tests -q
 ```
 
-These assert inspo sidebar labels, Composer placeholder, Thought/Ran/Creating stream mapping (tool_end counts once), Workbench source chrome, and `/` → Workbench redirect.
+- `bun run typecheck` — web + backend TypeScript
+- `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), shell source, mentions
+- `packages/backend` tests — agent runtime, patches, context packer
+- `packages/serve-engine` pytest — auto-config, cluster, captured corpus
+
+Those tests do **not** assert a `/` → Workbench redirect. `/` redirects to `/status`.
 
 ## Docker Compose
 
@@ -221,14 +235,6 @@ docker compose up --build
 
 Run vLLM or llama.cpp on the host; set `LAIL_VLLM_URL` / `LAIL_LLAMACPP_URL` (compose uses `host.docker.internal` by default).
 
-## Migration
-
-Previous Vite + FastAPI lab:
-
-`~/projects/ai-lab/local-ai-lab-legacy`
-
-Run envelopes under `data/runs` were carried forward. Serve APIs remain available through the serve-engine proxy.
-
 ## License
 
-Private lab software — use on your own hardware.
+Apache-2.0. See [LICENSE](./LICENSE).

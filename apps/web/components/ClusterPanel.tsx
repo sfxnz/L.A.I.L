@@ -455,8 +455,7 @@ export function ClusterPanel({
     return (
       <Panel title="Cluster" padded>
         <EmptyState title="Cluster probe unavailable">
-          Serve-engine didn’t return dual-Spark topology. Check :8765 and SSH to spark2 when you
-          need the fabric map.
+          Serve-engine didn’t return cluster topology. Check that the engine is up on :8765.
         </EmptyState>
       </Panel>
     );

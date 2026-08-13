@@ -1,38 +1,36 @@
 # Checkpoint — L.A.I.L (Local AI Lab)
 
-Session handoff. Read this before continuing lab work.
+> Maintainer session notes, not user documentation. See [README.md](./README.md) to run L.A.I.L.
 
-## What this product is
-
-**Cursor-style local agentic IDE** + lab tooling. **Phase A** (agent platform) is in: modes, review-first patches, streaming/cancel, risky shell approval. **Phase B** (context engine) is in: `EditorSnapshot`, `@file`/`@folder`/`@search` mentions, open-tab packing, Configure context budget.
+Session handoff. Primary product is the **serve & eval console**. Composer/Workbench is retired — Hermes is the agent.
 
 | Surface | Role |
 |---------|------|
-| **Workbench** | Primary — Composer (Plan / Ask / Agent), @mentions + context chips, patch review Accept/Reject, shell approval, cancel, file tabs, Status rail |
-| **Server** | vLLM Lab Safe / Workflow Max, smoke, perf, agentic, history |
-| **Models** | HF search + download for vLLM/llama.cpp |
-| **Usage / Configure / Status** | Metering, backends, context budget, health |
+| **Status** | Landing (`/` → `/status`) — health, cluster, recent runs |
+| **Serve** | vLLM Lab Safe / Workflow Max, auto-config, start/stop, job logs |
+| **Evals** | Smoke + perf + tool-eval history |
+| **Connect** | `/connect` — Hermes / OpenAI snippets |
+| **Configure** | Default backend / model |
 
-Path: `~/projects/ai-lab/local-ai-lab`  
-Legacy GUI: `~/projects/ai-lab/local-ai-lab-legacy`  
-Design: [Phase A](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md)
+Design (retired Workbench): [Phase A](./docs/superpowers/specs/2026-07-16-lail-cursor-ide-design.md) · [Phase B](./docs/superpowers/specs/2026-07-16-lail-phase-b-context-engine-design.md)
 
 ## Start
 
+From the repo root (see README Quick start for clone + `pip install -e "packages/serve-engine[dev]"`):
+
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
-cd ~/projects/ai-lab/local-ai-lab
 source .venv/bin/activate   # if using venv for serve-engine
 bun run dev
 ```
 
 | Service | Port |
 |---------|------|
-| Web | **3000** → `/workbench` |
+| Web | **3000** → `/status` |
 | Controller | **8787** |
 | Serve-engine | **8765** |
 
-Mac tunnel: `ssh -L 3000:127.0.0.1:3000 -L 8787:127.0.0.1:8787 sfxnz@spark1`
+Laptop tunnel: `ssh -L 3000:127.0.0.1:3000 -L 8787:127.0.0.1:8787 -L 8765:127.0.0.1:8765 "$USER@<lab-host>"`
 
 ## Model gotcha
 

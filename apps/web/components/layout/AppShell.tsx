@@ -4,10 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   Activity,
-  Boxes,
   FlaskConical,
   LayoutDashboard,
-  Plug,
   Server,
   Settings2,
 } from "lucide-react";
@@ -24,9 +22,7 @@ import { ThemeToggle } from "@/components/animus/ThemeToggle";
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   Status: LayoutDashboard,
   Serve: Server,
-  Models: Boxes,
   Evals: FlaskConical,
-  Connect: Plug,
   Configure: Settings2,
 };
 

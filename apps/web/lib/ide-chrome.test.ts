@@ -25,17 +25,13 @@ describe("ide-chrome nav contract", () => {
     expect([...WORKSPACE_NAV_LABELS]).toEqual([
       "Status",
       "Serve",
-      "Models",
       "Evals",
-      "Connect",
       "Configure",
     ]);
     expect(WORKSPACE_NAV.map((n) => n.href)).toEqual([
       "/status",
       "/server",
-      "/models",
       "/evals",
-      "/connect",
       "/configure",
     ]);
   });

@@ -17,20 +17,16 @@ if str(BACKEND) not in sys.path:
 
 from app.api.routes import router  # noqa: E402
 from app import db  # noqa: E402
-from app.bind import assert_safe_bind, token_from_headers  # noqa: E402
+from app.bind import (  # noqa: E402
+    allow_query_token,
+    assert_safe_bind,
+    cors_origins,
+    token_from_headers,
+)
 from app.config import APP_ROOT  # noqa: E402
 
 _LAIL_TOKEN = (os.environ.get("LAIL_TOKEN") or "").strip()
-_CORS_ORIGINS = [
-    x.strip()
-    for x in (os.environ.get("LAIL_CORS_ORIGINS") or "").split(",")
-    if x.strip()
-] or [
-    "http://127.0.0.1:3000",
-    "http://localhost:3000",
-    "http://127.0.0.1:8787",
-    "http://localhost:8787",
-]
+_CORS_ORIGINS = cors_origins(os.environ.get("LAIL_CORS_ORIGINS"))
 
 app = FastAPI(
     title="Local AI Lab",
@@ -59,7 +55,7 @@ async def _token_guard(request: Request, call_next):
     if token_from_headers(request.headers, _LAIL_TOKEN):
         return await call_next(request)
     q = request.query_params.get("token") or ""
-    if q == _LAIL_TOKEN:
+    if allow_query_token(path) and q == _LAIL_TOKEN:
         return await call_next(request)
     return JSONResponse(
         {"error": "unauthorized", "message": "LAIL_TOKEN required"},

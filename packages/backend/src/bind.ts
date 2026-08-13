@@ -27,7 +27,11 @@ export function assertSafeBind(opts: {
   );
 }
 
-export function tokenMatches(req: Request, token: string): boolean {
+export function tokenMatches(
+  req: Request,
+  token: string,
+  opts?: { allowQuery?: boolean },
+): boolean {
   const expected = (token || "").trim();
   if (!expected) return true;
   const auth = req.headers.get("authorization") || "";
@@ -35,11 +39,45 @@ export function tokenMatches(req: Request, token: string): boolean {
     return true;
   }
   if ((req.headers.get("x-lail-token") || "") === expected) return true;
+  if (opts?.allowQuery) {
+    try {
+      const u = new URL(req.url);
+      if (u.searchParams.get("token") === expected) return true;
+    } catch {
+      /* */
+    }
+  }
+  return false;
+}
+
+/** Query-string tokens are only for transports that cannot set headers. */
+export function allowQueryToken(pathname: string): boolean {
+  if (pathname === "/ws") return true;
+  return /^\/api\/jobs\/[^/]+\/logs$/.test(pathname);
+}
+
+export function isPublicUnauthedPath(pathname: string, method: string): boolean {
+  if (pathname === "/api/health") return true;
+  if (method !== "GET" && method !== "HEAD") return false;
+  return (
+    pathname.startsWith("/api/lab/p/") ||
+    pathname.startsWith("/api/lab/public/") ||
+    pathname.startsWith("/p/")
+  );
+}
+
+/** Never reflect an unknown Origin. Loopback hostnames are allowed on any port. */
+export function resolveCorsOrigin(
+  origin: string | undefined,
+  allow: string[],
+): string | undefined {
+  if (!origin) return allow[0];
+  if (allow.includes(origin)) return origin;
   try {
-    const u = new URL(req.url);
-    if (u.searchParams.get("token") === expected) return true;
+    const u = new URL(origin);
+    if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return origin;
   } catch {
     /* */
   }
-  return false;
+  return undefined;
 }

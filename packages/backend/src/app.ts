@@ -29,7 +29,7 @@ import { getUsageSummary } from "./controller/usage";
 import { searchHuggingFace, hfSearchQuery, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
 import { config } from "./config";
-import { tokenMatches } from "./bind";
+import { allowQueryToken, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
   ensureDemoLabRuns,
   compareLabRuns,
@@ -65,18 +65,7 @@ export function createApp() {
   app.use(
     "*",
     cors({
-      origin: (origin) => {
-        if (!origin) return corsAllow[0];
-        if (corsAllow.includes(origin)) return origin;
-        try {
-          const u = new URL(origin);
-          if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return origin;
-        } catch {
-          /* */
-        }
-        // Off-loopback operators must list extra origins in LAIL_CORS_ORIGINS.
-        return config.token ? corsAllow[0] : origin;
-      },
+      origin: (origin) => resolveCorsOrigin(origin, corsAllow),
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization", "X-Lail-Token"],
     }),
@@ -86,8 +75,10 @@ export function createApp() {
     if (!config.token) return next();
     if (c.req.method === "OPTIONS") return next();
     const path = new URL(c.req.url).pathname;
-    if (path === "/api/health") return next();
-    if (tokenMatches(c.req.raw, config.token)) return next();
+    if (isPublicUnauthedPath(path, c.req.method)) return next();
+    if (tokenMatches(c.req.raw, config.token, { allowQuery: allowQueryToken(path) })) {
+      return next();
+    }
     return c.json(
       { error: "unauthorized", message: "LAIL_TOKEN required (Authorization: Bearer or X-Lail-Token)" },
       401,

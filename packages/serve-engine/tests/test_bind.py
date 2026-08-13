@@ -5,7 +5,9 @@ import pytest
 
 from app.bind import (
     BindPolicyError,
+    allow_query_token,
     assert_safe_bind,
+    cors_origins,
     is_loopback_host,
     token_from_headers,
 )
@@ -44,3 +46,22 @@ def test_token_from_headers():
     assert token_from_headers({"authorization": "Bearer no"}, "abc") is False
     assert token_from_headers({}, "abc") is False
     assert token_from_headers({}, "") is True
+
+
+def test_cors_origins_appends_extras():
+    out = cors_origins("http://lab.example:3000")
+    assert "http://127.0.0.1:3000" in out
+    assert "http://localhost:3000" in out
+    assert "http://lab.example:3000" in out
+
+
+def test_cors_origins_empty_keeps_defaults():
+    out = cors_origins("")
+    assert "http://127.0.0.1:3000" in out
+    assert "http://lab.example:3000" not in out
+
+
+def test_query_token_only_on_job_logs():
+    assert allow_query_token("/api/jobs/abc/logs") is True
+    assert allow_query_token("/api/serve/start") is False
+    assert allow_query_token("/api/status") is False

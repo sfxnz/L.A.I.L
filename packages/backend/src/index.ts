@@ -27,7 +27,7 @@ const server = Bun.serve<WsData>({
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === "/ws") {
-      if (config.token && !tokenMatches(req, config.token)) {
+      if (config.token && !tokenMatches(req, config.token, { allowQuery: true })) {
         return new Response("unauthorized", { status: 401 });
       }
       const ok = server.upgrade(req, { data: { id: crypto.randomUUID() } });

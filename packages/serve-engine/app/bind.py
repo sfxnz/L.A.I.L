@@ -1,7 +1,17 @@
 """Host bind + token policy for serve-engine."""
 from __future__ import annotations
 
+import re
 from typing import Mapping
+
+_DEFAULT_CORS_ORIGINS = [
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:8787",
+    "http://localhost:8787",
+]
+
+_JOB_LOGS = re.compile(r"^/api/jobs/[^/]+/logs$")
 
 
 class BindPolicyError(RuntimeError):
@@ -39,3 +49,18 @@ def token_from_headers(headers: Mapping[str, str], expected: str) -> bool:
     if (lower.get("x-lail-token") or "") == token:
         return True
     return False
+
+
+def cors_origins(extra: str | None = None) -> list[str]:
+    """Loopback defaults plus comma-separated extras. Never replace the defaults."""
+    extras = [x.strip() for x in (extra or "").split(",") if x.strip()]
+    out: list[str] = []
+    for origin in _DEFAULT_CORS_ORIGINS + extras:
+        if origin not in out:
+            out.append(origin)
+    return out
+
+
+def allow_query_token(path: str) -> bool:
+    """Query-string tokens are only for EventSource job logs."""
+    return bool(_JOB_LOGS.match(path or ""))

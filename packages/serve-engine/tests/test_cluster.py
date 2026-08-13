@@ -80,6 +80,9 @@ def _probed(node: dict, *, local: bool, online: bool, **extra) -> dict:
 def isolated_cluster(monkeypatch, tmp_path):
     monkeypatch.delenv("LAIL_CLUSTER_JSON", raising=False)
     monkeypatch.setattr("app.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(cluster.platform, "node", lambda: "testhost")
+    monkeypatch.setattr(cluster, "_detect_local_net", lambda: {})
+    monkeypatch.setattr(cluster, "_discover_fabric_peers", lambda local: [])
     return tmp_path
 
 
@@ -99,8 +102,8 @@ def _install_probes(monkeypatch, *, remote_online: bool = False):
     return remote_calls
 
 
-def test_default_cluster_constant_is_single_local():
-    cfg = cluster._DEFAULT_CLUSTER
+def test_fallback_constant_is_single_local():
+    cfg = cluster._FALLBACK_CLUSTER
     assert len(cfg["nodes"]) == 1
     node = cfg["nodes"][0]
     assert node["id"] == "local"
@@ -127,13 +130,13 @@ def test_no_env_one_local_node_no_remote_ssh(isolated_cluster, monkeypatch):
 
     cfg = cluster._load_cluster_config()
     assert len(cfg["nodes"]) == 1
-    assert cfg["nodes"][0]["id"] == "local"
+    assert cfg["nodes"][0]["id"] == "testhost"
     assert cfg["nodes"][0]["local"] is True
 
     data = cluster.collect_cluster()
     assert len(data["nodes"]) == 1
     node = data["nodes"][0]
-    assert node["id"] == "local"
+    assert node["id"] == "testhost"
     assert node["local"] is True
     assert node["vllm_url"] == "http://127.0.0.1:8000"
     assert node.get("state") != "offline"
@@ -219,12 +222,12 @@ def test_invalid_cluster_json_falls_back_to_local(isolated_cluster, monkeypatch)
     monkeypatch.setenv("LAIL_CLUSTER_JSON", "{not-json")
     cfg = cluster._load_cluster_config()
     assert len(cfg["nodes"]) == 1
-    assert cfg["nodes"][0]["id"] == "local"
+    assert cfg["nodes"][0]["id"] == "testhost"
 
     monkeypatch.setenv("LAIL_CLUSTER_JSON", json.dumps({"name": "only"}))
     cfg = cluster._load_cluster_config()
     assert len(cfg["nodes"]) == 1
-    assert cfg["nodes"][0]["id"] == "local"
+    assert cfg["nodes"][0]["id"] == "testhost"
 
 
 def test_cluster_file_used_when_env_unset(isolated_cluster, monkeypatch):
@@ -281,3 +284,113 @@ def test_hostname_spark2_does_not_steal_worker(isolated_cluster, monkeypatch):
     assert worker["local"] is False
     assert worker["state"] == "offline"
     assert [c["id"] for c in remote_calls] == ["spark2"]
+
+
+_ADDR_SAMPLE = """\
+1: lo    inet 127.0.0.1/8 scope host lo
+2: eno1    inet 192.168.10.4/24 brd 192.168.10.255 scope global eno1
+4: roce0    inet 192.0.2.1/24 brd 192.0.2.255 scope global roce0
+8: tailscale0    inet 100.64.0.5/32 scope global tailscale0
+9: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+"""
+
+_IB_SAMPLE = """\
+roce0 port 1 ==> roce0 (Up)
+roce1 port 1 ==> roce1 (Down)
+"""
+
+_NEIGH_SAMPLE = """\
+192.0.2.8 lladdr aa:bb:cc:dd:ee:ff STALE
+192.0.2.9 FAILED
+"""
+
+
+def test_parse_live_net_from_proc_text():
+    addrs = cluster._parse_ip_addrs(_ADDR_SAMPLE)
+    assert ("eno1", "192.168.10.4") in addrs
+    assert ("roce0", "192.0.2.1") in addrs
+    assert ("lo", "127.0.0.1") in addrs
+    assert cluster._parse_roce_up(_IB_SAMPLE) == ["roce0"]
+    assert cluster._parse_neigh(_NEIGH_SAMPLE) == ["192.0.2.8"]
+
+
+def test_detect_local_net_uses_roce_and_lan(monkeypatch):
+    def fake_run(cmd, timeout=12):
+        if cmd[:3] == ["ip", "-4", "-o"] or (len(cmd) >= 3 and cmd[0] == "ip" and "-o" in cmd):
+            return 0, _ADDR_SAMPLE, ""
+        if cmd[0] == "ibdev2netdev":
+            return 0, _IB_SAMPLE, ""
+        if cmd[0] == "tailscale":
+            return 0, "100.64.0.5\n", ""
+        return 1, "", "no"
+
+    monkeypatch.setattr(cluster, "_run", fake_run)
+    net = cluster._detect_local_net()
+    assert net["lan_ip"] == "192.168.10.4"
+    assert net["qsfp_if"] == "roce0"
+    assert net["qsfp_ip"] == "192.0.2.1"
+    assert net["tailscale_ip"] == "100.64.0.5"
+    blob = json.dumps(net)
+    for bad in _BANNED_DEFAULTS:
+        assert bad.lower() not in blob.lower()
+
+
+def test_parse_ssh_config_maps_ip_to_alias():
+    text = "Host workerbox\n  Hostname 192.0.2.8\nHost github.com-lab\n  Hostname github.com\n"
+    m = cluster._parse_ssh_config(text)
+    assert m.get("192.0.2.8") == "workerbox"
+    assert m.get("github.com") == "github.com-lab"
+
+
+def test_discover_fabric_peers_from_neigh(monkeypatch):
+    local = {"id": "testhost", "qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"}
+
+    def fake_run(cmd, timeout=12):
+        if cmd[0] == "ip" and "neigh" in cmd:
+            return 0, _NEIGH_SAMPLE, ""
+        if cmd[0] == "getent":
+            return 0, "192.0.2.8 workerbox\n", ""
+        return 1, "", ""
+
+    monkeypatch.setattr(cluster, "_run", fake_run)
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True, "rtt_ms": 0.2})
+    peers = cluster._discover_fabric_peers(local)
+    assert len(peers) == 1
+    assert peers[0]["id"] == "workerbox"
+    assert peers[0]["local"] is False
+    assert peers[0]["qsfp_ip"] == "192.0.2.8"
+    assert peers[0]["ssh_host"] == "workerbox"
+
+
+def test_default_cluster_is_probed_host_plus_roce_peer(monkeypatch, tmp_path):
+    monkeypatch.delenv("LAIL_CLUSTER_JSON", raising=False)
+    monkeypatch.setattr("app.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(cluster.platform, "node", lambda: "headbox.lan")
+    monkeypatch.setattr(
+        cluster,
+        "_detect_local_net",
+        lambda: {"lan_ip": "192.168.10.4", "qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"},
+    )
+    monkeypatch.setattr(
+        cluster,
+        "_discover_fabric_peers",
+        lambda local: [
+            {
+                "id": "workerbox",
+                "label": "workerbox",
+                "role": "worker",
+                "local": False,
+                "ssh_host": "workerbox",
+                "qsfp_ip": "192.0.2.8",
+                "qsfp_if": "roce0",
+                "vllm_url": "http://127.0.0.1:8000",
+            }
+        ],
+    )
+    cfg = cluster._load_cluster_config()
+    assert [n["id"] for n in cfg["nodes"]] == ["headbox", "workerbox"]
+    assert cfg["nodes"][0]["local"] is True
+    assert cfg["nodes"][1]["local"] is False
+    blob = json.dumps(cfg).lower()
+    for bad in _BANNED_DEFAULTS:
+        assert bad.lower() not in blob

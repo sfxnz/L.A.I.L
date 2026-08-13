@@ -1,12 +1,13 @@
 """Cluster health for L.A.I.L Status (source of truth).
 
-Default topology is a single local node. Remotes are opt-in via
-LAIL_CLUSTER_JSON or gitignored data/cluster.json.
+Default topology is this machine as probed (hostname, LAN, Tailscale, RoCE)
+plus any RoCE L2 neighbors that answer ping. LAIL_CLUSTER_JSON or
+gitignored data/cluster.json still override.
 
 Probes:
-  - local node (this host) via existing metadata helpers
+  - local node via metadata + live NICs
   - remote nodes via passwordless SSH + a small JSON collector
-  - QSFP fabric reachability between configured interconnect IPs
+  - QSFP fabric reachability between discovered interconnect IPs
   - whether a model is loaded on each node and whether multi-node looks aligned
 """
 from __future__ import annotations
@@ -23,8 +24,8 @@ from . import metadata
 
 log = logging.getLogger(__name__)
 
-# Clone default: this host only. Dual-node labs set LAIL_CLUSTER_JSON or data/cluster.json.
-_DEFAULT_CLUSTER = {
+# Used only if live NIC/hostname probes fail.
+_FALLBACK_CLUSTER = {
     "name": "local",
     "nodes": [
         {
@@ -36,6 +37,9 @@ _DEFAULT_CLUSTER = {
         },
     ],
 }
+
+_SKIP_IFACES = {"lo", "docker0", "tailscale0"}
+_SKIP_IFACE_PREFIXES = ("br-", "veth", "virbr", "cni", "flannel", "wg")
 
 _REMOTE_PROBE_PY = r"""
 import json, platform, re, subprocess, urllib.request
@@ -171,8 +175,184 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
+def _parse_ip_addrs(text: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/", line)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def _parse_roce_up(text: str) -> list[str]:
+    up: list[str] = []
+    for line in (text or "").splitlines():
+        m = re.search(r"==>\s+(\S+)\s+\(Up\)", line)
+        if m:
+            up.append(m.group(1))
+    return up
+
+
+def _parse_neigh(text: str) -> list[str]:
+    ips: list[str] = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ip = parts[0]
+        if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
+            continue
+        blob = " ".join(parts[1:]).upper()
+        if "FAILED" in blob or "INCOMPLETE" in blob:
+            continue
+        if ip.startswith("169.254."):
+            continue
+        ips.append(ip)
+    return ips
+
+
+def _iface_skipped(name: str) -> bool:
+    n = (name or "").strip()
+    if n in _SKIP_IFACES:
+        return True
+    return any(n.startswith(p) for p in _SKIP_IFACE_PREFIXES)
+
+
+def _detect_local_net() -> dict[str, Any]:
+    """LAN / Tailscale / RoCE from this host. No baked lab addresses."""
+    code, addr_txt, _ = _run(["ip", "-4", "-o", "addr"], timeout=4)
+    addrs = _parse_ip_addrs(addr_txt) if code == 0 else []
+    code, ib_txt, _ = _run(["ibdev2netdev"], timeout=4)
+    roce_up = _parse_roce_up(ib_txt) if code == 0 else []
+
+    by_iface: dict[str, str] = {}
+    for iface, ip in addrs:
+        by_iface.setdefault(iface, ip)
+
+    qsfp_if = next((i for i in roce_up if i in by_iface), None)
+    qsfp_ip = by_iface.get(qsfp_if) if qsfp_if else None
+
+    lan_ip = None
+    for iface, ip in addrs:
+        if _iface_skipped(iface) or iface == qsfp_if:
+            continue
+        lan_ip = ip
+        break
+
+    ts_ip = by_iface.get("tailscale0")
+    if not ts_ip:
+        code, ts_out, _ = _run(["tailscale", "ip", "-4"], timeout=4)
+        if code == 0 and ts_out.strip():
+            ts_ip = ts_out.strip().splitlines()[0]
+
+    return {
+        "lan_ip": lan_ip,
+        "tailscale_ip": ts_ip,
+        "qsfp_if": qsfp_if,
+        "qsfp_ip": qsfp_ip,
+    }
+
+
+def _parse_ssh_config(text: str) -> dict[str, str]:
+    """Map HostName/IP -> first Host alias."""
+    out: dict[str, str] = {}
+    aliases: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, _, val = line.partition(" ")
+        key_l = key.lower()
+        if key_l == "host":
+            aliases = [a for a in val.split() if a and a != "*"]
+            continue
+        if key_l == "hostname" and aliases:
+            host = val.strip()
+            if host and host not in out:
+                out[host] = aliases[0]
+    return out
+
+
+def _ssh_alias_for_ip(ip: str) -> str | None:
+    path = os.path.expanduser("~/.ssh/config")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return _parse_ssh_config(f.read()).get(ip)
+    except OSError:
+        return None
+
+
+def _hostname_for_ip(ip: str) -> str | None:
+    code, out, _ = _run(["getent", "hosts", ip], timeout=3)
+    if code == 0 and out.strip():
+        parts = out.split()
+        if len(parts) >= 2:
+            return parts[1].split(".")[0]
+    return _ssh_alias_for_ip(ip)
+
+
+def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
+    """RoCE L2 neighbors that answer ping become remote nodes."""
+    qsfp_if = local.get("qsfp_if")
+    self_ip = local.get("qsfp_ip")
+    if not qsfp_if:
+        return []
+    code, neigh_txt, _ = _run(["ip", "neigh", "show", "dev", str(qsfp_if)], timeout=4)
+    if code != 0:
+        return []
+    peers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ip in _parse_neigh(neigh_txt):
+        if ip == self_ip or ip in seen:
+            continue
+        seen.add(ip)
+        ping = _ping_ok(ip, 1.0)
+        if not ping.get("ok"):
+            continue
+        name = _hostname_for_ip(ip)
+        if name == local.get("id"):
+            continue
+        ssh_host = name or ip
+        node_id = name or ip.replace(".", "-")
+        peers.append(
+            {
+                "id": node_id,
+                "label": node_id,
+                "role": "worker",
+                "local": False,
+                "ssh_host": ssh_host,
+                "qsfp_ip": ip,
+                "qsfp_if": qsfp_if,
+                "vllm_url": "http://127.0.0.1:8000",
+            }
+        )
+    return peers
+
+
 def _default_cluster() -> dict[str, Any]:
-    return json.loads(json.dumps(_DEFAULT_CLUSTER))
+    host = (platform.node() or "local").split(".")[0] or "local"
+    net = _detect_local_net()
+    local: dict[str, Any] = {
+        "id": host,
+        "label": host,
+        "role": "head",
+        "local": True,
+        "vllm_url": "http://127.0.0.1:8000",
+    }
+    for k, v in net.items():
+        if v:
+            local[k] = v
+    nodes = [local]
+    try:
+        for peer in _discover_fabric_peers(local):
+            if peer.get("id") and peer["id"] != host:
+                nodes.append(peer)
+    except Exception as e:
+        log.warning("fabric peer discovery failed (%s)", e)
+    if not nodes:
+        return json.loads(json.dumps(_FALLBACK_CLUSTER))
+    name = host if len(nodes) == 1 else f"{host}-lab"
+    return {"name": name, "nodes": nodes}
 
 
 def _parse_cluster_dict(data: Any, *, source: str) -> dict[str, Any] | None:
@@ -290,7 +470,10 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         if m:
             tp = int(m.group(1))
 
-    qsfp_if = node.get("qsfp_if") or None
+    net = _detect_local_net()
+    qsfp_if = node.get("qsfp_if") or net.get("qsfp_if") or None
+    lan_ip = node.get("lan_ip") or net.get("lan_ip")
+    qsfp_ip = node.get("qsfp_ip") or net.get("qsfp_ip")
     carrier = None
     speed = None
     if qsfp_if:
@@ -327,9 +510,9 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         "online": True,
         "probe_error": None,
         "hostname": hw.get("hostname") or platform.node(),
-        "lan_ip": node.get("lan_ip"),
-        "tailscale_ip": ts_ip or node.get("tailscale_ip"),
-        "qsfp_ip": node.get("qsfp_ip"),
+        "lan_ip": lan_ip,
+        "tailscale_ip": ts_ip or node.get("tailscale_ip") or net.get("tailscale_ip"),
+        "qsfp_ip": qsfp_ip,
         "gpu_sku": hw.get("gpu_sku"),
         "ram_gib": hw.get("ram_gib"),
         "available_gib": hw.get("available_gib"),

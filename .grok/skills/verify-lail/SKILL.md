@@ -31,4 +31,4 @@ Run the pytest line above. Add or update a corpus/fixture if a recipe or placeme
 
 ## Git
 
-Never commit or push on `main`. Branch, PR, CI green.
+Never commit or push on `main`. Branch, PR, CI green. Do not merge the PR — only the human merges.

@@ -52,8 +52,9 @@ These are gitignored for a reason. Re-tracking them dirties every serve/eval run
 1. Branch from latest `main`: `feat/`, `fix/`, `chore/`, `docs/`, `test/`, `ci/`.
 2. Conventional Commits: `type(scope): summary` — types `feat` `fix` `test` `chore` `docs` `refactor` `ci` `perf`. Scopes: `web` `backend` `serve-engine` `autoconfig` `security` `workflows`.
 3. Open a PR against `main`. CI (`.github/workflows/ci.yml`) must pass.
-4. Do not `--no-verify`, force-push to `main`, or amend other people's commits.
-5. Commit only after the required checks above have been run.
+4. **Do not merge the PR** — not `gh pr merge`, not the GitHub UI, not squash/rebase/merge. Only the human merges.
+5. Do not `--no-verify`, force-push to `main`, or amend other people's commits.
+6. Commit only after the required checks above have been run.
 
 Local hooks live in `scripts/git-hooks/` (`./scripts/install-git-hooks.sh` once per clone). Grok hooks in `.grok/hooks/` deny `git commit` / `git push` on `main` even if you forget.
 

@@ -965,8 +965,10 @@ def test_recommend_dsv4_two_sparks_end_to_end(monkeypatch):
     assert c["kv_cache_dtype"] == "nvfp4_ds_mla"
     assert c["moe_backend"] == "flashinfer_b12x"
     assert c["tensor_parallel_size"] == 2
-    assert c["util"] == 0.80
-    assert c["max_model_len"] == 1048576  # 1M preserved (not clamped by envelope)
+    assert c["max_model_len"] == 1048576  # keep overlay 1M; util is sized to hold it
+    assert isinstance(c.get("util"), float)
+    assert 0.45 <= c["util"] <= 0.90
+    assert any("Recommended util=" in x for x in (r.get("rationale") or []))
     ex = c["extra_flags"]
     assert "--nnodes 2" in ex and "--speculative-config" in ex and "dspark" in ex
     assert "--data-parallel-size" not in ex
@@ -1618,7 +1620,7 @@ def test_size_memory_sizes_multinode_per_node():
     )
     assert isinstance(cfg.get("max_model_len"), int) and cfg["max_model_len"] > 0
     assert cfg["max_model_len"] <= 1048576
-    assert cfg.get("util") == 0.8  # recipe pin kept
+    assert isinstance(cfg.get("util"), float) and 0.45 <= cfg["util"] <= 0.90
     assert int(cfg.get("max_num_seqs") or 6) <= 6
 
 

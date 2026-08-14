@@ -3697,23 +3697,19 @@ def _size_memory_for_spark(
     per_node_w = float(weights_gib) if weights_gib and weights_gib > 0 else 0.0
     ml = cfg.get("max_model_len")
     if not isinstance(ml, int) or ml <= 0:
-        if cfg.get("util") is None:
-            cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
-            rationale.append(f"Recommended util={cfg['util']} (no max-model-len to size)")
+        cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
+        rationale.append(f"Recommended util={cfg['util']} (no max-model-len to size)")
         return
-    util_pinned = cfg.get("util") is not None
     seqs = int(cfg.get("max_num_seqs") or 4)
-    if util_pinned:
-        budget = float(node_ram_gib) * float(cfg["util"]) - per_node_w - _RUNTIME_PAD_GIB
-    else:
-        budget = float(node_ram_gib) - _UMA_RESERVE_GIB - per_node_w - _RUNTIME_PAD_GIB
+    # Always size against reserved-UMA capacity so a low overlay/card util
+    # cannot shrink native/recipe context. Util is rewritten to match the window.
+    budget = float(node_ram_gib) - _UMA_RESERVE_GIB - per_node_w - _RUNTIME_PAD_GIB
     if budget < 8.0:
-        if not util_pinned:
-            cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
-            rationale.append(
-                f"Recommended util={cfg['util']} (weights≈{per_node_w:.1f} GiB; "
-                "KV budget too tight to size context)"
-            )
+        cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
+        rationale.append(
+            f"Recommended util={cfg['util']} (weights≈{per_node_w:.1f} GiB; "
+            "KV budget too tight to size context)"
+        )
         return
 
     bpt = _kv_bytes_per_token(
@@ -3722,9 +3718,8 @@ def _size_memory_for_spark(
         family=str((detected or {}).get("family") or ""),
     )
     if bpt <= 0:
-        if not util_pinned:
-            cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
-            rationale.append(f"Recommended util={cfg['util']} (no KV shape; weights + reserve)")
+        cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
+        rationale.append(f"Recommended util={cfg['util']} (no KV shape; weights + reserve)")
         return
 
     def need_gib(length: int, nseq: int) -> float:
@@ -3767,13 +3762,12 @@ def _size_memory_for_spark(
             cfg["max_num_seqs"] = chosen_seqs
 
     kv_used = need_gib(int(cfg["max_model_len"]), int(cfg.get("max_num_seqs") or chosen_seqs))
-    if not util_pinned:
-        cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, kv_used)
-        rationale.append(
-            f"Recommended util={cfg['util']} for max-model-len={cfg['max_model_len']} "
-            f"× {int(cfg.get('max_num_seqs') or chosen_seqs)} seq "
-            f"(kv≈{kv_used:.1f} GiB + weights≈{per_node_w:.1f} GiB on {node_ram_gib:.0f} GiB)"
-        )
+    cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, kv_used)
+    rationale.append(
+        f"Recommended util={cfg['util']} for max-model-len={cfg['max_model_len']} "
+        f"× {int(cfg.get('max_num_seqs') or chosen_seqs)} seq "
+        f"(kv≈{kv_used:.1f} GiB + weights≈{per_node_w:.1f} GiB on {node_ram_gib:.0f} GiB)"
+    )
 
 
 def _apply_hardware_envelope(

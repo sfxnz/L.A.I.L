@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import re
+import select
 import shlex
 import subprocess
 import time
@@ -1098,6 +1100,9 @@ def _hf_download_env() -> dict[str, str]:
     env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     env.pop("HF_XET_HIGH_PERFORMANCE", None)
     env["HF_HUB_DISABLE_XET"] = "1"
+    # hf is Python: unbuffered so tqdm \r frames reach the pipe before EOF.
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     # Only inject a token that actually authenticates (bad Bearer → 401 on public too)
     try:
         from .autoconfig import _hf_token, hf_token_usable
@@ -1119,6 +1124,92 @@ def _hf_download_env() -> dict[str, str]:
         env.pop("HF_TOKEN", None)
         env.pop("HUGGING_FACE_HUB_TOKEN", None)
     return env
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _split_cli_frames(buf: bytes) -> tuple[list[str], bytes]:
+    """Split a byte buffer on newlines and tqdm carriage returns."""
+    frames: list[str] = []
+    while True:
+        n_nl = buf.find(b"\n")
+        n_cr = buf.find(b"\r")
+        if n_nl < 0 and n_cr < 0:
+            break
+        if n_nl < 0:
+            cut = n_cr
+        elif n_cr < 0:
+            cut = n_nl
+        else:
+            cut = min(n_nl, n_cr)
+        raw, buf = buf[:cut], buf[cut + 1 :]
+        if cut == n_cr and buf.startswith(b"\n"):
+            buf = buf[1:]
+        text = _ANSI_RE.sub("", raw.decode("utf-8", "replace")).strip()
+        if text:
+            frames.append(text)
+    return frames, buf
+
+
+def _download_pct_from_line(line: str) -> int | None:
+    m = re.search(r"(\d+)\s*%", line)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if 0 <= n <= 100:
+        return n
+    return None
+
+
+def _pump_hf_output(
+    proc: subprocess.Popen[bytes],
+    *,
+    log: Any = None,
+    progress: Callable | None = None,
+    timeout: float = 7200,
+) -> tuple[int, list[str]]:
+    """Read hf stdout live (tqdm uses \\r). Throttle progress-bar log lines."""
+    assert proc.stdout is not None
+    buf = b""
+    lines: list[str] = []
+    last_pct = 0.05
+    last_log = 0.0
+    deadline = time.monotonic() + timeout
+    while True:
+        if time.monotonic() > deadline:
+            proc.kill()
+            raise TimeoutError("hf download timed out")
+        ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+        chunk = b""
+        if ready:
+            chunk = proc.stdout.read(8192)
+        if not chunk:
+            if proc.poll() is not None:
+                rest = proc.stdout.read() or b""
+                frames, _ = _split_cli_frames(buf + rest + b"\n")
+                for line in frames:
+                    lines.append(line)
+                    if log:
+                        log.write(line)
+                break
+            continue
+        buf += chunk
+        frames, buf = _split_cli_frames(buf)
+        now = time.monotonic()
+        for line in frames:
+            lines.append(line)
+            pct = _download_pct_from_line(line)
+            if pct is None or now - last_log >= 1.0:
+                if log:
+                    log.write(line)
+                last_log = now
+            if pct is not None and progress:
+                p = max(0.05, min(0.95, pct / 100.0))
+                if p - last_pct >= 0.02:
+                    progress(p, f"download {pct}%")
+                    last_pct = p
+    return int(proc.wait()), lines
 
 
 def download_model(
@@ -1151,45 +1242,16 @@ def download_model(
         progress(0.05, "downloading…")
 
     cmd = [hf_bin, "download", model]
-    # Stream so the GUI job log shows tqdm / errors live (capture_output hid hangs)
+    # Binary + \r split: tqdm progress is carriage-return frames, not newlines.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         env=env,
-        bufsize=1,
+        bufsize=0,
     )
-    assert proc.stdout is not None
-    last_pct = 0.05
-    lines: list[str] = []
     try:
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if not line:
-                continue
-            lines.append(line)
-            if log:
-                log.write(line)
-            # Rough progress from "Fetching N files:  42%|" style lines
-            if "%" in line and "Fetching" in line:
-                try:
-                    # take last integer before %
-                    part = line.rsplit("%", 1)[0]
-                    num = ""
-                    for ch in reversed(part):
-                        if ch.isdigit():
-                            num = ch + num
-                        elif num:
-                            break
-                    if num:
-                        pct = max(0.05, min(0.95, int(num) / 100.0))
-                        if pct - last_pct >= 0.02 and progress:
-                            progress(pct, f"download {int(num)}%")
-                            last_pct = pct
-                except Exception:
-                    pass
-        code = proc.wait(timeout=7200)
+        code, lines = _pump_hf_output(proc, log=log, progress=progress, timeout=7200)
     except Exception:
         proc.kill()
         raise

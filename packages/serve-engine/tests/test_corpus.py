@@ -228,3 +228,34 @@ def test_corpus_case(monkeypatch, case_dir: Path):
             f"{case_dir.name}: expected image containing {expect['image_contains']!r}, "
             f"got {cfg.get('image')!r}"
         )
+
+    # Every model: recommend must return a sized util + max-model-len.
+    assert isinstance(cfg.get("util"), (int, float)), (
+        f"{case_dir.name}: missing util; got {cfg.get('util')!r}"
+    )
+    assert 0.45 <= float(cfg["util"]) <= 0.90, (
+        f"{case_dir.name}: util {cfg['util']!r} outside recommended range"
+    )
+    assert isinstance(cfg.get("max_model_len"), int) and cfg["max_model_len"] > 0, (
+        f"{case_dir.name}: missing max_model_len; got {cfg.get('max_model_len')!r}"
+    )
+    rats = " ".join(result.get("rationale") or [])
+    if "Recommended util=" in rats and not result.get("serve_blocked"):
+        det = result.get("detected") or {}
+        topo = result.get("topology") or {}
+        w = topo.get("per_node_weights_gib")
+        if w is None:
+            w = topo.get("weights_gib") or case.get("weights_gib") or 0.0
+        ram = float(topo.get("node_ram_gib") or 121.7)
+        seqs = int(cfg.get("max_num_seqs") or 4)
+        bpt = ac._kv_bytes_per_token(
+            case.get("_config"),
+            kv_cache_dtype=str(cfg.get("kv_cache_dtype") or "fp8"),
+            family=str(det.get("family") or ""),
+        )
+        kv = (bpt * int(cfg["max_model_len"]) * seqs / (1024**3)) * 1.10
+        want = ac.recommended_gpu_util(ram, float(w or 0.0), kv)
+        assert cfg["util"] == want, (
+            f"{case_dir.name}: util {cfg['util']!r} != recommended {want!r} "
+            f"(len={cfg['max_model_len']} seqs={seqs} w={w} ram={ram})"
+        )

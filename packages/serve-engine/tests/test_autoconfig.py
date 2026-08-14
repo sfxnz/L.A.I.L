@@ -1595,7 +1595,8 @@ def test_size_memory_keeps_native_len_drops_seqs_first():
     assert any("Recommended util=" in r for r in rationale)
 
 
-def test_size_memory_skips_multinode_tp():
+def test_size_memory_sizes_multinode_per_node():
+    """TP=2 still sizes context/util from *per-node* weights, not a skip."""
     cfg = {
         "max_model_len": 1048576,
         "util": 0.8,
@@ -1609,13 +1610,16 @@ def test_size_memory_skips_multinode_tp():
         cfg,
         hf_config={"num_hidden_layers": 60},
         detected={"family": "deepseek_v4"},
-        weights_gib=155.4,
+        weights_gib=77.7,  # 155.4 / 2
         node_ram_gib=121.7,
         mode="workflow_max",
         rationale=rationale,
         warnings=warnings,
     )
-    assert cfg["max_model_len"] == 1048576
+    assert isinstance(cfg.get("max_model_len"), int) and cfg["max_model_len"] > 0
+    assert cfg["max_model_len"] <= 1048576
+    assert cfg.get("util") == 0.8  # recipe pin kept
+    assert int(cfg.get("max_num_seqs") or 6) <= 6
 
 
 def test_stock_image_semver_and_at_least():
@@ -2884,6 +2888,119 @@ def test_recommend_vendor_fetch_error_still_returns(monkeypatch):
     assert rec["serve_blocked"] is False
     # Overlay / config detection still fills parsers when vendor fetch fails.
     assert rec["config"].get("reasoning_parser") == "qwen3"
+
+
+def test_recommend_uses_native_window_not_262k_default(monkeypatch):
+    """A 4k-native checkpoint must not be started at the 262k envelope."""
+    hf = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "max_position_embeddings": 4096,
+    }
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# tiny\nNo serve recipe.\n",
+        config=hf,
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    rec = ac.recommend("example/Tiny-Llama-8B", fetch_remote=True)
+    cfg = rec["config"]
+    assert rec["serve_blocked"] is False
+    assert cfg.get("max_model_len") == 4096
+    assert isinstance(cfg.get("util"), float)
+    assert 0.45 <= cfg["util"] <= 0.90
+
+
+@pytest.mark.parametrize(
+    "model_id,hf,weights",
+    [
+        (
+            "mistralai/Magistral-Small-2509",
+            {
+                "architectures": ["MistralForCausalLM"],
+                "model_type": "mistral",
+                "hidden_size": 5120,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "max_position_embeddings": 131072,
+            },
+            24.0,
+        ),
+        (
+            "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "max_position_embeddings": 262144,
+                "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            },
+            20.0,
+        ),
+        (
+            "example/Mixed-MoE-NVFP4",
+            {
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "model_type": "qwen3_moe",
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 65536,
+                "quantization_config": {"quant_method": "compressed-tensors"},
+            },
+            18.0,
+        ),
+        (
+            "acme/Unknown-Dense-13B",
+            {
+                "architectures": ["FooForCausalLM"],
+                "model_type": "foo",
+                "hidden_size": 5120,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 40,
+                "num_key_value_heads": 8,
+                "max_position_embeddings": 8192,
+            },
+            14.0,
+        ),
+    ],
+)
+def test_recommend_sizes_util_and_max_len_for_every_family(monkeypatch, model_id, hf, weights):
+    """Every publisher/family gets a computed util and a hardware-sized native window."""
+    _patch_offline_recommend(monkeypatch, readme=f"# {model_id}\nNo serve.\n", config=hf)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: weights)
+    rec = ac.recommend(model_id, fetch_remote=True)
+    cfg = rec["config"]
+    native = int(hf["max_position_embeddings"])
+    assert rec["serve_blocked"] is False
+    assert isinstance(cfg.get("util"), float)
+    assert 0.45 <= cfg["util"] <= 0.90
+    assert isinstance(cfg.get("max_model_len"), int)
+    assert cfg["max_model_len"] <= native
+    # Must not ignore a small native window.
+    if native <= 32768:
+        assert cfg["max_model_len"] == native
+    rats = " ".join(rec.get("rationale") or [])
+    assert "Recommended util=" in rats
+    det = rec.get("detected") or {}
+    seqs = int(cfg.get("max_num_seqs") or 4)
+    bpt = ac._kv_bytes_per_token(
+        hf,
+        kv_cache_dtype=str(cfg.get("kv_cache_dtype") or "fp8"),
+        family=str(det.get("family") or ""),
+    )
+    kv = (bpt * int(cfg["max_model_len"]) * seqs / (1024**3)) * 1.10
+    assert cfg["util"] == ac.recommended_gpu_util(121.7, weights, kv)
 
 
 def test_recommend_accepts_request_with_no_mode(monkeypatch):

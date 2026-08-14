@@ -3690,17 +3690,11 @@ def _size_memory_for_spark(
 
     Prefer keeping the target context and dropping max-num-seqs before cutting
     length. Then set util from weights + that KV window + reserved UMA unless
-    a recipe already pinned util. Multi-node TP>=2 overlays keep their pin.
+    a recipe already pinned util. Runs for every model, including TP>=2
+    (``weights_gib`` must be per-node).
     """
     del mode
     per_node_w = float(weights_gib) if weights_gib and weights_gib > 0 else 0.0
-    if int(cfg.get("tensor_parallel_size") or 1) >= 2:
-        if cfg.get("util") is None:
-            cfg["util"] = recommended_gpu_util(node_ram_gib, per_node_w, 0.0)
-            rationale.append(
-                f"Recommended util={cfg['util']} (multi-node; recipe silent on util)"
-            )
-        return
     ml = cfg.get("max_model_len")
     if not isinstance(ml, int) or ml <= 0:
         if cfg.get("util") is None:
@@ -3789,25 +3783,34 @@ def _apply_hardware_envelope(
     card_set_util: bool = False,
     *,
     mode: str | None = None,
+    native_max_len: int | None = None,
 ) -> None:
-    """Fill util / max-len / image from hardware defaults when the recipe is silent.
+    """Fill max-len / image when the recipe is silent. Util is sized later.
 
-    ``mode`` is accepted for old callers and ignored. Reserved UMA lives in
-    ``plan_placement``; this only fills gaps and clamps 1M demo contexts.
+    Target context is the checkpoint's native window when known — not a
+    one-size 262k default. ``mode`` is ignored (legacy).
     """
-    del mode, card_set_util  # unused; kept so old call sites don't break
-    # util is sized after KV/context in _size_memory_for_spark — do not slam 0.85 here.
+    del mode, card_set_util
+    tp = int(cfg.get("tensor_parallel_size") or 1)
     if not card_set_max_len:
-        cfg["max_model_len"] = WORKFLOW_MAX_LEN
-        rationale.append(f"Hardware envelope → max-model-len={WORKFLOW_MAX_LEN} (card silent)")
+        if isinstance(native_max_len, int) and native_max_len > 0:
+            cfg["max_model_len"] = native_max_len
+            rationale.append(
+                f"Native max_position_embeddings → max-model-len={native_max_len}"
+            )
+        else:
+            cfg["max_model_len"] = WORKFLOW_MAX_LEN
+            rationale.append(
+                f"Hardware envelope → max-model-len={WORKFLOW_MAX_LEN} (card silent, no native window)"
+            )
     if not cfg.get("image"):
         cfg["image"] = DEFAULT_IMAGE_MAX
 
     # Single-node: card/demo 1M contexts OOMs under realistic util. Multi-node
-    # overlays (TP>=2) that intentionally pin a huge window keep it.
+    # overlays (TP>=2) that intentionally pin a huge window keep it as the *target*;
+    # the sizer still drops seqs / length if KV cannot fit per node.
     ceiling = WORKFLOW_MAX_LEN
     ml = cfg.get("max_model_len")
-    tp = int(cfg.get("tensor_parallel_size") or 1)
     if isinstance(ml, int) and ml > ceiling and tp < 2:
         cfg["max_model_len"] = ceiling
         rationale.append(
@@ -4124,8 +4127,15 @@ def recommend(
     # family overlay are authoritative — the envelope only fills gaps, never overrides them.
     card_set_util = cfg.get("util") is not None
     card_set_max_len = cfg.get("max_model_len") is not None
+    native_max = detected.get("max_position_embeddings")
+    if not isinstance(native_max, int) or native_max <= 0:
+        native_max = None
     _apply_hardware_envelope(
-        cfg, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util
+        cfg,
+        rationale,
+        card_set_max_len=card_set_max_len,
+        card_set_util=card_set_util,
+        native_max_len=native_max,
     )
 
     # Final image pass after overlay/mode envelope: re-apply capability floor on the
@@ -4159,11 +4169,15 @@ def recommend(
 
     plan = cfg.get("topology_plan") or {}
     node_ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
+    per_node = plan.get("per_node_weights_gib")
+    if per_node is None and weights_gib and weights_gib > 0:
+        n_used = max(1, int(plan.get("nodes_needed") or cfg.get("tensor_parallel_size") or 1))
+        per_node = float(weights_gib) / n_used
     _size_memory_for_spark(
         cfg,
         hf_config=hf_config,
         detected=detected,
-        weights_gib=weights_gib,
+        weights_gib=per_node if per_node is not None else weights_gib,
         node_ram_gib=node_ram,
         mode=mode,
         rationale=rationale,

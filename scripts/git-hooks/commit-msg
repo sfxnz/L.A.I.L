@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Conventional Commits. Merge commits are rejected (linear history on main).
+set -euo pipefail
+
+msg_file=$1
+first=$(head -n1 "$msg_file" | tr -d '\r')
+
+case "$first" in
+  Merge\ *|fixup!*\ |squash!*\ )
+    echo "commit-msg: merge/fixup/squash messages are not used. Rebase onto main." >&2
+    exit 1
+    ;;
+esac
+
+if printf '%s\n' "$first" | grep -Eq '^(feat|fix|test|chore|docs|refactor|ci|perf|revert)(\([a-z0-9/_-]+\))?(!)?: .{1,72}$'; then
+  exit 0
+fi
+
+echo "commit-msg: first line must be Conventional Commits:" >&2
+echo "  type(scope): summary" >&2
+echo "  types: feat fix test chore docs refactor ci perf revert" >&2
+echo "got: $first" >&2
+exit 1

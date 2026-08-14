@@ -14,7 +14,7 @@
       "enable_auto_tool_choice": true,
       "trust_remote_code": true
     },
-    "extra_flags_contains": ["--language-model-only"],
+    "extra_flags_contains": ["--limit-mm-per-prompt"],
     "forbidden": [
       "flashinfer_b12x",
       "humming",
@@ -22,7 +22,8 @@
       "--model ",
       "compressed-tensors",
       "yarn",
-      "1000000"
+      "1000000",
+      "language-model-only"
     ]
   }
 }

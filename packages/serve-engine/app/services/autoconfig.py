@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from ..config import (
@@ -1968,6 +1969,54 @@ def _looks_like_vllm_cookbook(url: str) -> bool:
     return "cookbook" in path or "vllm" in name or "/vllm" in path or "vllm_" in path
 
 
+_VENDOR_DOC_HOSTS = frozenset(
+    {
+        "unsloth.ai",
+        "www.unsloth.ai",
+        "docs.vllm.ai",
+        "recipes.vllm.ai",
+    }
+)
+_GENERIC_URL_RE = re.compile(r"https?://[^\s\)\]\"'<>]+", re.I)
+
+
+def vendor_doc_to_fetch_url(url: str) -> Optional[str]:
+    """Allowlisted vendor docs → fetchable HTTPS URL (GitBook pages get .md)."""
+    if not url:
+        return None
+    raw = url.strip().split("?", 1)[0].split("#", 1)[0]
+    try:
+        p = urlparse(raw)
+    except ValueError:
+        return None
+    host = (p.netloc or "").lower()
+    if p.scheme != "https" or host not in _VENDOR_DOC_HOSTS:
+        return None
+    path = p.path or "/"
+    if not any(path.lower().endswith(ext) for ext in _COOKBOOK_DOC_EXTS):
+        path = path.rstrip("/") + ".md"
+    return f"https://{host}{path}"
+
+
+def find_vendor_doc_urls(readme: str) -> list[str]:
+    """Scan README for Unsloth / vLLM recipe pages when the card has no serve line."""
+    if not readme:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _GENERIC_URL_RE.finditer(readme):
+        url = m.group(0).rstrip(".,;:")
+        fetch = vendor_doc_to_fetch_url(url)
+        if not fetch:
+            continue
+        key = fetch.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(url)
+    return found
+
+
 def find_cookbook_urls(readme: str) -> list[str]:
     """Scan README for public GitHub blob/raw cookbook URLs (vLLM-oriented)."""
     if not readme:
@@ -2019,15 +2068,18 @@ def fetch_cookbook_text(
     timeout: float = COOKBOOK_FETCH_TIMEOUT,
     max_bytes: int = COOKBOOK_MAX_BYTES,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Fetch a public GitHub cookbook URL. Returns (text, error). Never raises."""
+    """Fetch a public GitHub cookbook or allowlisted vendor doc. Returns (text, error). Never raises."""
     if not url:
         return None, "empty cookbook URL"
     raw_url = github_blob_to_raw_url(url)
-    if not raw_url:
-        return None, f"not a public GitHub blob/raw URL: {url}"
-    if not raw_url.startswith("https://raw.githubusercontent.com/"):
-        return None, f"refusing non-raw GitHub host: {raw_url}"
-    # Public cookbooks only — never send HF tokens to githubusercontent.
+    if raw_url:
+        if not raw_url.startswith("https://raw.githubusercontent.com/"):
+            return None, f"refusing non-raw GitHub host: {raw_url}"
+    else:
+        raw_url = vendor_doc_to_fetch_url(url)
+        if not raw_url:
+            return None, f"not a public GitHub/vendor-doc URL: {url}"
+    # Public docs only — never send HF tokens off-Hub.
     body, err = _http_get_raw(
         raw_url,
         timeout=timeout,
@@ -2073,14 +2125,24 @@ def _augment_candidates_from_cookbooks(
     rationale: list[str],
     warnings: list[str],
 ) -> list[ServeCandidate]:
-    """If card recipes are empty/weak, fetch linked vLLM cookbooks and re-extract."""
+    """If card recipes are empty/weak, fetch linked vLLM cookbooks / vendor docs and re-extract."""
     if not readme or not candidates_recipe_poor(candidates):
         return candidates
-    urls = find_cookbook_urls(readme)
+    urls = find_cookbook_urls(readme) + find_vendor_doc_urls(readme)
+    # Dedup by fetch URL
+    dedup: list[str] = []
+    seen_fetch: set[str] = set()
+    for u in urls:
+        key = (github_blob_to_raw_url(u) or vendor_doc_to_fetch_url(u) or u).lower()
+        if key in seen_fetch:
+            continue
+        seen_fetch.add(key)
+        dedup.append(u)
+    urls = dedup
     if not urls:
         return candidates
     rationale.append(
-        f"Card recipes empty/weak — trying {min(len(urls), COOKBOOK_MAX_URLS)} GitHub cookbook URL(s)"
+        f"Card recipes empty/weak — trying {min(len(urls), COOKBOOK_MAX_URLS)} linked cookbook/vendor doc(s)"
     )
     merged = list(candidates)
     seen_raw = {re.sub(r"\s+", " ", c.raw)[:200] for c in merged}
@@ -2093,18 +2155,21 @@ def _augment_candidates_from_cookbooks(
         if err or not text:
             warnings.append(f"Cookbook fetch skipped: {url} ({err or 'empty'})")
             continue
+        vendor = bool(vendor_doc_to_fetch_url(url))
         sources.append(
             {
-                "kind": "github_cookbook",
+                "kind": "vendor_doc" if vendor else "github_cookbook",
                 "ref": url,
-                "notes": "fetched vendor vLLM cookbook (card recipe-poor)",
+                "notes": "fetched vendor serve guide (card recipe-poor)"
+                if vendor
+                else "fetched vendor vLLM cookbook (card recipe-poor)",
             }
         )
         extra = extract_serve_candidates(text, detected=detected)
         added = 0
         for c in extra:
             if not c.section:
-                c.section = "github cookbook"
+                c.section = "vendor doc" if vendor else "github cookbook"
             key = re.sub(r"\s+", " ", c.raw)[:200]
             if key in seen_raw:
                 continue
@@ -2599,26 +2664,43 @@ def _apply_checkpoint_safety(
         rationale.append("MoE (from config) → --max-num-seqs 4 when card omitted it")
 
 
+_VL_MM_LIMIT = "--limit-mm-per-prompt '{\"image\":4,\"video\":1}'"
+
+
 def _apply_vl_spark_defaults(
     cfg: dict[str, Any],
     detected: dict[str, Any],
     warnings: list[str],
     rationale: list[str],
+    *,
+    mode: str = "lab_safe",
 ) -> None:
-    """GB10 first boot: skip vision towers unless the card already configured MM limits."""
+    """Lab Safe skips the vision tower. Workflow Max keeps VL with an MM cap."""
     if not detected.get("is_vl"):
         return
     ex = cfg.get("extra_flags") or ""
+    if mode == "workflow_max":
+        if "--language-model-only" in ex:
+            ex = _strip_flag_from_extra(ex, "--language-model-only")
+            cfg["extra_flags"] = ex
+            rationale.append("Workflow Max → drop --language-model-only (full VL)")
+        ex = cfg.get("extra_flags") or ""
+        if "--limit-mm-per-prompt" not in ex:
+            cfg["extra_flags"] = (ex + " " + _VL_MM_LIMIT).strip()
+            rationale.append(
+                "Workflow Max VL → keep vision/video, cap with --limit-mm-per-prompt"
+            )
+        return
     if "--language-model-only" in ex or "--limit-mm-per-prompt" in ex:
         return
     cfg["extra_flags"] = (ex + " --language-model-only").strip()
     rationale.append(
         "VL/multimodal checkpoint on Spark → --language-model-only "
-        "(avoids vision-tower OOM on first boot; remove to enable images)"
+        "(Lab Safe first boot; Workflow Max keeps vision)"
     )
     warnings.append(
-        "Multimodal model: serving language-model-only on Spark for stable first boot. "
-        "Drop --language-model-only and set --limit-mm-per-prompt when you need vision."
+        "Multimodal model: Lab Safe serves language-model-only. "
+        "Switch to Workflow Max for image/video, or drop --language-model-only."
     )
 
 
@@ -3614,13 +3696,13 @@ def recommend(
     weights_gib = estimate_weights_gib(model, hf_config)
 
     # ── Parse card for best vllm serve (scored with config.json knowledge) ──
-    # When a family overlay matches, the card's generic recipe is wrong for this
-    # checkpoint — skip card-candidate fill entirely and let the overlay drive.
-    # Never fetch cookbooks under an overlay either (overlay owns the serve path).
+    # Weak cards (Unsloth) often only link a vendor guide — follow those docs.
+    # Overlay still owns flags when it matches (MiniMax/DSpark), but we still
+    # fetch linked docs so the rationale shows what the vendor actually said.
     candidates: list[ServeCandidate] = []
-    if readme and not overlay:
+    if readme:
         candidates = extract_serve_candidates(readme, detected=detected)
-        # Card empty/weak → optional public GitHub cookbook fetch (timeout/size capped).
+        # Card empty/weak → GitHub cookbooks + allowlisted vendor docs (Unsloth / vLLM).
         candidates = _augment_candidates_from_cookbooks(
             readme,
             candidates=candidates,
@@ -3629,7 +3711,13 @@ def recommend(
             rationale=rationale,
             warnings=warnings,
         )
-        if candidates:
+        if overlay:
+            if candidates:
+                rationale.append(
+                    f"Family overlay owns serve flags; also found {len(candidates)} "
+                    "card/vendor serve snippet(s) as supporting source"
+                )
+        elif candidates:
             best = candidates[0]
             if candidates_recipe_poor(candidates):
                 rationale.append(
@@ -3748,7 +3836,7 @@ def recommend(
             warnings=warnings,
             rationale=rationale,
         )
-        _apply_vl_spark_defaults(cfg, detected, warnings, rationale)
+    _apply_vl_spark_defaults(cfg, detected, warnings, rationale, mode=mode)
 
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
     # Overlay already encodes the correct backend, so only run for card-driven configs.

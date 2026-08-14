@@ -1329,6 +1329,13 @@ def test_shipped_serve_overlays_json_loads_minimax():
     ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
     assert ov3 is not None and ov3["family_key"] == "minimax_m3"
     assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+    q38 = ac._family_overlay(
+        "unsloth/Qwen3.8-27B-NVFP4",
+        {"family": "qwen"},
+    )
+    assert q38 is not None and q38["family_key"] == "qwen38_nvfp4"
+    assert q38["config"].get("kv_cache_dtype") == "fp8"
+    assert "--language-model-only" not in (q38["config"].get("extra_flags") or "")
 
 
 def test_family_overlay_matches_detected_family_without_id_hint():
@@ -1612,10 +1619,22 @@ def test_vl_gets_language_model_only():
     warnings: list[str] = []
     rationale: list[str] = []
     ac._apply_vl_spark_defaults(
-        cfg, {"is_vl": True}, warnings, rationale
+        cfg, {"is_vl": True}, warnings, rationale, mode="lab_safe"
     )
     assert "--language-model-only" in cfg["extra_flags"]
     assert any("language-model-only" in r for r in rationale)
+
+
+def test_vl_workflow_max_keeps_vision():
+    cfg = {"extra_flags": "--language-model-only", "moe_backend": ""}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_vl_spark_defaults(
+        cfg, {"is_vl": True}, warnings, rationale, mode="workflow_max"
+    )
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
+    assert not any("Lab Safe serves language-model-only" in w for w in warnings)
 
 
 def test_resolve_dspark_draft_from_card():
@@ -1801,6 +1820,93 @@ def test_github_blob_to_raw_url():
     )
     # already-raw stays stable
     assert ac.github_blob_to_raw_url(raw) == raw
+
+
+def test_vendor_doc_urls_follow_unsloth_guide():
+    readme = (
+        "Read our [How to Run Qwen3.8-27B Guide!]"
+        "(https://unsloth.ai/docs/models/qwen3.8)\n"
+        "Also https://evil.example/steal\n"
+    )
+    urls = ac.find_vendor_doc_urls(readme)
+    assert urls == ["https://unsloth.ai/docs/models/qwen3.8"]
+    assert (
+        ac.vendor_doc_to_fetch_url(urls[0])
+        == "https://unsloth.ai/docs/models/qwen3.8.md"
+    )
+    assert ac.vendor_doc_to_fetch_url("https://evil.example/docs/x") is None
+
+
+def test_recommend_follows_unsloth_vendor_doc(monkeypatch):
+    """HF card has no vllm serve — follow the Unsloth guide linked on the card."""
+    readme = (
+        "# Qwen3.8-27B NVFP4\n\n"
+        "See the [run guide](https://unsloth.ai/docs/models/qwen3.8).\n"
+    )
+    guide = (
+        "#### **vLLM:**\n\n"
+        "```shell\n"
+        "vllm serve unsloth/Qwen3.8-27B-NVFP4 "
+        "--kv-cache-dtype fp8 --reasoning-parser qwen3\n"
+        "```\n"
+    )
+    hf_config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "vision_config": {"depth": 27},
+        "text_config": {
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "max_position_embeddings": 262144,
+        },
+        "quantization_config": {"quant_method": "compressed-tensors"},
+    }
+
+    def fake_fetch(model_id: str, timeout: float = 20.0):
+        return {
+            "model_id": model_id,
+            "readme": readme,
+            "config": hf_config,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [],
+        }
+
+    def fake_cookbook(url: str, **kwargs):
+        if "unsloth.ai" in url:
+            return guide, None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend(
+        "unsloth/Qwen3.8-27B-NVFP4",
+        mode="workflow_max",
+        fetch_remote=True,
+    )
+    kinds = [s.get("kind") for s in rec.get("sources") or []]
+    assert "vendor_doc" in kinds or any(
+        "unsloth.ai" in str(s.get("ref") or "") for s in rec.get("sources") or []
+    )
+    blob = " ".join(rec.get("rationale") or [])
+    assert "unsloth.ai" in blob.lower() or "vendor" in blob.lower()
+    assert rec["serve_blocked"] is False
+    assert "--language-model-only" not in (rec["config"].get("extra_flags") or "")
 
 
 def test_notebook_source_text_extracts_vllm_serve():
@@ -2032,8 +2138,7 @@ def test_family_overlay_not_overridden_by_cookbook(monkeypatch):
     )
 
     rec = ac.recommend(DSV4, mode="workflow_max", fetch_remote=True)
-    # Overlay path skips card/cookbook candidate fill entirely
-    assert called["n"] == 0, "must not fetch cookbooks when family overlay matches"
+    # Vendor docs may be fetched for provenance, but overlay still owns flags.
     assert any(s.get("kind") == "family_overlay" for s in (rec.get("sources") or []))
     assert (rec["config"].get("image") or "").startswith("ghcr.io/anemll/dspark-vllm-gx10")
     assert rec["config"].get("kv_cache_dtype") == "nvfp4_ds_mla"
@@ -2296,7 +2401,8 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... --hf-overrides '{"text_config": {
     assert "1000000" not in blob
     assert rec["serve_blocked"] is False
     assert cfg.get("reasoning_parser") == "qwen3"
-    assert "--language-model-only" in (cfg.get("extra_flags") or "")
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
     assert any("Skipped weak card recipe" in r for r in rec.get("rationale") or [])
 
 

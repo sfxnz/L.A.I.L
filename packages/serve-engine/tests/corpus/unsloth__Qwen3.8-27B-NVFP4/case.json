@@ -9,7 +9,9 @@
       "reasoning_parser": "qwen3",
       "tool_call_parser": "qwen3_coder",
       "enable_auto_tool_choice": true,
-      "trust_remote_code": true
+      "trust_remote_code": true,
+      "max_model_len": 262144,
+      "max_num_seqs": 2
     },
     "extra_flags_contains": ["--limit-mm-per-prompt"],
     "forbidden": [

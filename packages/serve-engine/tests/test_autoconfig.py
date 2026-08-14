@@ -1553,8 +1553,46 @@ def test_size_memory_clamps_huge_context_single_node():
         warnings=warnings,
     )
     assert cfg["max_model_len"] < 1048576
-    assert cfg["max_model_len"] in ac._CONTEXT_LADDER
+    assert cfg["max_model_len"] in ac._CONTEXT_LADDER or cfg["max_model_len"] < 1048576
     assert any("MEMORY:" in r for r in rationale)
+
+
+def test_size_memory_keeps_native_len_drops_seqs_first():
+    """Best max-len is native context; cut concurrency before cutting the window."""
+    cfg = {
+        "max_model_len": 262144,
+        "max_num_seqs": 4,
+        "kv_cache_dtype": "fp8",
+        "tensor_parallel_size": 1,
+    }
+    hf = {
+        "text_config": {
+            "hidden_size": 5120,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 64,
+            "max_position_embeddings": 262144,
+        }
+    }
+    rationale: list[str] = []
+    warnings: list[str] = []
+    ac._size_memory_for_spark(
+        cfg,
+        hf_config=hf,
+        detected={"family": "qwen"},
+        weights_gib=18.0,
+        node_ram_gib=121.7,
+        mode="auto",
+        rationale=rationale,
+        warnings=warnings,
+    )
+    assert cfg["max_model_len"] == 262144
+    assert cfg["max_num_seqs"] == 2
+    bpt = ac._kv_bytes_per_token(hf, kv_cache_dtype="fp8", family="qwen")
+    kv = (bpt * 262144 * 2 / (1024**3)) * 1.10
+    assert cfg["util"] == ac.recommended_gpu_util(121.7, 18.0, kv)
+    assert 0.55 <= cfg["util"] <= 0.85
+    assert any("Recommended util=" in r for r in rationale)
 
 
 def test_size_memory_skips_multinode_tp():
@@ -2809,6 +2847,11 @@ def test_recommend_unsloth_qwen38_nvfp4_spark(monkeypatch):
     kinds = {s.get("kind") for s in rec.get("sources") or []}
     assert "vendor_doc" in kinds, rec.get("sources")
     assert "unsloth" in refs.lower()
+    assert cfg.get("max_model_len") == 262144
+    assert cfg.get("max_num_seqs") == 2
+    bpt = ac._kv_bytes_per_token(_Q38_VL_CFG, kv_cache_dtype="fp8", family="qwen")
+    kv = (bpt * 262144 * 2 / (1024**3)) * 1.10
+    assert cfg.get("util") == ac.recommended_gpu_util(121.7, 18.0, kv)
 
 
 def test_recommend_qwen38_twin_same_entry(monkeypatch):

@@ -58,6 +58,16 @@ These are gitignored for a reason. Re-tracking them dirties every serve/eval run
 
 Local hooks live in `scripts/git-hooks/` (`./scripts/install-git-hooks.sh` once per clone). Grok hooks in `.grok/hooks/` deny `git commit` / `git push` on `main` even if you forget.
 
+## Taildrop screenshots
+
+Inbox: `/home/sfxnz/projects/ai-lab/incoming-screenshots` — not `~/Downloads`.
+
+```bash
+./scripts/taildrop-pull.sh
+```
+
+Once per machine (needs your password): `sudo tailscale set --operator=$USER`. After that, agents can pull and read the newest files in the inbox. Do not use `sudo tailscale file get`.
+
 ## UI changes
 
 Exercise the changed route the way a user would (Chrome DevTools MCP is configured on this lab). Confirm 401-without-token vs a real outage. Check other pages that share the state you touched. Layout/CSS: desktop and a narrow viewport.

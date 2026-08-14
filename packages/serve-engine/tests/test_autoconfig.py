@@ -626,25 +626,26 @@ def test_capability_min_image_for_modelopt_mixed():
     assert img == "vllm/vllm-openai:v0.27.0"
 
 
-def test_check_serve_loadability_lab_safe_vs_absolute():
-    # 50 GiB on 122 GiB node fits at 0.85 but not at Lab Safe 0.4
+def test_check_serve_loadability_absolute_only():
+    # 50 GiB on 122 GiB node fits at 0.85 after 15 GiB reserve.
     ok85, _ = ac.check_serve_loadability(
-        mode="workflow_max",
+        mode="auto",
         weights_gib=50.0,
         node_ram_gib=121.7,
         nodes_used=1,
         util=0.85,
     )
     assert ok85 is True
-    ok40, msg = ac.check_serve_loadability(
-        mode="lab_safe",
-        weights_gib=50.0,
+    # 400 GiB cannot fit even at the 0.85 ceiling.
+    ok_big, msg = ac.check_serve_loadability(
+        mode="lab_safe",  # ignored
+        weights_gib=400.0,
         node_ram_gib=121.7,
         nodes_used=1,
         util=0.4,
     )
-    assert ok40 is False
-    assert msg and "Lab Safe" in msg
+    assert ok_big is False
+    assert msg and "do not fit" in msg
 
 
 def test_resolve_stock_image_raises_never_downgrades():
@@ -826,10 +827,17 @@ def test_serve_ui_wires_auto_configure():
     at = api_ts.read_text()
     assert "recommendServe" in at
     assert "/serve/recommend" in at
+    assert "mode=" not in at.split("recommendServe")[1][:400]
     assert "recommendServe" in st
     assert "applyConfig" in st
     assert "from_website" in st
     assert "Auto-configure" in st
+    assert 'ariaLabel="Serve mode envelope"' not in st
+    assert "re-run Auto-configure after switch" not in st
+    assert "Lab Safe" not in st
+    assert "Workflow Max" not in st
+    assert "lab_safe" not in st
+    assert "workflow_max" not in st
     # Recipe scoring reasons (e.g. PENALTY for flashinfer) must render in UI
     assert "cr.reasons" in st or "reasons" in st
     assert "card_recipes" in st
@@ -1023,14 +1031,12 @@ def test_placement_dsv4_needs_two_nodes_computed_util():
 
 
 def test_placement_elevates_util_only_when_weights_require_it():
-    # Lab Safe default 0.40; weights that need more should elevate util_computed
-    # so the envelope can clamp + warn / block rather than silently under-util.
-    # (40+15)/121.7 ≈ 0.45 > 0.40 → elevate.
-    p = ac.plan_placement(40.0, _topo(1), mode="lab_safe", overlay=None)
+    # Default ceiling is 0.85; only elevate util_computed when weights need more.
+    p = ac.plan_placement(40.0, _topo(1), overlay=None)
     assert p["nodes_needed"] == 1
-    assert p["util_computed"] is not None and p["util_computed"] >= 0.45
-    # Workflow Max: only elevate when min_to_load exceeds the 0.85 default (rare).
-    p2 = ac.plan_placement(21.0, _topo(1), mode="workflow_max", overlay=None)
+    # (40+15)/121.7 ≈ 0.45 < 0.85 → envelope owns util
+    assert p["util_computed"] is None
+    p2 = ac.plan_placement(21.0, _topo(1), overlay=None)
     assert p2["util_computed"] is None
 
 
@@ -1614,23 +1620,22 @@ def test_analyze_config_qwen38_conditional_generation_is_vl():
     assert d["is_vl"] is True
 
 
-def test_vl_gets_language_model_only():
-    cfg = {"extra_flags": "--max-num-batched-tokens 8192", "moe_backend": ""}
+def test_vl_keeps_vision_by_default():
+    cfg = {"extra_flags": "--max-num-batched-tokens 8192 --language-model-only", "moe_backend": ""}
     warnings: list[str] = []
     rationale: list[str] = []
-    ac._apply_vl_spark_defaults(
-        cfg, {"is_vl": True}, warnings, rationale, mode="lab_safe"
-    )
-    assert "--language-model-only" in cfg["extra_flags"]
-    assert any("language-model-only" in r for r in rationale)
+    ac._apply_vl_spark_defaults(cfg, {"is_vl": True}, warnings, rationale)
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
+    assert any("vision" in r.lower() for r in rationale)
 
 
-def test_vl_workflow_max_keeps_vision():
+def test_vl_legacy_mode_arg_still_keeps_vision():
     cfg = {"extra_flags": "--language-model-only", "moe_backend": ""}
     warnings: list[str] = []
     rationale: list[str] = []
     ac._apply_vl_spark_defaults(
-        cfg, {"is_vl": True}, warnings, rationale, mode="workflow_max"
+        cfg, {"is_vl": True}, warnings, rationale, mode="lab_safe"
     )
     assert "--language-model-only" not in (cfg.get("extra_flags") or "")
     assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
@@ -2382,6 +2387,8 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... --hf-overrides '{"text_config": {
         },
     )
     monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "_http_get_raw", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
     monkeypatch.setattr(
         ac,
         "_cluster_topology",
@@ -2619,5 +2626,233 @@ def test_lab_safe_headroom_abort_only_on_large_uma():
     msg = sv._lab_safe_headroom_abort(avail=20.0, ram_total=121.7)
     assert msg is not None and "ABORT" in msg and "60" in msg
     assert sv._lab_safe_headroom_abort(avail=80.0, ram_total=121.7) is None
+
+
+# ─── Active vendor research (card-silent) + Qwen3.8-27B-NVFP4 ─────────────────
+
+UNSLOTH_QWEN38 = "unsloth/Qwen3.8-27B-NVFP4"
+
+_Q38_VL_CFG = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "language_model_only": False,
+    "vision_config": {"depth": 27, "hidden_size": 1152},
+    "text_config": {
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "max_position_embeddings": 262144,
+        "num_attention_heads": 24,
+        "num_hidden_layers": 64,
+        "num_key_value_heads": 4,
+        "vocab_size": 248320,
+    },
+    "quantization_config": {"quant_method": "compressed-tensors"},
+}
+
+
+def test_family_doc_slugs_publisher_agnostic():
+    slugs = ac.family_doc_slugs(
+        "acme/Qwen3.8-27B-NVFP4",
+        {"family": "qwen", "has_nvfp4": True},
+    )
+    assert "qwen3.8" in slugs
+    assert "nvfp4" in slugs
+    slugs_official = ac.family_doc_slugs("Qwen/Qwen3.8-27B", {"family": "qwen"})
+    assert "qwen3.8" in slugs_official
+    # Architecture-only id: Qwen3.8 ships as qwen3_5 VL classes.
+    slugs_arch = ac.family_doc_slugs(
+        "acme/mystery-vl-nvfp4",
+        {
+            "family": "qwen",
+            "has_nvfp4": True,
+            "is_vl": True,
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+        },
+    )
+    assert "qwen3.8" in slugs_arch
+
+
+def test_vendor_candidate_family_mismatch_drops_gemma_for_qwen():
+    gemma = ac.ServeCandidate(
+        raw="vllm serve unsloth/gemma-4 --reasoning-parser gemma4",
+        model="unsloth/gemma-4",
+        config={"reasoning_parser": "gemma4"},
+    )
+    qwen = ac.ServeCandidate(
+        raw="vllm serve unsloth/Qwen3.8-27B-NVFP4 --reasoning-parser qwen3",
+        model="unsloth/Qwen3.8-27B-NVFP4",
+        config={"reasoning_parser": "qwen3"},
+    )
+    assert ac._vendor_candidate_family_mismatch(gemma, "qwen") is True
+    assert ac._vendor_candidate_family_mismatch(qwen, "qwen") is False
+
+
+def test_discover_recipe_urls_without_card_links():
+    found = ac.discover_recipe_urls(
+        "acme/Qwen3.8-27B-NVFP4",
+        {
+            "family": "qwen",
+            "has_nvfp4": True,
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+        },
+        readme="# silent\nNo cookbook or vendor URL on this card.\n",
+    )
+    refs = [u.url for u in found]
+    assert any("unsloth.ai/docs/models/qwen3.8" in r for r in refs)
+    assert any(u.origin == "derived" and u.kind == "vendor_doc" for u in found)
+    assert any(u.kind == "nvidia_playbook" for u in found)
+
+
+def _patch_offline_recommend(monkeypatch, *, readme, config, topo_ram=121.7, sku="NVIDIA GB10"):
+    def fake_fetch(model_id: str, timeout: float = 20.0):
+        return {
+            "model_id": model_id,
+            "readme": readme,
+            "config": config,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [f"fixture://{model_id}"],
+        }
+
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=topo_ram, gpu_sku=sku),
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 18.0)
+
+
+def test_recommend_researches_vendor_when_card_has_no_url(monkeypatch):
+    """(a) Silent card — derived Unsloth URL still supplies flags + sources."""
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+    readme = "# Mystery Qwen\nNo links. No vllm serve.\n"
+    hf_config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "quantization_config": {"quant_method": "compressed-tensors"},
+        "hidden_size": 5120,
+        "num_hidden_layers": 64,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "max_position_embeddings": 262144,
+    }
+    _patch_offline_recommend(monkeypatch, readme=readme, config=hf_config)
+    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
+
+    fetched: list[str] = []
+
+    def fake_cookbook(url: str, **kwargs):
+        fetched.append(url)
+        if "unsloth.ai" in url:
+            return guide, None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+
+    rec = ac.recommend("acme/Silent-Qwen-27B-NVFP4", fetch_remote=True)
+    kinds = {s.get("kind") for s in rec.get("sources") or []}
+    refs = " ".join(s.get("ref") or "" for s in rec.get("sources") or [])
+    assert any("unsloth.ai" in u for u in fetched), fetched
+    assert "vendor_doc" in kinds, rec.get("sources")
+    assert "unsloth" in refs.lower() or "unsloth" in " ".join(rec.get("rationale") or []).lower()
+    cfg = rec["config"]
+    assert cfg.get("kv_cache_dtype") == "fp8"
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert rec["serve_blocked"] is False
+
+
+def test_recommend_unsloth_qwen38_nvfp4_spark(monkeypatch):
+    """(b) Named struggle case on Spark-class RAM."""
+    readme = (
+        "# Qwen3.8-27B-NVFP4\n\n"
+        "```shell\n"
+        "vllm serve unsloth/Qwen3.8-27B-NVFP4\n"
+        "```\n\n"
+        "```shell\n"
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... "
+        "--hf-overrides '{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\"}}}' "
+        "--max-model-len 1000000\n"
+        "```\n"
+    )
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+    _patch_offline_recommend(monkeypatch, readme=readme, config=_Q38_VL_CFG)
+
+    def fake_cookbook(url: str, **kwargs):
+        if "unsloth.ai" in url:
+            return guide, None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+
+    rec = ac.recommend(UNSLOTH_QWEN38, fetch_remote=True)
+    cfg = rec["config"]
+    blob = json.dumps(cfg) + " ".join(str(x) for x in (cfg.get("docker_env") or []))
+    assert rec["serve_blocked"] is False
+    assert cfg.get("kv_cache_dtype") == "fp8"
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert cfg.get("tool_call_parser") == "qwen3_coder"
+    assert cfg.get("trust_remote_code") is True
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "yarn" not in blob.lower()
+    assert "1000000" not in blob
+    assert "flashinfer_b12x" not in blob
+    refs = " ".join(s.get("ref") or "" for s in rec.get("sources") or [])
+    kinds = {s.get("kind") for s in rec.get("sources") or []}
+    assert "vendor_doc" in kinds, rec.get("sources")
+    assert "unsloth" in refs.lower()
+
+
+def test_recommend_qwen38_twin_same_entry(monkeypatch):
+    """(c) Official Qwen twin uses the same recommend() path — parsers + VL, no publisher switch."""
+    readme = "# Qwen3.8-27B\n\nNo serve recipe.\n"
+    _patch_offline_recommend(monkeypatch, readme=readme, config=_Q38_VL_CFG)
+    monkeypatch.setattr(
+        ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline")
+    )
+    rec = ac.recommend("Qwen/Qwen3.8-27B", fetch_remote=True)
+    cfg = rec["config"]
+    assert rec["serve_blocked"] is False
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert cfg.get("tool_call_parser") == "qwen3_coder"
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
+
+
+def test_recommend_vendor_fetch_error_still_returns(monkeypatch):
+    """(d) Extra-source fetch failure must not brick recommend."""
+    readme = "# Silent\nNo links.\n"
+    _patch_offline_recommend(monkeypatch, readme=readme, config=_Q38_VL_CFG)
+    monkeypatch.setattr(
+        ac, "fetch_cookbook_text", lambda *a, **k: (None, "timeout")
+    )
+    rec = ac.recommend(UNSLOTH_QWEN38, fetch_remote=True)
+    assert isinstance(rec, dict)
+    assert rec.get("config")
+    assert rec["config"].get("model") == UNSLOTH_QWEN38
+    assert rec["serve_blocked"] is False
+    # Overlay / config detection still fills parsers when vendor fetch fails.
+    assert rec["config"].get("reasoning_parser") == "qwen3"
+
+
+def test_recommend_accepts_request_with_no_mode(monkeypatch):
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# x\n```shell\nvllm serve org/x --reasoning-parser qwen3\n```\n",
+        config=_Q38_VL_CFG,
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    rec = ac.recommend(UNSLOTH_QWEN38, fetch_remote=True)
+    assert rec.get("mode") in (None, "auto")
+    assert rec["serve_blocked"] is False
+    assert rec["config"].get("util") is not None
 
 

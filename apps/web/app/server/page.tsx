@@ -177,7 +177,6 @@ export default function ServerPage() {
   usePageTitle("Serve");
   const [tab, setTab] = useState<Tab>("serve");
   const [status, setStatus] = useState<LabStatus | null>(null);
-  const [mode, setMode] = useState<"lab_safe" | "workflow_max">("lab_safe");
   const [model, setModel] = useState("");
   const [util, setUtil] = useState("");
   const [maxLen, setMaxLen] = useState("");
@@ -447,17 +446,15 @@ export default function ServerPage() {
     setStartError(null);
   }
 
-  async function autoConfigure(nextMode?: "lab_safe" | "workflow_max") {
+  async function autoConfigure() {
     if (!model.trim()) {
       setRecError("Enter a model id first (e.g. unsloth/Qwen3.6-35B-A3B-NVFP4)");
       return;
     }
-    const m = nextMode ?? mode;
-    if (nextMode) setMode(nextMode);
     setRecBusy(true);
     setRecError(null);
     try {
-      const r = await api.recommendServe(model.trim(), m, true);
+      const r = await api.recommendServe(model.trim(), true);
       setRec(r);
       applyConfig(r.config, r.model);
     } catch (e) {
@@ -480,7 +477,6 @@ export default function ServerPage() {
       .filter((l) => l && !l.startsWith("#") && l.includes("="));
     const body: Record<string, unknown> = {
       model: model.trim(),
-      mode,
       port: parseInt(port, 10) || 8000,
       docker_env: envLines,
       quantization: quantization.trim(),
@@ -615,12 +611,12 @@ export default function ServerPage() {
 
       {tab === "serve" && (
         <div className="space-y-4">
-          {/* 01 · ENVELOPE — one mode row: control, one-line hint, abort/restore. */}
+          {/* 01 · CONTROLS — stop / restore. Memory envelope is chosen by Auto-configure. */}
           <section className="animus-chamfer border border-lab-border bg-[color:var(--animus-glass)] px-4 py-3.5">
             <Seq
               n={step.envelope}
-              label="Envelope"
-              hint="memory ceiling applied to every launch"
+              label="Host"
+              hint="stop running serves · reserved UMA is automatic"
               action={
                 <>
                   <Btn
@@ -648,22 +644,11 @@ export default function ServerPage() {
                 </>
               }
             />
-            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
-              <SegmentedControl
-                ariaLabel="Serve mode envelope"
-                value={mode}
-                onChange={setMode}
-                options={[
-                  { id: "lab_safe", label: "Lab Safe" },
-                  { id: "workflow_max", label: "Workflow Max" },
-                ]}
-              />
-              <span className="max-w-md text-[11px] leading-snug text-lab-muted">
-                {mode === "lab_safe"
-                  ? "util ≤ 0.4 · headroom for OS / Hermes · re-run Auto-configure after switch"
-                  : "util ~0.7–0.85 · large weights / long ctx · re-run Auto-configure after switch"}
-              </span>
-            </div>
+            <p className="mt-3 max-w-xl text-[11px] leading-snug text-lab-muted">
+              Auto-configure sizes util, context, vision, and tensor parallel from the
+              researched recipe plus live hardware. Start still refuses when weights
+              cannot fit.
+            </p>
           </section>
 
           <div className="grid gap-3 lg:grid-cols-3">
@@ -681,10 +666,12 @@ export default function ServerPage() {
                 />
                 <div className="animus-rule" aria-hidden />
                 <p className="text-[11px] leading-relaxed text-lab-muted">
-                  Fetches the live model card + config from huggingface.co, scores every{" "}
+                  Fetches the live model card + config from huggingface.co, then researches
+                  Unsloth docs, NVIDIA playbooks, and GitHub vLLM recipes even when the card
+                  has no links. Scores every{" "}
                   <code className="font-mono text-[10.5px] text-lab-text-dim">vllm serve</code>{" "}
                   recipe, applies checkpoint safety (e.g. strips flashinfer_b12x on mixed FP8
-                  MoE), then fills Lab Safe / Workflow Max envelope gaps.
+                  MoE), and sizes the hardware envelope automatically.
                 </p>
                 <div className="flex flex-wrap items-end gap-3">
                   <div className="min-w-[16rem] flex-1">
@@ -1070,7 +1057,7 @@ export default function ServerPage() {
                     id="serve-util"
                     value={util}
                     onChange={(e) => setUtil(e.target.value)}
-                    placeholder={mode === "lab_safe" ? "0.4" : "0.85"}
+                    placeholder="0.85"
                   />
                 </Field>
                 <Field label="max-model-len" htmlFor="serve-maxlen">
@@ -1078,7 +1065,7 @@ export default function ServerPage() {
                     id="serve-maxlen"
                     value={maxLen}
                     onChange={(e) => setMaxLen(e.target.value)}
-                    placeholder={mode === "lab_safe" ? "65536" : "262144"}
+                    placeholder="262144"
                   />
                 </Field>
                 <Field label="Port" htmlFor="serve-port">
@@ -1321,7 +1308,7 @@ export default function ServerPage() {
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] tabular-nums text-lab-muted">
                   <span className="truncate">{model.trim() || "no target"}</span>
                   <Tick />
-                  <span>{mode === "lab_safe" ? "lab_safe" : "workflow_max"}</span>
+                  <span>auto</span>
                   <Tick />
                   <span>:{port || "8000"}</span>
                 </div>
@@ -1466,7 +1453,7 @@ function PerfTab({
   track: (id: string) => void;
   healthy: boolean;
 }) {
-  const [intent, setIntent] = useState("lab_safe");
+  const [intent, setIntent] = useState("published");
   const [runner, setRunner] = useState<"workflow" | "prefill" | "concurrency">("workflow");
   const [err, setErr] = useState<string | null>(null);
   const [smokeResult, setSmokeResult] = useState<string | null>(null);
@@ -1501,8 +1488,8 @@ function PerfTab({
               value={intent}
               onChange={(e) => setIntent(e.target.value)}
             >
-              <option value="lab_safe">lab_safe</option>
-              <option value="workflow_max">workflow_max</option>
+              <option value="published">published A/B</option>
+              <option value="long_context">long context</option>
               <option value="attach">attach</option>
             </select>
           </Field>

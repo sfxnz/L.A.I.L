@@ -1,0 +1,23 @@
+{
+  "model": "unsloth/Qwen3.8-27B-NVFP4",
+  "weights_gib": 18.0,
+  "note": "Named struggle case. Bare Unsloth serve + YaRN demo on the card; overlay + hardware envelope must keep VL, parsers, fp8 KV.",
+  "expect": {
+    "serve_blocked": false,
+    "config": {
+      "kv_cache_dtype": "fp8",
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_coder",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "extra_flags_contains": ["--limit-mm-per-prompt"],
+    "forbidden": [
+      "flashinfer_b12x",
+      "yarn",
+      "1000000",
+      "language-model-only",
+      "$"
+    ]
+  }
+}

@@ -401,34 +401,6 @@ export function LogView({
   );
 }
 
-export function ModeBanner({ mode }: { mode: "lab_safe" | "workflow_max" }) {
-  const safe = mode === "lab_safe";
-  return (
-    <div
-      className={cn(
-        "rounded-[2px] border border-l-2 px-3.5 py-3 text-[13px] leading-snug",
-        safe
-          ? "border-lab-border border-l-lab-line bg-lab-panel2 text-lab-text-dim"
-          : "border-[color:var(--animus-accent-edge)] border-l-[color:var(--color-lab-accent)] bg-[color:var(--animus-accent-wash)] text-lab-text-dim",
-      )}
-      role="status"
-    >
-      <span
-        className={cn(
-          "font-[family-name:var(--font-display)] font-semibold uppercase tracking-[0.12em]",
-          safe ? "text-lab-text" : "text-lab-accent-bright",
-        )}
-      >
-        {safe ? "Lab Safe" : "Workflow Max"}
-      </span>
-      <span className="text-lab-muted"> — </span>
-      {safe
-        ? "util ≤ 0.4, leave headroom for OS / Hermes. Best for long-lived agent endpoints."
-        : "util ~0.7–0.85 for large weights / long context. Watch free RAM; not set-and-forget."}
-    </div>
-  );
-}
-
 export function StatusDot({
   live,
   label,

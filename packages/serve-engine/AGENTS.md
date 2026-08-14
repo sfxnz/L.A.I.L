@@ -1,6 +1,6 @@
 # AGENTS.md — `packages/serve-engine`
 
-Python FastAPI: vLLM Lab Safe / Workflow Max, smoke, benches, run history.
+Python FastAPI: vLLM auto-configure, smoke, benches, run history.
 
 ## Placement
 

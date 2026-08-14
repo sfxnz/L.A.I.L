@@ -685,7 +685,7 @@ def _build_vllm_args(
 def serve_model(
     *,
     model: str,
-    mode: str = "lab_safe",
+    mode: str | None = None,
     util: float | None = None,
     max_model_len: int | None = None,
     port: int = DEFAULT_PORT,
@@ -719,19 +719,12 @@ def serve_model(
         if progress:
             progress(p, msg)
 
-    if mode == "lab_safe":
-        util = SAFE_UTIL if util is None else util
-        max_model_len = SAFE_MAX_LEN if max_model_len is None else max_model_len
-        _assert_lab_safe_util(util)
-        image = image or DEFAULT_IMAGE_SAFE
-        container = CONTAINER_SAFE
-    elif mode == "workflow_max":
-        util = WORKFLOW_UTIL if util is None else util
-        max_model_len = WORKFLOW_MAX_LEN if max_model_len is None else max_model_len
-        image = image or DEFAULT_IMAGE_MAX
-        container = CONTAINER_MAX
-    else:
-        raise ValueError(f"Unknown mode {mode}; use lab_safe or workflow_max")
+    # Dual user envelopes (Lab Safe / Workflow Max) are gone. Hardware
+    # defaults + reserved UMA are the only sizing policy.
+    util = WORKFLOW_UTIL if util is None else util
+    max_model_len = WORKFLOW_MAX_LEN if max_model_len is None else max_model_len
+    image = image or DEFAULT_IMAGE_MAX or DEFAULT_IMAGE_SAFE
+    container = CONTAINER_SAFE
 
     # Resolve TP once — fits gate and launch must use the same value (no plan
     # fallback only in the gate, which previously greenlit multi-node fit while
@@ -739,7 +732,7 @@ def serve_model(
     tp_n = max(1, int(tensor_parallel_size or 1))
 
     # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
-    # Shares check_serve_loadability with recommend() so Lab Safe util is honored.
+    # Shares check_serve_loadability with recommend() so Start and Auto-configure agree.
     try:
         from .autoconfig import (
             _cluster_topology,
@@ -763,13 +756,13 @@ def serve_model(
             weights_gib=weights,
             node_ram_gib=node_ram,
             nodes_used=n_use,
-            util=float(util if util is not None else (0.4 if mode == "lab_safe" else 0.85)),
+            util=float(util if util is not None else WORKFLOW_UTIL),
             reserve_gib=reserve,
         )
         if not fits_ok:
             raise RuntimeError(
                 f"SERVE BLOCKED: {msg or f'weights (~{weights} GiB) do not fit {n_avail} Spark(s)'}."
-                " Add nodes, switch mode, or pick a smaller checkpoint."
+                " Add nodes or pick a smaller checkpoint."
             )
     except RuntimeError:
         raise
@@ -1003,9 +996,10 @@ def serve_model(
     except Exception:
         ram_total = None
     abort = _lab_safe_headroom_abort(avail, ram_total if isinstance(ram_total, (int, float)) else None)
-    if mode == "lab_safe" and abort:
-        subprocess.run(["docker", "stop", container], capture_output=True)
-        raise RuntimeError(abort)
+    if abort:
+        # Informational only — reserved UMA is enforced at placement, not by
+        # killing a serve that already became healthy.
+        w(f"HEADROOM: {abort}", 1.0)
     w(f"API ready. available_gib={avail}", 1.0)
     return {
         "ok": True,

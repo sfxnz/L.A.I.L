@@ -28,7 +28,7 @@ No Ollama — only vLLM and llama.cpp.
 
 1. **Configure** → vLLM (`:8000`) or llama.cpp (`:8080`) + default model  
 2. **Models** → search HF / download weights into `data/models`  
-3. **Server** → start vLLM Lab Safe or Workflow Max  
+3. **Server** → paste an HF id, Auto-configure, Start  
 4. **Workbench** → Composer agent for multi-step file work  
 5. **Usage** → track lifetime tokens locally  
 

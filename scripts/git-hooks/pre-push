@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Refuse pushes whose destination is main/master.
+set -euo pipefail
+
+remote="$1"
+url="$2"
+current=$(git symbolic-ref --quiet --short HEAD || true)
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  dest=${remote_ref#refs/heads/}
+  if [ "$dest" = "main" ] || [ "$dest" = "master" ]; then
+    echo "pre-push: refusing push to $dest on $remote ($url)." >&2
+    echo "Push a topic branch and open a PR." >&2
+    exit 1
+  fi
+done
+
+if [ "$current" = "main" ] || [ "$current" = "master" ]; then
+  # Default push with no refspec still targets the upstream of main.
+  echo "pre-push: HEAD is $current — refusing to push. Use a topic branch." >&2
+  exit 1
+fi
+exit 0

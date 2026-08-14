@@ -12,20 +12,31 @@ source .venv/bin/activate
 pip install -e "packages/serve-engine[dev]"
 bun install
 cp .env.example .env
+./scripts/install-git-hooks.sh
 ```
+
+The last line points this clone at `scripts/git-hooks/` so commits on `main` and secret files are rejected locally.
 
 ## Checks
 
 ```bash
+export PATH="$HOME/.bun/bin:$PATH"
 bun run typecheck
 bun test apps/web packages/backend
-python3 -m pytest packages/serve-engine/tests -q
+.venv/bin/python -m pytest packages/serve-engine/tests -q
 ```
 
-## Coding
+CI (`.github/workflows/ci.yml`) runs the same three.
 
-See [AGENTS.md](./AGENTS.md). Surgical diffs; no drive-by refactors.
+## Git
 
-## Pull requests
+`main` is protected: pull request required, linear history, no force-push, CI `test` must pass.
 
-Open a PR against the default branch. CI (`.github/workflows/ci.yml`) must pass.
+1. Branch from latest `main`. Names: `feat/…`, `fix/…`, `chore/…`, `docs/…`, `test/…`, `ci/…`.
+2. Conventional Commits on the first line: `type(scope): summary`
+   - types: `feat` `fix` `test` `chore` `docs` `refactor` `ci` `perf` `revert`
+   - scopes (optional): `web` `backend` `serve-engine` `autoconfig` `security` `workflows`
+3. Open a PR against `main`. Do not commit or push to `main`.
+4. Do not use `--no-verify` to skip hooks.
+
+Agents follow the same rules — see [AGENTS.md](./AGENTS.md). Surgical diffs; no drive-by refactors.

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Refuse commits on main and refuse staging secrets / runtime DBs.
+set -euo pipefail
+
+branch=$(git symbolic-ref --quiet --short HEAD || true)
+if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+  echo "pre-commit: refusing commit on '$branch'." >&2
+  echo "Create a feat/fix/chore/docs branch and open a PR." >&2
+  exit 1
+fi
+
+blocked=$(git diff --cached --name-only -z | tr '\0' '\n' | grep -E \
+  '(^|/)\.env($|\.local$)|(^|/)data/.*\.sqlite($|-shm$|-wal$)|(^|/)data/(multinode_serve|cluster)\.json$|(^|/)apps/web/next-env\.d\.ts$' \
+  || true)
+if [ -n "$blocked" ]; then
+  echo "pre-commit: refusing to commit ignored/secret paths:" >&2
+  echo "$blocked" >&2
+  exit 1
+fi
+exit 0

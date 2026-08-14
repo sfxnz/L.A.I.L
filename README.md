@@ -1,6 +1,6 @@
 # L.A.I.L — Local AI Lab
 
-**Serve & eval console** — start/stop vLLM, run smoke/perf evals, and copy OpenAI-compatible endpoints for **Hermes** (and other clients).
+**Serve & eval console** — paste a Hugging Face id, auto-configure, start/stop vLLM (or llama.cpp), run smoke/perf evals, and copy an OpenAI-compatible endpoint for **Hermes** (or any client). All on your own hardware.
 
 Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to the live `:8000` endpoint.
 
@@ -68,7 +68,7 @@ A new clone is **one local node** (this host). Multi-node is opt-in via `LAIL_CL
 
 ```bash
 # 1. Clone, then stay at the repo root
-git clone <this-repo> lail
+git clone https://github.com/sfxnz/L.A.I.L.git lail
 cd lail
 
 # 2. Bun (skip if `bun --version` already works)

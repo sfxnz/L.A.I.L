@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from "bun:test";
-import { getClientToken, setClientToken, tokenQuery } from "./auth-token";
+import { getClientToken, isUnauthorizedError, setClientToken, tokenQuery } from "./auth-token";
 
 const mem: Record<string, string> = {};
 (globalThis as { sessionStorage: Storage }).sessionStorage = {
@@ -40,5 +40,13 @@ describe("client LAIL_TOKEN", () => {
     setClientToken("abc");
     expect(tokenQuery("/api/jobs/1/logs")).toBe("/api/jobs/1/logs?token=abc");
     expect(tokenQuery("/api/jobs/1/logs?x=1")).toBe("/api/jobs/1/logs?x=1&token=abc");
+  });
+
+  test("isUnauthorizedError treats 401 as token, not an outage", () => {
+    expect(isUnauthorizedError('{"error":"unauthorized","message":"LAIL_TOKEN required"}')).toBe(
+      true,
+    );
+    expect(isUnauthorizedError(new Error("401"))).toBe(true);
+    expect(isUnauthorizedError("serve-engine unreachable")).toBe(false);
   });
 });

@@ -9,7 +9,8 @@ if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   exit 1
 fi
 
-blocked=$(git diff --cached --name-only -z | tr '\0' '\n' | grep -E \
+# Additions/modifications only. Deletions are how we untrack a leaked runtime file.
+blocked=$(git diff --cached --diff-filter=ACMR --name-only -z | tr '\0' '\n' | grep -E \
   '(^|/)\.env($|\.local$)|(^|/)data/.*\.sqlite($|-shm$|-wal$)|(^|/)data/(multinode_serve|cluster)\.json$|(^|/)apps/web/next-env\.d\.ts$' \
   || true)
 if [ -n "$blocked" ]; then

@@ -16,7 +16,7 @@ export const metadata: Metadata = {
     default: "L.A.I.L — Serve & Evals",
     template: "%s · L.A.I.L",
   },
-  description: "Local AI Lab on DGX Spark: serve models, run evals, connect Hermes",
+  description: "Serve and eval any model on your own hardware.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

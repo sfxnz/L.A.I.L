@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type LabStatus, type RunRow } from "@/lib/api";
+import { isUnauthorizedError } from "@/lib/auth-token";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import {
   Badge,
@@ -98,6 +99,7 @@ export default function StatusPage() {
   const [status, setStatus] = useState<LabStatus | null>(null);
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [needToken, setNeedToken] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -111,8 +113,15 @@ export default function StatusPage() {
       setStatus(s);
       setRuns(r);
       setErr(null);
+      setNeedToken(false);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      if (isUnauthorizedError(e)) {
+        setNeedToken(true);
+        setErr(null);
+      } else {
+        setNeedToken(false);
+        setErr(String((e as Error).message || e));
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -147,21 +156,23 @@ export default function StatusPage() {
           >
             <div className="flex items-center gap-2">
               <StatusDot
-                live={loading ? null : healthy}
+                live={loading || needToken ? null : healthy}
                 label={
                   loading
                     ? "Checking endpoint"
-                    : healthy
-                      ? "Endpoint live"
-                      : err
-                        ? "Controller unreachable"
-                        : "No model serving"
+                    : needToken
+                      ? "Token required"
+                      : healthy
+                        ? "Endpoint live"
+                        : err
+                          ? "Controller unreachable"
+                          : "No model serving"
                 }
               />
               <span
                 className={cn(
                   "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em]",
-                  loading
+                  loading || needToken
                     ? "text-lab-muted"
                     : healthy
                       ? "text-lab-ok"
@@ -172,11 +183,13 @@ export default function StatusPage() {
               >
                 {loading
                   ? "Checking…"
-                  : healthy
-                    ? "Endpoint live"
-                    : err
-                      ? "Controller down"
-                      : "No model serving"}
+                  : needToken
+                    ? "Token required"
+                    : healthy
+                      ? "Endpoint live"
+                      : err
+                        ? "Controller down"
+                        : "No model serving"}
               </span>
             </div>
             {!loading && cluster && (
@@ -223,6 +236,13 @@ export default function StatusPage() {
         </div>
       </div>
 
+      {needToken && (
+        <Callout tone="warn" title="LAIL_TOKEN required">
+          The controller is up. Paste the token in the banner — it stays in sessionStorage and is
+          sent as <code className="text-lab-text">X-Lail-Token</code>.
+        </Callout>
+      )}
+
       {err && (
         <Callout
           tone="danger"
@@ -239,7 +259,7 @@ export default function StatusPage() {
         </Callout>
       )}
 
-      {!loading && !healthy && !err && (
+      {!loading && !healthy && !err && !needToken && (
         <Callout
           tone="warn"
           title="No model endpoint right now"

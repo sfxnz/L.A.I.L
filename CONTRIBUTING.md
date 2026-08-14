@@ -37,6 +37,7 @@ CI (`.github/workflows/ci.yml`) runs the same three.
    - types: `feat` `fix` `test` `chore` `docs` `refactor` `ci` `perf` `revert`
    - scopes (optional): `web` `backend` `serve-engine` `autoconfig` `security` `workflows`
 3. Open a PR against `main`. Do not commit or push to `main`.
-4. Do not use `--no-verify` to skip hooks.
+4. Do not merge the PR. Only the maintainer merges (`gh pr merge` and the GitHub merge button are both off-limits to agents).
+5. Do not use `--no-verify` to skip hooks.
 
 Agents follow the same rules — see [AGENTS.md](./AGENTS.md). Surgical diffs; no drive-by refactors.

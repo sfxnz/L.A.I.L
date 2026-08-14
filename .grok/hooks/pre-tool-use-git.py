@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deny git commit/push/merge on main, and deny staging secrets.
+"""Deny git commit/push/merge on main, deny gh pr merge, and deny staging secrets.
 
 Reads a Grok PreToolUse JSON envelope from stdin. Fail-open on parse errors.
 """
@@ -42,6 +42,7 @@ def looks_like_git(cmd: str) -> bool:
 COMMIT_RE = re.compile(r"\bgit\b(?:\s+-[^\s]+)*\s+commit\b")
 PUSH_RE = re.compile(r"\bgit\b(?:\s+-[^\s]+)*\s+push\b")
 MERGE_RE = re.compile(r"\bgit\b(?:\s+-[^\s]+)*\s+merge\b")
+GH_PR_MERGE_RE = re.compile(r"\bgh\b(?:\s+\S+)*?\s+pr\s+merge\b")
 PROTECTED = {"main", "master"}
 SECRET_RE = re.compile(
     r"(?:^|[\s'\"])((?:\.env(?:\.local)?)|(?:data/\S+\.sqlite(?:-shm|-wal)?)|(?:data/(?:multinode_serve|cluster)\.json)|(?:apps/web/next-env\.d\.ts))"
@@ -62,6 +63,11 @@ def main() -> None:
     cwd = data.get("cwd") or data.get("workspaceRoot") or os.getcwd()
     branch = head_branch(cwd)
 
+    if GH_PR_MERGE_RE.search(cmd):
+        deny(
+            "Refusing gh pr merge. Open the PR and stop — only the human merges."
+        )
+
     if not looks_like_git(cmd):
         allow()
 
@@ -81,7 +87,8 @@ def main() -> None:
 
     if MERGE_RE.search(cmd) and branch in PROTECTED:
         deny(
-            f"Refusing git merge while on '{branch}'. Merge via a pull request."
+            f"Refusing git merge while on '{branch}'. "
+            "Open a PR; only the human merges."
         )
 
     if re.search(r"\bgit\b(?:\s+-[^\s]+)*\s+add\b", cmd):

@@ -35,13 +35,18 @@ describe("LAIL_TOKEN middleware", () => {
 
   test("query token is accepted on job-log EventSource path", async () => {
     const prev = config.token;
+    const origFetch = globalThis.fetch;
     config.token = "secret";
+    globalThis.fetch = (async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
     try {
       const app = createApp();
+      const denied = await app.request("/api/jobs/x/logs");
+      expect(denied.status).toBe(401);
       const logs = await app.request("/api/jobs/x/logs?token=secret");
-      expect(logs.status).not.toBe(401);
+      expect(logs.status).toBe(200);
     } finally {
       config.token = prev;
+      globalThis.fetch = origFetch;
     }
   });
 

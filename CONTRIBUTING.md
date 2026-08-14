@@ -5,7 +5,7 @@ Thanks for helping with L.A.I.L (Local AI Lab). Keep the product name; do not co
 ## Setup
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/sfxnz/L.A.I.L.git
 cd <repo>
 python3 -m venv .venv
 source .venv/bin/activate

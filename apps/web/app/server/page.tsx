@@ -25,6 +25,7 @@ import {
   inputCls,
   btnClass,
 } from "@/components/ui";
+import { isUnauthorizedError } from "@/lib/auth-token";
 import { cn } from "@/lib/utils";
 import { usePageTitle } from "@/lib/usePageTitle";
 
@@ -221,7 +222,9 @@ export default function ServerPage() {
     return api
       .labStatus()
       .then(setStatus)
-      .catch((e) => setStartError(String((e as Error).message || e)))
+      .catch((e) => {
+        if (!isUnauthorizedError(e)) setStartError(String((e as Error).message || e));
+      })
       .finally(() => {
         setStatusLoading(false);
         setRefreshing(false);
@@ -922,7 +925,7 @@ export default function ServerPage() {
                       <Readout label="Served model" value={serve?.model_id} unset="No model" />
                       <Readout label="Endpoint" value={serve?.base_url} unset="Not set" />
                       <Readout
-                        label="Available UMA"
+                        label="Memory free"
                         value={
                           avail != null
                             ? `${avail} GiB${headroom ? ` · ${headroom}` : ""}`
@@ -992,7 +995,7 @@ export default function ServerPage() {
                 />
                 <div className="animus-rule" aria-hidden />
                 <p className="text-[11px] leading-relaxed text-lab-muted">
-                  Static Spark-proven presets. Prefer Auto-configure for newest HF cards.
+                  Static hardware-proven presets. Prefer Auto-configure for newest HF cards.
                 </p>
                 {formFlash && (
                   <Callout tone="ok" title="Form updated">
@@ -1081,7 +1084,7 @@ export default function ServerPage() {
                 <Field label="Port" htmlFor="serve-port">
                   <Input id="serve-port" value={port} onChange={(e) => setPort(e.target.value)} />
                 </Field>
-                <Field label="tensor-parallel-size (Sparks)" htmlFor="serve-tp">
+                <Field label="tensor-parallel-size" htmlFor="serve-tp">
                   <Input
                     id="serve-tp"
                     value={tpSize}
@@ -1287,7 +1290,7 @@ export default function ServerPage() {
                 : "border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)]",
             )}
           >
-            <Seq n={step.launch} label="Launch" hint="starts a real vLLM container on Spark" />
+            <Seq n={step.launch} label="Launch" hint="starts a real vLLM container on this host" />
             <div className="animus-rule mt-3" aria-hidden />
             <div className="mt-3.5 flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
               <div className="min-w-0 space-y-1.5">

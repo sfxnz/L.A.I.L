@@ -22,7 +22,7 @@ export default function ConnectPage() {
 
   const serve = status?.serve;
   const healthy = !!(serve && !serve.unreachable && serve.healthy);
-  const model = serve?.model_id || "laguna";
+  const model = serve?.model_id || "auto";
   const port =
     (serve?.base_url || "").match(/:(\d+)/)?.[1] ||
     "8000";

@@ -34,3 +34,9 @@ export function tokenQuery(url: string): string {
   if (!t) return url;
   return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
 }
+
+/** 401 / LAIL_TOKEN required is not "controller down". */
+export function isUnauthorizedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /401|unauthorized|LAIL_TOKEN/i.test(msg);
+}

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type Settings } from "@/lib/api";
+import { isUnauthorizedError } from "@/lib/auth-token";
 import {
   Btn,
   Callout,
@@ -42,8 +43,12 @@ export default function ConfigurePage() {
           </div>
         </div>
         <Callout
-          tone="danger"
-          title="Couldn’t load settings"
+          tone={isUnauthorizedError(loadError) ? "warn" : "danger"}
+          title={
+            isUnauthorizedError(loadError)
+              ? "LAIL_TOKEN required"
+              : "Couldn’t load settings"
+          }
           action={
             <Btn
               variant="secondary"
@@ -60,7 +65,9 @@ export default function ConfigurePage() {
             </Btn>
           }
         >
-          {loadError}
+          {isUnauthorizedError(loadError)
+            ? "The controller is up. Paste the token in the banner, then retry."
+            : loadError}
         </Callout>
       </div>
     );

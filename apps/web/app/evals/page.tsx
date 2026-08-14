@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, watchJob, type LabStatus, type RunRow } from "@/lib/api";
+import { isUnauthorizedError } from "@/lib/auth-token";
 import {
   Badge,
   Btn,
@@ -185,7 +186,7 @@ export default function EvalsPage() {
       setRuns(r);
       setErr(null);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      if (!isUnauthorizedError(e)) setErr(String((e as Error).message || e));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -302,7 +303,7 @@ export default function EvalsPage() {
         </div>
       </div>
 
-      {!loading && !healthy && (
+      {!loading && !healthy && status && (
         <Callout
           tone="warn"
           title="vLLM isn’t healthy"

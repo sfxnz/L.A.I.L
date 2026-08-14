@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { setClientToken } from "@/lib/auth-token";
+import { isUnauthorizedError, setClientToken } from "@/lib/auth-token";
 import { useLabStore } from "@/lib/store";
 import { WORKSPACE_NAV } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
@@ -93,8 +93,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           );
         })
         .catch((e: unknown) => {
-          const msg = e instanceof Error ? e.message : String(e);
-          const unauthorized = /401|unauthorized|LAIL_TOKEN/i.test(msg);
+          const unauthorized = isUnauthorizedError(e);
           setHealthy(false);
           setServeOk(false);
           setAvail(null);
@@ -200,17 +199,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
             <span className="flex items-center gap-1.5" title={probeNote}>
               <StatusDot
-                live={healthy}
+                live={needToken ? null : healthy}
                 label={
                   healthy === null
                     ? "Controller status unknown"
-                    : healthy
-                      ? "Controller online"
-                      : "Controller offline"
+                    : needToken
+                      ? "Token required"
+                      : healthy
+                        ? "Controller online"
+                        : "Controller offline"
                 }
               />
               <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted lg:inline">
-                {healthy === null ? "…" : healthy ? "controller" : "offline"}
+                {healthy === null ? "…" : needToken ? "token" : healthy ? "controller" : "offline"}
               </span>
             </span>
 

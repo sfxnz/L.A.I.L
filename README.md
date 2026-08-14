@@ -8,7 +8,7 @@ Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to 
 |-------|--------|
 | UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
 | Controller | Bun + Hono · lab-status, models, configure, proxy to serve-engine |
-| Serve-engine | Python FastAPI · vLLM Lab Safe / Workflow Max, smoke, benches, run history |
+| Serve-engine | Python FastAPI · vLLM auto-configure, smoke, benches, run history |
 | Models | **vLLM** and **llama.cpp** (no Ollama) |
 
 ## Product surface
@@ -49,7 +49,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (Lab Safe util ≤ 0.4, Workflow Max, stop, agent-restore, benches, envelopes). Composer agent remains in the backend for now but is **out of the primary UI**.
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). Composer agent remains in the backend for now but is **out of the primary UI**.
 
 ### Model resolution
 
@@ -110,17 +110,11 @@ Then in the UI:
 
 1. **Status** — controller up; one local node unless you set `LAIL_CLUSTER_JSON`.
 2. **Serve** — paste an HF model id.
-3. **Auto-configure from HF** — fills Lab Safe / Workflow Max flags from the live card.
+3. **Auto-configure** — researches the HF card plus Unsloth / NVIDIA / GitHub / vLLM recipes and sizes flags for this host.
 4. **Start** — launches the vLLM container. Watch the job dock.
 5. **`/connect`** — copy the Hermes / OpenAI base URL.
 
-| Intent | When | Defaults |
-|--------|------|----------|
-| `lab_safe` | Published A/B | util ≤ **0.4** |
-| `workflow_max` | Real agent / long ctx | util **0.7–0.85** |
-| `attach` | Already-served model | Probe only |
-
-**Lab Safe** keeps headroom for the OS / Hermes. **Workflow Max** is for large weights / long context (keep ≳15–20 GiB free on Spark-class UMA).
+Auto-configure picks util, max-model-len, vision, and tensor parallel from the researched recipe plus live hardware (keeps ≳15 GiB reserved on Spark-class UMA). Start still refuses when weights cannot fit.
 
 ### Apple Silicon
 
@@ -154,7 +148,7 @@ OPENAI_MODEL=<served-model-id>
 
 ## Serve (vLLM serve & evals)
 
-- Lab Safe / Workflow Max start · stop · agent-restore
+- Auto-configure + start · stop · agent-restore
 - HF auto-configure · live job logs
 - Smoke · perf · golden tools · run history envelopes
 

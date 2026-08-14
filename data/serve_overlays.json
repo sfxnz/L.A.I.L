@@ -86,7 +86,7 @@
     },
     "rationale": [
       "Unsloth/Qwen NVFP4 cards have no parseable vllm serve (docs are a bare serve). Parsers + FP8 KV from Unsloth's calibrated cache.",
-      "Vision stays on for Workflow Max; Lab Safe still strips the tower."
+      "Vision stays on; hardware envelope sizes util / max-len from live UMA."
     ]
   }
 ]

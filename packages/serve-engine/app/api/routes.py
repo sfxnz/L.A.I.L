@@ -77,10 +77,10 @@ async def hardware() -> dict[str, Any]:
 
 
 class ServeRequest(BaseModel):
-    """Fully explicit serve config — nothing is injected server-side beyond mode envelope."""
+    """Fully explicit serve config — hardware envelope is chosen by autoconfig."""
 
     model: str
-    mode: Literal["lab_safe", "workflow_max"] = "lab_safe"
+    mode: Optional[str] = None  # ignored; kept so old clients do not 422
     util: Optional[float] = None
     max_model_len: Optional[int] = None
     port: int = 8000
@@ -151,13 +151,16 @@ async def serve_examples() -> dict[str, Any]:
 @router.get("/serve/recommend")
 async def serve_recommend(
     model: str = Query(..., description="HF model id or local path"),
-    mode: Literal["lab_safe", "workflow_max"] = "lab_safe",
+    mode: Optional[str] = Query(
+        None,
+        description="Ignored (legacy). Hardware envelope is chosen automatically.",
+    ),
     fetch_remote: bool = Query(
         True,
         description="If local cache misses config/README, fetch from huggingface.co",
     ),
 ) -> dict[str, Any]:
-    """Recommend best-effort vLLM flags from HF card/config, lab recipes, Spark heuristics.
+    """Recommend vLLM flags from the HF card plus researched vendor recipes.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
     """

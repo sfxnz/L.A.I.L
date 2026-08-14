@@ -7,7 +7,7 @@ Session handoff. Primary product is the **serve & eval console**. Composer/Workb
 | Surface | Role |
 |---------|------|
 | **Status** | Landing (`/` → `/status`) — health, cluster, recent runs |
-| **Serve** | vLLM Lab Safe / Workflow Max, auto-config, start/stop, job logs |
+| **Serve** | vLLM auto-configure, start/stop, job logs |
 | **Evals** | Smoke + perf + tool-eval history |
 | **Connect** | `/connect` — Hermes / OpenAI snippets |
 | **Configure** | Default backend / model |
@@ -45,7 +45,7 @@ If Composer says model `default` does not exist:
 
 Same as legacy lab:
 
-- **0.4** Lab Safe · **0.7–0.85** Workflow Max with free RAM buffer  
+- Auto-configure sizes util (typically ~0.85 after reserved UMA) from weights + live topology  
 - One large model at a time; trust `free -h` available more than `docker stats` on UMA  
 
 ## Phase A + B Workbench (handoff)
@@ -94,7 +94,7 @@ cd packages/serve-engine && PYTHONPATH=. python -m pytest tests/test_autoconfig.
 
 ## Server section (2026-07-21)
 
-- **Auto-configure** pulls live HF card + config.json; scores recipes; strips unsafe `flashinfer_b12x` on mixed FP8 MoE; Lab Safe util≤0.4 envelope.
+- **Auto-configure** pulls the live HF card + config.json, then researches Unsloth / NVIDIA / GitHub / vLLM recipes even when the card has no links; scores recipes; strips unsafe `flashinfer_b12x` on mixed FP8 MoE; sizes util / max-len / VL from hardware.
 - **UI** (`apps/web/app/server/page.tsx`): full recommend panel (warnings, card recipes, rationale, sources), live status, job log always visible across tabs.
 - **HF token**: stale `hf_oauth_*` in `~/.cache/huggingface/token` 401s public fetches — code retries anonymous + warns. Re-login: `hf auth login` for gated models.
 - Pin image still `vllm/vllm-openai:v0.27.1`.

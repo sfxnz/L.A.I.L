@@ -1,12 +1,14 @@
-"""Auto-configure vLLM from the live Hugging Face model card.
+"""Auto-configure vLLM from the live Hugging Face model card plus vendor docs.
 
-Primary source of truth:
+Primary sources:
   1. README.md on huggingface.co (parsed `vllm serve` / docker recipes)
   2. config.json on huggingface.co (quantization_config, architecture)
   3. HF model API tags / cardData
+  4. Derived public recipes (Unsloth docs, NVIDIA cookbooks, vLLM docs, GitHub)
+     looked up from the model id / family even when the card has no links.
 
-Lab Safe / Workflow Max only supply the UMA envelope (util / default max-len
-when the card is silent). Local cache is a fallback if the network fails —
+Hardware envelope (util / max-len / VL / reserved UMA) is computed from
+weights + live topology. Local cache is a fallback if the network fails —
 never a substitute for the card when the card is available.
 """
 from __future__ import annotations
@@ -1026,17 +1028,17 @@ def plan_placement(
     weights_gib: Optional[float],
     topology: dict[str, Any],
     *,
-    mode: str,
-    overlay: Optional[dict[str, Any]],
+    mode: str | None = None,
+    overlay: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Decide nodes_needed / TP / PP / per-node util from real weights + probed hardware.
 
-    One rule (UMA): fit weights on the fewest nodes that can hold them at the mode's
-    util ceiling. ``util_computed`` is set only when weights need *more* util than the
-    mode default (envelope fills Lab Safe 0.40 / Workflow Max 0.85 otherwise). That
-    stops small checkpoints from being pinned to 0.40 on Workflow Max (which starved
-    KV and looked like a broken Auto-configure). Overlay may still pin util later.
+    One rule (UMA): fit weights on the fewest nodes that can hold them at the
+    0.85 util ceiling after reserved RAM. ``util_computed`` is set only when
+    weights need *more* than the default (envelope fills 0.85 otherwise).
+    Overlay may still pin util later. ``mode`` is ignored (legacy).
     """
+    del mode  # dual user envelopes are gone; reserved RAM is the safety
     nodes = topology.get("node_list") or []
     n_avail = max(1, int(topology.get("nodes") or 1))
     head = topology.get("head") or (nodes[0] if nodes else None)
@@ -1044,7 +1046,7 @@ def plan_placement(
     reserve = 15.0  # OS + Hermes + runtime headroom per node (lab rule)
 
     # Usable weights capacity per node at the util ceiling.
-    util_cap = 0.85 if mode == "workflow_max" else 0.40
+    util_cap = 0.85
     mode_default_util = util_cap
     single_fit_gib = node_ram * util_cap - reserve
 
@@ -1749,8 +1751,9 @@ def _is_anemll_image(image: str | None) -> bool:
     return "anemll" in s or "dspark-vllm" in s
 
 
-def _lab_default_image(mode: str) -> str:
-    return DEFAULT_IMAGE_SAFE if mode == "lab_safe" else DEFAULT_IMAGE_MAX
+def _lab_default_image(mode: str | None = None) -> str:
+    """Single stock image. ``mode`` is ignored (legacy)."""
+    return DEFAULT_IMAGE_MAX or DEFAULT_IMAGE_SAFE
 
 
 def _resolve_image_for_gates(
@@ -1896,9 +1899,10 @@ def check_serve_loadability(
 ) -> tuple[bool, Optional[str]]:
     """Shared Start/recommend gate: can weights load at final util on N nodes?
 
-    Returns (fits, warning_or_none). Absolute capacity uses 0.85; Lab Safe also
-    requires weights+reserve to fit under the requested util.
+    Returns (fits, warning_or_none). Absolute capacity uses 0.85 after reserved
+    UMA. ``mode`` is ignored (legacy).
     """
+    del mode  # fit is hardware-only now
     if not weights_gib or weights_gib <= 0:
         return True, None
     n = max(1, int(nodes_used or 1))
@@ -1909,21 +1913,14 @@ def check_serve_loadability(
         return False, (
             f"weights (~{weights_gib} GiB) do not fit {n} node(s) even at util=0.85"
         )
-    if mode == "lab_safe":
-        u = float(util if util is not None else SAFE_UTIL)
-        if per + reserve > ram * u + 1e-6:
-            return False, (
-                f"Lab Safe util={u} cannot hold ~{per:.0f} GiB weights/node "
-                f"(need ≈{(per + reserve) / ram:.2f}). Switch to Workflow Max or add nodes."
-            )
     return True, None
 
 
 # ─── Optional GitHub cookbook fetch (card recipe-poor) ───────────────────────
 
-COOKBOOK_FETCH_TIMEOUT = 12.0
+COOKBOOK_FETCH_TIMEOUT = 8.0
 COOKBOOK_MAX_BYTES = 1_500_000  # ~1.5 MiB hard cap
-COOKBOOK_MAX_URLS = 3
+COOKBOOK_MAX_URLS = 6
 
 _GITHUB_BLOB_OR_RAW_RE = re.compile(
     r"https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/(?:blob|raw)/[^\s\)\]\"'<>]+",
@@ -2037,6 +2034,158 @@ def find_cookbook_urls(readme: str) -> list[str]:
     return found
 
 
+@dataclass
+class RecipeUrl:
+    """A public recipe document to fetch (card-extracted or derived)."""
+
+    url: str
+    kind: str  # vendor_doc | github_cookbook | nvidia_playbook | vllm_docs
+    origin: str = "card"  # card | derived
+
+
+def family_doc_slugs(model_id: str, detected: dict[str, Any] | None = None) -> list[str]:
+    """Stable vendor-doc slugs derived from the model id + detected family.
+
+    Publisher-agnostic: ``Qwen/Qwen3.8-27B`` and ``unsloth/Qwen3.8-27B-NVFP4``
+    both yield ``qwen3.8``.
+    """
+    det = detected or {}
+    mid = (model_id or "").lower()
+    name = mid.split("/")[-1] if mid else ""
+    blob = " ".join(
+        [
+            mid,
+            name,
+            str(det.get("family") or ""),
+            str(det.get("model_type") or ""),
+            " ".join(str(a) for a in (det.get("architectures") or [])),
+        ]
+    ).lower()
+    slugs: list[str] = []
+
+    def add(slug: str) -> None:
+        if slug and slug not in slugs:
+            slugs.append(slug)
+
+    if re.search(r"qwen3[\._\s-]*8\b", blob) or "qwen3_8" in blob or "qwen3.8" in blob:
+        add("qwen3.8")
+    elif re.search(r"qwen3[\._\s-]*6\b", blob) or "qwen3_6" in blob or "qwen3.6" in blob:
+        add("qwen3.6")
+    elif re.search(r"qwen3[\._\s-]*5\b", blob) or "qwen3_5" in blob or "qwen3.5" in blob:
+        # Qwen3.8 reused the qwen3_5 class names for the 27B VL checkpoint.
+        if det.get("is_vl") or "conditionalgeneration" in blob:
+            add("qwen3.8")
+        add("qwen3.5")
+    elif "qwen3" in blob or det.get("family") == "qwen":
+        add("qwen3")
+        if det.get("is_vl") or "conditionalgeneration" in blob:
+            add("qwen3.8")
+    if "nemotron" in blob:
+        add("nemotron")
+    if "minimax" in blob and re.search(r"(^|[^a-z])m3([^0-9]|$)", blob):
+        add("minimax-m3")
+    elif "minimax" in blob:
+        add("minimax")
+    if "deepseek" in blob and "v4" in blob:
+        add("deepseek-v4")
+    elif "deepseek" in blob:
+        add("deepseek")
+    if det.get("has_nvfp4") or "nvfp4" in blob:
+        add("nvfp4")
+    return slugs
+
+
+def _recipe_source_kind(url: str) -> str:
+    u = (url or "").lower()
+    host = ""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except ValueError:
+        host = ""
+    if (
+        "nvidia.com" in host
+        or "nvidia-nemo" in u
+        or "dgx-spark" in u
+        or ("nemotron" in u and ("github.com" in host or "githubusercontent.com" in host))
+    ):
+        if "github.com" in host or "githubusercontent.com" in host or "nvidia.com" in host:
+            return "nvidia_playbook"
+    if host in ("docs.vllm.ai", "recipes.vllm.ai"):
+        return "vllm_docs"
+    if host in ("unsloth.ai", "www.unsloth.ai"):
+        return "vendor_doc"
+    if "github.com" in host or "githubusercontent.com" in host:
+        return "github_cookbook"
+    return "vendor_doc"
+
+
+# Deterministic NVIDIA vLLM cookbook paths (fail closed if 404 / HTML).
+_NVIDIA_VLLM_COOKBOOKS = (
+    "https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Example/vllm_cookbook.ipynb",
+    "https://raw.githubusercontent.com/NVIDIA/dgx-spark-playbooks/main/nvidia/vllm/README.md",
+)
+
+
+def discover_recipe_urls(
+    model_id: str,
+    detected: dict[str, Any] | None = None,
+    readme: str = "",
+) -> list[RecipeUrl]:
+    """Card-extracted URLs plus derived Unsloth / NVIDIA / vLLM / GitHub recipes.
+
+    Derived URLs do not require a link on the HF card. Hosts are allowlisted;
+    HTML-only pages fail later at fetch.
+    """
+    out: list[RecipeUrl] = []
+    seen: set[str] = set()
+
+    def add(url: str, *, kind: str | None = None, origin: str) -> None:
+        if not url:
+            return
+        key = (github_blob_to_raw_url(url) or vendor_doc_to_fetch_url(url) or url).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(RecipeUrl(url=url, kind=kind or _recipe_source_kind(url), origin=origin))
+
+    for u in find_cookbook_urls(readme or ""):
+        add(u, origin="card")
+    for u in find_vendor_doc_urls(readme or ""):
+        add(u, origin="card")
+
+    slugs = family_doc_slugs(model_id, detected)
+    mid = (model_id or "").lower()
+    fam = str((detected or {}).get("family") or "").lower()
+    publisher = mid.split("/")[0] if "/" in mid else ""
+
+    for slug in slugs:
+        if slug == "nvfp4":
+            add("https://unsloth.ai/docs/basics/nvfp4", kind="vendor_doc", origin="derived")
+            continue
+        add(f"https://unsloth.ai/docs/models/{slug}", kind="vendor_doc", origin="derived")
+
+    want_nvidia = (
+        publisher == "nvidia"
+        or fam == "nemotron"
+        or "nemotron" in mid
+        or "nvfp4" in slugs
+        or "qwen3.8" in slugs
+        or "qwen3.6" in slugs
+    )
+    if want_nvidia:
+        for u in _NVIDIA_VLLM_COOKBOOKS:
+            add(u, kind="nvidia_playbook", origin="derived")
+
+    # vLLM docs last — often HTML/404 and must not crowd out Unsloth/NVIDIA.
+    for slug in slugs:
+        if slug == "nvfp4":
+            continue
+        add(f"https://docs.vllm.ai/en/latest/models/{slug}.md", kind="vllm_docs", origin="derived")
+        add(f"https://recipes.vllm.ai/{slug}.md", kind="vllm_docs", origin="derived")
+
+    return out
+
+
 def notebook_source_text(body: str) -> str:
     """Flatten Jupyter notebook JSON cell sources; plain text returned as-is."""
     if not body:
@@ -2116,6 +2265,28 @@ def candidates_recipe_poor(candidates: list[ServeCandidate]) -> bool:
     return (not rich) or best.score < 20
 
 
+def _vendor_candidate_family_mismatch(cand: ServeCandidate, want_fam: str) -> bool:
+    """True when a vendor-doc snippet is clearly for another model family.
+
+    Unsloth / NVIDIA pages mix several models on one document; a high-scoring
+    Gemma serve line must not win for a Qwen checkpoint.
+    """
+    if not want_fam or want_fam == "unknown":
+        return False
+    if cand.model:
+        other = analyze_config({}, cand.model).get("family") or ""
+        if other and other != "unknown" and other != want_fam:
+            return True
+    rp = str((cand.config or {}).get("reasoning_parser") or "").lower()
+    tcp = str((cand.config or {}).get("tool_call_parser") or "").lower()
+    blob = f"{rp} {tcp} {cand.model or ''} {cand.raw or ''}".lower()
+    if want_fam == "qwen" and re.search(r"gemma", blob) and "qwen" not in (cand.model or "").lower():
+        return True
+    if want_fam.startswith("gemma") and re.search(r"qwen", blob) and "gemma" not in (cand.model or "").lower():
+        return True
+    return False
+
+
 def _augment_candidates_from_cookbooks(
     readme: str,
     *,
@@ -2124,29 +2295,32 @@ def _augment_candidates_from_cookbooks(
     sources: list[dict[str, str]],
     rationale: list[str],
     warnings: list[str],
+    model_id: str = "",
+    vendor_bodies: list[str] | None = None,
 ) -> list[ServeCandidate]:
-    """If card recipes are empty/weak, fetch linked vLLM cookbooks / vendor docs and re-extract."""
-    if not readme or not candidates_recipe_poor(candidates):
+    """Fetch card-linked *and derived* vendor docs when recipes are weak or thin."""
+    best_cfg = (candidates[0].config if candidates else {}) or {}
+    thin = not (
+        best_cfg.get("reasoning_parser")
+        or best_cfg.get("tool_call_parser")
+        or best_cfg.get("kv_cache_dtype")
+        or best_cfg.get("quantization")
+    )
+    if not candidates_recipe_poor(candidates) and not thin:
         return candidates
-    urls = find_cookbook_urls(readme) + find_vendor_doc_urls(readme)
-    # Dedup by fetch URL
-    dedup: list[str] = []
-    seen_fetch: set[str] = set()
-    for u in urls:
-        key = (github_blob_to_raw_url(u) or vendor_doc_to_fetch_url(u) or u).lower()
-        if key in seen_fetch:
-            continue
-        seen_fetch.add(key)
-        dedup.append(u)
-    urls = dedup
-    if not urls:
+    found = discover_recipe_urls(model_id, detected, readme or "")
+    if not found:
         return candidates
+    derived_n = sum(1 for r in found if r.origin == "derived")
     rationale.append(
-        f"Card recipes empty/weak — trying {min(len(urls), COOKBOOK_MAX_URLS)} linked cookbook/vendor doc(s)"
+        f"Card recipes empty/weak — trying {min(len(found), COOKBOOK_MAX_URLS)} "
+        f"cookbook/vendor doc(s)"
+        + (f" ({derived_n} derived from model id/family)" if derived_n else "")
     )
     merged = list(candidates)
     seen_raw = {re.sub(r"\s+", " ", c.raw)[:200] for c in merged}
-    for url in urls[:COOKBOOK_MAX_URLS]:
+    for rec in found[:COOKBOOK_MAX_URLS]:
+        url = rec.url
         try:
             text, err = fetch_cookbook_text(url)
         except Exception as e:  # never brick recommend
@@ -2155,21 +2329,29 @@ def _augment_candidates_from_cookbooks(
         if err or not text:
             warnings.append(f"Cookbook fetch skipped: {url} ({err or 'empty'})")
             continue
-        vendor = bool(vendor_doc_to_fetch_url(url))
+        if vendor_bodies is not None:
+            vendor_bodies.append(text)
         sources.append(
             {
-                "kind": "vendor_doc" if vendor else "github_cookbook",
+                "kind": rec.kind,
                 "ref": url,
-                "notes": "fetched vendor serve guide (card recipe-poor)"
-                if vendor
-                else "fetched vendor vLLM cookbook (card recipe-poor)",
+                "notes": (
+                    f"fetched {rec.kind} ({rec.origin})"
+                    if rec.origin == "derived"
+                    else f"fetched {rec.kind} (card recipe-poor)"
+                ),
             }
         )
         extra = extract_serve_candidates(text, detected=detected)
         added = 0
+        want_fam = str((detected or {}).get("family") or "")
         for c in extra:
             if not c.section:
-                c.section = "vendor doc" if vendor else "github cookbook"
+                c.section = rec.kind.replace("_", " ")
+            if want_fam and want_fam != "unknown" and _vendor_candidate_family_mismatch(
+                c, want_fam
+            ):
+                continue
             key = re.sub(r"\s+", " ", c.raw)[:200]
             if key in seen_raw:
                 continue
@@ -2177,9 +2359,9 @@ def _augment_candidates_from_cookbooks(
             merged.append(c)
             added += 1
         if added:
-            rationale.append(f"Cookbook {url}: added {added} vllm serve recipe(s)")
+            rationale.append(f"{rec.kind} {url}: added {added} vllm serve recipe(s)")
         else:
-            rationale.append(f"Cookbook {url}: fetched but no parseable vllm serve")
+            rationale.append(f"{rec.kind} {url}: fetched but no parseable vllm serve")
     merged.sort(key=lambda c: c.score, reverse=True)
     return merged
 
@@ -2673,35 +2855,20 @@ def _apply_vl_spark_defaults(
     warnings: list[str],
     rationale: list[str],
     *,
-    mode: str = "lab_safe",
+    mode: str | None = None,
 ) -> None:
-    """Lab Safe skips the vision tower. Workflow Max keeps VL with an MM cap."""
+    """Keep vision on by default with an MM cap. ``mode`` is ignored (legacy)."""
     if not detected.get("is_vl"):
         return
     ex = cfg.get("extra_flags") or ""
-    if mode == "workflow_max":
-        if "--language-model-only" in ex:
-            ex = _strip_flag_from_extra(ex, "--language-model-only")
-            cfg["extra_flags"] = ex
-            rationale.append("Workflow Max → drop --language-model-only (full VL)")
-        ex = cfg.get("extra_flags") or ""
-        if "--limit-mm-per-prompt" not in ex:
-            cfg["extra_flags"] = (ex + " " + _VL_MM_LIMIT).strip()
-            rationale.append(
-                "Workflow Max VL → keep vision/video, cap with --limit-mm-per-prompt"
-            )
-        return
-    if "--language-model-only" in ex or "--limit-mm-per-prompt" in ex:
-        return
-    cfg["extra_flags"] = (ex + " --language-model-only").strip()
-    rationale.append(
-        "VL/multimodal checkpoint on Spark → --language-model-only "
-        "(Lab Safe first boot; Workflow Max keeps vision)"
-    )
-    warnings.append(
-        "Multimodal model: Lab Safe serves language-model-only. "
-        "Switch to Workflow Max for image/video, or drop --language-model-only."
-    )
+    if "--language-model-only" in ex:
+        ex = _strip_flag_from_extra(ex, "--language-model-only")
+        cfg["extra_flags"] = ex
+        rationale.append("Keep vision on — drop --language-model-only")
+    ex = cfg.get("extra_flags") or ""
+    if "--limit-mm-per-prompt" not in ex:
+        cfg["extra_flags"] = (ex + " " + _VL_MM_LIMIT).strip()
+        rationale.append("VL → keep vision/video, cap with --limit-mm-per-prompt")
 
 
 def _apply_first_boot_defaults(
@@ -3160,6 +3327,13 @@ def _card_prose_hints(readme: str) -> dict[str, Any]:
         hints["quantization"] = "compressed-tensors"
     if re.search(r"--quantization\s+fp8\b", readme):
         hints["quantization"] = "fp8"
+    if re.search(r"fp8\s+kv(\s+cache)?", readme, re.I) or re.search(
+        r"kv[\s-]?cache[^\n]{0,40}fp8", readme, re.I
+    ):
+        hints["kv_cache_dtype"] = "fp8"
+        hints["notes"].append("Vendor/card prose: FP8 KV cache")
+    if re.search(r"--trust-remote-code\b", readme, re.I):
+        hints["trust_remote_code"] = True
     return hints
 
 
@@ -3226,6 +3400,11 @@ def _fill_from_config_detection(
                 rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
             if not base.get("trust_remote_code"):
                 base["trust_remote_code"] = True
+            if not base.get("kv_cache_dtype") and (
+                detected.get("has_nvfp4") or detected.get("suggested_kv_cache_dtype") == "fp8"
+            ):
+                base["kv_cache_dtype"] = "fp8"
+                rationale.append("Qwen NVFP4 / calibrated KV → --kv-cache-dtype fp8")
     elif family == "nemotron":
         mid = (
             str(base.get("model") or "")
@@ -3488,7 +3667,7 @@ def _size_memory_for_spark(
     ml = cfg.get("max_model_len")
     if not isinstance(ml, int) or ml <= 0:
         return
-    util = float(cfg.get("util") or (0.4 if mode == "lab_safe" else 0.85))
+    util = float(cfg.get("util") or WORKFLOW_UTIL)
     seqs = int(cfg.get("max_num_seqs") or 4)
     per_node_w = float(weights_gib) if weights_gib and weights_gib > 0 else 0.0
     runtime_pad = 4.0
@@ -3542,58 +3721,53 @@ def _size_memory_for_spark(
             cfg["max_num_seqs"] = chosen_seqs
 
 
-def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], card_set_max_len: bool, card_set_util: bool = False) -> None:
-    if mode == "lab_safe":
-        if cfg.get("util") is None:
-            cfg["util"] = SAFE_UTIL
-            rationale.append(f"Lab Safe envelope → util={SAFE_UTIL} (not on HF card)")
-        # Card max-len may be huge (262k); Lab Safe still prefers safer default unless card was modest
-        if not card_set_max_len:
-            cfg["max_model_len"] = SAFE_MAX_LEN
-            rationale.append(f"Lab Safe envelope → max-model-len={SAFE_MAX_LEN} (card silent)")
-        elif cfg.get("max_model_len") and cfg["max_model_len"] > SAFE_MAX_LEN:
-            rationale.append(
-                f"Card max-model-len={cfg['max_model_len']} kept; "
-                f"Lab Safe often uses {SAFE_MAX_LEN} — edit if you want more free UMA"
-            )
-        if not cfg.get("image"):
-            cfg["image"] = DEFAULT_IMAGE_SAFE
-    else:
-        if cfg.get("util") is None:
-            cfg["util"] = WORKFLOW_UTIL
-            rationale.append(f"Workflow Max envelope → util={WORKFLOW_UTIL} (not on HF card)")
-        if not card_set_max_len:
-            cfg["max_model_len"] = WORKFLOW_MAX_LEN
-            rationale.append(f"Workflow Max envelope → max-model-len={WORKFLOW_MAX_LEN} (card silent)")
-        if not cfg.get("image"):
-            cfg["image"] = DEFAULT_IMAGE_MAX
+def _apply_hardware_envelope(
+    cfg: dict[str, Any],
+    rationale: list[str],
+    card_set_max_len: bool,
+    card_set_util: bool = False,
+    *,
+    mode: str | None = None,
+) -> None:
+    """Fill util / max-len / image from hardware defaults when the recipe is silent.
 
-    # Lab Safe clamps util, but never below a card/overlay-specified floor (large NVFP4 /
-    # DSpark weights need the card's util just to load — clamping to 0.4 would brick the boot).
-    # Exception: Lab Safe Start hard-fails above SAFE_UTIL, so always clamp for that mode and
-    # tell the user to switch to Workflow Max when the recipe needed more.
-    if mode == "lab_safe" and cfg.get("util") is not None and cfg["util"] > SAFE_UTIL + 1e-9:
-        prev = cfg["util"]
-        cfg["util"] = SAFE_UTIL
-        if card_set_util:
-            rationale.append(
-                f"clamped util {prev} → {SAFE_UTIL} for Lab Safe "
-                "(card/overlay needs more — use Workflow Max to load this checkpoint)"
-            )
-        else:
-            rationale.append(f"clamped util to Lab Safe max {SAFE_UTIL}")
+    ``mode`` is accepted for old callers and ignored. Reserved UMA lives in
+    ``plan_placement``; this only fills gaps and clamps 1M demo contexts.
+    """
+    del mode, card_set_util  # unused; kept so old call sites don't break
+    if cfg.get("util") is None:
+        cfg["util"] = WORKFLOW_UTIL
+        rationale.append(f"Hardware envelope → util={WORKFLOW_UTIL} (recipe silent)")
+    if not card_set_max_len:
+        cfg["max_model_len"] = WORKFLOW_MAX_LEN
+        rationale.append(f"Hardware envelope → max-model-len={WORKFLOW_MAX_LEN} (card silent)")
+    if not cfg.get("image"):
+        cfg["image"] = DEFAULT_IMAGE_MAX
 
-    # Single-node Spark: card/demo 1M contexts OOMs under realistic util. Multi-node
+    # Single-node: card/demo 1M contexts OOMs under realistic util. Multi-node
     # overlays (TP>=2) that intentionally pin a huge window keep it.
-    ceiling = SAFE_MAX_LEN if mode == "lab_safe" else WORKFLOW_MAX_LEN
+    ceiling = WORKFLOW_MAX_LEN
     ml = cfg.get("max_model_len")
     tp = int(cfg.get("tensor_parallel_size") or 1)
     if isinstance(ml, int) and ml > ceiling and tp < 2:
         cfg["max_model_len"] = ceiling
         rationale.append(
             f"clamped max-model-len {ml} → {ceiling} "
-            f"({mode} envelope on single-node Spark; raise TP or edit form for longer ctx)"
+            "(single-node Spark; raise TP or edit form for longer ctx)"
         )
+
+
+def _apply_mode_envelope(
+    cfg: dict[str, Any],
+    mode: str | None,
+    rationale: list[str],
+    card_set_max_len: bool,
+    card_set_util: bool = False,
+) -> None:
+    """Legacy wrapper — ``mode`` is ignored."""
+    _apply_hardware_envelope(
+        cfg, rationale, card_set_max_len, card_set_util=card_set_util, mode=mode
+    )
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -3602,10 +3776,15 @@ def _apply_mode_envelope(cfg: dict[str, Any], mode: str, rationale: list[str], c
 def recommend(
     model: str,
     *,
-    mode: str = "lab_safe",
+    mode: str | None = None,
     fetch_remote: bool = True,
 ) -> dict[str, Any]:
-    """Build serve config primarily from the Hugging Face model card on the website."""
+    """Build serve config from the HF card plus researched vendor recipes.
+
+    ``mode`` is accepted for old clients and ignored — util / max-len / VL
+    come from the researched recipe + live hardware envelope.
+    """
+    mode = None  # user-facing dual envelopes are gone
     model = (model or "").strip()
     if not model:
         raise ValueError("model is required")
@@ -3697,20 +3876,24 @@ def recommend(
 
     # ── Parse card for best vllm serve (scored with config.json knowledge) ──
     # Weak cards (Unsloth) often only link a vendor guide — follow those docs.
-    # Overlay still owns flags when it matches (MiniMax/DSpark), but we still
-    # fetch linked docs so the rationale shows what the vendor actually said.
+    # When the card is silent we still *derive* Unsloth / NVIDIA / vLLM / GitHub
+    # URLs from the model id and family. Overlay still owns flags when it matches
+    # (MiniMax/DSpark), but we still fetch so sources name every class used.
     candidates: list[ServeCandidate] = []
+    vendor_bodies: list[str] = []
     if readme:
         candidates = extract_serve_candidates(readme, detected=detected)
-        # Card empty/weak → GitHub cookbooks + allowlisted vendor docs (Unsloth / vLLM).
-        candidates = _augment_candidates_from_cookbooks(
-            readme,
-            candidates=candidates,
-            detected=detected,
-            sources=sources,
-            rationale=rationale,
-            warnings=warnings,
-        )
+    candidates = _augment_candidates_from_cookbooks(
+        readme or "",
+        candidates=candidates,
+        detected=detected,
+        sources=sources,
+        rationale=rationale,
+        warnings=warnings,
+        model_id=model,
+        vendor_bodies=vendor_bodies,
+    )
+    if readme or candidates:
         if overlay:
             if candidates:
                 rationale.append(
@@ -3761,12 +3944,21 @@ def recommend(
             warnings.append("Model card has no parseable `vllm serve` command")
             rationale.append("No vllm serve snippets on card — using config.json + prose hints")
 
-        prose = _card_prose_hints(readme)
+        if readme:
+            prose = _card_prose_hints(readme)
+            for n in prose.pop("notes", []):
+                rationale.append(n)
+            filled = _merge_fill(cfg, prose)
+            if filled:
+                rationale.append(f"Card prose filled: {', '.join(filled)}")
+
+    for body in vendor_bodies:
+        prose = _card_prose_hints(body)
         for n in prose.pop("notes", []):
             rationale.append(n)
         filled = _merge_fill(cfg, prose)
         if filled:
-            rationale.append(f"Card prose filled: {', '.join(filled)}")
+            rationale.append(f"Vendor-doc prose filled: {', '.join(filled)}")
 
     card_set_max_len = cfg.get("max_model_len") is not None
 
@@ -3797,6 +3989,9 @@ def recommend(
     # checkpoint's Spark path (DeepSeek DSpark: custom image + b12x + nvfp4_ds_mla).
     if overlay:
         overlay_cfg = overlay["config"]
+        # Qwen3.8 NVFP4 overlay is last-mile fill. MiniMax / DSpark still own
+        # flags because the card recipe is known-wrong for those Spark paths.
+        gap_only = overlay.get("family_key") == "qwen38_nvfp4"
         for k, v in overlay_cfg.items():
             if k == "docker_env":
                 cfg["docker_env"] = _dedupe_env(list(cfg.get("docker_env") or []) + list(v))
@@ -3805,6 +4000,22 @@ def recommend(
                 cfg["extra_flags"] = _merge_extra_flags(
                     cfg.get("extra_flags") or "", v or ""
                 )
+            elif (
+                gap_only
+                and k
+                in (
+                    "quantization",
+                    "kv_cache_dtype",
+                    "reasoning_parser",
+                    "tool_call_parser",
+                    "enable_auto_tool_choice",
+                    "trust_remote_code",
+                    "moe_backend",
+                    "load_format",
+                )
+                and cfg.get(k) not in (None, "", False)
+            ):
+                continue
             else:
                 cfg[k] = v
         for r in overlay["rationale"]:
@@ -3850,12 +4061,13 @@ def recommend(
             rationale=rationale,
         )
 
-    # Mode envelope for util / defaults when card silent. util/max-len set by the card OR a
+    # Hardware envelope for util / defaults when card silent. util/max-len set by the card OR a
     # family overlay are authoritative — the envelope only fills gaps, never overrides them.
-    # Lab Safe still clamps util ≤ SAFE_UTIL so Start cannot hard-fail the contract.
     card_set_util = cfg.get("util") is not None
     card_set_max_len = cfg.get("max_model_len") is not None
-    _apply_mode_envelope(cfg, mode, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util)
+    _apply_hardware_envelope(
+        cfg, rationale, card_set_max_len=card_set_max_len, card_set_util=card_set_util
+    )
 
     # Final image pass after overlay/mode envelope: re-apply capability floor on the
     # fully filled cfg. Anemll overlay image is preserved (never replaced).
@@ -3981,7 +4193,7 @@ def recommend(
         weights_gib=weights_gib,
         node_ram_gib=_resolved_node_ram_gib(plan.get("node_ram_gib")),
         nodes_used=int(plan.get("nodes_needed") or 1),
-        util=float(cfg.get("util") or (SAFE_UTIL if mode == "lab_safe" else WORKFLOW_UTIL)),
+        util=float(cfg.get("util") or WORKFLOW_UTIL),
         reserve_gib=float(plan.get("reserve_gib") or 15.0),
     )
     if fits and not ok_load:
@@ -4024,7 +4236,7 @@ def recommend(
 
     return {
         "model": model,
-        "mode": mode,
+        "mode": "auto",
         "confidence": confidence,
         "label": label,
         "notes": notes,

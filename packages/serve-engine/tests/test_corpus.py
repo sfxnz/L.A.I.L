@@ -110,7 +110,12 @@ def _recommend_offline(monkeypatch, case: dict) -> dict:
     elif case.get("topology") == "two_spark":
         # Overlay placement needs weights; pin a known-fit DSv4-sized blob when fixtures omit Hub.
         monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 155.4)
-    return ac.recommend(model, mode=case.get("mode", "workflow_max"))
+    monkeypatch.setattr(
+        ac,
+        "fetch_cookbook_text",
+        lambda *a, **k: (None, "offline corpus — no extra vendor fetch"),
+    )
+    return ac.recommend(model, fetch_remote=True)
 
 
 def _final_command(model: str, cfg: dict) -> str:

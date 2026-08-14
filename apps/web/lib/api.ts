@@ -352,9 +352,9 @@ export const api = {
     req<{ job_id: string }>("/api/serve/start", { method: "POST", body: JSON.stringify(body) }),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
   agentRestore: () => req<{ job_id: string }>("/api/serve/agent-restore", { method: "POST" }),
-  recommendServe: (model: string, mode: string, fetchRemote = true) =>
+  recommendServe: (model: string, fetchRemote = true) =>
     req<ServeRecommend>(
-      `/api/serve/recommend?model=${encodeURIComponent(model)}&mode=${encodeURIComponent(mode)}&fetch_remote=${fetchRemote}`,
+      `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}`,
     ),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
   jobs: () =>

@@ -1329,6 +1329,13 @@ def test_shipped_serve_overlays_json_loads_minimax():
     ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
     assert ov3 is not None and ov3["family_key"] == "minimax_m3"
     assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+    q38 = ac._family_overlay(
+        "unsloth/Qwen3.8-27B-NVFP4",
+        {"family": "qwen"},
+    )
+    assert q38 is not None and q38["family_key"] == "qwen38_nvfp4"
+    assert q38["config"].get("kv_cache_dtype") == "fp8"
+    assert "--language-model-only" not in (q38["config"].get("extra_flags") or "")
 
 
 def test_family_overlay_matches_detected_family_without_id_hint():
@@ -1612,10 +1619,22 @@ def test_vl_gets_language_model_only():
     warnings: list[str] = []
     rationale: list[str] = []
     ac._apply_vl_spark_defaults(
-        cfg, {"is_vl": True}, warnings, rationale
+        cfg, {"is_vl": True}, warnings, rationale, mode="lab_safe"
     )
     assert "--language-model-only" in cfg["extra_flags"]
     assert any("language-model-only" in r for r in rationale)
+
+
+def test_vl_workflow_max_keeps_vision():
+    cfg = {"extra_flags": "--language-model-only", "moe_backend": ""}
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_vl_spark_defaults(
+        cfg, {"is_vl": True}, warnings, rationale, mode="workflow_max"
+    )
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
+    assert not any("Lab Safe serves language-model-only" in w for w in warnings)
 
 
 def test_resolve_dspark_draft_from_card():
@@ -2296,7 +2315,8 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... --hf-overrides '{"text_config": {
     assert "1000000" not in blob
     assert rec["serve_blocked"] is False
     assert cfg.get("reasoning_parser") == "qwen3"
-    assert "--language-model-only" in (cfg.get("extra_flags") or "")
+    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
+    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
     assert any("Skipped weak card recipe" in r for r in rec.get("rationale") or [])
 
 

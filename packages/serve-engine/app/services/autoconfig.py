@@ -2599,26 +2599,43 @@ def _apply_checkpoint_safety(
         rationale.append("MoE (from config) → --max-num-seqs 4 when card omitted it")
 
 
+_VL_MM_LIMIT = "--limit-mm-per-prompt '{\"image\":4,\"video\":1}'"
+
+
 def _apply_vl_spark_defaults(
     cfg: dict[str, Any],
     detected: dict[str, Any],
     warnings: list[str],
     rationale: list[str],
+    *,
+    mode: str = "lab_safe",
 ) -> None:
-    """GB10 first boot: skip vision towers unless the card already configured MM limits."""
+    """Lab Safe skips the vision tower. Workflow Max keeps VL with an MM cap."""
     if not detected.get("is_vl"):
         return
     ex = cfg.get("extra_flags") or ""
+    if mode == "workflow_max":
+        if "--language-model-only" in ex:
+            ex = _strip_flag_from_extra(ex, "--language-model-only")
+            cfg["extra_flags"] = ex
+            rationale.append("Workflow Max → drop --language-model-only (full VL)")
+        ex = cfg.get("extra_flags") or ""
+        if "--limit-mm-per-prompt" not in ex:
+            cfg["extra_flags"] = (ex + " " + _VL_MM_LIMIT).strip()
+            rationale.append(
+                "Workflow Max VL → keep vision/video, cap with --limit-mm-per-prompt"
+            )
+        return
     if "--language-model-only" in ex or "--limit-mm-per-prompt" in ex:
         return
     cfg["extra_flags"] = (ex + " --language-model-only").strip()
     rationale.append(
         "VL/multimodal checkpoint on Spark → --language-model-only "
-        "(avoids vision-tower OOM on first boot; remove to enable images)"
+        "(Lab Safe first boot; Workflow Max keeps vision)"
     )
     warnings.append(
-        "Multimodal model: serving language-model-only on Spark for stable first boot. "
-        "Drop --language-model-only and set --limit-mm-per-prompt when you need vision."
+        "Multimodal model: Lab Safe serves language-model-only. "
+        "Switch to Workflow Max for image/video, or drop --language-model-only."
     )
 
 
@@ -3748,7 +3765,7 @@ def recommend(
             warnings=warnings,
             rationale=rationale,
         )
-        _apply_vl_spark_defaults(cfg, detected, warnings, rationale)
+    _apply_vl_spark_defaults(cfg, detected, warnings, rationale, mode=mode)
 
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
     # Overlay already encodes the correct backend, so only run for card-driven configs.

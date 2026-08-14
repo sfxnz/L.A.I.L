@@ -1836,6 +1836,19 @@ def test_candidates_recipe_poor_empty_and_bare():
         reasons=["quant"],
     )
     assert ac.candidates_recipe_poor([rich]) is False
+    yarn_cfg = ac._empty_config("Qwen/Qwen3.8-27B")
+    yarn_cfg["docker_env"] = ["VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"]
+    yarn_cfg["extra_flags"] = "--hf-overrides '{...yarn...}'"
+    yarn_cfg["max_model_len"] = 1000000
+    yarn = ac.ServeCandidate(
+        raw="VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... --hf-overrides yarn --max-model-len 1000000",
+        args=["--max-model-len", "1000000"],
+        config=yarn_cfg,
+        section="Best Practices",
+        score=-82.0,
+        reasons=["YaRN / extreme rope override demo — not default", "placeholder command"],
+    )
+    assert ac.candidates_recipe_poor([yarn]) is True
 
 
 def test_recommend_fetches_cookbook_when_card_recipe_poor(monkeypatch):
@@ -2180,10 +2193,42 @@ def test_unavailable_topology_probes_local_hardware(monkeypatch):
     assert p["node_ram_gib"] == 64.0
 
 
+_MODELOPT_MIXED_27B = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "dtype": "bfloat16",
+    "model_type": "qwen3",
+    "text_config": {
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3",
+        "num_attention_heads": 24,
+        "num_hidden_layers": 64,
+        "num_key_value_heads": 4,
+        "vocab_size": 151936,
+    },
+    "quantization_config": {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"},
+        "config_groups": {
+            "group_0": {
+                "input_activations": {"dynamic": False, "num_bits": 8, "type": "float"},
+                "weights": {"dynamic": False, "num_bits": 8, "type": "float"},
+            }
+        },
+        "quantized_layers": {
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+            "model.layers.0.mlp.down_proj": {"quant_algo": "W4A16_NVFP4"},
+        },
+    },
+}
+
+
 def test_estimate_weights_honors_modelopt_algo_without_nvfp4_in_id(monkeypatch):
     """Offline heuristic must use quant_algo / quantized_layers, not the repo id."""
     monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
-    cfg = json.loads((QWEN38_DIR / "config.json").read_text())
+    cfg = _MODELOPT_MIXED_27B
     w = ac.estimate_weights_gib(QWEN38, cfg)
     assert w is not None
     # 4-bit 27B-class dense is well under bf16 (~37 GiB from the 12 L H^2 formula).
@@ -2193,10 +2238,78 @@ def test_estimate_weights_honors_modelopt_algo_without_nvfp4_in_id(monkeypatch):
     assert w < bf16 * 0.6
 
 
+def test_recommend_skips_yarn_demo_on_live_shaped_qwen38(monkeypatch):
+    """Official card's only parseable serve line is the optional 1M YaRN demo — do not apply it."""
+    readme = """# Qwen3.8-27B
+
+## Best Practices
+
+```shell
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve ... --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' --max-model-len 1000000
+```
+"""
+    hf_config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "language_model_only": False,
+        "vision_config": {"depth": 27, "hidden_size": 1152},
+        "text_config": {
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 24,
+            "num_hidden_layers": 64,
+            "num_key_value_heads": 4,
+            "vocab_size": 248320,
+        },
+    }
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda model_id, timeout=20.0: {
+            "model_id": model_id,
+            "readme": readme,
+            "config": hf_config,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [f"fixture://{model_id}"],
+        },
+    )
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+
+    rec = ac.recommend(QWEN38, mode="workflow_max", fetch_remote=True)
+    cfg = rec["config"]
+    blob = json.dumps(cfg) + " ".join(str(x) for x in (cfg.get("docker_env") or []))
+    assert "yarn" not in blob.lower()
+    assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" not in blob
+    assert "1000000" not in blob
+    assert rec["serve_blocked"] is False
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert "--language-model-only" in (cfg.get("extra_flags") or "")
+    assert any("Skipped weak card recipe" in r for r in rec.get("rationale") or [])
+
+
 def test_recommend_unknown_dense_qwen38_offline(monkeypatch):
     """Brand-new Qwen3.x id: card+config only, no overlay, single-node TP=1, fits."""
-    readme = (QWEN38_DIR / "card.md").read_text()
-    hf_config = json.loads((QWEN38_DIR / "config.json").read_text())
+    readme = (
+        "# Qwen3.8-27B\n\n"
+        "```sh\n"
+        "vllm serve Qwen/Qwen3.8-27B --port 8000 --quantization modelopt "
+        "--max-model-len 262144 --reasoning-parser qwen3\n"
+        "```\n"
+    )
+    hf_config = _MODELOPT_MIXED_27B
 
     monkeypatch.setattr(
         ac,

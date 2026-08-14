@@ -1,25 +1,28 @@
 {
   "model": "Qwen/Qwen3.8-27B",
   "mode": "workflow_max",
-  "note": "Unknown dense Qwen3.x (no overlay, no nvfp4 in id). Card+config modeled on nvidia/Qwen3.6-27B. Heuristic must treat ModelOpt MIXED as ~4-bit so a 27B fits one node.",
+  "weights_gib": 51.7,
+  "note": "Live BF16 VL (qwen3_5). Card's only parseable serve is optional 1M YaRN — skip it and serve native defaults.",
   "expect": {
     "serve_blocked": false,
-    "weights_gib_min": 5.0,
-    "weights_gib_max": 25.0,
+    "weights_gib_min": 50.0,
+    "weights_gib_max": 55.0,
     "config": {
-      "quantization": "modelopt_mixed",
-      "kv_cache_dtype": "fp8",
+      "quantization": "",
       "reasoning_parser": "qwen3",
       "tool_call_parser": "qwen3_coder",
       "enable_auto_tool_choice": true,
       "trust_remote_code": true
     },
+    "extra_flags_contains": ["--language-model-only"],
     "forbidden": [
       "flashinfer_b12x",
       "humming",
       "$",
       "--model ",
-      "compressed-tensors"
+      "compressed-tensors",
+      "yarn",
+      "1000000"
     ]
   }
 }

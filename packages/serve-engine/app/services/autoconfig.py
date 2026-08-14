@@ -3631,27 +3631,44 @@ def recommend(
         )
         if candidates:
             best = candidates[0]
-            applied = _apply_card_candidate(cfg, best)
-            rationale.append(
-                f"Best card recipe (score {best.score:.0f})"
-                + (f" in «{best.section}»" if best.section else "")
-                + f": {best.raw[:180].replace(chr(10), ' ')}"
-            )
-            for r in best.reasons:
-                rationale.append(f"  · {r}")
-            if applied:
-                rationale.append(f"Applied from card: {', '.join(applied)}")
-            # Winning recipe may omit tools; harvest from tool-focused alts (e.g. Nano nemotron_json).
-            _harvest_tool_flags_from_candidates(cfg, candidates, rationale)
-            sources.insert(
-                0,
-                {
-                    "kind": "hf_card_recipe",
-                    "ref": card_url or "README.md",
-                    "notes": f"score={best.score:.0f}; section={best.section or 'n/a'}",
-                },
-            )
-            confidence = "high" if from_website else confidence
+            if candidates_recipe_poor(candidates):
+                rationale.append(
+                    f"Skipped weak card recipe (score {best.score:.0f})"
+                    + (f" in «{best.section}»" if best.section else "")
+                    + " — native config.json defaults"
+                )
+                for r in best.reasons:
+                    rationale.append(f"  · {r}")
+                sources.insert(
+                    0,
+                    {
+                        "kind": "hf_card_recipe_skipped",
+                        "ref": card_url or "README.md",
+                        "notes": f"score={best.score:.0f}; section={best.section or 'n/a'}",
+                    },
+                )
+            else:
+                applied = _apply_card_candidate(cfg, best)
+                rationale.append(
+                    f"Best card recipe (score {best.score:.0f})"
+                    + (f" in «{best.section}»" if best.section else "")
+                    + f": {best.raw[:180].replace(chr(10), ' ')}"
+                )
+                for r in best.reasons:
+                    rationale.append(f"  · {r}")
+                if applied:
+                    rationale.append(f"Applied from card: {', '.join(applied)}")
+                # Winning recipe may omit tools; harvest from tool-focused alts (e.g. Nano nemotron_json).
+                _harvest_tool_flags_from_candidates(cfg, candidates, rationale)
+                sources.insert(
+                    0,
+                    {
+                        "kind": "hf_card_recipe",
+                        "ref": card_url or "README.md",
+                        "notes": f"score={best.score:.0f}; section={best.section or 'n/a'}",
+                    },
+                )
+                confidence = "high" if from_website else confidence
         else:
             warnings.append("Model card has no parseable `vllm serve` command")
             rationale.append("No vllm serve snippets on card — using config.json + prose hints")

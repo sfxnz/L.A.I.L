@@ -2799,12 +2799,21 @@ def _vendor_candidate_sibling_mismatch(cand: ServeCandidate, model_id: str) -> b
 
     Unsloth's Gemma-4 page scores the 26B-A4B Spark MoE line (flashinfer_b12x)
     above the official dense 31B recipe. That backend is wrong for 31B.
+    NVIDIA Agent-Ready lines name nvidia/… and must not win for unsloth/….
     """
     if not model_id:
         return False
     other = _candidate_model_id(cand)
     if not other:
         return False
+    # Competing weight forks (Unsloth vs NVIDIA NVFP4 of the same 35B) must not
+    # steal each other's parsers. Official catalog orgs (Google, Qwen, …) stay.
+    _weight_forks = frozenset({"nvidia", "unsloth", "bartowski", "lmstudio-community"})
+    if "/" in model_id and "/" in other:
+        pa = model_id.split("/")[0].lower()
+        pb = other.split("/")[0].lower()
+        if pa != pb and pa in _weight_forks and pb in _weight_forks:
+            return True
     want = _model_size_tokens(model_id)
     got = _model_size_tokens(other)
     if not want or not got:
@@ -3168,6 +3177,9 @@ def _flashinfer_b12x_unsafe_for_checkpoint(
     """
     if not detected:
         return False
+    # flashinfer_b12x is an MoE kernel. Dense 31B Gemma must not keep a 26B-A4B Spark line.
+    if not detected.get("is_moe"):
+        return True
     # Unknown/custom/Anemll and stock ≥0.27: keep the vendor Spark flag.
     if _image_at_least(image, 0, 27, 0):
         return False
@@ -3848,8 +3860,11 @@ def _harvest_tool_flags_from_candidates(
         return
     if not candidates:
         return
+    want_model = str(cfg.get("model") or "")
     ranked: list[tuple[int, int, float, ServeCandidate]] = []
     for c in candidates:
+        if _vendor_candidate_sibling_mismatch(c, want_model):
+            continue
         tcp = str((c.config or {}).get("tool_call_parser") or "").strip()
         if not tcp:
             continue

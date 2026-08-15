@@ -175,6 +175,13 @@ def test_analyze_config_modelopt_mixed_precision():
     assert ac._flashinfer_b12x_unsafe_for_checkpoint(d, "vllm/vllm-openai:v0.25.0") is True
     assert ac._flashinfer_b12x_unsafe_for_checkpoint(d, "vllm/vllm-openai:v0.27.1") is False
     assert ac._flashinfer_b12x_unsafe_for_checkpoint(d) is False  # lab default ≥0.27
+    # Dense Gemma-4 31B must never keep a 26B-A4B flashinfer_b12x Spark line.
+    dense = ac.analyze_config(
+        {"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"},
+        "google/gemma-4-31B-it",
+    )
+    assert dense["is_moe"] is False
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(dense, "vllm/vllm-openai:v0.27.1") is True
     # Nemotron still keeps marlin despite mixed ModelOpt.
     assert ac._marlin_unsafe_for_checkpoint(d) is False
 
@@ -3252,6 +3259,17 @@ def test_vendor_candidate_sibling_mismatch_drops_26b_moe_for_31b_dense():
     # Same family, no size token — do not invent a mismatch.
     bare = ac.ServeCandidate(raw="vllm serve unsloth/gemma-4", model="unsloth/gemma-4")
     assert ac._vendor_candidate_sibling_mismatch(bare, "google/gemma-4-31B-it") is False
+    nvidia_35 = ac.ServeCandidate(
+        raw="vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 --tool-call-parser qwen3_xml",
+        model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        config={"tool_call_parser": "qwen3_xml"},
+    )
+    assert (
+        ac._vendor_candidate_sibling_mismatch(
+            nvidia_35, "unsloth/Qwen3.6-35B-A3B-NVFP4"
+        )
+        is True
+    )
 
 
 def test_discover_recipe_urls_gemma4_official_catalog_not_nvidia_qwen():

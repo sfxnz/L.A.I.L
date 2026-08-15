@@ -1,0 +1,14 @@
+{
+  "model": "internlm/internlm3-8b-instruct",
+  "weights_gib": 16.0,
+  "note": "Fits 1 Spark. vLLM tools use --tool-call-parser internlm.",
+  "expect": {
+    "serve_blocked": false,
+    "config": {
+      "tool_call_parser": "internlm",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true
+    },
+    "forbidden": ["$", "--model ", "qwen3_coder"]
+  }
+}

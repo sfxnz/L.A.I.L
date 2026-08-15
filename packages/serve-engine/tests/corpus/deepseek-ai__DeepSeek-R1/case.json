@@ -1,0 +1,14 @@
+{
+  "model": "deepseek-ai/DeepSeek-R1",
+  "weights_gib": 700.0,
+  "note": "Full R1 does not fit 1–2× GB10. Placement must refuse Start.",
+  "expect": {
+    "serve_blocked": true,
+    "weights_gib_min": 600.0,
+    "config": {
+      "reasoning_parser": "deepseek_r1",
+      "trust_remote_code": true
+    },
+    "forbidden": ["$", "--model "]
+  }
+}

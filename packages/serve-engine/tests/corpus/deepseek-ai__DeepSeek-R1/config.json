@@ -1,0 +1,8 @@
+{
+  "architectures": ["DeepseekV3ForCausalLM"],
+  "model_type": "deepseek_v3",
+  "max_position_embeddings": 163840,
+  "hidden_size": 7168,
+  "num_hidden_layers": 61,
+  "n_routed_experts": 256
+}

@@ -1,0 +1,25 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "mode": "workflow_max",
+  "note": "MXFP4 MoE (~38.4 GiB Hub blobs). Fits 1 Spark. vLLM: --quantization mxfp4 + --tool-call-parser openai. No Spark crash flags.",
+  "weights_gib": 38.4,
+  "weights_source": "blobs",
+  "expect": {
+    "serve_blocked": false,
+    "weights_gib_min": 26.9,
+    "weights_gib_max": 54.9,
+    "config": {
+      "quantization": "mxfp4",
+      "tool_call_parser": "openai",
+      "enable_auto_tool_choice": true
+    },
+    "forbidden": [
+      "$",
+      "--model ",
+      "--enable-expert-parallel",
+      "--data-parallel-size",
+      "humming",
+      "flashinfer_b12x"
+    ]
+  }
+}

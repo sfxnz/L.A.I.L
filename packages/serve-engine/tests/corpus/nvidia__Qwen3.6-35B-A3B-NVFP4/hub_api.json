@@ -1,0 +1,7 @@
+{
+  "model_id": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+  "siblings_weight_files": 3,
+  "siblings_bytes": 23424338320,
+  "weights_gib": 21.8,
+  "source": "blobs"
+}

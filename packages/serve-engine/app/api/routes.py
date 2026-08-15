@@ -96,6 +96,7 @@ class ServeRequest(BaseModel):
     max_num_seqs: Optional[int] = None
     mtp: bool = False
     mtp_num_tokens: int = 2
+    mtp_moe_backend: str = ""
     load_format: str = ""
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
@@ -129,6 +130,7 @@ async def serve_start(body: ServeRequest) -> dict[str, str]:
             max_num_seqs=body.max_num_seqs,
             mtp=body.mtp,
             mtp_num_tokens=body.mtp_num_tokens,
+            mtp_moe_backend=body.mtp_moe_backend,
             load_format=body.load_format,
             enable_chunked_prefill=body.enable_chunked_prefill,
             enable_prefix_caching=body.enable_prefix_caching,
@@ -159,13 +161,24 @@ async def serve_recommend(
         True,
         description="If local cache misses config/README, fetch from huggingface.co",
     ),
+    backend: Optional[str] = Query(
+        None,
+        description="vllm (default), llamacpp, or sglang. GGUF ids should use llamacpp.",
+    ),
 ) -> dict[str, Any]:
-    """Recommend vLLM flags from the HF card plus researched vendor recipes.
+    """Recommend vLLM, llama.cpp, or SGLang flags from the card plus vendor recipes.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
     """
     try:
-        return autoconfig.recommend(model, mode=mode, fetch_remote=fetch_remote)
+        rec = autoconfig.recommend(
+            model, mode=mode, fetch_remote=fetch_remote, backend=backend
+        )
+        if autoconfig.looks_like_gguf(model) and rec.get("engine") == "vllm":
+            rec.setdefault("warnings", []).append(
+                "This id looks like GGUF — use ?backend=llamacpp for the Spark llama.cpp pack"
+            )
+        return rec
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 

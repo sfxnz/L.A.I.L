@@ -1,0 +1,6 @@
+{
+  "id": "example/Tiny-Qwen-0.5B-GGUF",
+  "path": "/models/tiny-qwen.Q4_K_M.gguf",
+  "tags": ["gguf", "llama.cpp", "qwen"],
+  "vllm_id": "Qwen/Qwen3.6-27B"
+}

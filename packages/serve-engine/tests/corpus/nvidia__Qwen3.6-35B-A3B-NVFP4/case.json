@@ -1,0 +1,39 @@
+{
+  "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+  "mode": "workflow_max",
+  "note": "NVIDIA ModelOpt MIXED_PRECISION MoE. Playbook: marlin + qwen3_xml + flashinfer attention + MTP 3. Fits 1 Spark (~21.8 GiB).",
+  "weights_gib": 21.8,
+  "weights_source": "blobs",
+  "expect": {
+    "label_contains": "playbook",
+    "serve_blocked": false,
+    "weights_gib_min": 15.0,
+    "weights_gib_max": 35.0,
+    "config": {
+      "quantization": "modelopt_mixed",
+      "kv_cache_dtype": "fp8",
+      "moe_backend": "marlin",
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_xml",
+      "enable_auto_tool_choice": true,
+      "trust_remote_code": true,
+      "mtp": true,
+      "mtp_num_tokens": 3,
+      "mtp_moe_backend": "triton"
+    },
+    "extra_flags_contains": [
+      "--attention-backend flashinfer",
+      "--max-num-batched-tokens 8192"
+    ],
+    "cmd_contains": [
+      "\"moe_backend\":\"triton\"",
+      "--max-num-batched-tokens 8192"
+    ],
+    "forbidden": [
+      "flashinfer_b12x",
+      "humming",
+      "$",
+      "--model "
+    ]
+  }
+}

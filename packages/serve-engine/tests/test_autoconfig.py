@@ -72,26 +72,28 @@ def test_mixed_checkpoint_penalizes_flashinfer_in_scoring():
     ]
     assert flash_raw, "fixture must include flashinfer recipe text"
     assert non_flash, "fixture must include non-flashinfer recipe"
-    # Best overall must not keep flashinfer_b12x in config (cleared for safety)
+    # Lab default ≥0.27: Unsloth Spark recipe keeps flashinfer_b12x (no crash).
     best = cands[0]
-    assert (best.config.get("moe_backend") or "") != "flashinfer_b12x"
-    # Flashinfer card recipes must carry a penalty / clearance reason
-    assert any(
-        any(
-            "PENALTY" in (x or "") or "FP8 MoE" in (x or "") or "cleared moe_backend" in (x or "")
-            for x in (c.reasons or [])
-        )
-        for c in flash_raw
+    assert (best.config.get("moe_backend") or "") == "flashinfer_b12x"
+    old = ac.extract_serve_candidates(readme, detected=detected)
+    for c in old:
+        c.config["image"] = "vllm/vllm-openai:v0.25.0"
+        ac._sanitize_moe_backend_on_candidate(c, detected)
+    assert all(
+        (c.config.get("moe_backend") or "") != "flashinfer_b12x"
+        for c in old
+        if "flashinfer_b12x" in (c.raw or "")
     )
 
 
-def test_checkpoint_safety_strips_flashinfer_b12x():
+def test_checkpoint_safety_strips_flashinfer_b12x_on_old_image():
     cfg_json = json.loads((FIX / "config_mixed_compressed_tensors.json").read_text())
     detected = ac.analyze_config(cfg_json, "example/Mixed-MoE-NVFP4")
     serve_cfg = {
         "model": "example/Mixed-MoE-NVFP4",
         "quantization": "compressed-tensors",
         "moe_backend": "flashinfer_b12x",
+        "image": "vllm/vllm-openai:v0.25.0",
         "docker_env": ["CUTE_DSL_ARCH=sm_121a"],
         "kv_cache_dtype": "",
         "max_num_seqs": None,
@@ -104,6 +106,40 @@ def test_checkpoint_safety_strips_flashinfer_b12x():
     assert any("SAFETY" in r for r in rationale)
     # Still keeps Spark env
     assert any(e.startswith("CUTE_DSL_ARCH=") for e in serve_cfg["docker_env"])
+
+
+def test_checkpoint_safety_keeps_flashinfer_b12x_on_v027():
+    """Unsloth Spark recipe: keep flashinfer_b12x + CUTE on the lab default image."""
+    cfg_json = json.loads((FIX / "config_mixed_compressed_tensors.json").read_text())
+    detected = ac.analyze_config(cfg_json, "unsloth/Qwen3.6-35B-A3B-NVFP4")
+    serve_cfg = {
+        "model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+        "quantization": "compressed-tensors",
+        "moe_backend": "flashinfer_b12x",
+        "image": "vllm/vllm-openai:v0.27.1",
+        "docker_env": [],
+        "kv_cache_dtype": "",
+        "max_num_seqs": None,
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_checkpoint_safety(serve_cfg, detected, warnings, rationale)
+    assert serve_cfg["moe_backend"] == "flashinfer_b12x"
+    assert any(e == "CUTE_DSL_ARCH=sm_121a" for e in serve_cfg["docker_env"])
+    ac._apply_first_boot_defaults(
+        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+    )
+    assert serve_cfg["moe_backend"] == "flashinfer_b12x"
+
+
+def test_serve_example_unsloth_35b_matches_spark_recipe():
+    """GUI example must match the official Unsloth Spark command on ≥0.27."""
+    from app.config import SERVE_EXAMPLES
+
+    ex = SERVE_EXAMPLES["unsloth-35b-spark"]
+    assert ex["moe_backend"] == "flashinfer_b12x"
+    assert any(e == "CUTE_DSL_ARCH=sm_121a" for e in (ex.get("docker_env") or []))
+    assert "flashinfer_b12x" in (ex.get("notes") or "")
 
 
 def test_modelopt_card_recipe_sets_quantization():
@@ -136,7 +172,16 @@ def test_analyze_config_modelopt_mixed_precision():
     assert d["quant_algo"] == "MIXED_PRECISION"
     assert d["is_mixed_nvfp4_fp8"] is True
     assert d["suggested_kv_cache_dtype"] == "fp8"
-    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d) is True
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d, "vllm/vllm-openai:v0.25.0") is True
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d, "vllm/vllm-openai:v0.27.1") is False
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(d) is False  # lab default ≥0.27
+    # Dense Gemma-4 31B must never keep a 26B-A4B flashinfer_b12x Spark line.
+    dense = ac.analyze_config(
+        {"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"},
+        "google/gemma-4-31B-it",
+    )
+    assert dense["is_moe"] is False
+    assert ac._flashinfer_b12x_unsafe_for_checkpoint(dense, "vllm/vllm-openai:v0.27.1") is True
     # Nemotron still keeps marlin despite mixed ModelOpt.
     assert ac._marlin_unsafe_for_checkpoint(d) is False
 
@@ -240,8 +285,16 @@ def test_analyze_config_detects_mixed_formats():
         ("meta-llama/Llama-4-Scout-17B-16E-Instruct", ["Llama4ForCausalLM"], "llama4"),
         ("google/gemma-2-9b-it", ["Gemma2ForCausalLM"], "gemma"),
         ("google/gemma-4-9b-it", ["Gemma4ForCausalLM"], "gemma4"),
+        ("google/diffusiongemma-26B-A4B-it", ["DiffusionGemmaForBlockDiffusion"], "diffusiongemma"),
+        ("nvidia/diffusiongemma-26B-A4B-it-NVFP4", ["DiffusionGemmaForBlockDiffusion"], "diffusiongemma"),
         ("microsoft/Phi-4-mini-instruct", ["Phi3ForCausalLM"], "phi"),
         ("ibm-granite/granite-3.3-8b-instruct", ["GraniteForCausalLM"], "granite"),
+        ("internlm/internlm3-8b-instruct", ["InternLM3ForCausalLM"], "internlm"),
+        ("tencent/Hunyuan-A13B-Instruct-FP8", ["HunYuanMoEV1ForCausalLM"], "hunyuan"),
+        ("tencent/Hy3-preview", ["Hy3ForCausalLM"], "hy_v3"),
+        ("stepfun-ai/step3", ["Step3VLForConditionalGeneration"], "step3"),
+        ("stepfun-ai/Step-3.5-Flash", ["Step3p5ForCausalLM"], "step3p5"),
+        ("baidu/ERNIE-4.5-21B-A3B-Thinking", ["Ernie4_5_MoeForCausalLM"], "ernie"),
     ],
 )
 
@@ -275,9 +328,28 @@ def test_qwen3_still_gets_parsers():
     assert cfg["tool_call_parser"] == "qwen3_coder"
 
 
+def test_qwen_coder_uses_qwen3_xml():
+    cfg = ac._empty_config("Qwen/Qwen3-Coder-30B-A3B-Instruct")
+    rationale: list[str] = []
+    ac._fill_from_config_detection(
+        cfg,
+        {
+            "family": "qwen",
+            "quant_flag": "",
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+        },
+        rationale,
+    )
+    assert cfg["tool_call_parser"] == "qwen3_xml"
+
+
 def test_strip_spark_unsafe_flags():
     cfg = {
-        "extra_flags": "--enable-expert-parallel --data-parallel-size 8 --max-num-batched-tokens 8192",
+        "extra_flags": (
+            "--enable-expert-parallel --data-parallel-size 8 "
+            "--linear-backend humming --max-num-batched-tokens 8192"
+        ),
         "moe_backend": "humming",
         "docker_env": ["VLLM_USE_DEEP_GEMM_MEGA_MOE=1", "CUTE_DSL_ARCH=sm_121a"],
     }
@@ -287,6 +359,8 @@ def test_strip_spark_unsafe_flags():
     ex = cfg["extra_flags"]
     assert "--enable-expert-parallel" not in ex
     assert "--data-parallel-size" not in ex
+    assert "--linear-backend" not in ex
+    assert "humming" not in ex.lower()
     assert "--max-num-batched-tokens" in ex
     assert cfg["moe_backend"] == ""
     assert not any(e.startswith("VLLM_USE_DEEP_GEMM_MEGA_MOE=") for e in cfg["docker_env"])
@@ -340,6 +414,16 @@ def test_fill_from_config_minimax_and_mistral_parsers():
     assert gemma4["reasoning_parser"] == "gemma4"
     assert gemma4["tool_call_parser"] == "gemma4"
 
+    dgemma = ac._empty_config("google/diffusiongemma-26B-A4B-it")
+    ac._fill_from_config_detection(
+        dgemma,
+        {"family": "diffusiongemma", "quant_flag": "", "architectures": [], "model_type": "diffusiongemma"},
+        rationale,
+    )
+    assert dgemma["reasoning_parser"] == "gemma4"
+    assert dgemma["tool_call_parser"] == "gemma4"
+    assert dgemma["enable_auto_tool_choice"] is True
+
     phi = ac._empty_config("microsoft/Phi-4-mini-instruct")
     ac._fill_from_config_detection(
         phi,
@@ -367,20 +451,16 @@ def test_live_recommend_unsloth_35b_mixed_moe():
     assert r.get("card_url", "").startswith("https://huggingface.co/")
     c = r["config"]
     assert c.get("quantization") == "compressed-tensors"
-    # Must not force flashinfer_b12x on mixed FP8 MoE
-    assert (c.get("moe_backend") or "") == ""
+    # Unsloth Spark (vLLM ≥0.27): keep flashinfer_b12x + CUTE_DSL_ARCH.
+    assert (c.get("moe_backend") or "") == "flashinfer_b12x"
     assert c.get("reasoning_parser") == "qwen3"
     assert any(e.startswith("CUTE_DSL_ARCH=") for e in (c.get("docker_env") or []))
     # Live sources present
     kinds = {s.get("kind") for s in r.get("sources") or []}
     assert "huggingface" in kinds or "hf_card_recipe" in kinds
     assert len(r.get("card_recipes") or []) >= 1
-    # Criterion 3: clear warning + rationale when card recommends flashinfer but we avoid it
-    warn_blob = " ".join(r.get("warnings") or [])
     rat_blob = " ".join(r.get("rationale") or [])
-    assert "flashinfer_b12x" in warn_blob, f"expected flashinfer warning, got {r.get('warnings')}"
-    assert "flashinfer_b12x" in rat_blob or "SAFETY" in rat_blob
-    # Penalized recipes must expose reasons (for UI)
+    assert "flashinfer_b12x" in rat_blob
     flash_recipes = [
         cr
         for cr in (r.get("card_recipes") or [])
@@ -388,10 +468,6 @@ def test_live_recommend_unsloth_35b_mixed_moe():
         or (cr.get("config") or {}).get("moe_backend") == "flashinfer_b12x"
     ]
     assert flash_recipes, "card should still list flashinfer recipe among candidates"
-    assert any(
-        any("PENALTY" in (x or "") or "FP8 MoE" in (x or "") for x in (cr.get("reasons") or []))
-        for cr in flash_recipes
-    )
 
 @requires_hub
 def test_live_recommend_nvidia_27b_modelopt():
@@ -503,6 +579,72 @@ def test_mtp_speculative_config_not_duplicated_in_extra():
     assert "speculative-config" not in (cfg.get("extra_flags") or "")
 
 
+def test_args_to_config_harvests_mtp_spark_moe_keys():
+    """Playbook MTP JSON carries moe_backend:triton — not the top-level --moe-backend."""
+    args = [
+        "--moe-backend",
+        "marlin",
+        "--speculative-config",
+        '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}',
+        "--max-num-batched-tokens",
+        "8192",
+    ]
+    cfg = ac._args_to_config(args, [])
+    assert cfg.get("mtp") is True
+    assert cfg.get("mtp_num_tokens") == 3
+    assert cfg.get("moe_backend") == "marlin"
+    assert cfg.get("mtp_moe_backend") == "triton"
+    assert "--max-num-batched-tokens" in (cfg.get("extra_flags") or "")
+
+
+def test_build_vllm_args_mtp_emits_spark_moe_keys():
+    """Structured MTP emit must carry Spark MoE keys (not just method + token count)."""
+    from app.services import serve as sv
+
+    argv = sv._build_vllm_args(
+        util=0.4,
+        max_model_len=65536,
+        port=8000,
+        moe_backend="marlin",
+        mtp=True,
+        mtp_num_tokens=3,
+        mtp_moe_backend="triton",
+        extra_flags="--max-num-batched-tokens 8192",
+    )
+    specs = [argv[i + 1] for i, a in enumerate(argv) if a == "--speculative-config"]
+    assert len(specs) == 1, argv
+    spec = json.loads(specs[0])
+    assert spec.get("method") == "mtp"
+    assert spec.get("num_speculative_tokens") == 3
+    assert spec.get("moe_backend") == "triton"
+    assert "--moe-backend" in argv and argv[argv.index("--moe-backend") + 1] == "marlin"
+    assert "--max-num-batched-tokens" in argv
+    assert argv[argv.index("--max-num-batched-tokens") + 1] == "8192"
+
+
+def test_build_vllm_args_mtp_merges_spark_moe_from_extra_spec():
+    """Leftover playbook --speculative-config extras must fold into the structured emit."""
+    from app.services import serve as sv
+
+    argv = sv._build_vllm_args(
+        util=0.4,
+        max_model_len=65536,
+        port=8000,
+        mtp=True,
+        mtp_num_tokens=3,
+        extra_flags=(
+            '--speculative-config \'{"method":"mtp","num_speculative_tokens":3,'
+            '"moe_backend":"triton"}\' --max-num-batched-tokens 8192'
+        ),
+    )
+    specs = [argv[i + 1] for i, a in enumerate(argv) if a == "--speculative-config"]
+    assert len(specs) == 1, argv
+    spec = json.loads(specs[0])
+    assert spec.get("moe_backend") == "triton"
+    assert spec.get("num_speculative_tokens") == 3
+    assert "--max-num-batched-tokens" in argv
+
+
 def test_strip_flag_from_extra():
     s = ac._strip_flag_from_extra(
         '--foo 1 --speculative-config \'{"method":"mtp"}\' --bar',
@@ -522,8 +664,9 @@ def test_mixed_checkpoint_prefers_spark_salvage_over_bare():
     # Selected recipe should carry Spark signal (CUTE or DGX section), not bare-only
     blob = (best.raw + " " + (best.section or "")).lower()
     assert "spark" in blob or "cute" in blob or best.config.get("docker_env")
-    assert (best.config.get("moe_backend") or "") != "flashinfer_b12x" or any(
-        "PENALTY" in r for r in best.reasons
+    # ≥0.27: Spark flashinfer recipe is legal (Unsloth). Penalty only on old images.
+    assert (best.config.get("moe_backend") or "") == "flashinfer_b12x" or any(
+        "PENALTY" in r or "spark" in r.lower() or "cute" in r.lower() for r in best.reasons
     )
 
 
@@ -666,6 +809,19 @@ def test_resolve_stock_image_raises_never_downgrades():
             "ghcr.io/anemll/dspark-vllm-gx10:0.1.1", "vllm/vllm-openai:v0.27.1", []
         )
         == "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
+    )
+    # Playbook tags are not semver — do not parse gemma4-cu130 as v4.0.0 / raise over stock.
+    assert (
+        ac._resolve_stock_image(
+            "vllm/vllm-openai:v0.27.1", "vllm/vllm-openai:gemma4-cu130", []
+        )
+        == "vllm/vllm-openai:v0.27.1"
+    )
+    assert (
+        ac._resolve_stock_image(
+            "vllm/vllm-openai:v0.28.0", "vllm/vllm-openai:gemma4-cu130", []
+        )
+        == "vllm/vllm-openai:v0.28.0"
     )
 
 
@@ -876,9 +1032,9 @@ def test_fixture_card_mixed_moe_surfaces_flashinfer_warning_via_recommend_path(m
     )
     r = ac.recommend("example/Mixed-MoE-NVFP4", mode="lab_safe", fetch_remote=True)
     assert r["from_website"] is True
-    assert (r["config"].get("moe_backend") or "") == ""
-    assert any("flashinfer_b12x" in w for w in (r.get("warnings") or []))
-    assert any("flashinfer" in x.lower() or "SAFETY" in x for x in (r.get("rationale") or []))
+    assert (r["config"].get("moe_backend") or "") == "flashinfer_b12x"
+    assert any(e.startswith("CUTE_DSL_ARCH=") for e in (r["config"].get("docker_env") or []))
+    assert any("flashinfer_b12x" in x for x in (r.get("rationale") or []))
 
 
 # ─── Topology-aware auto-config + model-family overlay ───────────────────────
@@ -1158,6 +1314,7 @@ def test_single_node_anemll_hf_home_and_entrypoint_parity():
     assert f"HF_HOME={serve.HF_CACHE_IN_CONTAINER}" in cmd
     # Must NOT use the old /root/.cache path (diverged from multi-node).
     assert "/root/.cache/huggingface" not in joined
+    assert "--shm-size=32g" in cmd
     # Anemll entrypoint clear + bash wrapper (same pattern as multi-node).
     assert "--entrypoint" in cmd and cmd[cmd.index("--entrypoint") + 1] == "bash"
     img_i = cmd.index(image)
@@ -1334,16 +1491,60 @@ def test_shipped_serve_overlays_json_loads_minimax():
     )
     assert ov is not None and ov["family_key"] == "minimax_m2"
     assert ov["config"].get("reasoning_parser") == "minimax_m2"
+    assert ac._overlay_gap_only(ov) is False
     ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
     assert ov3 is not None and ov3["family_key"] == "minimax_m3"
     assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+    assert ac._overlay_gap_only(ov3) is False
     q38 = ac._family_overlay(
         "unsloth/Qwen3.8-27B-NVFP4",
         {"family": "qwen"},
     )
     assert q38 is not None and q38["family_key"] == "qwen38_nvfp4"
+    assert ac._overlay_gap_only(q38) is True
     assert q38["config"].get("kv_cache_dtype") == "fp8"
     assert "--language-model-only" not in (q38["config"].get("extra_flags") or "")
+    nv35 = ac._family_overlay(
+        "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        {"family": "qwen"},
+    )
+    assert nv35 is not None and nv35["family_key"] == "qwen36_35b_nvfp4_playbook"
+    assert ac._overlay_gap_only(nv35) is False
+    assert nv35["config"].get("moe_backend") == "marlin"
+    assert nv35["config"].get("tool_call_parser") == "qwen3_xml"
+    assert nv35["config"].get("mtp") is True
+    assert nv35["config"].get("mtp_num_tokens") == 3
+    assert nv35["config"].get("mtp_moe_backend") == "triton"
+    assert "--attention-backend flashinfer" in (nv35["config"].get("extra_flags") or "")
+    assert "--max-num-batched-tokens 8192" in (nv35["config"].get("extra_flags") or "")
+    # Unsloth twin must not steal the NVIDIA playbook overlay.
+    assert ac._family_overlay("unsloth/Qwen3.6-35B-A3B-NVFP4", {"family": "qwen"}) is None
+    assert ac._family_overlay("nvidia/Qwen3.6-27B-NVFP4", {"family": "qwen"}) is None
+    g4 = ac._family_overlay("google/gemma-4-31B-it", {"family": "gemma4"})
+    assert g4 is not None and g4["family_key"] == "gemma4"
+    assert g4["config"].get("reasoning_parser") == "gemma4"
+    assert g4["config"].get("tool_call_parser") == "gemma4"
+    assert ac._overlay_gap_only(g4) is True
+    # DiffusionGemma overlay is id-specific — do not steal Gemma 4 parsers-only overlay.
+    assert ac._family_overlay("google/diffusiongemma-26B-A4B-it", {"family": "diffusiongemma"})[
+        "family_key"
+    ] == "diffusiongemma"
+    assert ac._family_overlay("google/diffusiongemma-26B-A4B-it", {"family": "gemma4"})[
+        "family_key"
+    ] == "diffusiongemma"
+    assert ac._family_overlay("unsloth/gemma-4-31B-it-NVFP4", {"family": "gemma4"})[
+        "family_key"
+    ] == "gemma4"
+    ds = ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash", {})
+    assert ds is not None and ds["family_key"] == "deepseek_v4_dspark"
+    assert ac._overlay_gap_only(ds) is False
+    gptoss = ac._family_overlay("openai/gpt-oss-20b", {})
+    assert gptoss is not None and gptoss["family_key"] == "gpt_oss"
+    assert gptoss["config"].get("quantization") == "mxfp4"
+    assert gptoss["config"].get("tool_call_parser") == "openai"
+    assert gptoss["config"].get("enable_auto_tool_choice") is True
+    assert "--enable-expert-parallel" not in (gptoss["config"].get("extra_flags") or "")
+    assert "--data-parallel-size" not in (gptoss["config"].get("extra_flags") or "")
 
 
 def test_family_overlay_matches_detected_family_without_id_hint():
@@ -1404,6 +1605,75 @@ def test_overlay_extra_flags_merge_no_duplicate_mistral(monkeypatch):
     env = ac._dedupe_env(["FOO=1", "BAR=2"] + ["FOO=3", "BAZ=9"])
     assert env.count("FOO=3") == 1
     assert not any(e == "FOO=1" for e in env)
+
+
+def test_nvidia_qwen36_35b_playbook_overlay_spares_unsloth():
+    nvidia = ac._family_overlay(
+        "nvidia/Qwen3.6-35B-A3B-NVFP4", {"family": "qwen"}
+    )
+    assert nvidia is not None
+    assert nvidia["family_key"] == "qwen36_35b_nvfp4_playbook"
+    assert nvidia["config"]["moe_backend"] == "marlin"
+    assert nvidia["config"]["tool_call_parser"] == "qwen3_xml"
+    assert nvidia["config"].get("mtp_moe_backend") == "triton"
+    assert "--max-num-batched-tokens 8192" in (nvidia["config"].get("extra_flags") or "")
+    unsloth = ac._family_overlay(
+        "unsloth/Qwen3.6-35B-A3B-NVFP4", {"family": "qwen"}
+    )
+    assert unsloth is None or unsloth.get("family_key") != "qwen36_35b_nvfp4_playbook"
+
+
+def test_recommend_nvidia_qwen36_35b_emits_playbook_mtp_moe(monkeypatch):
+    """Agent Ready MTP must keep moe_backend:triton + --max-num-batched-tokens 8192."""
+    from app.services import serve as sv
+
+    corpus = Path(__file__).resolve().parent / "corpus" / "nvidia__Qwen3.6-35B-A3B-NVFP4"
+    readme = (corpus / "card.md").read_text(encoding="utf-8")
+    hf_config = json.loads((corpus / "config.json").read_text())
+    _patch_offline_recommend(monkeypatch, readme=readme, config=hf_config)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 21.8)
+    monkeypatch.setattr(
+        ac,
+        "fetch_cookbook_text",
+        lambda *a, **k: (None, "offline — no extra vendor fetch"),
+    )
+    rec = ac.recommend("nvidia/Qwen3.6-35B-A3B-NVFP4", fetch_remote=True)
+    cfg = rec["config"]
+    assert rec.get("serve_blocked") is False
+    assert cfg.get("moe_backend") == "marlin"
+    assert cfg.get("mtp") is True
+    assert cfg.get("mtp_num_tokens") == 3
+    assert cfg.get("mtp_moe_backend") == "triton"
+    assert "--max-num-batched-tokens 8192" in (cfg.get("extra_flags") or "")
+    argv = sv._build_vllm_args(
+        util=float(cfg.get("util") or 0.4),
+        max_model_len=int(cfg.get("max_model_len") or 65536),
+        port=8000,
+        quantization=cfg.get("quantization") or "",
+        kv_cache_dtype=cfg.get("kv_cache_dtype") or "",
+        moe_backend=cfg.get("moe_backend") or "",
+        trust_remote_code=bool(cfg.get("trust_remote_code")),
+        enable_auto_tool_choice=bool(cfg.get("enable_auto_tool_choice")),
+        tool_call_parser=cfg.get("tool_call_parser") or "",
+        reasoning_parser=cfg.get("reasoning_parser") or "",
+        max_num_seqs=cfg.get("max_num_seqs"),
+        mtp=bool(cfg.get("mtp")),
+        mtp_num_tokens=int(cfg.get("mtp_num_tokens") or 2),
+        mtp_moe_backend=cfg.get("mtp_moe_backend") or "",
+        load_format=cfg.get("load_format") or "",
+        enable_chunked_prefill=bool(cfg.get("enable_chunked_prefill")),
+        enable_prefix_caching=bool(cfg.get("enable_prefix_caching")),
+        extra_flags=cfg.get("extra_flags") or "",
+        tensor_parallel_size=int(cfg.get("tensor_parallel_size") or 1),
+    )
+    cmd = "vllm serve " + rec["model"] + " " + " ".join(argv)
+    assert "$" not in cmd and "--model " not in cmd
+    specs = [argv[i + 1] for i, a in enumerate(argv) if a == "--speculative-config"]
+    assert len(specs) == 1
+    spec = json.loads(specs[0])
+    assert spec.get("moe_backend") == "triton"
+    assert spec.get("num_speculative_tokens") == 3
+    assert "--max-num-batched-tokens" in argv
 
 
 def test_minimax_overlay_label_fp8_vs_nvfp4():
@@ -1772,6 +2042,110 @@ def test_blob_weights_not_overridden_by_expert_floor(monkeypatch):
     assert floor is None or floor > w
 
 
+def _magistral_dual_dump_siblings(*, gib: float = 44.7) -> list[dict]:
+    """Mistral Hub layout: consolidated.safetensors AND model-*-of-* of the same BF16."""
+    tot = int(gib * (1024**3))
+    half = tot // 2
+    return [
+        {"rfilename": "consolidated.safetensors", "size": tot},
+        {"rfilename": "model-00001-of-00002.safetensors", "size": half},
+        {"rfilename": "model-00002-of-00002.safetensors", "size": tot - half},
+        {"rfilename": "params.json", "size": 400},
+        {"rfilename": "config.json", "size": 2000},
+    ]
+
+
+def test_select_weight_blobs_drops_duplicate_consolidated_dump():
+    """Same tensors twice must not both enter the blob sum.
+
+    Live Magistral-Small-2509 ships consolidated.safetensors (~44.7 GiB) plus
+    model-*-of-* shards (~44.7). Summing both is 89.4 and 1-Spark serve_blocked.
+    """
+    siblings = _magistral_dual_dump_siblings()
+    chosen = ac._select_weight_blobs(siblings)
+    tot = sum(int(f.get("size") or 0) for f in chosen)
+    gib = tot / (1024**3)
+    assert 40.0 <= gib <= 50.0, f"expected one ~44.7 GiB dump, got {gib:.1f}"
+    names = {str(f.get("rfilename") or "") for f in chosen}
+    has_cons = any(n.rsplit("/", 1)[-1].startswith("consolidated.") for n in names)
+    has_shards = any("-of-" in n for n in names)
+    assert not (has_cons and has_shards), names
+    # Shards-only still sums; consolidated-only still counts.
+    shards_only = [f for f in siblings if "-of-" in str(f.get("rfilename") or "")]
+    cons_only = [f for f in siblings if "consolidated." in str(f.get("rfilename") or "")]
+    assert abs(sum(int(f["size"]) for f in ac._select_weight_blobs(shards_only)) - tot) < 1
+    assert abs(sum(int(f["size"]) for f in ac._select_weight_blobs(cons_only)) - tot) < 1
+
+
+def test_hub_blob_measure_does_not_double_count_consolidated_and_shards(monkeypatch):
+    api = json.dumps({"siblings": _magistral_dual_dump_siblings()})
+
+    def fake_http(url, timeout=20.0):
+        if "blobs=true" in url or "api/models" in url:
+            return api, None
+        return None, "skip"
+
+    monkeypatch.setattr(ac, "_http_get", fake_http)
+    blob = ac._hub_blob_measure("mistralai/Magistral-Small-2509")
+    assert blob is not None
+    assert 40.0 <= float(blob["gib"]) <= 50.0, blob
+    w = ac.estimate_weights_gib("mistralai/Magistral-Small-2509", None)
+    assert w is not None
+    assert 40.0 <= float(w) <= 50.0, w
+
+
+def test_recommend_magistral_fits_1_spark_despite_dual_hub_dumps(monkeypatch):
+    """Live 1-Spark recommend must not serve_block Magistral because of 89.4 GiB."""
+    api = json.dumps({"siblings": _magistral_dual_dump_siblings()})
+
+    def fake_http(url, timeout=20.0):
+        if "blobs=true" in url or "api/models" in url:
+            return api, None
+        return None, "skip"
+
+    corpus = Path(__file__).resolve().parent / "corpus" / "mistralai__Magistral-Small-2509"
+    readme = (corpus / "card.md").read_text(encoding="utf-8")
+    hf = json.loads((corpus / "config.json").read_text(encoding="utf-8"))
+
+    def fake_fetch(model_id: str, timeout: float = 20.0) -> dict:
+        return {
+            "model_id": model_id,
+            "readme": readme,
+            "config": hf,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": [f"fixture://{model_id}"],
+        }
+
+    monkeypatch.setattr(ac, "_http_get", fake_http)
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    rec = ac.recommend("mistralai/Magistral-Small-2509", fetch_remote=True)
+    w = (rec.get("topology") or {}).get("weights_gib")
+    assert w is not None
+    assert 40.0 <= float(w) <= 55.0, f"double-counted Hub dumps? weights_gib={w}"
+    assert rec["serve_blocked"] is False, rec.get("warnings")
+    cmd = " ".join(
+        [
+            rec["config"].get("extra_flags") or "",
+            rec["config"].get("tool_call_parser") or "",
+        ]
+    )
+    assert "$" not in cmd
+    assert "--model " not in (rec["config"].get("extra_flags") or "")
+
+
 def test_weight_floor_not_for_compact_moe_in_name():
     """30B-A3B / similar compact MoE ids must not get the 400 GiB expert refuse floor."""
     cfg = {"n_routed_experts": 128}
@@ -1830,6 +2204,167 @@ def test_ensure_dspark_after_scrub_without_method_token():
     assert "--speculative_config.model nvidia/Lightning-DSpark" in cfg["extra_flags"]
 
 
+# Live Nemotron Lightning card (Aug 2026): Spark/DSpark Quick Start is duplicated
+# under #### 1x DGX Spark, and Ampere is headed **W4A16 (vLLM)** — that heading
+# used to take the +35 vLLM bonus and skip the Ampere penalty (125 vs 57).
+_NEMOTRON_LIVE_SHAPED_CARD = """
+## Quick Start
+
+To get quickly started on DGX Spark (GB10) you can use the following command.
+
+```shell
+export MODEL_CKPT=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+export DSPARK_CKPT=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
+```
+
+```shell
+vllm serve --model $MODEL_CKPT \\
+  --moe-backend marlin \\
+  --kv-cache-dtype fp8 \\
+  --enable-prefix-caching \\
+  --speculative_config.num_speculative_tokens 3 \\
+  --mamba-backend flashinfer \\
+  --mamba-cache-mode align \\
+  --reasoning-parser nemotron_v3 \\
+  --speculative_config.model $DSPARK_CKPT \\
+  --tool-call-parser qwen3_coder \\
+  --enable-auto-tool-choice
+```
+
+## **Quick Start Guide**
+
+### **vLLM**
+
+#### **1x DGX Spark (GB10)**
+
+```shell
+vllm serve --model $MODEL_CKPT \\
+  --moe-backend marlin \\
+  --kv-cache-dtype fp8 \\
+  --enable-prefix-caching \\
+  --speculative_config.num_speculative_tokens 3 \\
+  --mamba-backend flashinfer \\
+  --mamba-cache-mode align \\
+  --reasoning-parser nemotron_v3 \\
+  --speculative_config.model $DSPARK_CKPT \\
+  --tool-call-parser qwen3_coder \\
+  --enable-auto-tool-choice
+```
+
+#### **W4A16 (vLLM)**
+
+```shell
+vllm serve --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \\
+    --moe-backend humming \\
+    --linear-backend humming \\
+    --max-num-seqs 256 \\
+    --max-num-batched-tokens 32768 \\
+    --enable-prefix-caching \\
+    --async-scheduling \\
+    --quantization modelopt_fp4 \\
+    --mamba-backend flashinfer \\
+    --mamba-cache-mode align \\
+    --mamba-ssu-algorithm simple \\
+    --reasoning-parser nemotron_v3 \\
+    --tool-call-parser qwen3_coder \\
+    --enable-auto-tool-choice
+```
+"""
+
+
+def _nemotron_lightning_detected() -> dict:
+    return ac.analyze_config(
+        {
+            "architectures": ["NemotronHForCausalLM"],
+            "model_type": "nemotron_h",
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "a": {"quant_algo": "FP8"},
+                    "b": {"quant_algo": "W4A16_NVFP4"},
+                },
+            },
+        },
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    )
+
+
+def test_w4a16_vllm_heading_loses_to_spark_dspark():
+    """Live heading 'W4A16 (vLLM)' must not out-score Spark/DSpark Quick Start."""
+    det = _nemotron_lightning_detected()
+    cands = ac.extract_serve_candidates(_NEMOTRON_LIVE_SHAPED_CARD, detected=det)
+    assert cands
+    best = cands[0]
+    w4 = next(c for c in cands if "w4a16" in (c.section or "").lower())
+    blob = f"{best.section} {best.raw}".lower()
+    assert "spark" in blob or "dspark" in blob, (
+        f"expected Spark/DSpark winner, got section={best.section!r} score={best.score}"
+    )
+    assert best.score > w4.score, (
+        f"Spark/DSpark {best.score} must beat W4A16 (vLLM) {w4.score} "
+        f"(section={best.section!r} vs {w4.section!r})"
+    )
+    # Duplicate Spark cmd should keep the hardware heading, not only Quick Start.
+    assert "spark" in (best.section or "").lower()
+
+
+def test_recommend_nemotron_resolves_dspark_and_strips_humming(monkeypatch):
+    """Winning Spark recipe must resolve $DSPARK_CKPT and drop leftover humming."""
+    det_cfg = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "max_position_embeddings": 1048576,
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "a": {"quant_algo": "FP8"},
+                "b": {"quant_algo": "W4A16_NVFP4"},
+            },
+        },
+    }
+
+    def fake_fetch(model_id: str, timeout: float = 20.0) -> dict:
+        return {
+            "model_id": model_id,
+            "readme": _NEMOTRON_LIVE_SHAPED_CARD,
+            "config": det_cfg,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": ["fixture://nemotron-live-shaped"],
+        }
+
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.1)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+    rec = ac.recommend(
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", fetch_remote=True
+    )
+    cfg = rec["config"]
+    extra = cfg.get("extra_flags") or ""
+    assert "spark" in (rec.get("label") or "").lower(), rec.get("label")
+    assert "W4A16" not in (rec.get("label") or "")
+    assert "$" not in extra
+    assert "--model " not in extra
+    assert "humming" not in extra.lower()
+    assert (cfg.get("moe_backend") or "") != "humming"
+    assert "--linear-backend" not in extra
+    assert "--speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark" in extra
+    assert "--speculative_config.method dspark" in extra
+
+
 def test_config_quant_overrides_ampere_prose_modelopt_fp4():
     """Card Ampere recipe mentions modelopt_fp4; config MIXED_PRECISION must win."""
     base = {"quantization": "modelopt_fp4", "model": "nvidia/Nemotron-X-NVFP4"}
@@ -1884,6 +2419,61 @@ def test_vendor_doc_urls_follow_unsloth_guide():
         == "https://unsloth.ai/docs/models/qwen3.8.md"
     )
     assert ac.vendor_doc_to_fetch_url("https://evil.example/docs/x") is None
+
+
+def test_vendor_doc_to_fetch_url_recipes_vllm_catalog_org_no_md():
+    """recipes.vllm.ai is not GitBook: {path}.md 404s; catalog org is Google (HF is google)."""
+    fetch = ac.vendor_doc_to_fetch_url("https://recipes.vllm.ai/google/gemma-4-31B-it")
+    assert fetch == "https://recipes.vllm.ai/Google/gemma-4-31B-it"
+    assert not fetch.endswith(".md")
+    assert (
+        ac.vendor_doc_to_fetch_url("https://recipes.vllm.ai/Google/gemma-4-31B-it")
+        == "https://recipes.vllm.ai/Google/gemma-4-31B-it"
+    )
+    # Accidental .md on a catalog path must be stripped, not kept.
+    assert (
+        ac.vendor_doc_to_fetch_url("https://recipes.vllm.ai/google/gemma-4-31B-it.md")
+        == "https://recipes.vllm.ai/Google/gemma-4-31B-it"
+    )
+    # Unsloth GitBook still gets .md
+    assert (
+        ac.vendor_doc_to_fetch_url("https://unsloth.ai/docs/models/gemma-4")
+        == "https://unsloth.ai/docs/models/gemma-4.md"
+    )
+
+
+def test_fetch_cookbook_text_ingests_recipes_vllm_html(monkeypatch):
+    """Official catalog page is HTML; ingest serve recipes instead of failing on <!DOCTYPE."""
+    html = (
+        "<!DOCTYPE html><html><body>"
+        "<script>vllm serve ignore-me --reasoning-parser skip</script>"
+        "<pre><code>vllm serve google/gemma-4-31B-it \\\n"
+        "  --reasoning-parser gemma4 \\\n"
+        "  --tool-call-parser gemma4</code></pre>"
+        "</body></html>"
+    )
+    seen: list[str] = []
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        return html, None
+
+    monkeypatch.setattr(ac, "_http_get_raw", fake_get)
+    text, err = ac.fetch_cookbook_text("https://recipes.vllm.ai/google/gemma-4-31B-it")
+    assert err is None
+    assert text is not None
+    assert "reasoning-parser gemma4" in text
+    assert "tool-call-parser gemma4" in text
+    assert "ignore-me" not in text
+    assert seen
+    assert not any(u.endswith(".md") for u in seen)
+    assert any("/Google/gemma-4-31B-it" in u and not u.endswith(".md") for u in seen)
+    cands = ac.extract_serve_candidates(text)
+    assert any(
+        (c.config or {}).get("reasoning_parser") == "gemma4"
+        and (c.config or {}).get("tool_call_parser") == "gemma4"
+        for c in cands
+    )
 
 
 def test_recommend_follows_unsloth_vendor_doc(monkeypatch):
@@ -2590,6 +3180,71 @@ def test_marlin_kept_for_pure_nvfp4_qwen_on_027():
     assert ac._marlin_unsafe_for_checkpoint(mixed, "vllm/vllm-openai:v0.27.1") is True
 
 
+def test_marlin_kept_for_modelopt_mixed_qwen_on_027():
+    """NVIDIA Qwen3.6-35B ModelOpt MIXED_PRECISION playbook keeps marlin on ≥0.27."""
+    mixed = {
+        "family": "qwen",
+        "is_moe": True,
+        "has_nvfp4": True,
+        "has_fp8": True,
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "modelopt_mixed",
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+    }
+    assert ac._marlin_unsafe_for_checkpoint(mixed, "vllm/vllm-openai:v0.27.1") is False
+    assert ac._marlin_unsafe_for_checkpoint(mixed, "vllm/vllm-openai:v0.25.0") is True
+    assert ac._marlin_unsafe_for_checkpoint(mixed) is False  # lab default ≥0.27
+
+
+def test_first_boot_keeps_playbook_mtp_and_attention():
+    """Playbook MTP 3 + flashinfer attention must survive first-boot when marlin is legal."""
+    detected = {
+        "is_moe": True,
+        "has_nvfp4": True,
+        "has_fp8": True,
+        "is_mixed_nvfp4_fp8": True,
+        "quant_flag": "modelopt_mixed",
+        "quant_method": "modelopt",
+        "family": "qwen",
+    }
+    serve_cfg = {
+        "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        "quantization": "modelopt_mixed",
+        "moe_backend": "marlin",
+        "mtp": True,
+        "mtp_num_tokens": 3,
+        "mtp_moe_backend": "triton",
+        "image": "vllm/vllm-openai:v0.27.1",
+        "extra_flags": "--attention-backend flashinfer --max-num-batched-tokens 8192",
+        "kv_cache_dtype": "fp8",
+        "max_num_seqs": 4,
+        "docker_env": [],
+    }
+    warnings: list[str] = []
+    rationale: list[str] = []
+    ac._apply_checkpoint_safety(serve_cfg, detected, warnings, rationale)
+    assert serve_cfg["moe_backend"] == "marlin"
+    ac._apply_first_boot_defaults(
+        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+    )
+    assert serve_cfg["moe_backend"] == "marlin"
+    assert serve_cfg["mtp"] is True
+    assert serve_cfg["mtp_num_tokens"] == 3
+    assert serve_cfg.get("mtp_moe_backend") == "triton"
+    assert "--attention-backend flashinfer" in (serve_cfg.get("extra_flags") or "")
+    assert "--max-num-batched-tokens 8192" in (serve_cfg.get("extra_flags") or "")
+
+
+def test_card_prose_hints_qwen3_xml():
+    prose = ac._card_prose_hints(
+        "Spark serve uses --tool-call-parser qwen3_xml --enable-auto-tool-choice "
+        "(not the qwen3_coder default)."
+    )
+    assert prose.get("tool_call_parser") == "qwen3_xml"
+    assert prose.get("enable_auto_tool_choice") is True
+
+
 def test_parse_card_image_skips_nightly_but_flags_floating_only():
     readme = (
         "To serve this checkpoint start docker `vllm/vllm-openai:nightly` "
@@ -2701,6 +3356,8 @@ def test_family_doc_slugs_publisher_agnostic():
     )
     assert "qwen3.8" in slugs
     assert "nvfp4" in slugs
+    assert "qwen3.6" not in slugs
+    assert "qwen3.5" not in slugs
     slugs_official = ac.family_doc_slugs("Qwen/Qwen3.8-27B", {"family": "qwen"})
     assert "qwen3.8" in slugs_official
     # Architecture-only id: Qwen3.8 ships as qwen3_5 VL classes.
@@ -2715,6 +3372,18 @@ def test_family_doc_slugs_publisher_agnostic():
         },
     )
     assert "qwen3.8" in slugs_arch
+    # 3.6 / 3.5 stay specific — must not collapse onto 3.8.
+    slugs_36 = ac.family_doc_slugs(
+        "unsloth/Qwen3.6-35B-A3B-NVFP4",
+        {"family": "qwen", "has_nvfp4": True},
+    )
+    assert "qwen3.6" in slugs_36
+    assert "qwen3.8" not in slugs_36
+    assert "qwen3.5" not in slugs_36
+    slugs_35 = ac.family_doc_slugs("Qwen/Qwen3.5-27B", {"family": "qwen"})
+    assert "qwen3.5" in slugs_35
+    assert "qwen3.8" not in slugs_35
+    assert "qwen3.6" not in slugs_35
 
 
 def test_vendor_candidate_family_mismatch_drops_gemma_for_qwen():
@@ -2730,6 +3399,75 @@ def test_vendor_candidate_family_mismatch_drops_gemma_for_qwen():
     )
     assert ac._vendor_candidate_family_mismatch(gemma, "qwen") is True
     assert ac._vendor_candidate_family_mismatch(qwen, "qwen") is False
+    assert ac._vendor_candidate_family_mismatch(qwen, "gemma4") is True
+    assert ac._vendor_candidate_family_mismatch(gemma, "gemma4") is False
+
+
+def test_vendor_candidate_sibling_mismatch_drops_26b_moe_for_31b_dense():
+    """Unsloth Gemma-4 page mixes 26B-A4B Spark MoE with dense 31B."""
+    moe_26b = ac.ServeCandidate(
+        raw="export CUTE_DSL_ARCH=sm_121a\nvllm serve unsloth/gemma-4-26B-A4B-it-NVFP4 --moe-backend flashinfer_b12x",
+        model="unsloth/gemma-4-26B-A4B-it-NVFP4",
+        config={"moe_backend": "flashinfer_b12x"},
+    )
+    dense_31b = ac.ServeCandidate(
+        raw="vllm serve google/gemma-4-31B-it --reasoning-parser gemma4",
+        model="google/gemma-4-31B-it",
+        config={"reasoning_parser": "gemma4"},
+    )
+    assert ac._model_size_tokens("google/gemma-4-31B-it") == frozenset({"31b"})
+    assert ac._model_size_tokens("unsloth/gemma-4-26B-A4B-it-NVFP4") == frozenset(
+        {"26b-a4b"}
+    )
+    assert ac._model_size_tokens("google/gemma-4-E4B-it") == frozenset({"e4b"})
+    assert ac._vendor_candidate_sibling_mismatch(moe_26b, "google/gemma-4-31B-it") is True
+    assert (
+        ac._vendor_candidate_sibling_mismatch(moe_26b, "unsloth/gemma-4-31B-it-NVFP4")
+        is True
+    )
+    assert ac._vendor_candidate_sibling_mismatch(dense_31b, "google/gemma-4-31B-it") is False
+    assert (
+        ac._vendor_candidate_sibling_mismatch(dense_31b, "unsloth/gemma-4-31B-it-NVFP4")
+        is False
+    )
+    # Same family, no size token — do not invent a mismatch.
+    bare = ac.ServeCandidate(raw="vllm serve unsloth/gemma-4", model="unsloth/gemma-4")
+    assert ac._vendor_candidate_sibling_mismatch(bare, "google/gemma-4-31B-it") is False
+    nvidia_35 = ac.ServeCandidate(
+        raw="vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 --tool-call-parser qwen3_xml",
+        model="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        config={"tool_call_parser": "qwen3_xml"},
+    )
+    assert (
+        ac._vendor_candidate_sibling_mismatch(
+            nvidia_35, "unsloth/Qwen3.6-35B-A3B-NVFP4"
+        )
+        is True
+    )
+
+
+def test_discover_recipe_urls_gemma4_official_catalog_not_nvidia_qwen():
+    """Unsloth Gemma-4 NVFP4: official Google catalog page, not NVIDIA Qwen cookbooks.
+
+    recipes.vllm.ai/unsloth/gemma-4-31B-it-NVFP4 404s; the live page is
+    recipes.vllm.ai/Google/gemma-4-31B-it. NVIDIA playbooks are Qwen/Nemotron.
+    """
+    found = ac.discover_recipe_urls(
+        "unsloth/gemma-4-31B-it-NVFP4",
+        {"family": "gemma4", "has_nvfp4": True},
+    )
+    refs = [u.url for u in found]
+    assert any("unsloth.ai/docs/models/gemma-4" in r for r in refs), refs
+    assert any(r.endswith("recipes.vllm.ai/unsloth/gemma-4-31B-it-NVFP4") for r in refs), refs
+    assert any(r.endswith("recipes.vllm.ai/Google/gemma-4-31B-it") for r in refs), refs
+    assert not any("recipes.vllm.ai/" in r and r.endswith(".md") for r in refs)
+    assert not any(u.kind == "nvidia_playbook" for u in found), refs
+    # Official Qwen still gets NVIDIA playbooks (family-aware, not NVFP4-blind).
+    qwen = ac.discover_recipe_urls(
+        "unsloth/Qwen3.6-35B-A3B-NVFP4",
+        {"family": "qwen", "has_nvfp4": True},
+    )
+    assert any(u.kind == "nvidia_playbook" for u in qwen)
 
 
 def test_discover_recipe_urls_without_card_links():
@@ -2746,6 +3484,8 @@ def test_discover_recipe_urls_without_card_links():
     assert any("unsloth.ai/docs/models/qwen3.8" in r for r in refs)
     assert any(u.origin == "derived" and u.kind == "vendor_doc" for u in found)
     assert any(u.kind == "nvidia_playbook" for u in found)
+    assert any(r.endswith("recipes.vllm.ai/acme/Qwen3.8-27B-NVFP4") for r in refs)
+    assert not any(r.endswith("recipes.vllm.ai/qwen3.8.md") for r in refs)
 
 
 def _patch_offline_recommend(monkeypatch, *, readme, config, topo_ram=121.7, sku="NVIDIA GB10"):
@@ -2812,6 +3552,131 @@ def test_recommend_researches_vendor_when_card_has_no_url(monkeypatch):
     assert cfg.get("kv_cache_dtype") == "fp8"
     assert cfg.get("reasoning_parser") == "qwen3"
     assert rec["serve_blocked"] is False
+
+
+def test_recommend_gemma4_nvfp4_ignores_nvidia_qwen_playbook(monkeypatch):
+    """Gemma-4 NVFP4 must not inherit --reasoning-parser qwen3 from NVIDIA cookbooks.
+
+    The Unsloth recipes.vllm.ai path 404s; fetch the official Google catalog page.
+    """
+    hf_config = {
+        "architectures": ["Gemma4ForCausalLM"],
+        "model_type": "gemma4",
+        "hidden_size": 5376,
+        "num_hidden_layers": 46,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 16,
+        "max_position_embeddings": 131072,
+        "quantization_config": {"quant_method": "compressed-tensors"},
+    }
+    nvidia_qwen = (
+        "vllm serve nvidia/Qwen3.6-35B-A3B-NVFP4 "
+        "--reasoning-parser qwen3 --tool-call-parser qwen3_xml\n"
+        "Spark serve uses --reasoning-parser qwen3 --tool-call-parser qwen3_xml.\n"
+    )
+    google_recipe = (
+        "<!DOCTYPE html><html><body><pre><code>"
+        "vllm serve google/gemma-4-31B-it \\\n"
+        "  --reasoning-parser gemma4 \\\n"
+        "  --tool-call-parser gemma4 --enable-auto-tool-choice"
+        "</code></pre></body></html>"
+    )
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# unsloth/gemma-4-31B-it-NVFP4\nNo serve recipe.\n",
+        config=hf_config,
+    )
+    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
+
+    fetched: list[str] = []
+
+    def fake_cookbook(url: str, **kwargs):
+        fetched.append(url)
+        if "dgx-spark-playbooks" in url or "NVIDIA-NeMo" in url:
+            return nvidia_qwen, None
+        if "recipes.vllm.ai" in url and "Google/gemma-4-31B-it" in url:
+            return ac.html_recipe_text(google_recipe), None
+        if "recipes.vllm.ai" in url:
+            return None, "404"
+        if "unsloth.ai/docs/models/gemma-4" in url:
+            return (
+                "vllm serve unsloth/gemma-4-31B-it "
+                "--reasoning-parser gemma4 --tool-call-parser gemma4\n"
+            ), None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+
+    rec = ac.recommend("unsloth/gemma-4-31B-it-NVFP4", fetch_remote=True)
+    cfg = rec["config"]
+    assert rec["serve_blocked"] is False
+    assert cfg.get("reasoning_parser") == "gemma4", rec.get("rationale")
+    assert cfg.get("tool_call_parser") == "gemma4"
+    assert cfg.get("reasoning_parser") != "qwen3"
+    assert "qwen3" not in str(cfg.get("tool_call_parser") or "")
+    assert "gemma4-cu130" in (cfg.get("image") or ""), rec.get("rationale")
+    assert not any("dgx-spark-playbooks" in u or "NVIDIA-NeMo" in u for u in fetched), fetched
+    assert any("recipes.vllm.ai/Google/gemma-4-31B-it" in u for u in fetched), fetched
+
+
+def test_recommend_gemma4_31b_ignores_unsloth_26b_moe_spark(monkeypatch):
+    """Official 31B extras survive the parsers-only overlay; 26B-A4B Spark MoE does not win."""
+    hf_config = {
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "model_type": "gemma4",
+        "hidden_size": 5376,
+        "num_hidden_layers": 46,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 16,
+        "max_position_embeddings": 131072,
+    }
+    unsloth_page = (
+        "## DGX Spark with NVFP4 quants\n"
+        "```bash\n"
+        "export CUTE_DSL_ARCH=sm_121a\n"
+        "vllm serve unsloth/gemma-4-26B-A4B-it-NVFP4 --moe-backend flashinfer_b12x\n"
+        "```\n"
+    )
+    google_recipe = (
+        "<!DOCTYPE html><html><body><pre><code>"
+        "vllm serve google/gemma-4-31B-it \\\n"
+        "  --enable-auto-tool-choice --reasoning-parser gemma4 --tool-call-parser gemma4 \\\n"
+        "  --chat-template examples/tool_chat_template_gemma4.jinja \\\n"
+        "  --limit-mm-per-prompt '{\"image\": 4, \"audio\": 1}' --async-scheduling"
+        "</code></pre></body></html>"
+    )
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# google/gemma-4-31B-it\nNo serve recipe.\n",
+        config=hf_config,
+    )
+
+    def fake_cookbook(url: str, **kwargs):
+        if "unsloth.ai/docs/models/gemma-4" in url:
+            return unsloth_page, None
+        if "recipes.vllm.ai" in url and "Google/gemma-4-31B-it" in url:
+            return ac.html_recipe_text(google_recipe), None
+        if "recipes.vllm.ai" in url:
+            return None, "404"
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+
+    ov = ac._family_overlay("google/gemma-4-31B-it", {"family": "gemma4"})
+    assert ov is not None and ov["family_key"] == "gemma4"
+
+    for mid in ("google/gemma-4-31B-it", "unsloth/gemma-4-31B-it-NVFP4"):
+        rec = ac.recommend(mid, fetch_remote=True)
+        cfg = rec["config"]
+        extras = cfg.get("extra_flags") or ""
+        assert rec["serve_blocked"] is False
+        assert cfg.get("reasoning_parser") == "gemma4", (mid, rec.get("rationale"))
+        assert cfg.get("tool_call_parser") == "gemma4"
+        assert cfg.get("moe_backend") != "flashinfer_b12x", (mid, rec.get("rationale"))
+        assert "--chat-template" in extras, extras
+        assert "--async-scheduling" in extras, extras
+        assert "--limit-mm-per-prompt" in extras, extras
+        assert "26B-A4B" not in " ".join(rec.get("rationale") or [])
 
 
 def test_recommend_unsloth_qwen38_nvfp4_spark(monkeypatch):
@@ -3016,5 +3881,601 @@ def test_recommend_accepts_request_with_no_mode(monkeypatch):
     assert rec.get("mode") in (None, "auto")
     assert rec["serve_blocked"] is False
     assert rec["config"].get("util") is not None
+
+
+def test_family_doc_slugs_cover_playbook_families():
+    cases = (
+        ("google/gemma-2-9b-it", {"family": "gemma"}, "gemma"),
+        ("google/gemma-4-31B-it", {"family": "gemma4"}, "gemma-4"),
+        ("unsloth/gemma-4-31B-it-NVFP4", {"family": "gemma4", "has_nvfp4": True}, "gemma-4"),
+        ("THUDM/glm-4-9b-chat", {"family": "glm"}, "glm"),
+        ("moonshotai/Kimi-K2-Instruct", {"family": "kimi"}, "kimi"),
+        ("meta-llama/Llama-3.3-70B-Instruct", {"family": "llama"}, "llama"),
+        ("microsoft/Phi-4-mini-instruct", {"family": "phi"}, "phi"),
+        ("ibm-granite/granite-3.3-8b-instruct", {"family": "granite"}, "granite"),
+        ("openai/gpt-oss-120b", {}, "gpt-oss"),
+        ("mistralai/Magistral-Small-2509", {"family": "mistral"}, "mistral"),
+        ("internlm/internlm3-8b-instruct", {"family": "internlm"}, "internlm"),
+    )
+    for model_id, detected, slug in cases:
+        slugs = ac.family_doc_slugs(model_id, detected)
+        assert slug in slugs, (model_id, slug, slugs)
+
+    for mid, det in (
+        ("google/gemma-4-31B-it", {"family": "gemma4"}),
+        ("unsloth/gemma-4-31B-it-NVFP4", {"family": "gemma4", "has_nvfp4": True}),
+    ):
+        found = ac.discover_recipe_urls(mid, det)
+        refs = [u.url for u in found]
+        org, name = mid.split("/", 1)
+        catalog_org = ac.recipes_vllm_catalog_org(org)
+        assert any("unsloth.ai/docs/models/gemma-4" in r for r in refs), refs
+        assert any(r.endswith(f"recipes.vllm.ai/{catalog_org}/{name}") for r in refs), refs
+        if org.lower() == "google":
+            assert catalog_org == "Google"
+            assert not any("recipes.vllm.ai/google/" in r for r in refs)
+        else:
+            # Quant twin: also emit the official catalog page (HF-org path 404s).
+            assert any(r.endswith("recipes.vllm.ai/Google/gemma-4-31B-it") for r in refs), refs
+        assert not any("recipes.vllm.ai/" in r and r.endswith(".md") for r in refs)
+        assert not any(u.kind == "nvidia_playbook" for u in found), refs
+
+
+def test_playbook_image_gemma4_not_anemll():
+    assert ac._playbook_required_image("google/gemma-4-31B-it", {"family": "gemma4"}) == (
+        "vllm/vllm-openai:gemma4-cu130"
+    )
+    assert ac._playbook_required_image(
+        "unsloth/gemma-4-31B-it-NVFP4", {"family": "gemma4"}
+    ) == "vllm/vllm-openai:gemma4-cu130"
+    assert ac._playbook_required_image(
+        "nvidia/Gemma-4-31B-IT-NVFP4", {}
+    ) == "vllm/vllm-openai:gemma4-cu130"
+    assert ac._playbook_required_image(
+        "google/diffusiongemma-26B-A4B-it", {"family": "gemma4"}
+    ) == "vllm/vllm-openai:gemma"
+    assert ac._playbook_required_image(
+        "nvidia/diffusiongemma-26B-A4B-it-NVFP4", {"family": "diffusiongemma"}
+    ) == "vllm/vllm-openai:gemma"
+    assert ac._playbook_required_image(
+        "deepseek-ai/DeepSeek-V4-Flash", {"family": "deepseek_v4"}
+    ) is None
+    assert ac._stock_image_semver("vllm/vllm-openai:gemma4-cu130") is None
+    assert ac._stock_image_semver("vllm/vllm-openai:gemma") is None
+    cfg = ac._empty_config("google/gemma-4-31B-it")
+    ac._resolve_image_for_gates(
+        cfg,
+        mode=None,
+        candidate_image=None,
+        card_image=None,
+        detected={"family": "gemma4"},
+        rationale=[],
+    )
+    assert cfg["image"] == "vllm/vllm-openai:gemma4-cu130"
+
+    dcfg = ac._empty_config("google/diffusiongemma-26B-A4B-it")
+    ac._resolve_image_for_gates(
+        dcfg,
+        mode=None,
+        candidate_image="vllm/vllm-openai:v0.27.1",
+        card_image="vllm/vllm-openai:v0.27.1",
+        detected={"family": "diffusiongemma"},
+        rationale=[],
+    )
+    assert dcfg["image"] == "vllm/vllm-openai:gemma"
+
+    # Overlay Anemll is never replaced by the Gemma 4 playbook pin.
+    anemll = ac._empty_config("google/gemma-4-31B-it")
+    anemll["image"] = ac.DSPARK_IMAGE
+    ac._resolve_image_for_gates(
+        anemll,
+        mode=None,
+        candidate_image="vllm/vllm-openai:gemma4-cu130",
+        card_image="vllm/vllm-openai:gemma4-cu130",
+        detected={"family": "gemma4"},
+        rationale=[],
+    )
+    assert anemll["image"] == ac.DSPARK_IMAGE
+
+    anemll_dg = ac._empty_config("google/diffusiongemma-26B-A4B-it")
+    anemll_dg["image"] = ac.DSPARK_IMAGE
+    ac._resolve_image_for_gates(
+        anemll_dg,
+        mode=None,
+        candidate_image=None,
+        card_image=None,
+        detected={"family": "diffusiongemma"},
+        rationale=[],
+    )
+    assert anemll_dg["image"] == ac.DSPARK_IMAGE
+
+
+def test_fill_internlm_hunyuan_step_ernie():
+    rationale: list[str] = []
+    intern = ac._empty_config("internlm/internlm3-8b-instruct")
+    ac._fill_from_config_detection(
+        intern, {"family": "internlm", "quant_flag": "", "architectures": []}, rationale
+    )
+    assert intern["tool_call_parser"] == "internlm"
+    hy = ac._empty_config("tencent/Hunyuan-A13B-Instruct-FP8")
+    ac._fill_from_config_detection(
+        hy, {"family": "hunyuan", "quant_flag": "", "architectures": []}, rationale
+    )
+    assert hy["reasoning_parser"] == "hunyuan_a13b"
+    assert hy["tool_call_parser"] == "hunyuan_a13b"
+    step = ac._empty_config("stepfun-ai/Step-3.5-Flash")
+    ac._fill_from_config_detection(
+        step, {"family": "step3p5", "quant_flag": "", "architectures": []}, rationale
+    )
+    assert step["tool_call_parser"] == "step3p5"
+    ernie = ac._empty_config("baidu/ERNIE-4.5-21B-A3B-Thinking")
+    ac._fill_from_config_detection(
+        ernie, {"family": "ernie", "quant_flag": "", "architectures": []}, rationale
+    )
+    assert ernie["reasoning_parser"] == "ernie45"
+
+
+def test_weight_floor_step_hy3_ernie300():
+    assert ac._weight_floor_gib("stepfun-ai/step3") >= 300
+    assert ac._weight_floor_gib("stepfun-ai/Step-3.5-Flash") is None
+    assert ac._weight_floor_gib("tencent/Hy3-preview") >= 500
+    assert ac._weight_floor_gib("tencent/Hunyuan-A13B-Instruct-FP8") is None
+    assert ac._weight_floor_gib("baidu/ERNIE-4.5-300B-A47B") >= 400
+    assert ac._weight_floor_gib("baidu/ERNIE-4.5-21B-A3B-Thinking") is None
+
+
+def test_recommend_gemma4_playbook_image(monkeypatch):
+    """recommend(google/gemma-4-*) auto-selects gemma4-cu130 (not note-and-keep v0.27.1)."""
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# google/gemma-4-31B-it\n\n```shell\nvllm serve google/gemma-4-31B-it\n```\n",
+        config={
+            "architectures": ["Gemma4ForCausalLM"],
+            "model_type": "gemma4",
+            "max_position_embeddings": 131072,
+            "hidden_size": 5376,
+            "num_hidden_layers": 46,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+        },
+    )
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 62.0)
+    rec = ac.recommend("google/gemma-4-31B-it", fetch_remote=True)
+    cfg = rec["config"]
+    assert rec["serve_blocked"] is False
+    assert cfg.get("image") == "vllm/vllm-openai:gemma4-cu130", rec.get("rationale")
+    assert cfg.get("reasoning_parser") == "gemma4"
+    assert cfg.get("tool_call_parser") == "gemma4"
+    assert "anemll" not in (cfg.get("image") or "").lower()
+
+
+def test_recommend_diffusiongemma_playbook(monkeypatch):
+    """DiffusionGemma pins :gemma + NVIDIA playbook flags; never Anemll; no $ / --model."""
+    _patch_offline_recommend(
+        monkeypatch,
+        readme=(
+            "# google/diffusiongemma-26B-A4B-it\n\n"
+            "docker pull vllm/vllm-openai:gemma\n"
+        ),
+        config={
+            "architectures": ["DiffusionGemmaForBlockDiffusion"],
+            "model_type": "diffusiongemma",
+            "max_position_embeddings": 262144,
+            "hidden_size": 5376,
+            "num_hidden_layers": 30,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 16,
+        },
+    )
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 49.0)
+    rec = ac.recommend("google/diffusiongemma-26B-A4B-it", fetch_remote=True)
+    cfg = rec["config"]
+    from app.services import serve as sv
+
+    cmd = "vllm serve " + rec["model"] + " " + " ".join(
+        sv._build_vllm_args(
+            util=float(cfg.get("util") or 0.4),
+            max_model_len=int(cfg.get("max_model_len") or 65536),
+            port=8000,
+            quantization=cfg.get("quantization") or "",
+            kv_cache_dtype=cfg.get("kv_cache_dtype") or "",
+            moe_backend=cfg.get("moe_backend") or "",
+            trust_remote_code=bool(cfg.get("trust_remote_code")),
+            enable_auto_tool_choice=bool(cfg.get("enable_auto_tool_choice")),
+            tool_call_parser=cfg.get("tool_call_parser") or "",
+            reasoning_parser=cfg.get("reasoning_parser") or "",
+            max_num_seqs=cfg.get("max_num_seqs"),
+            mtp=bool(cfg.get("mtp")),
+            mtp_num_tokens=int(cfg.get("mtp_num_tokens") or 2),
+            load_format=cfg.get("load_format") or "",
+            enable_chunked_prefill=bool(cfg.get("enable_chunked_prefill")),
+            enable_prefix_caching=bool(cfg.get("enable_prefix_caching")),
+            extra_flags=cfg.get("extra_flags") or "",
+            tensor_parallel_size=int(cfg.get("tensor_parallel_size") or 1),
+        )
+    )
+    assert rec["serve_blocked"] is False
+    assert cfg.get("image") == "vllm/vllm-openai:gemma", rec.get("rationale")
+    assert "gemma4-cu130" not in (cfg.get("image") or "")
+    assert "anemll" not in (cfg.get("image") or "").lower()
+    assert cfg.get("reasoning_parser") == "gemma4"
+    assert cfg.get("tool_call_parser") == "gemma4"
+    assert cfg.get("enable_auto_tool_choice") is True
+    extras = cfg.get("extra_flags") or ""
+    assert "--attention-backend" in extras and "TRITON_ATTN" in extras
+    assert "--diffusion-config" in extras
+    env = " ".join(str(e) for e in (cfg.get("docker_env") or []))
+    assert "VLLM_USE_V2_MODEL_RUNNER=1" in env
+    assert "$" not in cmd
+    assert "--model " not in cmd
+    assert "anemll" not in cmd.lower()
+
+
+def test_recommend_llamacpp_spark_pack(monkeypatch):
+    """Tiny GGUF-id fixture → Spark llama.cpp pack. Does not start llama-server."""
+    fixture = json.loads((FIX / "gguf_tiny.json").read_text())
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 0.4)
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}},
+    )
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    mid = fixture["id"]
+    rec = ac.recommend(mid, backend="llamacpp", fetch_remote=False)
+    via_helper = ac.recommend_llamacpp(mid, fetch_remote=False)
+    assert rec["engine"] == via_helper["engine"] == "llamacpp"
+    assert rec["serve_blocked"] is False
+    cfg = rec["config"]
+    assert cfg["ngl"] == 99
+    assert cfg["flash_attn"] == "on"
+    assert cfg["no_mmap"] is True
+    assert cfg["jinja"] is True
+    assert cfg["ubatch"] == 2048
+    assert cfg["ctx_size"] >= 8192
+    argv = rec["argv"]
+    assert "$" not in argv
+    assert "-ngl 99" in argv
+    assert "--no-mmap" in argv
+    assert "--flash-attn on" in argv
+    assert "--jinja" in argv
+    assert "-ub 2048" in argv or "--ubatch 2048" in argv
+    assert ac.looks_like_gguf(mid) is True
+    assert ac.looks_like_gguf(fixture["path"]) is True
+    assert ac.looks_like_gguf("org/plain-model", tags=fixture["tags"]) is True
+    assert ac.looks_like_gguf(fixture["vllm_id"]) is False
+
+
+def _gguf_multiquant_http(fixture):
+    api = json.dumps({"siblings": fixture["siblings"], "tags": fixture.get("tags") or ["gguf"]})
+
+    def fake_http(url, timeout=20.0):
+        if "blobs=true" in url or "api/models" in url:
+            return api, None
+        return None, "skip"
+
+    return fake_http
+
+
+def test_estimate_weights_gguf_picks_one_spark_quant(monkeypatch):
+    """Multi-quant GGUF repos must weigh one Spark quant, not the 26-file sum."""
+    fixture = json.loads((FIX / "gguf_multiquant.json").read_text())
+    monkeypatch.setattr(ac, "_http_get", _gguf_multiquant_http(fixture))
+    mid = fixture["id"]
+    w = ac.estimate_weights_gib(mid, None)
+    all_gguf = sum(
+        int(f["size"])
+        for f in fixture["siblings"]
+        if str(f.get("rfilename") or "").endswith(".gguf")
+    )
+    sum_gib = all_gguf / (1024**3)
+    assert sum_gib > 400.0, f"fixture must reproduce the 26-file sum, got {sum_gib:.1f}"
+    assert w is not None
+    assert 20.5 <= w <= 22.0, f"expected ~21.28 GiB UD-Q4_K_XL, got {w}"
+    assert w < 40.0
+    assert w < sum_gib / 10.0
+
+
+def test_recommend_llamacpp_multiquant_hf_quant_and_mtp(monkeypatch):
+    """NVIDIA playbook GGUF: -hf repo:UD-Q4_K_XL + MTP, not -m repo / serve_blocked -c 8192."""
+    fixture = json.loads((FIX / "gguf_multiquant.json").read_text())
+    monkeypatch.setattr(ac, "_http_get", _gguf_multiquant_http(fixture))
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}},
+    )
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    mid = fixture["id"]
+    rec = ac.recommend(mid, backend="llamacpp", fetch_remote=False)
+    assert rec["engine"] == "llamacpp"
+    assert rec["serve_blocked"] is False, rec.get("warnings")
+    cfg = rec["config"]
+    assert cfg["ngl"] == 99
+    assert cfg["ctx_size"] > 8192
+    argv = rec["argv"]
+    assert "$" not in argv
+    assert f"-hf {mid}:{fixture['spark_quant']}" in argv
+    assert f"-m {mid}" not in argv
+    assert "-m " not in argv
+    assert "--spec-type draft-mtp" in argv or "--spec-type mtp" in argv
+    assert "spec-draft-n-max" in argv
+    topo_w = (rec.get("topology") or {}).get("weights_gib")
+    assert topo_w is not None and 20.5 <= float(topo_w) <= 22.0
+
+
+def test_recommend_safetensors_stays_vllm(monkeypatch):
+    """Safetensors still take the vLLM recommend path when backend is omitted."""
+    hf = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "max_position_embeddings": 4096,
+    }
+    _patch_offline_recommend(monkeypatch, readme="# tiny\nNo serve recipe.\n", config=hf)
+    rec = ac.recommend("example/Tiny-Llama-8B", fetch_remote=True)
+    assert rec.get("engine") == "vllm"
+    assert rec["config"].get("ngl") is None
+    assert rec["config"].get("max_model_len") == 4096
+    assert "-ngl" not in str(rec.get("argv") or "")
+
+
+def test_api_route_wires_llamacpp_backend():
+    routes = Path(__file__).resolve().parents[1] / "app" / "api" / "routes.py"
+    text = routes.read_text()
+    assert "autoconfig.recommend" in text
+    assert "backend" in text
+    assert "llamacpp" in text
+    assert "sglang" in text
+
+
+def test_http_recommend_selects_all_three_engines(monkeypatch):
+    """Shipped GET /api/serve/recommend?backend=… hits recommend() per engine."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    fixture = json.loads((FIX / "gguf_tiny.json").read_text())
+    hf = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "max_position_embeddings": 32768,
+        "hidden_size": 2048,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+    }
+    _patch_offline_recommend(monkeypatch, readme="# x\nvllm serve org/x\n", config=hf)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 8.0)
+    client = TestClient(app)
+    vllm = client.get(
+        "/api/serve/recommend",
+        params={"model": "Qwen/Qwen3-8B", "backend": "vllm", "fetch_remote": True},
+    )
+    sgl = client.get(
+        "/api/serve/recommend",
+        params={"model": "Qwen/Qwen3-8B", "backend": "sglang", "fetch_remote": True},
+    )
+    assert vllm.status_code == 200, vllm.text
+    assert sgl.status_code == 200, sgl.text
+    assert vllm.json()["engine"] == "vllm"
+    assert sgl.json()["engine"] == "sglang"
+    assert "sglang.launch_server" in sgl.json()["argv"]
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}, "readme": None, "errors": []},
+    )
+    llama = client.get(
+        "/api/serve/recommend",
+        params={"model": fixture["id"], "backend": "llamacpp", "fetch_remote": False},
+    )
+    assert llama.status_code == 200, llama.text
+    assert llama.json()["engine"] == "llamacpp"
+    assert "-ngl 99" in llama.json()["argv"]
+
+
+def test_extract_sglang_candidates_from_unsloth_fixture():
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+    cands = ac.extract_sglang_candidates(guide)
+    assert cands
+    best = cands[0]
+    assert (best.config.get("spec_algorithm") or "").upper() == "NEXTN"
+    assert best.config.get("spec_num_steps") == 3
+    assert best.config.get("spec_draft_tokens") == 4
+    raw = (best.raw or "").lower()
+    assert "sglang.launch_server" in raw
+    assert "vllm serve" not in raw
+
+
+def test_parse_sglang_speculative_algo_alias():
+    """Unsloth cards spell --speculative-algo, not --speculative-algorithm."""
+    line = (
+        "python -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B "
+        "--port 8000 --tp-size 8 --mem-fraction-static 0.8 --context-length 262144 "
+        "--reasoning-parser qwen3 --speculative-algo NEXTN --speculative-num-steps 3 "
+        "--speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
+    )
+    cand = ac._parse_one_sglang_command(line)
+    assert cand is not None
+    assert (cand.config.get("spec_algorithm") or "").upper() == "NEXTN"
+    assert cand.config.get("spec_num_steps") == 3
+    assert cand.score >= 30
+
+
+def test_recommend_sglang_unsloth35b_corpus_card(monkeypatch):
+    """Shipped recommend(backend=sglang) on the real Unsloth 35B corpus card.
+
+    The card's MTP line uses --speculative-algo NEXTN (not --speculative-algorithm).
+    That recipe must win over the generic tp=8 serve, and argv must contain NEXTN
+    for the pasted unsloth id on this 1-Spark cluster.
+    """
+    case_dir = Path(__file__).resolve().parent / "corpus" / "unsloth__Qwen3.6-35B-A3B-NVFP4"
+    card = (case_dir / "card.md").read_text()
+    cfg = json.loads((case_dir / "config.json").read_text())
+    case = json.loads((case_dir / "case.json").read_text())
+    assert "--speculative-algo NEXTN" in card
+    assert "--speculative-algorithm NEXTN" not in card
+    _patch_offline_recommend(monkeypatch, readme=card, config=cfg)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline corpus"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: float(case["weights_gib"]))
+    rec = ac.recommend(case["model"], backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is False
+    argv = rec["argv"]
+    assert argv.startswith("python -m sglang.launch_server")
+    assert "NEXTN" in argv
+    assert "--speculative-algo NEXTN" in argv
+    assert rec["config"]["model_path"] == case["model"]
+    assert int(rec["config"]["tp_size"]) == 1
+    assert int(rec["config"]["port"]) == 30000
+    assert "$" not in argv
+    # Generic 8-GPU official-Qwen line must not win.
+    assert "--tp-size 8" not in argv
+
+
+def test_recommend_sglang_from_vendor_doc(monkeypatch):
+    """Public recommend(backend=sglang) emits an SGLang launch, not vllm serve."""
+    readme = "# Qwen3.8 NVFP4\n\nBare card. See Unsloth.\n"
+    cfg = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "max_position_embeddings": 262144,
+        "text_config": {
+            "hidden_size": 5120,
+            "num_attention_heads": 24,
+            "num_hidden_layers": 64,
+            "num_key_value_heads": 4,
+            "max_position_embeddings": 262144,
+        },
+    }
+    _patch_offline_recommend(monkeypatch, readme=readme, config=cfg)
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+
+    def fake_cookbook(url: str, **kwargs):
+        if "unsloth.ai" in url:
+            return guide, None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 18.0)
+    rec = ac.recommend("unsloth/Qwen3.8-27B-NVFP4", backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is False
+    argv = rec["argv"]
+    assert argv.startswith("python -m sglang.launch_server")
+    assert "vllm serve" not in argv
+    assert "--model-path" in argv
+    assert "unsloth/Qwen3.8-27B-NVFP4" in argv
+    assert rec["config"]["model_path"] == "unsloth/Qwen3.8-27B-NVFP4"
+    assert int(rec["config"]["tp_size"]) <= 2
+    assert int(rec["config"]["port"]) == 30000
+    assert "NEXTN" in argv
+    assert "--speculative-algo NEXTN" in argv or "--speculative-algorithm NEXTN" in argv
+    assert "--speculative-num-steps 3" in argv
+    assert "--speculative-num-draft-tokens 4" in argv
+    assert "$" not in argv
+    assert "--model " not in argv
+    assert rec["config"]["engine"] == "sglang"
+    # Same model, default backend stays vLLM.
+    vllm = ac.recommend("unsloth/Qwen3.8-27B-NVFP4", fetch_remote=True)
+    assert vllm["engine"] == "vllm"
+    assert vllm["config"].get("ngl") is None
+
+
+def test_recommend_sglang_clamps_vendor_tp_and_keeps_pasted_id(monkeypatch):
+    """An 8-GPU official-Qwen SGLang line must not win over the pasted Unsloth id."""
+    readme = (
+        "# mixed\n\n```bash\n"
+        "python -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B "
+        "--tp-size 8 --port 8000 --mem-fraction-static 0.9\n"
+        "```\n"
+    )
+    _patch_offline_recommend(
+        monkeypatch,
+        readme=readme,
+        config={
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "max_position_embeddings": 262144,
+        },
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 24.7)
+    rec = ac.recommend(
+        "unsloth/Qwen3.6-35B-A3B-NVFP4", backend="sglang", fetch_remote=True
+    )
+    assert rec["engine"] == "sglang"
+    assert rec["config"]["model_path"] == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    assert int(rec["config"]["tp_size"]) == 1
+    assert int(rec["config"]["port"]) == 30000
+    assert "--tp-size 8" not in rec["argv"]
+    assert "--model-path unsloth/Qwen3.6-35B-A3B-NVFP4" in rec["argv"]
+
+
+def test_recommend_sglang_refuses_too_big(monkeypatch):
+    """Too-big weights refuse on the SGLang path too — not an optimistic argv."""
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# DeepSeek-R1\n",
+        config={
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "n_routed_experts": 256,
+        },
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 700.0)
+    rec = ac.recommend("deepseek-ai/DeepSeek-R1", backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is True
+    assert "sglang.launch_server" in rec["argv"]
+    assert "$" not in rec["argv"]
+
+
+def test_recommend_three_engines_same_public_entry(monkeypatch):
+    """One public recommend() branches to three engine-native configs."""
+    fixture = json.loads((FIX / "gguf_tiny.json").read_text())
+    hf = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "max_position_embeddings": 32768,
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+    }
+    _patch_offline_recommend(monkeypatch, readme="# x\nvllm serve org/x --reasoning-parser qwen3\n", config=hf)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 16.0)
+    vllm = ac.recommend("Qwen/Qwen3-8B", backend="vllm", fetch_remote=True)
+    sgl = ac.recommend("Qwen/Qwen3-8B", backend="sglang", fetch_remote=True)
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}},
+    )
+    llama = ac.recommend(fixture["id"], backend="llamacpp", fetch_remote=False)
+    assert vllm["engine"] == "vllm"
+    assert "quantization" in vllm["config"] or vllm["config"].get("max_model_len")
+    assert sgl["engine"] == "sglang"
+    assert sgl["argv"].startswith("python -m sglang.launch_server")
+    assert llama["engine"] == "llamacpp"
+    assert "-ngl 99" in llama["argv"]
+    for rec in (vllm, sgl, llama):
+        blob = json.dumps(rec.get("config") or {}) + str(rec.get("argv") or "")
+        assert "$" not in blob
 
 

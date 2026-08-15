@@ -1,0 +1,17 @@
+{
+  "model": "google/gemma-4-31B-it",
+  "weights_gib": 62.0,
+  "note": "NVIDIA DGX Spark playbook: Gemma 4 family requires vllm/vllm-openai:gemma4-cu130.",
+  "expect": {
+    "serve_blocked": false,
+    "weights_gib_min": 50.0,
+    "weights_gib_max": 70.0,
+    "image_contains": "gemma4-cu130",
+    "config": {
+      "reasoning_parser": "gemma4",
+      "tool_call_parser": "gemma4",
+      "enable_auto_tool_choice": true
+    },
+    "forbidden": ["$", "--model ", "anemll"]
+  }
+}

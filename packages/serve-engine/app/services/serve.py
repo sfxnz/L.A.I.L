@@ -1,6 +1,7 @@
 """Serve / stop vLLM — fully driven by explicit user config (no profiles)."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import select
@@ -197,7 +198,7 @@ def build_single_node_docker_cmd(
         "--name", container,
         "--restart", "no",
         "--gpus", "all",
-        "--shm-size=4g",
+        "--shm-size=32g",
         "-p", f"127.0.0.1:{port}:{port}",
         "-v", f"{hf}:{HF_CACHE_IN_CONTAINER}",
         "-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}",
@@ -536,6 +537,44 @@ def _parse_extra_flags(extra_flags: str) -> list[str]:
     return shlex.split(s)
 
 
+def _mtp_speculative_json(
+    *,
+    num_tokens: int,
+    moe_backend: str = "",
+    extras: list[str] | None = None,
+) -> str:
+    """Structured MTP JSON, including Spark playbook keys (e.g. moe_backend:triton)."""
+    spec: dict[str, Any] = {
+        "method": "mtp",
+        "num_speculative_tokens": int(num_tokens),
+    }
+    extra_keys: dict[str, Any] = {}
+    args = extras or []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        raw = ""
+        if a == "--speculative-config" and i + 1 < len(args):
+            raw = str(args[i + 1])
+        elif a.startswith("--speculative-config="):
+            raw = a.split("=", 1)[1]
+        if raw:
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                obj = None
+            if isinstance(obj, dict):
+                extra_keys.update(
+                    {k: v for k, v in obj.items() if k not in ("method", "num_speculative_tokens")}
+                )
+        i += 1
+    moe = (moe_backend or "").strip() or extra_keys.pop("moe_backend", None)
+    if moe:
+        spec["moe_backend"] = str(moe)
+    spec.update(extra_keys)
+    return json.dumps(spec, separators=(",", ":"))
+
+
 def _strip_flag(args: list[str], flag: str) -> list[str]:
     """Drop ``flag`` (+ value) from an argv-style list."""
     out: list[str] = []
@@ -605,6 +644,7 @@ def _build_vllm_args(
     max_num_seqs: int | None = None,
     mtp: bool = False,
     mtp_num_tokens: int = 2,
+    mtp_moe_backend: str = "",
     load_format: str = "",
     enable_chunked_prefill: bool = False,
     enable_prefix_caching: bool = False,
@@ -646,13 +686,16 @@ def _build_vllm_args(
         args.append("--enable-chunked-prefill")
     if enable_prefix_caching:
         args.append("--enable-prefix-caching")
-    if mtp:
-        # Compact JSON; shlex-safe single token after the flag
-        cfg = f'{{"method":"mtp","num_speculative_tokens":{int(mtp_num_tokens)}}}'
-        args += ["--speculative-config", cfg]
     extras = _parse_extra_flags(extra_flags)
-    # Drop free-form duplicates of structured fields we already set.
     if mtp:
+        args += [
+            "--speculative-config",
+            _mtp_speculative_json(
+                num_tokens=mtp_num_tokens,
+                moe_backend=mtp_moe_backend,
+                extras=extras,
+            ),
+        ]
         extras = _strip_flag(extras, "--speculative-config")
     if quantization.strip():
         extras = _strip_flag(extras, "--quantization")
@@ -701,6 +744,7 @@ def serve_model(
     max_num_seqs: int | None = None,
     mtp: bool = False,
     mtp_num_tokens: int = 2,
+    mtp_moe_backend: str = "",
     load_format: str = "",
     enable_chunked_prefill: bool = False,
     enable_prefix_caching: bool = False,
@@ -773,33 +817,29 @@ def serve_model(
 
     env_list = _normalize_docker_env(docker_env)
 
-    # Guard: flashinfer_b12x crashes on mixed FP8+NVFP4 compressed-tensors MoE (e.g. Unsloth 35B).
+    # Guard: flashinfer_b12x crashed mixed FP8+NVFP4 on vLLM 0.25.x. On ≥0.27
+    # (lab default) Unsloth's Spark recipe *requires* it — share autoconfig policy.
     moe_backend = (moe_backend or "").strip()
     quant_l = (quantization or "").strip().lower()
     mid = (model or "").lower()
-    if moe_backend == "flashinfer_b12x" and (
-        quant_l in ("compressed-tensors", "compressed_tensors")
-        or "unsloth" in mid
-        or "mixed" in mid
-    ):
-        # Confirm via local HF config when available
-        unsafe = quant_l in ("compressed-tensors", "compressed_tensors") or "unsloth" in mid
+    if moe_backend == "flashinfer_b12x":
+        drop_b12x = False
         try:
-            from .autoconfig import analyze_config, load_local_fallback
+            from .autoconfig import (
+                analyze_config,
+                load_local_fallback,
+                _flashinfer_b12x_unsafe_for_checkpoint,
+            )
 
             local = load_local_fallback(model)
-            if local.get("config"):
-                det = analyze_config(local["config"], model)
-                unsafe = bool(
-                    det.get("is_mixed_nvfp4_fp8")
-                    or (det.get("is_moe") and det.get("has_fp8") and det.get("quant_flag") == "compressed-tensors")
-                )
+            det = analyze_config(local.get("config") or {}, model)
+            drop_b12x = _flashinfer_b12x_unsafe_for_checkpoint(det, image)
         except Exception:
-            pass
-        if unsafe:
+            drop_b12x = False
+        if drop_b12x:
             w(
                 "SAFETY: dropping --moe-backend flashinfer_b12x "
-                "(not supported for FP8 MoE on mixed compressed-tensors; leave auto)",
+                "(not supported for FP8 MoE on this image; leave auto)",
                 0.15,
             )
             moe_backend = ""
@@ -848,6 +888,7 @@ def serve_model(
         max_num_seqs=max_num_seqs,
         mtp=mtp,
         mtp_num_tokens=mtp_num_tokens,
+        mtp_moe_backend=mtp_moe_backend,
         load_format=load_format,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_prefix_caching=enable_prefix_caching,

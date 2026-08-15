@@ -4226,7 +4226,7 @@ def test_recommend_safetensors_stays_vllm(monkeypatch):
     }
     _patch_offline_recommend(monkeypatch, readme="# tiny\nNo serve recipe.\n", config=hf)
     rec = ac.recommend("example/Tiny-Llama-8B", fetch_remote=True)
-    assert rec.get("engine") != "llamacpp"
+    assert rec.get("engine") == "vllm"
     assert rec["config"].get("ngl") is None
     assert rec["config"].get("max_model_len") == 4096
     assert "-ngl" not in str(rec.get("argv") or "")
@@ -4235,9 +4235,200 @@ def test_recommend_safetensors_stays_vllm(monkeypatch):
 def test_api_route_wires_llamacpp_backend():
     routes = Path(__file__).resolve().parents[1] / "app" / "api" / "routes.py"
     text = routes.read_text()
-    assert "recommend_llamacpp" in text or 'backend=' in text
+    assert "autoconfig.recommend" in text
     assert "backend" in text
-    assert 'llamacpp' in text
-    assert 'backend or "vllm"' in text or "backend or 'vllm'" in text
+    assert "llamacpp" in text
+    assert "sglang" in text
+
+
+def test_http_recommend_selects_all_three_engines(monkeypatch):
+    """Shipped GET /api/serve/recommend?backend=… hits recommend() per engine."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    fixture = json.loads((FIX / "gguf_tiny.json").read_text())
+    hf = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "max_position_embeddings": 32768,
+        "hidden_size": 2048,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+    }
+    _patch_offline_recommend(monkeypatch, readme="# x\nvllm serve org/x\n", config=hf)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 8.0)
+    client = TestClient(app)
+    vllm = client.get(
+        "/api/serve/recommend",
+        params={"model": "Qwen/Qwen3-8B", "backend": "vllm", "fetch_remote": True},
+    )
+    sgl = client.get(
+        "/api/serve/recommend",
+        params={"model": "Qwen/Qwen3-8B", "backend": "sglang", "fetch_remote": True},
+    )
+    assert vllm.status_code == 200, vllm.text
+    assert sgl.status_code == 200, sgl.text
+    assert vllm.json()["engine"] == "vllm"
+    assert sgl.json()["engine"] == "sglang"
+    assert "sglang.launch_server" in sgl.json()["argv"]
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}, "readme": None, "errors": []},
+    )
+    llama = client.get(
+        "/api/serve/recommend",
+        params={"model": fixture["id"], "backend": "llamacpp", "fetch_remote": False},
+    )
+    assert llama.status_code == 200, llama.text
+    assert llama.json()["engine"] == "llamacpp"
+    assert "-ngl 99" in llama.json()["argv"]
+
+
+def test_extract_sglang_candidates_from_unsloth_fixture():
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+    cands = ac.extract_sglang_candidates(guide)
+    assert cands
+    best = cands[0]
+    assert (best.config.get("spec_algorithm") or "").upper() == "NEXTN"
+    assert best.config.get("spec_num_steps") == 3
+    assert best.config.get("spec_draft_tokens") == 4
+    raw = (best.raw or "").lower()
+    assert "sglang.launch_server" in raw
+    assert "vllm serve" not in raw
+
+
+def test_recommend_sglang_from_vendor_doc(monkeypatch):
+    """Public recommend(backend=sglang) emits an SGLang launch, not vllm serve."""
+    readme = "# Qwen3.8 NVFP4\n\nBare card. See Unsloth.\n"
+    cfg = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "max_position_embeddings": 262144,
+        "text_config": {
+            "hidden_size": 5120,
+            "num_attention_heads": 24,
+            "num_hidden_layers": 64,
+            "num_key_value_heads": 4,
+            "max_position_embeddings": 262144,
+        },
+    }
+    _patch_offline_recommend(monkeypatch, readme=readme, config=cfg)
+    guide = (FIX / "vendor_unsloth_qwen38.md").read_text()
+
+    def fake_cookbook(url: str, **kwargs):
+        if "unsloth.ai" in url:
+            return guide, None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 18.0)
+    rec = ac.recommend("unsloth/Qwen3.8-27B-NVFP4", backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is False
+    argv = rec["argv"]
+    assert argv.startswith("python -m sglang.launch_server")
+    assert "vllm serve" not in argv
+    assert "--model-path" in argv
+    assert "unsloth/Qwen3.8-27B-NVFP4" in argv
+    assert rec["config"]["model_path"] == "unsloth/Qwen3.8-27B-NVFP4"
+    assert int(rec["config"]["tp_size"]) <= 2
+    assert int(rec["config"]["port"]) == 30000
+    assert "--speculative-algorithm NEXTN" in argv
+    assert "--speculative-num-steps 3" in argv
+    assert "--speculative-num-draft-tokens 4" in argv
+    assert "$" not in argv
+    assert "--model " not in argv
+    assert rec["config"]["engine"] == "sglang"
+    # Same model, default backend stays vLLM.
+    vllm = ac.recommend("unsloth/Qwen3.8-27B-NVFP4", fetch_remote=True)
+    assert vllm["engine"] == "vllm"
+    assert vllm["config"].get("ngl") is None
+
+
+def test_recommend_sglang_clamps_vendor_tp_and_keeps_pasted_id(monkeypatch):
+    """An 8-GPU official-Qwen SGLang line must not win over the pasted Unsloth id."""
+    readme = (
+        "# mixed\n\n```bash\n"
+        "python -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B "
+        "--tp-size 8 --port 8000 --mem-fraction-static 0.9\n"
+        "```\n"
+    )
+    _patch_offline_recommend(
+        monkeypatch,
+        readme=readme,
+        config={
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "max_position_embeddings": 262144,
+        },
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 24.7)
+    rec = ac.recommend(
+        "unsloth/Qwen3.6-35B-A3B-NVFP4", backend="sglang", fetch_remote=True
+    )
+    assert rec["engine"] == "sglang"
+    assert rec["config"]["model_path"] == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    assert int(rec["config"]["tp_size"]) == 1
+    assert int(rec["config"]["port"]) == 30000
+    assert "--tp-size 8" not in rec["argv"]
+    assert "--model-path unsloth/Qwen3.6-35B-A3B-NVFP4" in rec["argv"]
+
+
+def test_recommend_sglang_refuses_too_big(monkeypatch):
+    """Too-big weights refuse on the SGLang path too — not an optimistic argv."""
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# DeepSeek-R1\n",
+        config={
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "n_routed_experts": 256,
+        },
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 700.0)
+    rec = ac.recommend("deepseek-ai/DeepSeek-R1", backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is True
+    assert "sglang.launch_server" in rec["argv"]
+    assert "$" not in rec["argv"]
+
+
+def test_recommend_three_engines_same_public_entry(monkeypatch):
+    """One public recommend() branches to three engine-native configs."""
+    fixture = json.loads((FIX / "gguf_tiny.json").read_text())
+    hf = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "max_position_embeddings": 32768,
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+    }
+    _patch_offline_recommend(monkeypatch, readme="# x\nvllm serve org/x --reasoning-parser qwen3\n", config=hf)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 16.0)
+    vllm = ac.recommend("Qwen/Qwen3-8B", backend="vllm", fetch_remote=True)
+    sgl = ac.recommend("Qwen/Qwen3-8B", backend="sglang", fetch_remote=True)
+    monkeypatch.setattr(
+        ac,
+        "fetch_hf_card",
+        lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": fixture["tags"]}},
+    )
+    llama = ac.recommend(fixture["id"], backend="llamacpp", fetch_remote=False)
+    assert vllm["engine"] == "vllm"
+    assert "quantization" in vllm["config"] or vllm["config"].get("max_model_len")
+    assert sgl["engine"] == "sglang"
+    assert sgl["argv"].startswith("python -m sglang.launch_server")
+    assert llama["engine"] == "llamacpp"
+    assert "-ngl 99" in llama["argv"]
+    for rec in (vllm, sgl, llama):
+        blob = json.dumps(rec.get("config") or {}) + str(rec.get("argv") or "")
+        assert "$" not in blob
 
 

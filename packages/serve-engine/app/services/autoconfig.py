@@ -1,4 +1,4 @@
-"""Auto-configure vLLM from the live Hugging Face model card plus vendor docs.
+"""Auto-configure vLLM, llama.cpp, or SGLang from the live HF card plus vendor docs.
 
 Primary sources:
   1. README.md on huggingface.co (parsed `vllm serve` / docker recipes)
@@ -3032,6 +3032,205 @@ def extract_serve_candidates(
     return candidates
 
 
+_SGLANG_LAUNCH_RE = re.compile(
+    r"(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?sglang\.launch_server\b",
+    re.I,
+)
+
+
+def _is_sglang_block(body: str) -> bool:
+    b = (body or "").lower()
+    return "sglang.launch_server" in b or "sglang.launch" in b
+
+
+def _parse_one_sglang_command(text: str) -> Optional[ServeCandidate]:
+    """Parse ``python -m sglang.launch_server …`` (or bare ``sglang.launch_server``)."""
+    text = _collapse_continuations(text or "")
+    m = _SGLANG_LAUNCH_RE.search(text)
+    if not m:
+        return None
+    after = text[m.end() :].strip()
+    lines: list[str] = []
+    for ln in after.splitlines():
+        s = ln.strip()
+        if not s:
+            if lines:
+                break
+            continue
+        if s.startswith("#") and lines:
+            break
+        if s.startswith("#"):
+            continue
+        if lines and re.match(r"^(export|uv |pip |source |cd |curl |vllm )\b", s):
+            break
+        lines.append(s)
+    joined = re.sub(r"\s+#\s.*$", "", " ".join(lines))
+    try:
+        tokens = shlex.split(joined, posix=True)
+    except ValueError:
+        tokens = joined.split()
+    cfg: dict[str, Any] = {
+        "engine": "sglang",
+        "model_path": "",
+        "tp_size": None,
+        "mem_fraction_static": None,
+        "context_length": None,
+        "trust_remote_code": False,
+        "host": "0.0.0.0",
+        "port": 30000,
+        "quantization": "",
+        "tool_call_parser": "",
+        "reasoning_parser": "",
+        "spec_algorithm": "",
+        "spec_num_steps": None,
+        "spec_eagle_topk": None,
+        "spec_draft_tokens": None,
+        "extra_flags": "",
+    }
+    extras: list[str] = []
+    model = None
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+
+        if t in ("--model-path", "--model") or t.startswith("--model-path=") or t.startswith("--model="):
+            val = t.split("=", 1)[1] if "=" in t and t.startswith("--") else (nxt or "")
+            if "=" in t and t.startswith("--"):
+                i += 1
+            else:
+                i += 2
+            cfg["model_path"] = val
+            model = val
+            continue
+        if t in ("--tp-size", "--tensor-parallel-size") or t.startswith("--tp-size="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["tp_size"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if t == "--mem-fraction-static" or t.startswith("--mem-fraction-static="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["mem_fraction_static"] = float(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if t == "--context-length" or t.startswith("--context-length="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["context_length"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if t == "--trust-remote-code":
+            cfg["trust_remote_code"] = True
+            i += 1
+            continue
+        if t in ("--host", "--port", "--quantization", "--tool-call-parser", "--reasoning-parser") or any(
+            t.startswith(p) for p in (
+                "--host=", "--port=", "--quantization=",
+                "--tool-call-parser=", "--reasoning-parser=",
+            )
+        ):
+            key = t.lstrip("-").split("=", 1)[0].replace("-", "_")
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            if key == "port":
+                try:
+                    cfg["port"] = int(val)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                cfg[key] = val
+            continue
+        if t == "--speculative-algorithm" or t.startswith("--speculative-algorithm="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            cfg["spec_algorithm"] = val
+            continue
+        if t == "--speculative-num-steps" or t.startswith("--speculative-num-steps="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["spec_num_steps"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if t == "--speculative-eagle-topk" or t.startswith("--speculative-eagle-topk="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["spec_eagle_topk"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if t == "--speculative-num-draft-tokens" or t.startswith("--speculative-num-draft-tokens="):
+            val = t.split("=", 1)[1] if "=" in t else (nxt or "")
+            i += 1 if "=" in t else 2
+            try:
+                cfg["spec_draft_tokens"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        extras.append(t)
+        i += 1
+    extra = " ".join(x for x in extras if x and not x.startswith("$"))
+    cfg["extra_flags"] = extra.strip()
+    reasons = []
+    score = 10.0
+    if cfg.get("spec_algorithm"):
+        score += 20
+        reasons.append(f"speculative {cfg['spec_algorithm']}")
+    if cfg.get("trust_remote_code"):
+        score += 5
+    return ServeCandidate(
+        raw=text.strip()[:500],
+        model=model,
+        args=tokens,
+        config=cfg,
+        score=score,
+        reasons=reasons,
+    )
+
+
+def extract_sglang_candidates(readme: str) -> list[ServeCandidate]:
+    """SGLang launch recipes on a card or vendor doc."""
+    if not readme:
+        return []
+    heads = _section_map(readme)
+    out: list[ServeCandidate] = []
+    seen: set[str] = set()
+    for start, _lang, body in _extract_code_blocks(readme):
+        if not _is_sglang_block(body):
+            continue
+        cand = _parse_one_sglang_command(_collapse_continuations(body))
+        if not cand:
+            continue
+        key = re.sub(r"\s+", " ", cand.raw)[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        cand.section = _section_at(heads, start)
+        out.append(cand)
+    for m in _SGLANG_LAUNCH_RE.finditer(readme):
+        cand = _parse_one_sglang_command(readme[m.start() : m.start() + 800])
+        if not cand:
+            continue
+        key = re.sub(r"\s+", " ", cand.raw)[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        cand.section = _section_at(heads, m.start())
+        out.append(cand)
+    out.sort(key=lambda c: c.score, reverse=True)
+    return out
+
+
 def _split_serve_fragments(body: str) -> list[str]:
     """Split a code block into independent serve command fragments."""
     body = body.strip()
@@ -4589,8 +4788,8 @@ def recommend(
     ``mode`` is accepted for old clients and ignored — util / max-len / VL
     come from the researched recipe + live hardware envelope.
 
-    ``backend`` is ``vllm`` (default) or ``llamacpp``. GGUF ids should use
-    ``llamacpp`` — that path never starts llama-server.
+    ``backend`` is ``vllm`` (default), ``llamacpp``, or ``sglang``. GGUF ids
+    should use ``llamacpp``. None of these paths start a server.
     """
     mode = None  # user-facing dual envelopes are gone
     model = (model or "").strip()
@@ -4600,6 +4799,8 @@ def recommend(
     eng = (backend or "vllm").strip().lower()
     if eng in ("llamacpp", "llama.cpp", "gguf"):
         return recommend_llamacpp(model, fetch_remote=fetch_remote)
+    if eng in ("sglang", "sg-lang", "sgl"):
+        return recommend_sglang(model, fetch_remote=fetch_remote)
 
     rationale: list[str] = []
     warnings: list[str] = []
@@ -5076,6 +5277,7 @@ def recommend(
 
     return {
         "model": model,
+        "engine": "vllm",
         "mode": "auto",
         "confidence": confidence,
         "label": label,
@@ -5247,4 +5449,254 @@ def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, An
         "rationale": rationale,
         "warnings": warnings,
         "detected": {"family": "gguf" if looks_like_gguf(hub_id, tags) else "unknown"},
+    }
+
+
+def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]:
+    """Spark-optimal SGLang flags from the card / Unsloth docs. Recommend-only.
+
+    Unsloth NVFP4 pages publish ``python -m sglang.launch_server`` with NEXTN
+    speculative decoding. Hardware envelope sets ``--tp-size`` and
+    ``--mem-fraction-static`` from live UMA when the vendor line is silent.
+    """
+    model = (model or "").strip()
+    if not model:
+        raise ValueError("model is required")
+
+    rationale: list[str] = []
+    warnings: list[str] = []
+    sources: list[dict[str, str]] = []
+    readme: Optional[str] = None
+    hf_config: Optional[dict] = None
+    if (
+        fetch_remote
+        and not Path(model).is_dir()
+        and not model.startswith("/")
+        and "/" in model
+    ):
+        remote = fetch_hf_card(model)
+        readme = remote.get("readme")
+        hf_config = remote.get("config")
+        for u in remote.get("fetched") or []:
+            sources.append({"kind": "huggingface", "ref": u, "notes": "HF card/config"})
+        for e in remote.get("errors") or []:
+            rationale.append(f"HF fetch note: {e}")
+    if readme is None or hf_config is None:
+        local = load_local_fallback(model)
+        if readme is None and local.get("readme"):
+            readme = local["readme"]
+            sources.append({"kind": "hf_card_local_fallback", "ref": model, "notes": "offline README"})
+        if hf_config is None and local.get("config"):
+            hf_config = local["config"]
+
+    detected = analyze_config(hf_config or {}, model)
+    weights_gib = estimate_weights_gib(model, hf_config)
+    topology = _cluster_topology()
+    plan = plan_placement(weights_gib, topology)
+    ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
+    tp = max(1, int(plan.get("tensor_parallel_size") or 1))
+    w = float(weights_gib or 0.0)
+    per = float(plan.get("per_node_weights_gib") or w or 0.0)
+    mem = recommended_gpu_util(ram, per, 0.0)
+
+    candidates: list[ServeCandidate] = []
+    if readme:
+        candidates = extract_sglang_candidates(readme)
+    # Same derived Unsloth / vLLM / GitHub URLs as vLLM — those pages ship SGLang too.
+    if not candidates or candidates_recipe_poor(candidates):
+        for rec in discover_recipe_urls(model, detected, readme or "")[:COOKBOOK_MAX_URLS]:
+            text, err = fetch_cookbook_text(rec.url)
+            if err or not text:
+                continue
+            extra = extract_sglang_candidates(text)
+            if extra:
+                sources.append(
+                    {"kind": rec.kind, "ref": rec.url, "notes": f"SGLang from {rec.kind}"}
+                )
+                candidates.extend(extra)
+    want_fam = str(detected.get("family") or "")
+    filtered: list[ServeCandidate] = []
+    for c in candidates:
+        if want_fam and want_fam != "unknown" and _vendor_candidate_family_mismatch(c, want_fam):
+            continue
+        if _vendor_candidate_sibling_mismatch(c, model):
+            continue
+        filtered.append(c)
+    filtered.sort(key=lambda c: c.score, reverse=True)
+    candidates = filtered
+
+    cfg: dict[str, Any] = {
+        "engine": "sglang",
+        "model": model,
+        "model_path": model,
+        "tp_size": tp,
+        "mem_fraction_static": mem,
+        "context_length": None,
+        "trust_remote_code": True,
+        "host": "0.0.0.0",
+        "port": 30000,
+        "quantization": "",
+        "tool_call_parser": "",
+        "reasoning_parser": "",
+        "spec_algorithm": "",
+        "spec_num_steps": None,
+        "spec_eagle_topk": None,
+        "spec_draft_tokens": None,
+        "extra_flags": "",
+    }
+    if candidates:
+        best = candidates[0]
+        for k, v in (best.config or {}).items():
+            if k in ("engine", "model"):
+                continue
+            if k == "extra_flags":
+                cfg["extra_flags"] = v or ""
+            elif k == "model_path" and v:
+                cfg["model_path"] = v
+            elif v not in (None, "", False):
+                cfg[k] = v
+        rationale.append(
+            f"Best SGLang recipe (score {best.score:.0f}"
+            + (f" in «{best.section}»" if best.section else "")
+            + f"): {(best.raw or '')[:160].replace(chr(10), ' ')}"
+        )
+        for r in best.reasons:
+            rationale.append(f"  · {r}")
+    else:
+        rationale.append(
+            "No parseable sglang.launch_server on card/vendor docs — Spark defaults "
+            "(tp/mem from live UMA)"
+        )
+
+    # Always launch the id the operator pasted (vendor snippets name twins).
+    cfg["model_path"] = model
+    cfg["model"] = model
+    # Placement owns TP on this cluster — never keep a vendor --tp-size 8 on 1 Spark.
+    vendor_tp = cfg.get("tp_size")
+    if not vendor_tp or int(vendor_tp) > tp:
+        if vendor_tp and int(vendor_tp) > tp:
+            rationale.append(
+                f"Vendor --tp-size {vendor_tp} exceeds the online cluster ({tp}) — using placement TP"
+            )
+        cfg["tp_size"] = tp
+    if cfg.get("mem_fraction_static") is None:
+        cfg["mem_fraction_static"] = mem
+        rationale.append(f"mem-fraction-static={mem} from leftover UMA after weights")
+    # SGLang default port — do not inherit vLLM :8000 from a mixed cookbook line.
+    if int(cfg.get("port") or 0) in (0, 8000):
+        cfg["port"] = 30000
+    native = detected.get("max_position_embeddings")
+    if cfg.get("context_length") is None and isinstance(native, int) and native > 0:
+        leftover = ram - per - _UMA_RESERVE_GIB
+        ctx = 8192
+        for cand in _CONTEXT_LADDER:
+            if cand > native:
+                continue
+            need = (float(cand) / 8192.0) * 0.25
+            if leftover >= need + _RUNTIME_PAD_GIB:
+                ctx = int(cand)
+                break
+        cfg["context_length"] = min(int(native), ctx)
+
+    # Never launch a second --model; SGLang takes --model-path only.
+    if cfg.get("extra_flags"):
+        cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--model")
+        cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
+
+    parts = [
+        "python -m sglang.launch_server",
+        "--model-path",
+        str(cfg["model_path"] or model),
+        "--host",
+        str(cfg.get("host") or "0.0.0.0"),
+        "--port",
+        str(int(cfg.get("port") or 30000)),
+        "--tp-size",
+        str(int(cfg.get("tp_size") or 1)),
+        "--mem-fraction-static",
+        f"{float(cfg.get('mem_fraction_static') or mem):.2f}",
+    ]
+    if cfg.get("trust_remote_code"):
+        parts.append("--trust-remote-code")
+    if cfg.get("context_length"):
+        parts += ["--context-length", str(int(cfg["context_length"]))]
+    if cfg.get("quantization"):
+        parts += ["--quantization", str(cfg["quantization"])]
+    if cfg.get("tool_call_parser"):
+        parts += ["--tool-call-parser", str(cfg["tool_call_parser"])]
+    if cfg.get("reasoning_parser"):
+        parts += ["--reasoning-parser", str(cfg["reasoning_parser"])]
+    if cfg.get("spec_algorithm"):
+        parts += ["--speculative-algorithm", str(cfg["spec_algorithm"])]
+        if cfg.get("spec_num_steps") is not None:
+            parts += ["--speculative-num-steps", str(int(cfg["spec_num_steps"]))]
+        if cfg.get("spec_eagle_topk") is not None:
+            parts += ["--speculative-eagle-topk", str(int(cfg["spec_eagle_topk"]))]
+        if cfg.get("spec_draft_tokens") is not None:
+            parts += ["--speculative-num-draft-tokens", str(int(cfg["spec_draft_tokens"]))]
+    extra = (cfg.get("extra_flags") or "").strip()
+    if extra:
+        parts.append(extra)
+    argv = " ".join(parts)
+    if "$" in argv:
+        warnings.append("Stripped leftover $ from SGLang argv")
+        argv = re.sub(r"\$\w+|\$\{\w+\}", "", argv)
+        argv = re.sub(r"\s+", " ", argv).strip()
+
+    fits = bool(plan.get("fits", True))
+    ok_load, load_msg = check_serve_loadability(
+        mode=None,
+        weights_gib=weights_gib,
+        node_ram_gib=ram,
+        nodes_used=int(plan.get("nodes_needed") or tp or 1),
+        util=float(cfg.get("mem_fraction_static") or mem or WORKFLOW_UTIL),
+        reserve_gib=float(plan.get("reserve_gib") or 15.0),
+    )
+    if fits and not ok_load:
+        fits = False
+        if load_msg:
+            warnings.append(load_msg)
+    serve_blocked = not fits
+    if serve_blocked:
+        warnings.append(
+            "SERVE BLOCKED: weights do not fit the online cluster — Start will refuse until "
+            "you add nodes or pick a smaller checkpoint."
+        )
+    rationale.append(
+        "SGLang Spark pack: python -m sglang.launch_server (not vllm serve). "
+        "Refs: Unsloth NVFP4 SGLang tutorial (NEXTN)."
+    )
+    return {
+        "model": model,
+        "engine": "sglang",
+        "mode": "auto",
+        "confidence": "high" if candidates else ("medium" if hf_config else "low"),
+        "label": "SGLang Spark",
+        "notes": "Recommend-only. Start sglang yourself (L.A.I.L does not spawn it yet).",
+        "serve_blocked": serve_blocked,
+        "config": cfg,
+        "argv": argv,
+        "topology": {
+            "nodes": topology.get("nodes", 1),
+            "nodes_used": plan.get("nodes_needed", 1),
+            "weights_gib": weights_gib,
+            "node_ram_gib": ram,
+            "fits": fits,
+            "tensor_parallel_size": tp,
+        },
+        "sources": sources,
+        "rationale": rationale,
+        "warnings": warnings,
+        "detected": detected,
+        "card_recipes": [
+            {
+                "score": c.score,
+                "section": c.section,
+                "raw": (c.raw or "")[:400],
+                "selected": i == 0,
+                "reasons": c.reasons,
+                "config": c.config,
+            }
+            for i, c in enumerate(candidates[:8])
+        ],
     }

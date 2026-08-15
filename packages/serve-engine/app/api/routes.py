@@ -163,19 +163,18 @@ async def serve_recommend(
     ),
     backend: Optional[str] = Query(
         None,
-        description="vllm (default) or llamacpp. GGUF ids should use llamacpp.",
+        description="vllm (default), llamacpp, or sglang. GGUF ids should use llamacpp.",
     ),
 ) -> dict[str, Any]:
-    """Recommend vLLM or llama.cpp flags from the card plus researched recipes.
+    """Recommend vLLM, llama.cpp, or SGLang flags from the card plus vendor recipes.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
     """
     try:
-        eng = (backend or "vllm").strip().lower()
-        if eng in ("llamacpp", "llama.cpp", "gguf"):
-            return autoconfig.recommend_llamacpp(model, fetch_remote=fetch_remote)
-        rec = autoconfig.recommend(model, mode=mode, fetch_remote=fetch_remote)
-        if autoconfig.looks_like_gguf(model):
+        rec = autoconfig.recommend(
+            model, mode=mode, fetch_remote=fetch_remote, backend=backend
+        )
+        if autoconfig.looks_like_gguf(model) and rec.get("engine") == "vllm":
             rec.setdefault("warnings", []).append(
                 "This id looks like GGUF — use ?backend=llamacpp for the Spark llama.cpp pack"
             )

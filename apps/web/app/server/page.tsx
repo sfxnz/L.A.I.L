@@ -196,6 +196,7 @@ export default function ServerPage() {
   const [prefixCaching, setPrefixCaching] = useState(false);
   const [mtp, setMtp] = useState(false);
   const [mtpTokens, setMtpTokens] = useState("2");
+  const [mtpMoeBackend, setMtpMoeBackend] = useState("");
   const [dockerEnv, setDockerEnv] = useState("");
   const [extra, setExtra] = useState("");
   const [download, setDownload] = useState(false);
@@ -375,6 +376,7 @@ export default function ServerPage() {
     setExtra(String(c.extra_flags || ""));
     setMtp(!!c.mtp);
     if (c.mtp_num_tokens != null) setMtpTokens(String(c.mtp_num_tokens));
+    setMtpMoeBackend(String(c.mtp_moe_backend ?? ""));
     setLoadFormat(String(c.load_format || ""));
     setChunkedPrefill(!!c.enable_chunked_prefill);
     setPrefixCaching(!!c.enable_prefix_caching);
@@ -438,6 +440,7 @@ export default function ServerPage() {
     setPrefixCaching(false);
     setMtp(false);
     setMtpTokens("2");
+    setMtpMoeBackend("");
     setDockerEnv("");
     setExtra("");
     setDownload(false);
@@ -488,6 +491,7 @@ export default function ServerPage() {
       reasoning_parser: reasoningParser.trim(),
       mtp,
       mtp_num_tokens: parseInt(mtpTokens, 10) || 2,
+      mtp_moe_backend: mtpMoeBackend.trim(),
       load_format: loadFormat.trim(),
       enable_chunked_prefill: chunkedPrefill,
       enable_prefix_caching: prefixCaching,

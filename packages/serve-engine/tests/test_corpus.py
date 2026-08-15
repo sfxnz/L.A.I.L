@@ -41,6 +41,7 @@ def _one_spark_topo() -> dict:
         "qsfp_ip": "10.100.8.1",
         "qsfp_if": "enp1s0f1np1",
         "ram_gib": 121.7,
+        "gpu_sku": "NVIDIA GB10",
         "local": True,
         "ssh_host": "spark1",
     }
@@ -70,6 +71,7 @@ def _two_spark_topo() -> dict:
             "qsfp_ip": f"10.100.8.{i}",
             "qsfp_if": "enp1s0f1np1",
             "ram_gib": 121.7,
+            "gpu_sku": "NVIDIA GB10",
             "local": i == 1,
             "ssh_host": f"spark{i}",
         }
@@ -134,6 +136,7 @@ def _final_command(model: str, cfg: dict) -> str:
         max_num_seqs=cfg.get("max_num_seqs"),
         mtp=bool(cfg.get("mtp")),
         mtp_num_tokens=int(cfg.get("mtp_num_tokens") or 2),
+        mtp_moe_backend=cfg.get("mtp_moe_backend") or "",
         load_format=cfg.get("load_format") or "",
         enable_chunked_prefill=bool(cfg.get("enable_chunked_prefill")),
         enable_prefix_caching=bool(cfg.get("enable_prefix_caching")),
@@ -211,6 +214,17 @@ def test_corpus_case(monkeypatch, case_dir: Path):
             f"got {cfg.get('extra_flags')!r}"
         )
 
+    for frag in expect.get("cmd_contains") or []:
+        assert frag in cmd, (
+            f"{case_dir.name}: expected {frag!r} in composed command:\n{cmd}"
+        )
+
+    for frag in expect.get("docker_env_contains") or []:
+        env = cfg.get("docker_env") or []
+        assert any(frag in str(e) for e in env), (
+            f"{case_dir.name}: expected {frag!r} in docker_env, got {env!r}"
+        )
+
     for frag in expect.get("forbidden") or []:
         assert frag not in cmd, (
             f"{case_dir.name}: {frag!r} must not appear in composed command:\n{cmd}"
@@ -223,6 +237,10 @@ def test_corpus_case(monkeypatch, case_dir: Path):
             f"got {n}:\n{cmd}"
         )
 
+    if expect.get("image"):
+        assert cfg.get("image") == expect["image"], (
+            f"{case_dir.name}: expected image {expect['image']!r}, got {cfg.get('image')!r}"
+        )
     if expect.get("image_contains"):
         assert expect["image_contains"] in (cfg.get("image") or ""), (
             f"{case_dir.name}: expected image containing {expect['image_contains']!r}, "

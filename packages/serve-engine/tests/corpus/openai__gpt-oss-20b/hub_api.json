@@ -1,0 +1,7 @@
+{
+  "model_id": "openai/gpt-oss-20b",
+  "siblings_weight_files": 5,
+  "siblings_bytes": 41273504288,
+  "weights_gib": 38.4,
+  "source": "blobs"
+}

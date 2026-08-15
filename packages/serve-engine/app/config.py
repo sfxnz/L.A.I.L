@@ -88,10 +88,10 @@ SERVE_EXAMPLES: dict[str, dict] = {
     "unsloth-35b-spark": {
         "label": "Unsloth 35B NVFP4 (Spark — proven)",
         "model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
-        # Mixed FP8+NVFP4 compressed-tensors. Do NOT force flashinfer_b12x (breaks FP8 MoE on v0.25+).
+        # Unsloth Aug 2026 Spark recipe: flashinfer_b12x + CUTE on vLLM ≥0.27.
         "quantization": "compressed-tensors",
         "kv_cache_dtype": "fp8",
-        "moe_backend": "",
+        "moe_backend": "flashinfer_b12x",
         "trust_remote_code": True,
         "reasoning_parser": "qwen3",
         "tool_call_parser": "qwen3_coder",
@@ -100,12 +100,12 @@ SERVE_EXAMPLES: dict[str, dict] = {
         "docker_env": ["CUTE_DSL_ARCH=sm_121a"],
         "extra_flags": "",
         "mtp": False,
-        "notes": "Proven path on Spark (v0.25 smoke; default image now v0.27.1): quant=compressed-tensors, leave moe-backend empty (auto), CUTE_DSL_ARCH=sm_121a. MTP optional later.",
+        "notes": "Unsloth Spark path on v0.27.1: --moe-backend flashinfer_b12x and CUTE_DSL_ARCH=sm_121a. Matches Auto-configure.",
     },
     "nvidia-27b": {
         "label": "NVIDIA 27B NVFP4",
         "model": "nvidia/Qwen3.6-27B-NVFP4",
-        "quantization": "modelopt",
+        "quantization": "modelopt_mixed",
         "kv_cache_dtype": "fp8",
         "moe_backend": "",
         "trust_remote_code": True,
@@ -116,7 +116,7 @@ SERVE_EXAMPLES: dict[str, dict] = {
         "docker_env": [],
         "extra_flags": "",
         "mtp": False,
-        "notes": "Dense ModelOpt NVFP4 — quantization=modelopt matches NVIDIA checkpoints.",
+        "notes": "Dense ModelOpt MIXED_PRECISION — quantization=modelopt_mixed from config.json.",
     },
 }
 

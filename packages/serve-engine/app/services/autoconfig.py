@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
@@ -559,10 +560,22 @@ def _args_to_config(args: list[str], env: list[str]) -> dict[str, Any]:
             cfg = take_val()
             # Map into structured MTP fields only — do NOT also dump into
             # extra_flags (serve.py would emit --speculative-config twice).
-            out["mtp"] = "mtp" in cfg.lower()
-            mm = re.search(r"num_speculative_tokens[\"']?\s*:\s*(\d+)", cfg)
-            if mm:
-                out["mtp_num_tokens"] = int(mm.group(1))
+            spec = _parse_speculative_json(cfg)
+            method = str(spec.get("method") or "").lower()
+            out["mtp"] = method == "mtp" or "mtp" in cfg.lower()
+            ntok = spec.get("num_speculative_tokens")
+            if ntok is not None:
+                try:
+                    out["mtp_num_tokens"] = int(ntok)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                mm = re.search(r"num_speculative_tokens[\"']?\s*:\s*(\d+)", cfg)
+                if mm:
+                    out["mtp_num_tokens"] = int(mm.group(1))
+            extra = _mtp_spark_extra(spec)
+            if extra.get("moe_backend"):
+                out["mtp_moe_backend"] = str(extra["moe_backend"])
             if not out.get("mtp"):
                 # Non-MTP speculative methods stay as free-form extras.
                 extras += ["--speculative-config", cfg]
@@ -587,6 +600,48 @@ def _args_to_config(args: list[str], env: list[str]) -> dict[str, Any]:
     if extras:
         out["extra_flags"] = " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in extras)
     return out
+
+
+def _parse_speculative_json(raw: str) -> dict[str, Any]:
+    """Parse a --speculative-config value into a dict. Empty on garbage."""
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+        if not m:
+            return {}
+        try:
+            obj = json.loads(m.group(0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _mtp_spark_extra(spec: dict[str, Any]) -> dict[str, Any]:
+    """Spark playbook keys inside MTP speculative-config (e.g. moe_backend:triton)."""
+    if not isinstance(spec, dict):
+        return {}
+    return {k: v for k, v in spec.items() if k not in ("method", "num_speculative_tokens")}
+
+
+def _speculative_json_from_extra(extra: str) -> dict[str, Any]:
+    """Pull the first --speculative-config JSON object out of extra_flags."""
+    s = (extra or "").strip()
+    if not s or "speculative-config" not in s:
+        return {}
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        parts = s.split()
+    for i, p in enumerate(parts):
+        if p == "--speculative-config" and i + 1 < len(parts):
+            return _parse_speculative_json(parts[i + 1])
+        if p.startswith("--speculative-config="):
+            return _parse_speculative_json(p.split("=", 1)[1])
+    return {}
 
 
 def _dedupe_env(items: list[str]) -> list[str]:
@@ -801,6 +856,16 @@ def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[
     # Full GLM 4.5/4.6/4.7 MoE (not 9b / edge / air distillations).
     if re.search(r"glm-?4\.[567]", mid) and not re.search(r"(9b|air|edge|flash)", mid):
         return 500.0
+    # Step-3 classic VLM (not 3.5 Flash). Vendor: FP8 ≈ 326 GiB.
+    if re.search(r"step[\s._-]*3(?![\s._-]*[57])", mid) and "flash" not in mid:
+        return 320.0
+    # HY-v3 / Hy3-preview ~556 GiB BF16.
+    if re.search(r"(^|[^a-z])hy[\s._-]*v?3", mid) or "hy3" in mid or "hunyuan-v3" in mid:
+        if "a13b" not in mid:
+            return 550.0
+    # ERNIE 300B-A47B class — 21B-A3B must not match.
+    if "ernie" in mid and re.search(r"300b|a47b", mid):
+        return 400.0
     cfg = hf_config or {}
     experts = cfg.get("n_routed_experts") or cfg.get("num_experts") or cfg.get("num_local_experts")
     try:
@@ -822,6 +887,234 @@ def _weight_floor_gib(model: str, hf_config: Optional[dict] = None) -> Optional[
     return None
 
 
+# Spark GGUF preference (hardware default, not a model recipe). Unsloth / ggml
+# Spark benches land on UD-Q4_K_XL — quality that still leaves UMA for long ctx.
+_SPARK_GGUF_QUANT_PREF = (
+    "UD-Q4_K_XL",
+    "Q4_K_XL",
+    "UD-Q4_K_M",
+    "Q4_K_M",
+    "UD-Q5_K_XL",
+    "Q5_K_M",
+    "UD-Q4_K_S",
+    "Q4_K_S",
+    "MXFP4_MOE",
+    "UD-IQ4_NL_XL",
+    "UD-IQ4_NL",
+    "UD-IQ4_XS",
+    "UD-Q3_K_XL",
+    "Q3_K_M",
+    "UD-Q6_K_XL",
+    "Q6_K",
+    "Q8_0",
+    "UD-Q8_K_XL",
+    "BF16",
+)
+_GGUF_SPLIT_RE = re.compile(r"-\d{5}-of-\d{5}$", re.I)
+
+
+def _hf_repo_ref(model: str) -> tuple[str, Optional[str]]:
+    """Split ``org/name:QUANT`` from a Hub id. Local paths are returned unchanged."""
+    m = (model or "").strip()
+    if not m:
+        return m, None
+    if m.startswith("/") or m.endswith(".gguf") or Path(m).is_dir():
+        return m, None
+    if ":" in m:
+        left, right = m.rsplit(":", 1)
+        if "/" in left and right and "/" not in right and not right.startswith("//"):
+            return left, right
+    return m, None
+
+
+def _gguf_is_sidecar(name: str) -> bool:
+    """Vision projector / imatrix / isolated MTP head — not the served weights."""
+    base = str(name or "").split("/")[-1].lower()
+    if not base.endswith(".gguf"):
+        return False
+    if "mmproj" in base or "imatrix" in base:
+        return True
+    if base.startswith("mtp") or "-mtp." in base or base.endswith("-mtp.gguf"):
+        return True
+    return False
+
+
+def _gguf_quant_tag(name: str) -> str:
+    """Extract ``UD-Q4_K_XL`` / ``Q4_K_M`` from a GGUF filename."""
+    stem = str(name or "").split("/")[-1]
+    if stem.lower().endswith(".gguf"):
+        stem = stem[:-5]
+    stem = _GGUF_SPLIT_RE.sub("", stem)
+    up = stem.upper()
+    for tag in sorted(_SPARK_GGUF_QUANT_PREF, key=len, reverse=True):
+        if tag.upper() in up:
+            return tag
+    m = re.search(r"(UD-)?((?:IQ|Q|BF|F|MXFP)\d+[A-Z0-9_]*)", stem, re.I)
+    return m.group(0) if m else stem
+
+
+def _gguf_siblings_have_mtp(model: str, siblings: list) -> bool:
+    if "mtp" in (model or "").lower():
+        return True
+    for f in siblings or []:
+        n = str((f or {}).get("rfilename") or "").lower()
+        if "mtp" in n:
+            return True
+    return False
+
+
+def pick_spark_gguf(
+    siblings: list,
+    *,
+    preferred: Optional[str] = None,
+) -> dict[str, Any]:
+    """Pick one Spark quant from a multi-quant GGUF repo (sum shards of that quant only)."""
+    groups: dict[str, list] = {}
+    for f in siblings or []:
+        if not isinstance(f, dict):
+            continue
+        n = str(f.get("rfilename") or "")
+        if not n.endswith(".gguf") or _gguf_is_sidecar(n):
+            continue
+        tag = _gguf_quant_tag(n)
+        groups.setdefault(tag, []).append(f)
+    if not groups:
+        tot = 0
+        for f in siblings or []:
+            if isinstance(f, dict) and str(f.get("rfilename") or "").endswith(".gguf"):
+                tot += int(f.get("size") or 0)
+        return {"quant": preferred, "bytes": tot, "files": []}
+
+    pref_u = (preferred or "").upper()
+
+    def _rank(tag: str) -> tuple[int, int]:
+        tu = tag.upper()
+        if pref_u and (pref_u == tu or pref_u in tu or tu in pref_u):
+            return (0, 0)
+        try:
+            return (1, _SPARK_GGUF_QUANT_PREF.index(tag))
+        except ValueError:
+            return (2, 99)
+
+    tag = min(groups, key=_rank)
+    chosen = groups[tag]
+    tot = sum(int(f.get("size") or 0) for f in chosen)
+    return {"quant": tag, "bytes": tot, "files": chosen}
+
+
+_SHARD_WEIGHT_RE = re.compile(
+    r"(?:^|/)(?:model|pytorch_model)-\d+-of-\d+\.(safetensors|bin)$",
+    re.I,
+)
+_CONSOLIDATED_WEIGHT_RE = re.compile(
+    r"(?:^|/)consolidated(?:\.\d+)?\.(safetensors|bin|pth)$",
+    re.I,
+)
+_SINGLE_WEIGHT_RE = re.compile(
+    r"(?:^|/)(?:model|pytorch_model)\.(safetensors|bin)$",
+    re.I,
+)
+
+
+def _select_weight_blobs(siblings: list) -> list[dict]:
+    """Pick one on-disk dump of the same tensors.
+
+    Mistral / Magistral Hub repos often ship ``consolidated.safetensors``
+    (mistral-common) *and* ``model-*-of-*`` shards (transformers) of the
+    same BF16. Summing both doubles the weight (∼44.7 → 89.4 GiB) and
+    falsely serve_blocks a 1-Spark node.
+    """
+    files: list[dict] = []
+    for f in siblings or []:
+        if not isinstance(f, dict):
+            continue
+        n = str(f.get("rfilename") or "")
+        if n.endswith((".safetensors", ".bin")):
+            files.append(f)
+    if not files:
+        return []
+
+    def _name(f: dict) -> str:
+        return str(f.get("rfilename") or "")
+
+    def _prefer_safetensors(group: list[dict]) -> list[dict]:
+        st = [f for f in group if _name(f).endswith(".safetensors")]
+        return st or group
+
+    shards = [f for f in files if _SHARD_WEIGHT_RE.search(_name(f))]
+    cons = [f for f in files if _CONSOLIDATED_WEIGHT_RE.search(_name(f))]
+    singles = [f for f in files if _SINGLE_WEIGHT_RE.search(_name(f))]
+    extras = [
+        f
+        for f in files
+        if f not in shards and f not in cons and f not in singles
+    ]
+    if shards:
+        primary = _prefer_safetensors(shards)
+    elif cons:
+        primary = _prefer_safetensors(cons)
+    elif singles:
+        primary = _prefer_safetensors(singles)
+    else:
+        return _prefer_safetensors(files)
+    return primary + extras
+
+
+def _hub_blob_measure(model: str) -> Optional[dict[str, Any]]:
+    """Hub blob sizes. Safetensors: one weight dump (not consolidated+shards). GGUF: one Spark quant."""
+    hub_id, want_quant = _hf_repo_ref(model)
+    if not hub_id or hub_id.startswith("/") or Path(hub_id).is_dir():
+        return None
+    try:
+        body, err = _http_get(
+            f"https://huggingface.co/api/models/{hub_id}?blobs=true", timeout=20.0
+        )
+        if not body or err:
+            return None
+        d = json.loads(body)
+    except Exception:
+        return None
+    siblings = list(d.get("siblings") or [])
+    st: list[dict] = []
+    gg: list[dict] = []
+    for f in siblings:
+        if not isinstance(f, dict):
+            continue
+        n = str(f.get("rfilename") or "")
+        if n.endswith((".safetensors", ".bin")):
+            st.append(f)
+        elif n.endswith(".gguf"):
+            gg.append(f)
+    if st:
+        tot = sum(int(f.get("size") or 0) for f in _select_weight_blobs(st))
+        if tot <= 0:
+            return None
+        return {
+            "source": "blobs",
+            "kind": "safetensors",
+            "bytes": tot,
+            "gib": round(tot / (1024**3), 1),
+            "quant": None,
+            "siblings": siblings,
+            "mtp": False,
+        }
+    if gg:
+        picked = pick_spark_gguf(gg, preferred=want_quant)
+        tot = int(picked.get("bytes") or 0)
+        if tot <= 0:
+            return None
+        return {
+            "source": "blobs",
+            "kind": "gguf",
+            "bytes": tot,
+            "gib": round(tot / (1024**3), 1),
+            "quant": picked.get("quant") or want_quant,
+            "siblings": siblings,
+            "mtp": _gguf_siblings_have_mtp(hub_id, siblings),
+        }
+    return None
+
+
 def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[float]:
     """Best-effort weight size for ANY model. Order: exact HF blob sum → safetensors
     index total_size → config param estimate → known-family floor → None.
@@ -829,22 +1122,19 @@ def estimate_weights_gib(model: str, hf_config: Optional[dict]) -> Optional[floa
 
     Hub blob / index measurements are authoritative — family floors only fill total
     absence (never max'd over a real ~20 GiB NVFP4 sum).
+
+    Safetensors count **one** on-disk dump (shards *or* consolidated, not both).
+    Multi-quant GGUF repos (dozens of alternative files) count **one** Spark quant,
+    not the sum of every sibling.
     """
     measured: Optional[float] = None
     source: Optional[str] = None
-    # 1) Exact: sum safetensors/bin blobs from the HF API (most accurate).
+    # 1) Exact: Hub blobs. Safetensors/bin shards are summed; GGUF picks one quant.
     try:
-        body, err = _http_get(f"https://huggingface.co/api/models/{model}?blobs=true", timeout=20.0)
-        if body and not err:
-            d = json.loads(body)
-            tot = 0
-            for f in d.get("siblings") or []:
-                n = f.get("rfilename", "")
-                if n.endswith((".safetensors", ".bin", ".gguf")):
-                    tot += f.get("size") or 0
-            if tot > 0:
-                measured = round(tot / (1024**3), 1)
-                source = "blobs"
+        blob = _hub_blob_measure(model)
+        if blob and blob.get("gib"):
+            measured = float(blob["gib"])
+            source = "blobs"
     except Exception:
         pass
     # 2) Safetensors index metadata.total_size (when blob sizes are missing).
@@ -1704,6 +1994,9 @@ def _stock_image_semver(image: str | None) -> tuple[int, ...] | None:
     tag = s.rsplit(":", 1)[-1]
     if not tag or tag in ("latest", "nightly") or tag.startswith("nightly"):
         return None
+    # Playbook pins like gemma4-cu130 are not semver — do not parse "4" as v4.0.0.
+    if not re.match(r"^v?\d+\.\d+", tag):
+        return None
     # strip arch/cuda suffixes: v0.27.1-aarch64 → 0.27.1
     tag = tag.split("-")[0]
     ver = _semver_tuple(tag)
@@ -1723,23 +2016,28 @@ def _image_at_least(image: str | None, major: int, minor: int, patch: int = 0) -
 
 
 def _resolve_stock_image(default: str, card_image: str | None, rationale: list[str]) -> str:
-    """Raise the lab default to the card's min stock tag; never downgrade; never replace Anemll."""
+    """Raise the lab default to the card's min stock tag; never downgrade; never replace Anemll.
+
+    Playbook tags (gemma4-cu130, :gemma) are not semver — they are not a stock raise.
+    """
     if not card_image:
         return default
     if "anemll" in (default or "").lower() or "dspark-vllm" in (default or "").lower():
         return default
     if not card_image.startswith("vllm/vllm-openai:"):
         return default
-    d_tag = default.split(":")[-1] if ":" in default else ""
-    c_tag = card_image.split(":")[-1]
-    if _semver_tuple(c_tag) > _semver_tuple(d_tag):
+    d_ver = _stock_image_semver(default)
+    c_ver = _stock_image_semver(card_image)
+    if c_ver is None or d_ver is None:
+        return default
+    if c_ver > d_ver:
         rationale.append(
             f"Card requires newer stock image {card_image} than lab default {default} → using card pin"
         )
         return card_image
-    if card_image != default and _semver_tuple(c_tag) == _semver_tuple(d_tag):
+    if card_image != default and c_ver == d_ver:
         return default
-    if _semver_tuple(c_tag) < _semver_tuple(d_tag):
+    if c_ver < d_ver:
         rationale.append(
             f"Card pin {card_image} is older than lab default {default} — keeping lab default (no downgrade)"
         )
@@ -1754,6 +2052,21 @@ def _is_anemll_image(image: str | None) -> bool:
 def _lab_default_image(mode: str | None = None) -> str:
     """Single stock image. ``mode`` is ignored (legacy)."""
     return DEFAULT_IMAGE_MAX or DEFAULT_IMAGE_SAFE
+
+
+def _playbook_required_image(model: str, detected: dict[str, Any] | None) -> str | None:
+    """NVIDIA DGX Spark playbook image pins that stock v0.27.1 cannot replace.
+
+    Gemma 4 needs ``vllm/vllm-openai:gemma4-cu130``. DiffusionGemma needs
+    ``vllm/vllm-openai:gemma``. Anemll/DSpark stays overlay-owned.
+    """
+    mid = (model or "").lower()
+    fam = str((detected or {}).get("family") or "")
+    if fam == "diffusiongemma" or "diffusiongemma" in mid:
+        return "vllm/vllm-openai:gemma"
+    if fam == "gemma4" or re.search(r"gemma[\s._-]*4", mid):
+        return "vllm/vllm-openai:gemma4-cu130"
+    return None
 
 
 def _resolve_image_for_gates(
@@ -1778,6 +2091,13 @@ def _resolve_image_for_gates(
 
     if _is_anemll_image(cur):
         return cur
+
+    playbook = _playbook_required_image(str(cfg.get("model") or ""), detected)
+    if playbook and not _is_anemll_image(playbook):
+        if cur != playbook:
+            rationale.append(f"NVIDIA DGX Spark playbook → image {playbook}")
+        cfg["image"] = playbook
+        return playbook
 
     # Never sit below the lab stock default (candidate may have applied an older pin).
     if not cur:
@@ -1976,6 +2296,135 @@ _VENDOR_DOC_HOSTS = frozenset(
 )
 _GENERIC_URL_RE = re.compile(r"https?://[^\s\)\]\"'<>]+", re.I)
 
+# recipes.vllm.ai is case-sensitive: HF `google` → 500, catalog `Google` → 200.
+# Only mixed-case catalog orgs need a map; lowercase HF orgs pass through.
+_RECIPES_VLLM_ORGS = (
+    "ByteDance-Seed",
+    "Google",
+    "IndexTeam",
+    "JetBrains",
+    "LiquidAI",
+    "MiniMaxAI",
+    "OpenGVLab",
+    "OpenMOSS-Team",
+    "PaddlePaddle",
+    "Qwen",
+    "Wan-AI",
+    "XiaomiMiMo",
+    "inclusionAI",
+)
+_RECIPES_VLLM_ORG_BY_LOWER = {o.lower(): o for o in _RECIPES_VLLM_ORGS}
+
+# Official catalog org for a detected family. Quant twins (Unsloth) live under a
+# different HF org; recipes.vllm.ai/{hf_org}/{name} 404s — also try this page.
+_FAMILY_RECIPES_VLLM_ORG = {
+    "gemma": "Google",
+    "gemma4": "Google",
+    "qwen": "Qwen",
+}
+_QUANT_NAME_SUFFIX_RE = re.compile(
+    r"-(?:NVFP4|FP8|GGUF|GPTQ|AWQ|BNB-4BIT|INT4|INT8)(?:-.*)?$",
+    re.I,
+)
+
+
+def recipes_vllm_catalog_org(org: str) -> str:
+    """HF org → recipes.vllm.ai catalog org (google → Google). Unknown orgs unchanged."""
+    if not org:
+        return org
+    return _RECIPES_VLLM_ORG_BY_LOWER.get(org.lower(), org)
+
+
+def _recipes_vllm_official_page(
+    org: str, name: str, detected: dict[str, Any] | None
+) -> str | None:
+    """Official family catalog URL when the HF id is a requant / publisher twin."""
+    fam = str((detected or {}).get("family") or "").lower()
+    official_org = _FAMILY_RECIPES_VLLM_ORG.get(fam)
+    if not official_org or not name:
+        return None
+    stem = _QUANT_NAME_SUFFIX_RE.sub("", name) or name
+    if recipes_vllm_catalog_org(org).lower() == official_org.lower() and stem == name:
+        return None
+    return f"https://recipes.vllm.ai/{official_org}/{stem}"
+
+
+def _want_nvidia_playbooks(
+    model_id: str, detected: dict[str, Any] | None, slugs: list[str]
+) -> bool:
+    """NVIDIA cookbooks are Qwen / Nemotron / NVIDIA-org — not every NVFP4 family."""
+    mid = (model_id or "").lower()
+    fam = str((detected or {}).get("family") or "").lower()
+    publisher = mid.split("/")[0] if "/" in mid else ""
+    if publisher == "nvidia" or fam == "nemotron" or "nemotron" in mid:
+        return True
+    if fam == "qwen" or any(s.startswith("qwen") for s in slugs):
+        return True
+    return False
+
+
+def _canonicalize_recipes_vllm_path(path: str) -> str:
+    """/{org}/{name} with catalog org casing; never keep a trailing .md (those 404)."""
+    parts = [p for p in (path or "").split("/") if p]
+    if not parts:
+        return "/"
+    if parts[-1].lower().endswith(".md"):
+        parts[-1] = parts[-1][:-3]
+        if not parts[-1]:
+            parts.pop()
+    if not parts:
+        return "/"
+    parts[0] = recipes_vllm_catalog_org(parts[0])
+    return "/" + "/".join(parts)
+
+
+class _HTMLRecipeText(HTMLParser):
+    """Strip scripts/styles; wrap <pre> as fences so the last serve flag is kept."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("script", "style", "noscript"):
+            self._skip += 1
+            return
+        if tag == "pre":
+            self._parts.append("\n```\n")
+            return
+        if tag in ("p", "br", "div", "li", "h1", "h2", "h3", "h4", "h5", "tr", "section"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "noscript"):
+            if self._skip:
+                self._skip -= 1
+            return
+        if tag == "pre":
+            self._parts.append("\n```\n")
+            return
+        if tag in ("p", "div", "li", "section"):
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self._parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def html_recipe_text(body: str) -> str:
+    """HTML catalog page → text with serve commands (scripts dropped)."""
+    parser = _HTMLRecipeText()
+    try:
+        parser.feed(body or "")
+        parser.close()
+    except Exception:
+        return body or ""
+    return parser.text()
+
 
 def vendor_doc_to_fetch_url(url: str) -> Optional[str]:
     """Allowlisted vendor docs → fetchable HTTPS URL (GitBook pages get .md)."""
@@ -1990,6 +2439,9 @@ def vendor_doc_to_fetch_url(url: str) -> Optional[str]:
     if p.scheme != "https" or host not in _VENDOR_DOC_HOSTS:
         return None
     path = p.path or "/"
+    if host == "recipes.vllm.ai":
+        # Catalog pages are HTML at /{Org}/{name}. Appending .md always 404s.
+        return f"https://{host}{_canonicalize_recipes_vllm_path(path)}"
     if not any(path.lower().endswith(ext) for ext in _COOKBOOK_DOC_EXTS):
         path = path.rstrip("/") + ".md"
     return f"https://{host}{path}"
@@ -2090,6 +2542,36 @@ def family_doc_slugs(model_id: str, detected: dict[str, Any] | None = None) -> l
         add("deepseek-v4")
     elif "deepseek" in blob:
         add("deepseek")
+    if det.get("family") == "gemma4" or re.search(r"gemma[\s._-]*4", blob):
+        add("gemma-4")
+    elif det.get("family") == "gemma" or "gemma" in blob:
+        add("gemma")
+    if det.get("family") == "glm" or "glm" in blob or "chatglm" in blob:
+        add("glm")
+    if det.get("family") == "kimi" or "kimi" in blob or "moonshot" in blob:
+        add("kimi")
+    if det.get("family") in ("llama", "llama4") or "llama" in blob:
+        add("llama")
+    if det.get("family") == "phi" or re.search(r"(^|[^a-z])phi", blob):
+        if "phi-4" in blob or "phi4" in blob:
+            add("phi-4")
+        add("phi")
+    if det.get("family") == "granite" or "granite" in blob:
+        add("granite")
+    if "gpt-oss" in blob or "gptoss" in blob:
+        add("gpt-oss")
+    if det.get("family") == "mistral" or any(
+        k in blob for k in ("mistral", "magistral", "devstral", "mixtral", "pixtral")
+    ):
+        add("mistral")
+    if det.get("family") == "internlm" or "internlm" in blob:
+        add("internlm")
+    if det.get("family") in ("hunyuan", "hy_v3") or "hunyuan" in blob or re.search(r"(^|[^a-z])hy3", blob):
+        add("hunyuan")
+    if det.get("family") in ("step3", "step3p5") or "step" in blob:
+        add("step")
+    if det.get("family") == "ernie" or "ernie" in blob:
+        add("ernie")
     if det.get("has_nvfp4") or "nvfp4" in blob:
         add("nvfp4")
     return slugs
@@ -2154,9 +2636,6 @@ def discover_recipe_urls(
         add(u, origin="card")
 
     slugs = family_doc_slugs(model_id, detected)
-    mid = (model_id or "").lower()
-    fam = str((detected or {}).get("family") or "").lower()
-    publisher = mid.split("/")[0] if "/" in mid else ""
 
     for slug in slugs:
         if slug == "nvfp4":
@@ -2164,24 +2643,24 @@ def discover_recipe_urls(
             continue
         add(f"https://unsloth.ai/docs/models/{slug}", kind="vendor_doc", origin="derived")
 
-    want_nvidia = (
-        publisher == "nvidia"
-        or fam == "nemotron"
-        or "nemotron" in mid
-        or "nvfp4" in slugs
-        or "qwen3.8" in slugs
-        or "qwen3.6" in slugs
-    )
-    if want_nvidia:
+    # Canonical recipes.vllm.ai page is /{Org}/{name}, not /{slug}.md (those 404).
+    # Catalog org is case-sensitive (google → 500, Google → 200). Quant twins
+    # (unsloth/gemma-4-*-NVFP4) 404 at the HF org — also try the official family page.
+    if "/" in (model_id or "") and not str(model_id).startswith("/"):
+        org, name = model_id.split("/", 1)
+        if org and name:
+            add(
+                f"https://recipes.vllm.ai/{recipes_vllm_catalog_org(org)}/{name}",
+                kind="vllm_docs",
+                origin="derived",
+            )
+            official = _recipes_vllm_official_page(org, name, detected)
+            if official:
+                add(official, kind="vllm_docs", origin="derived")
+
+    if _want_nvidia_playbooks(model_id, detected, slugs):
         for u in _NVIDIA_VLLM_COOKBOOKS:
             add(u, kind="nvidia_playbook", origin="derived")
-
-    # vLLM docs last — often HTML/404 and must not crowd out Unsloth/NVIDIA.
-    for slug in slugs:
-        if slug == "nvfp4":
-            continue
-        add(f"https://docs.vllm.ai/en/latest/models/{slug}.md", kind="vllm_docs", origin="derived")
-        add(f"https://recipes.vllm.ai/{slug}.md", kind="vllm_docs", origin="derived")
 
     return out
 
@@ -2239,6 +2718,15 @@ def fetch_cookbook_text(
     if err or not body:
         return None, err or "empty cookbook body"
     if body.lstrip().startswith("<!"):
+        host = ""
+        try:
+            host = (urlparse(raw_url).netloc or "").lower()
+        except ValueError:
+            host = ""
+        if host == "recipes.vllm.ai":
+            text = html_recipe_text(body)
+            if text.strip():
+                return text, None
         return None, f"HTML response (not raw content) for {raw_url}"
     return notebook_source_text(body), None
 
@@ -2285,6 +2773,62 @@ def _vendor_candidate_family_mismatch(cand: ServeCandidate, want_fam: str) -> bo
     if want_fam.startswith("gemma") and re.search(r"qwen", blob) and "gemma" not in (cand.model or "").lower():
         return True
     return False
+
+
+# E2B/E4B before bare NNB so Gemma-4-E4B stays e4b; 26B-A4B stays one MoE token.
+_MODEL_SIZE_TOKEN_RE = re.compile(
+    r"(?i)(?:e\d+b|\d+(?:\.\d+)?[bt](?:-a\d+[bt])?)"
+)
+
+
+def _model_size_tokens(model_id: str) -> frozenset[str]:
+    """Size/variant tokens from a HF id (31b, 26b-a4b, e4b). Empty if none."""
+    name = (model_id or "").split("/")[-1]
+    return frozenset(m.group(0).lower() for m in _MODEL_SIZE_TOKEN_RE.finditer(name))
+
+
+def _candidate_model_id(cand: ServeCandidate) -> str:
+    if cand.model:
+        return cand.model
+    m = re.search(r"vllm\s+serve\s+(\S+)", cand.raw or "", re.I)
+    return m.group(1).strip("\"'") if m else ""
+
+
+def _vendor_candidate_sibling_mismatch(cand: ServeCandidate, model_id: str) -> bool:
+    """True when a vendor snippet is a different size/variant of the same family.
+
+    Unsloth's Gemma-4 page scores the 26B-A4B Spark MoE line (flashinfer_b12x)
+    above the official dense 31B recipe. That backend is wrong for 31B.
+    """
+    if not model_id:
+        return False
+    other = _candidate_model_id(cand)
+    if not other:
+        return False
+    want = _model_size_tokens(model_id)
+    got = _model_size_tokens(other)
+    if not want or not got:
+        return False
+    return want != got
+
+
+def _drop_family_mismatched_hints(hints: dict[str, Any], detected: dict[str, Any] | None) -> None:
+    """Strip parsers harvested from a mixed vendor page that name another family."""
+    want_fam = str((detected or {}).get("family") or "")
+    if not want_fam or want_fam == "unknown" or not hints:
+        return
+    dummy = ServeCandidate(
+        raw="",
+        model="",
+        config={
+            "reasoning_parser": hints.get("reasoning_parser") or "",
+            "tool_call_parser": hints.get("tool_call_parser") or "",
+        },
+    )
+    if _vendor_candidate_family_mismatch(dummy, want_fam):
+        hints.pop("reasoning_parser", None)
+        hints.pop("tool_call_parser", None)
+        hints.pop("enable_auto_tool_choice", None)
 
 
 def _augment_candidates_from_cookbooks(
@@ -2351,6 +2895,8 @@ def _augment_candidates_from_cookbooks(
             if want_fam and want_fam != "unknown" and _vendor_candidate_family_mismatch(
                 c, want_fam
             ):
+                continue
+            if _vendor_candidate_sibling_mismatch(c, model_id):
                 continue
             key = re.sub(r"\s+", " ", c.raw)[:200]
             if key in seen_raw:
@@ -2484,7 +3030,7 @@ def score_candidate(
 
     # Performance / Spark-relevant flags from the card
     moe = (cfg.get("moe_backend") or "").strip()
-    flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det)
+    flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det, cfg.get("image"))
     marlin_unsafe = _marlin_unsafe_for_checkpoint(det, cfg.get("image"))
     if moe:
         if moe == "flashinfer_b12x" and flashinfer_unsafe:
@@ -2518,6 +3064,10 @@ def score_candidate(
         score += 8
     if cfg.get("load_format"):
         score += 5
+    extra_l = (cfg.get("extra_flags") or "").lower()
+    if "--attention-backend" in extra_l and "flashinfer" in extra_l:
+        score += 12
+        reasons.append("Spark --attention-backend flashinfer")
     if cfg.get("mtp") or "speculative-config" in (cfg.get("extra_flags") or ""):
         # MTP is optional — never preferred as first-boot default over stable recipes
         score -= 25
@@ -2604,9 +3154,22 @@ def score_candidate(
     return score, reasons
 
 
-def _flashinfer_b12x_unsafe_for_checkpoint(detected: dict[str, Any]) -> bool:
-    """True when forcing flashinfer_b12x will crash (FP8 MoE path on mixed checkpoints)."""
+def _flashinfer_b12x_unsafe_for_checkpoint(
+    detected: dict[str, Any],
+    image: str | None = None,
+) -> bool:
+    """True when forcing flashinfer_b12x will crash on this checkpoint×image.
+
+    Unsloth's Aug 2026 DGX Spark recipe *requires* ``--moe-backend flashinfer_b12x``
+    plus ``CUTE_DSL_ARCH=sm_121a`` on vLLM ≥0.27 (lab default ``v0.27.1``) once
+    FlashInfer ships b12x MoE kernels. Older 0.25.x images still raise
+    ``moe_backend=flashinfer_b12x is not supported for FP8 MoE`` on mixed
+    compressed-tensors checkpoints.
+    """
     if not detected:
+        return False
+    # Unknown/custom/Anemll and stock ≥0.27: keep the vendor Spark flag.
+    if _image_at_least(image, 0, 27, 0):
         return False
     if detected.get("is_mixed_nvfp4_fp8"):
         return True
@@ -2678,8 +3241,10 @@ def _marlin_unsafe_for_checkpoint(
 
     Nemotron hybrid Spark cards *require* marlin on GB10. Pure NVFP4 MoE
     (including Qwen) is legal on ≥0.27; on older images treat non-Nemotron
-    marlin as unsafe. Mixed FP8+NVFP4 should leave moe auto. Qwen MoE
-    without a proven NVFP4 layout still rejects marlin.
+    marlin as unsafe. compressed-tensors mixed FP8+NVFP4 still leaves moe
+    auto. ModelOpt MIXED_PRECISION Spark playbooks (NVIDIA Qwen3.6-35B)
+    keep marlin on ≥0.27. Qwen MoE without a proven NVFP4 layout still
+    rejects marlin.
     """
     if not detected:
         return True
@@ -2687,6 +3252,10 @@ def _marlin_unsafe_for_checkpoint(
     if family == "nemotron":
         return False
     if detected.get("is_mixed_nvfp4_fp8"):
+        qf = (detected.get("quant_flag") or "").lower()
+        # NVIDIA Qwen3.6-35B-A3B-NVFP4 playbook: marlin on vLLM ≥0.27.
+        if qf.startswith("modelopt") and _image_at_least(image, 0, 27, 0):
+            return False
         return True
     # Pure NVFP4 MoE (including Qwen): keep marlin on ≥0.27 (SM121).
     if detected.get("has_nvfp4") and not detected.get("is_mixed_nvfp4_fp8"):
@@ -2712,11 +3281,13 @@ def _sanitize_moe_backend_on_candidate(
     moe = (c.config.get("moe_backend") or "").strip().lower()
     if not moe:
         return
-    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(det):
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(
+        det, c.config.get("image")
+    ):
         c.config["moe_backend"] = ""
         if not any("cleared moe_backend" in r for r in c.reasons):
             c.reasons.append(
-                "cleared moe_backend=flashinfer_b12x on this recipe (unsafe for checkpoint)"
+                "cleared moe_backend=flashinfer_b12x on this recipe (unsafe for checkpoint×image)"
             )
     elif moe == "marlin" and _marlin_unsafe_for_checkpoint(det, c.config.get("image")):
         c.config["moe_backend"] = ""
@@ -2756,7 +3327,7 @@ def _note_card_flashinfer_avoidance(
     Scoring may pick a non-flashinfer recipe so moe_backend is already empty —
     criterion 3 still requires a clear warning/rationale for that adjustment.
     """
-    if not _flashinfer_b12x_unsafe_for_checkpoint(detected):
+    if not _flashinfer_b12x_unsafe_for_checkpoint(detected, cfg.get("image")):
         return
     if not _card_has_flashinfer_b12x(candidates, readme):
         return
@@ -2801,16 +3372,18 @@ def _apply_checkpoint_safety(
     quantization layout. Card recipes that crash on this checkpoint are fixed here.
     """
     moe = (cfg.get("moe_backend") or "").strip()
-    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected):
+    img = cfg.get("image")
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected, img):
         cfg["moe_backend"] = ""
         warnings.append(
-            "Card recipe used --moe-backend flashinfer_b12x, but HF config.json shows "
-            "mixed FP8 + NVFP4 MoE (compressed-tensors). flashinfer_b12x is NVFP4-only and "
-            "crashes with: 'moe_backend=flashinfer_b12x is not supported for FP8 MoE'. "
-            "Cleared moe-backend so vLLM auto-selects (TRITON for FP8 MoE, FlashInfer NVFP4 where valid)."
+            "Card recipe used --moe-backend flashinfer_b12x, but this image still "
+            "crashes mixed FP8 + NVFP4 MoE (compressed-tensors) with: "
+            "'moe_backend=flashinfer_b12x is not supported for FP8 MoE'. "
+            "Cleared moe-backend so vLLM auto-selects. On vLLM ≥0.27 the Spark "
+            "Unsloth recipe keeps flashinfer_b12x."
         )
         rationale.append(
-            "SAFETY (config.json > card flag): removed flashinfer_b12x for mixed FP8 MoE checkpoint"
+            "SAFETY (image <0.27 × mixed FP8 MoE): removed flashinfer_b12x"
         )
         # Keep cute-DSL if card mentioned it
         env = list(cfg.get("docker_env") or [])
@@ -2818,6 +3391,15 @@ def _apply_checkpoint_safety(
             env.append("CUTE_DSL_ARCH=sm_121a")
             cfg["docker_env"] = env
             rationale.append("Kept/added CUTE_DSL_ARCH=sm_121a from card Spark guidance")
+    elif moe == "flashinfer_b12x":
+        rationale.append(
+            "Spark Unsloth/NVIDIA path: keep --moe-backend flashinfer_b12x on vLLM ≥0.27"
+        )
+        env = list(cfg.get("docker_env") or [])
+        if not any(e.startswith("CUTE_DSL_ARCH=") for e in env):
+            env.append("CUTE_DSL_ARCH=sm_121a")
+            cfg["docker_env"] = env
+            rationale.append("Unsloth Spark recipe → CUTE_DSL_ARCH=sm_121a")
 
     moe = (cfg.get("moe_backend") or "").strip()
     if moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, cfg.get("image")):
@@ -2882,34 +3464,26 @@ def _apply_first_boot_defaults(
     """Make Auto-configure → Start serve work on first try (Spark lab posture).
 
     Cards often ship kitchen-sink demos (MTP + exotic moe backends). First boot
-    should be stable: correct quant, safe moe auto, no speculative decode.
+    should be stable: correct quant, safe moe auto. Playbook MTP stays when the
+    surviving moe backend is known-safe for this checkpoint×image.
     """
-    # MTP is opt-in — many cards include it; first boot should not.
-    if cfg.get("mtp"):
-        cfg["mtp"] = False
-        cfg["mtp_num_tokens"] = 2
-        if cfg.get("extra_flags"):
-            cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--speculative-config")
-        warnings.append(
-            "Disabled MTP / speculative decode for first boot (card had it on). "
-            "Re-enable MTP in the form after a healthy serve if you want it."
-        )
-        rationale.append("FIRST BOOT: MTP off (stable serve; re-enable later if needed)")
-
     # Empty moe = vLLM auto — preferred on Spark unless user/card forces a known-good backend
     moe = (cfg.get("moe_backend") or "").strip().lower()
     img = cfg.get("image")
-    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected):
+    if moe == "flashinfer_b12x" and _flashinfer_b12x_unsafe_for_checkpoint(detected, img):
         cfg["moe_backend"] = ""
     elif moe == "marlin" and _marlin_unsafe_for_checkpoint(detected, img):
         cfg["moe_backend"] = ""
 
     # Prefer empty moe for MoE first boot even if card set something exotic we didn't list.
-    # Keep backends that are known-safe for this checkpoint×image (incl. Nemotron marlin).
+    # Keep backends that are known-safe for this checkpoint×image (incl. Nemotron marlin
+    # and Unsloth Spark flashinfer_b12x on ≥0.27).
     moe = (cfg.get("moe_backend") or "").strip().lower()
     allowed = {"", "auto", "triton", "flashinfer_trtllm", "flashinfer_cutlass", "aiter"}
     if not _marlin_unsafe_for_checkpoint(detected, img):
         allowed.add("marlin")
+    if not _flashinfer_b12x_unsafe_for_checkpoint(detected, img):
+        allowed.add("flashinfer_b12x")
     if detected.get("is_moe") and moe and moe not in allowed:
         cfg["moe_backend"] = ""
         if moe not in ("marlin", "flashinfer_b12x"):
@@ -2917,6 +3491,37 @@ def _apply_first_boot_defaults(
                 f"Cleared --moe-backend {moe} for first-boot MoE safety (vLLM auto)."
             )
             rationale.append(f"FIRST BOOT: moe-backend {moe!r} → empty (auto)")
+
+    moe = (cfg.get("moe_backend") or "").strip().lower()
+    # NVIDIA Spark playbook ships MTP 3 with marlin. Keep it when that backend
+    # is still legal. Unsloth's winning Spark recipe has no MTP, so first boot
+    # stays MTP-off there.
+    keep_playbook_mtp = bool(cfg.get("mtp")) and moe in {"marlin", "flashinfer_b12x"}
+    if cfg.get("mtp") and not keep_playbook_mtp:
+        cfg["mtp"] = False
+        cfg["mtp_num_tokens"] = 2
+        cfg["mtp_moe_backend"] = ""
+        if cfg.get("extra_flags"):
+            cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--speculative-config")
+        warnings.append(
+            "Disabled MTP / speculative decode for first boot (card had it on). "
+            "Re-enable MTP in the form after a healthy serve if you want it."
+        )
+        rationale.append("FIRST BOOT: MTP off (stable serve; re-enable later if needed)")
+    elif keep_playbook_mtp:
+        spec_extra = _mtp_spark_extra(_speculative_json_from_extra(cfg.get("extra_flags") or ""))
+        if spec_extra.get("moe_backend") and not (cfg.get("mtp_moe_backend") or "").strip():
+            cfg["mtp_moe_backend"] = str(spec_extra["moe_backend"])
+        rationale.append(
+            f"Playbook MTP kept (moe-backend={moe}, num_speculative_tokens="
+            f"{cfg.get('mtp_num_tokens')}"
+            + (
+                f", mtp_moe_backend={cfg.get('mtp_moe_backend')}"
+                if cfg.get("mtp_moe_backend")
+                else ""
+            )
+            + ")"
+        )
 
     # Long card contexts are clamped by _apply_mode_envelope on single-node Spark.
     # Multi-node overlays (TP>=2) keep their pin.
@@ -3107,8 +3712,22 @@ def analyze_config(cfg: dict[str, Any], model_id: str = "", tags: list[str] | No
     elif "llama" in blob:
         # Llama 4 Scout/Maverick vs 3.x — tool parsers differ.
         family = "llama4" if ("llama4" in blob or "llama-4" in mid or "scout" in mid or "maverick" in mid) else "llama"
+    elif "diffusiongemma" in blob:
+        family = "diffusiongemma"
     elif "gemma" in blob:
         family = "gemma4" if ("gemma4" in blob or "gemma-4" in mid or "gemma_4" in mid) else "gemma"
+    elif "internlm" in blob:
+        family = "internlm"
+    elif "hunyuan" in blob or re.search(r"(^|[^a-z])hy3", blob) or "hy_v3" in blob:
+        family = "hy_v3" if (
+            "hy3" in blob or "hy_v3" in blob or "hy-v3" in mid or "hunyuan-v3" in mid
+        ) else "hunyuan"
+    elif re.search(r"step[\s._-]*3", blob) or "step3" in blob:
+        family = "step3p5" if (
+            "step3p5" in blob or "step-3.5" in mid or "step3.5" in mid or "3.5" in mid
+        ) else "step3"
+    elif "ernie" in blob:
+        family = "ernie"
 
     return {
         "model_type": model_type or None,
@@ -3144,6 +3763,7 @@ def _empty_config(model: str) -> dict[str, Any]:
         "extra_flags": "",
         "mtp": False,
         "mtp_num_tokens": 2,
+        "mtp_moe_backend": "",
         "load_format": "",
         "enable_chunked_prefill": False,
         "enable_prefix_caching": False,
@@ -3310,8 +3930,11 @@ def _card_prose_hints(readme: str) -> dict[str, Any]:
         hints["notes"].append("Card: do NOT use Marlin MoE backend")
     if re.search(r"reasoning.?parser\s+qwen3", readme, re.I):
         hints["reasoning_parser"] = "qwen3"
-    # Prefer more-specific Nano tool parser when both appear on a card.
-    if re.search(r"tool.?call.?parser\s+[\"']?nemotron_json", readme, re.I):
+    # Prefer more-specific tool parsers when both appear on a card.
+    if re.search(r"tool.?call.?parser\s+[\"']?qwen3_xml", readme, re.I):
+        hints["tool_call_parser"] = "qwen3_xml"
+        hints["enable_auto_tool_choice"] = True
+    elif re.search(r"tool.?call.?parser\s+[\"']?nemotron_json", readme, re.I):
         hints["tool_call_parser"] = "nemotron_json"
         hints["enable_auto_tool_choice"] = True
     elif re.search(r"tool.?call.?parser\s+qwen3_coder", readme, re.I):
@@ -3395,9 +4018,11 @@ def _fill_from_config_detection(
                 base["reasoning_parser"] = "qwen3"
                 rationale.append("Qwen architecture (from HF config) → --reasoning-parser qwen3")
             if not base.get("tool_call_parser"):
-                base["tool_call_parser"] = "qwen3_coder"
+                # vLLM Coder checkpoints use qwen3_xml; chat/reasoners use qwen3_coder.
+                tool = "qwen3_xml" if re.search(r"(^|[^a-z])coder([^a-z]|$)", mid) else "qwen3_coder"
+                base["tool_call_parser"] = tool
                 base["enable_auto_tool_choice"] = True
-                rationale.append("Qwen architecture → tool-call-parser qwen3_coder + auto tool choice")
+                rationale.append(f"Qwen architecture → tool-call-parser {tool} + auto tool choice")
             if not base.get("trust_remote_code"):
                 base["trust_remote_code"] = True
             if not base.get("kv_cache_dtype") and (
@@ -3538,7 +4163,7 @@ def _fill_from_config_detection(
             base["tool_call_parser"] = "llama3_json"
             base["enable_auto_tool_choice"] = True
             rationale.append("Llama 3.x → tool-call-parser llama3_json + auto tool choice")
-    elif family == "gemma4":
+    elif family in ("gemma4", "diffusiongemma"):
         if not base.get("reasoning_parser"):
             base["reasoning_parser"] = "gemma4"
             rationale.append("Gemma 4 → --reasoning-parser gemma4")
@@ -3594,6 +4219,61 @@ def _fill_from_config_detection(
                 if not base.get("reasoning_parser"):
                     base["reasoning_parser"] = "granite"
                     rationale.append("Granite 3.2 → --reasoning-parser granite")
+    elif family == "internlm":
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "internlm"
+            base["enable_auto_tool_choice"] = True
+            rationale.append("InternLM → tool-call-parser internlm + auto tool choice")
+        base["trust_remote_code"] = True
+    elif family == "hunyuan":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "hunyuan_a13b"
+            rationale.append("Hunyuan A13B → --reasoning-parser hunyuan_a13b")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "hunyuan_a13b"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "hy_v3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "hy_v3"
+            rationale.append("HY-v3 / Hy3 → --reasoning-parser hy_v3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "hy_v3"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "step3p5":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "step3p5"
+            rationale.append("Step-3.5 → --reasoning-parser step3p5")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "step3p5"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "step3":
+        if not base.get("reasoning_parser"):
+            base["reasoning_parser"] = "step3"
+            rationale.append("Step-3 → --reasoning-parser step3")
+        if not base.get("tool_call_parser"):
+            base["tool_call_parser"] = "step3"
+            base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
+    elif family == "ernie":
+        mid = (
+            (detected.get("model_type") or "")
+            + " "
+            + " ".join(str(a) for a in (detected.get("architectures") or []))
+            + " "
+            + str(base.get("model") or "")
+        ).lower()
+        # Thinking variants use ernie45; PT-only omit parsers unless the card set them.
+        if "thinking" in mid:
+            if not base.get("reasoning_parser"):
+                base["reasoning_parser"] = "ernie45"
+                rationale.append("ERNIE-4.5 Thinking → --reasoning-parser ernie45")
+            if not base.get("tool_call_parser"):
+                base["tool_call_parser"] = "ernie45"
+                base["enable_auto_tool_choice"] = True
+        base["trust_remote_code"] = True
 
 
 _CONTEXT_LADDER = (1048576, 524288, 262144, 131072, 65536, 32768, 16384)
@@ -3834,16 +4514,24 @@ def recommend(
     *,
     mode: str | None = None,
     fetch_remote: bool = True,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     """Build serve config from the HF card plus researched vendor recipes.
 
     ``mode`` is accepted for old clients and ignored — util / max-len / VL
     come from the researched recipe + live hardware envelope.
+
+    ``backend`` is ``vllm`` (default) or ``llamacpp``. GGUF ids should use
+    ``llamacpp`` — that path never starts llama-server.
     """
     mode = None  # user-facing dual envelopes are gone
     model = (model or "").strip()
     if not model:
         raise ValueError("model is required")
+
+    eng = (backend or "vllm").strip().lower()
+    if eng in ("llamacpp", "llama.cpp", "gguf"):
+        return recommend_llamacpp(model, fetch_remote=fetch_remote)
 
     rationale: list[str] = []
     warnings: list[str] = []
@@ -3939,6 +4627,15 @@ def recommend(
     vendor_bodies: list[str] = []
     if readme:
         candidates = extract_serve_candidates(readme, detected=detected)
+        want_fam = str(detected.get("family") or "")
+        candidates = [
+            c
+            for c in candidates
+            if not (
+                (want_fam and want_fam != "unknown" and _vendor_candidate_family_mismatch(c, want_fam))
+                or _vendor_candidate_sibling_mismatch(c, model)
+            )
+        ]
     candidates = _augment_candidates_from_cookbooks(
         readme or "",
         candidates=candidates,
@@ -4002,6 +4699,7 @@ def recommend(
 
         if readme:
             prose = _card_prose_hints(readme)
+            _drop_family_mismatched_hints(prose, detected)
             for n in prose.pop("notes", []):
                 rationale.append(n)
             filled = _merge_fill(cfg, prose)
@@ -4010,6 +4708,7 @@ def recommend(
 
     for body in vendor_bodies:
         prose = _card_prose_hints(body)
+        _drop_family_mismatched_hints(prose, detected)
         for n in prose.pop("notes", []):
             rationale.append(n)
         filled = _merge_fill(cfg, prose)
@@ -4196,7 +4895,11 @@ def recommend(
     cfg["docker_env"] = _scrub_unexpanded_docker_env(env_out, warnings)
 
     # If MTP structured flag is on, strip duplicate --speculative-config from extras
+    # after harvesting Spark MoE keys the structured emit must carry.
     if cfg.get("mtp") and cfg.get("extra_flags"):
+        spec_extra = _mtp_spark_extra(_speculative_json_from_extra(cfg["extra_flags"]))
+        if spec_extra.get("moe_backend") and not (cfg.get("mtp_moe_backend") or "").strip():
+            cfg["mtp_moe_backend"] = str(spec_extra["moe_backend"])
         cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--speculative-config")
 
     # GB10 / Spark: Qwen FP8 dense has hit DeepGEMM issues — soft env when card silent
@@ -4335,3 +5038,143 @@ def recommend(
 def list_known_recipes() -> list[dict[str, Any]]:
     """No static lab recipe list — cards are authoritative. Keep endpoint stable."""
     return []
+
+
+def looks_like_gguf(model: str, tags: list[str] | None = None) -> bool:
+    """True when the id, path, or Hub tags point at a GGUF / llama.cpp checkpoint."""
+    mid = (model or "").lower()
+    if mid.endswith(".gguf") or "/gguf" in mid or "gguf" in mid.split("/")[-1]:
+        return True
+    for t in tags or []:
+        if "gguf" in str(t).lower():
+            return True
+    return False
+
+
+def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, Any]:
+    """Spark-optimal llama.cpp flags. Recommend-only — does not start llama-server.
+
+    Pack from ggml DGX Spark benches + NVIDIA forum Spark guides:
+    ``-ngl 99 --flash-attn on --no-mmap --jinja -ub 2048`` and a ctx sized
+    to leftover UMA after weights + reserved 15 GiB.
+    """
+    model = (model or "").strip()
+    if not model:
+        raise ValueError("model is required")
+
+    rationale: list[str] = []
+    warnings: list[str] = []
+    hf_config: Optional[dict] = None
+    tags: list[str] = []
+    if (
+        fetch_remote
+        and not Path(model).is_dir()
+        and not model.startswith("/")
+        and "/" in model
+    ):
+        remote = fetch_hf_card(model)
+        hf_config = remote.get("config")
+        api = remote.get("api") or {}
+        tags = list(api.get("tags") or [])
+        for u in remote.get("fetched") or []:
+            rationale.append(f"HF fetch: {u}")
+
+    hub_id, want_quant = _hf_repo_ref(model)
+    blob = _hub_blob_measure(model)
+    if blob and blob.get("gib") is not None:
+        weights_gib = float(blob["gib"])
+    else:
+        weights_gib = estimate_weights_gib(hub_id, hf_config)
+    spark_quant = (want_quant or (blob or {}).get("quant") or "UD-Q4_K_XL") if (
+        "/" in hub_id and not hub_id.startswith("/") and not Path(hub_id).is_dir()
+    ) else None
+    use_mtp = bool((blob or {}).get("mtp")) or _gguf_siblings_have_mtp(
+        hub_id, (blob or {}).get("siblings") or []
+    )
+    topology = _cluster_topology()
+    plan = plan_placement(weights_gib, topology)
+    ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
+    w = float(weights_gib or 0.0)
+    leftover = ram - w - _UMA_RESERVE_GIB
+    ctx = 8192
+    for cand in _CONTEXT_LADDER:
+        # Unknown GQA/arch: budget ~0.25 GiB KV per 8k tokens (q8 cache, conservative).
+        need = (float(cand) / 8192.0) * 0.25
+        if leftover >= need + _RUNTIME_PAD_GIB:
+            ctx = int(cand)
+            break
+    if leftover < 8.0:
+        warnings.append(
+            "Weights leave little UMA headroom — shrink --ctx-size if llama-server OOMs"
+        )
+
+    mtp_n = 3
+    cfg = {
+        "engine": "llamacpp",
+        "model": hub_id,
+        "ngl": 99,
+        "flash_attn": "on",
+        "no_mmap": True,
+        "jinja": True,
+        "ubatch": 2048,
+        "ctx_size": ctx,
+        "host": "0.0.0.0",
+        "port": 8080,
+        "hf_quant": spark_quant,
+        "mtp": use_mtp,
+        "mtp_num_tokens": mtp_n if use_mtp else 0,
+        "extra_flags": "",
+    }
+    if spark_quant and "/" in hub_id and not hub_id.startswith("/"):
+        model_arg = f"-hf {hub_id}:{spark_quant}"
+        rationale.append(f"llama.cpp Hub ref: -hf {hub_id}:{spark_quant} (one Spark quant, not -m repo)")
+    else:
+        model_arg = f"-m {hub_id}"
+    mtp_arg = ""
+    if use_mtp:
+        mtp_arg = f" --spec-type draft-mtp --spec-draft-n-max {mtp_n}"
+        rationale.append(
+            f"MTP GGUF detected → --spec-type draft-mtp --spec-draft-n-max {mtp_n}"
+        )
+    argv = (
+        f"llama-server {model_arg} -ngl 99 --flash-attn on --no-mmap --jinja "
+        f"-ub 2048 -c {ctx} --host 0.0.0.0 --port 8080{mtp_arg}"
+    )
+    rationale.append(
+        "DGX Spark llama.cpp pack: -ngl 99, --flash-attn on, --no-mmap "
+        "(GB10 mmap is slow), --jinja (tools). "
+        "Refs: ggml-org/llama.cpp#16578, NVIDIA Spark Qwen3.5 llama.cpp guide."
+    )
+    rationale.append(f"ctx_size={ctx} from leftover UMA ({leftover:.1f} GiB after weights+reserve)")
+    fits = bool(plan.get("fits", True))
+    if weights_gib is None:
+        fits = True
+        warnings.append("Weight size unknown — ctx is conservative; verify the GGUF fits UMA")
+    return {
+        "model": hub_id,
+        "engine": "llamacpp",
+        "mode": "auto",
+        "confidence": "medium" if weights_gib else "low",
+        "label": "llama.cpp Spark",
+        "notes": "Recommend-only. Start llama-server yourself (L.A.I.L does not spawn it yet).",
+        "serve_blocked": not fits,
+        "config": cfg,
+        "argv": argv,
+        "topology": {
+            "nodes": topology.get("nodes", 1),
+            "weights_gib": weights_gib,
+            "node_ram_gib": ram,
+            "fits": fits,
+            "gguf_quant": spark_quant,
+        },
+        "sources": [
+            {
+                "kind": "vendor_doc",
+                "ref": "https://github.com/ggml-org/llama.cpp/discussions/16578",
+                "notes": "DGX Spark llama.cpp benches",
+            }
+        ],
+        "rationale": rationale,
+        "warnings": warnings,
+        "detected": {"family": "gguf" if looks_like_gguf(hub_id, tags) else "unknown"},
+    }

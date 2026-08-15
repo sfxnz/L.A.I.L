@@ -1,7 +1,7 @@
 {
   "model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
   "mode": "workflow_max",
-  "note": "Unsloth mixed FP8+NVFP4 MoE (compressed-tensors). Card recommends flashinfer_b12x — must be stripped. Proven single-Spark path. Hub index total_size ~24.7 GiB.",
+  "note": "Unsloth mixed FP8+NVFP4 MoE. On vLLM ≥0.27 keep official Spark recipe: flashinfer_b12x + CUTE_DSL_ARCH. Hub index ~24.7 GiB.",
   "weights_gib": 24.7,
   "weights_source": "index",
   "expect": {
@@ -12,15 +12,17 @@
     "config": {
       "quantization": "compressed-tensors",
       "kv_cache_dtype": "fp8",
-      "moe_backend": "",
+      "moe_backend": "flashinfer_b12x",
       "reasoning_parser": "qwen3",
       "tool_call_parser": "qwen3_coder",
       "enable_auto_tool_choice": true,
       "trust_remote_code": true
     },
+    "docker_env_contains": [
+      "CUTE_DSL_ARCH=sm_121a"
+    ],
     "extra_flags_contains": [],
     "forbidden": [
-      "flashinfer_b12x",
       "humming",
       "$",
       "--model "

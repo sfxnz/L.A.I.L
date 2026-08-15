@@ -1,14 +1,14 @@
 {
   "model": "example/Mixed-MoE-NVFP4",
   "mode": "workflow_max",
-  "note": "Offline fixture: compressed-tensors mixed FP8+NVFP4 must not keep flashinfer_b12x.",
+  "note": "Offline fixture: mixed FP8+NVFP4 on lab default ≥0.27 keeps Unsloth Spark flashinfer_b12x.",
   "expect": {
     "config": {
       "quantization": "compressed-tensors",
-      "kv_cache_dtype": "fp8"
+      "kv_cache_dtype": "fp8",
+      "moe_backend": "flashinfer_b12x"
     },
     "forbidden": [
-      "flashinfer_b12x",
       "humming",
       "$",
       "--model "

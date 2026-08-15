@@ -30,17 +30,23 @@ def slug(model_id: str) -> str:
 
 
 def _weights_from_api_siblings(api: Optional[dict]) -> tuple[Optional[float], Optional[dict]]:
-    """Sum safetensors/bin/gguf sibling sizes from HF model API (blobs=true style)."""
+    """Sum one safetensors dump (not consolidated+shards) or GGUF siblings."""
     if not isinstance(api, dict):
         return None, None
-    tot = 0
-    n = 0
+    st: list[dict] = []
+    gg: list[dict] = []
     for f in api.get("siblings") or []:
         if not isinstance(f, dict):
             continue
-        name = f.get("rfilename") or f.get("path") or ""
-        if not str(name).endswith((".safetensors", ".bin", ".gguf")):
-            continue
+        name = str(f.get("rfilename") or f.get("path") or "")
+        if name.endswith((".safetensors", ".bin")):
+            st.append(f)
+        elif name.endswith(".gguf"):
+            gg.append(f)
+    chosen = ac._select_weight_blobs(st) if st else gg
+    tot = 0
+    n = 0
+    for f in chosen:
         size = f.get("size")
         if isinstance(size, (int, float)) and size > 0:
             tot += int(size)

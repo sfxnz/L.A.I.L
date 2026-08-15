@@ -88,5 +88,98 @@
       "Unsloth/Qwen NVFP4 cards have no parseable vllm serve (docs are a bare serve). Parsers + FP8 KV from Unsloth's calibrated cache.",
       "Vision stays on; hardware envelope sizes util / max-len from live UMA."
     ]
+  },
+  {
+    "match": {
+      "all": ["nvidia", "qwen3.6", "35b", "a3b"],
+      "any": ["nvfp4"],
+      "family": ["qwen"]
+    },
+    "family_key": "qwen36_35b_nvfp4_playbook",
+    "label": "Qwen3.6 35B-A3B NVFP4 (DGX Spark playbook)",
+    "source": "https://github.com/NVIDIA/dgx-spark-playbooks/blob/main/nvidia/vllm/README.md",
+    "config": {
+      "trust_remote_code": true,
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3_xml",
+      "enable_auto_tool_choice": true,
+      "kv_cache_dtype": "fp8",
+      "moe_backend": "marlin",
+      "mtp": true,
+      "mtp_num_tokens": 3,
+      "mtp_moe_backend": "triton",
+      "enable_chunked_prefill": true,
+      "enable_prefix_caching": true,
+      "extra_flags": "--attention-backend flashinfer --async-scheduling --load-format fastsafetensors --max-num-batched-tokens 8192"
+    },
+    "rationale": [
+      "NVIDIA dgx-spark-playbooks Agent Ready Qwen3.6 35B: marlin + qwen3_xml + flashinfer attention + MTP 3.",
+      "MTP speculative-config carries moe_backend:triton (draft MoE); top-level --moe-backend stays marlin.",
+      "Do not apply this overlay to Unsloth 35B (that path keeps flashinfer_b12x).",
+      "Playbook MTP 3 is kept on vLLM ≥0.27; hardware envelope sizes util / max-len."
+    ]
+  },
+  {
+    "match": {
+      "all": ["diffusiongemma"],
+      "any": [],
+      "family": []
+    },
+    "family_key": "diffusiongemma",
+    "label": "DiffusionGemma (DGX Spark playbook)",
+    "source": "https://github.com/NVIDIA/dgx-spark-playbooks/blob/main/nvidia/vllm/README.md",
+    "config": {
+      "reasoning_parser": "gemma4",
+      "tool_call_parser": "gemma4",
+      "enable_auto_tool_choice": true,
+      "enable_prefix_caching": true,
+      "load_format": "fastsafetensors",
+      "docker_env": [
+        "VLLM_USE_V2_MODEL_RUNNER=1"
+      ],
+      "extra_flags": "--attention-backend TRITON_ATTN --diffusion-config '{\"canvas_length\":256}' --override-generation-config '{\"max_new_tokens\": null}' --default-chat-template-kwargs '{\"enable_thinking\": true}'"
+    },
+    "rationale": [
+      "NVIDIA DGX Spark playbook: DiffusionGemma uses vllm/vllm-openai:gemma (image pin is resolver-owned).",
+      "V2 model runner + TRITON_ATTN + --diffusion-config canvas_length=256; parsers stay gemma4."
+    ]
+  },
+  {
+    "match": {
+      "all": [],
+      "any": ["gemma-4", "gemma4", "gemma_4"],
+      "family": ["gemma4"]
+    },
+    "family_key": "gemma4",
+    "label": "Gemma 4 (parsers)",
+    "source": "https://github.com/NVIDIA/dgx-spark-playbooks/blob/main/nvidia/vllm/README.md",
+    "config": {
+      "reasoning_parser": "gemma4",
+      "tool_call_parser": "gemma4",
+      "enable_auto_tool_choice": true
+    },
+    "rationale": [
+      "Gemma 4 family: --reasoning-parser gemma4 + --tool-call-parser gemma4.",
+      "Image pin vllm/vllm-openai:gemma4-cu130 is resolver-owned (not this overlay)."
+    ]
+  },
+  {
+    "match": {
+      "all": ["gpt-oss"],
+      "any": [],
+      "family": []
+    },
+    "family_key": "gpt_oss",
+    "label": "GPT-OSS (MXFP4)",
+    "source": "https://docs.vllm.ai/en/latest/features/tool_calling/",
+    "config": {
+      "quantization": "mxfp4",
+      "tool_call_parser": "openai",
+      "enable_auto_tool_choice": true
+    },
+    "rationale": [
+      "GPT-OSS checkpoints ship MXFP4 MoE weights; vLLM tool parser is openai.",
+      "Card is a bare `vllm serve` — no expert/DP crash flags on the 1–2× GB10 path."
+    ]
   }
 ]

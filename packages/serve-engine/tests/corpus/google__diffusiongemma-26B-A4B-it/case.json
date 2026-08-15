@@ -1,0 +1,26 @@
+{
+  "model": "google/diffusiongemma-26B-A4B-it",
+  "weights_gib": 49.0,
+  "note": "NVIDIA DGX Spark playbook: DiffusionGemma uses vllm/vllm-openai:gemma + TRITON_ATTN / diffusion-config / V2 runner.",
+  "expect": {
+    "serve_blocked": false,
+    "weights_gib_min": 40.0,
+    "weights_gib_max": 60.0,
+    "image": "vllm/vllm-openai:gemma",
+    "config": {
+      "reasoning_parser": "gemma4",
+      "tool_call_parser": "gemma4",
+      "enable_auto_tool_choice": true,
+      "load_format": "fastsafetensors"
+    },
+    "extra_flags_contains": [
+      "--attention-backend",
+      "TRITON_ATTN",
+      "--diffusion-config"
+    ],
+    "docker_env_contains": [
+      "VLLM_USE_V2_MODEL_RUNNER=1"
+    ],
+    "forbidden": ["$", "--model ", "anemll", "gemma4-cu130"]
+  }
+}

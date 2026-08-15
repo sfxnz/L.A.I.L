@@ -153,6 +153,7 @@
     "family_key": "gemma4",
     "label": "Gemma 4 (parsers)",
     "source": "https://github.com/NVIDIA/dgx-spark-playbooks/blob/main/nvidia/vllm/README.md",
+    "gap_only": true,
     "config": {
       "reasoning_parser": "gemma4",
       "tool_call_parser": "gemma4",
@@ -160,6 +161,7 @@
     },
     "rationale": [
       "Gemma 4 family: --reasoning-parser gemma4 + --tool-call-parser gemma4.",
+      "Parsers-only — official 31B extras (--chat-template / --async-scheduling / --limit-mm-per-prompt) stay.",
       "Image pin vllm/vllm-openai:gemma4-cu130 is resolver-owned (not this overlay)."
     ]
   },

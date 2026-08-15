@@ -346,7 +346,10 @@ def test_qwen_coder_uses_qwen3_xml():
 
 def test_strip_spark_unsafe_flags():
     cfg = {
-        "extra_flags": "--enable-expert-parallel --data-parallel-size 8 --max-num-batched-tokens 8192",
+        "extra_flags": (
+            "--enable-expert-parallel --data-parallel-size 8 "
+            "--linear-backend humming --max-num-batched-tokens 8192"
+        ),
         "moe_backend": "humming",
         "docker_env": ["VLLM_USE_DEEP_GEMM_MEGA_MOE=1", "CUTE_DSL_ARCH=sm_121a"],
     }
@@ -356,6 +359,8 @@ def test_strip_spark_unsafe_flags():
     ex = cfg["extra_flags"]
     assert "--enable-expert-parallel" not in ex
     assert "--data-parallel-size" not in ex
+    assert "--linear-backend" not in ex
+    assert "humming" not in ex.lower()
     assert "--max-num-batched-tokens" in ex
     assert cfg["moe_backend"] == ""
     assert not any(e.startswith("VLLM_USE_DEEP_GEMM_MEGA_MOE=") for e in cfg["docker_env"])
@@ -1486,14 +1491,17 @@ def test_shipped_serve_overlays_json_loads_minimax():
     )
     assert ov is not None and ov["family_key"] == "minimax_m2"
     assert ov["config"].get("reasoning_parser") == "minimax_m2"
+    assert ac._overlay_gap_only(ov) is False
     ov3 = ac._family_overlay("MiniMaxAI/MiniMax-M3", {"family": "minimax_m3"})
     assert ov3 is not None and ov3["family_key"] == "minimax_m3"
     assert "--block-size 128" in (ov3["config"].get("extra_flags") or "")
+    assert ac._overlay_gap_only(ov3) is False
     q38 = ac._family_overlay(
         "unsloth/Qwen3.8-27B-NVFP4",
         {"family": "qwen"},
     )
     assert q38 is not None and q38["family_key"] == "qwen38_nvfp4"
+    assert ac._overlay_gap_only(q38) is True
     assert q38["config"].get("kv_cache_dtype") == "fp8"
     assert "--language-model-only" not in (q38["config"].get("extra_flags") or "")
     nv35 = ac._family_overlay(
@@ -1501,6 +1509,7 @@ def test_shipped_serve_overlays_json_loads_minimax():
         {"family": "qwen"},
     )
     assert nv35 is not None and nv35["family_key"] == "qwen36_35b_nvfp4_playbook"
+    assert ac._overlay_gap_only(nv35) is False
     assert nv35["config"].get("moe_backend") == "marlin"
     assert nv35["config"].get("tool_call_parser") == "qwen3_xml"
     assert nv35["config"].get("mtp") is True
@@ -1515,6 +1524,7 @@ def test_shipped_serve_overlays_json_loads_minimax():
     assert g4 is not None and g4["family_key"] == "gemma4"
     assert g4["config"].get("reasoning_parser") == "gemma4"
     assert g4["config"].get("tool_call_parser") == "gemma4"
+    assert ac._overlay_gap_only(g4) is True
     # DiffusionGemma overlay is id-specific — do not steal Gemma 4 parsers-only overlay.
     assert ac._family_overlay("google/diffusiongemma-26B-A4B-it", {"family": "diffusiongemma"})[
         "family_key"
@@ -1525,6 +1535,9 @@ def test_shipped_serve_overlays_json_loads_minimax():
     assert ac._family_overlay("unsloth/gemma-4-31B-it-NVFP4", {"family": "gemma4"})[
         "family_key"
     ] == "gemma4"
+    ds = ac._family_overlay("deepseek-ai/DeepSeek-V4-Flash", {})
+    assert ds is not None and ds["family_key"] == "deepseek_v4_dspark"
+    assert ac._overlay_gap_only(ds) is False
     gptoss = ac._family_overlay("openai/gpt-oss-20b", {})
     assert gptoss is not None and gptoss["family_key"] == "gpt_oss"
     assert gptoss["config"].get("quantization") == "mxfp4"
@@ -2189,6 +2202,167 @@ def test_ensure_dspark_after_scrub_without_method_token():
     # Recover path when expand was skipped but speculative_config remnants remain.
     ac._ensure_dspark_draft_or_strip(cfg, readme, warnings, rationale)
     assert "--speculative_config.model nvidia/Lightning-DSpark" in cfg["extra_flags"]
+
+
+# Live Nemotron Lightning card (Aug 2026): Spark/DSpark Quick Start is duplicated
+# under #### 1x DGX Spark, and Ampere is headed **W4A16 (vLLM)** — that heading
+# used to take the +35 vLLM bonus and skip the Ampere penalty (125 vs 57).
+_NEMOTRON_LIVE_SHAPED_CARD = """
+## Quick Start
+
+To get quickly started on DGX Spark (GB10) you can use the following command.
+
+```shell
+export MODEL_CKPT=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+export DSPARK_CKPT=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
+```
+
+```shell
+vllm serve --model $MODEL_CKPT \\
+  --moe-backend marlin \\
+  --kv-cache-dtype fp8 \\
+  --enable-prefix-caching \\
+  --speculative_config.num_speculative_tokens 3 \\
+  --mamba-backend flashinfer \\
+  --mamba-cache-mode align \\
+  --reasoning-parser nemotron_v3 \\
+  --speculative_config.model $DSPARK_CKPT \\
+  --tool-call-parser qwen3_coder \\
+  --enable-auto-tool-choice
+```
+
+## **Quick Start Guide**
+
+### **vLLM**
+
+#### **1x DGX Spark (GB10)**
+
+```shell
+vllm serve --model $MODEL_CKPT \\
+  --moe-backend marlin \\
+  --kv-cache-dtype fp8 \\
+  --enable-prefix-caching \\
+  --speculative_config.num_speculative_tokens 3 \\
+  --mamba-backend flashinfer \\
+  --mamba-cache-mode align \\
+  --reasoning-parser nemotron_v3 \\
+  --speculative_config.model $DSPARK_CKPT \\
+  --tool-call-parser qwen3_coder \\
+  --enable-auto-tool-choice
+```
+
+#### **W4A16 (vLLM)**
+
+```shell
+vllm serve --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \\
+    --moe-backend humming \\
+    --linear-backend humming \\
+    --max-num-seqs 256 \\
+    --max-num-batched-tokens 32768 \\
+    --enable-prefix-caching \\
+    --async-scheduling \\
+    --quantization modelopt_fp4 \\
+    --mamba-backend flashinfer \\
+    --mamba-cache-mode align \\
+    --mamba-ssu-algorithm simple \\
+    --reasoning-parser nemotron_v3 \\
+    --tool-call-parser qwen3_coder \\
+    --enable-auto-tool-choice
+```
+"""
+
+
+def _nemotron_lightning_detected() -> dict:
+    return ac.analyze_config(
+        {
+            "architectures": ["NemotronHForCausalLM"],
+            "model_type": "nemotron_h",
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "a": {"quant_algo": "FP8"},
+                    "b": {"quant_algo": "W4A16_NVFP4"},
+                },
+            },
+        },
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    )
+
+
+def test_w4a16_vllm_heading_loses_to_spark_dspark():
+    """Live heading 'W4A16 (vLLM)' must not out-score Spark/DSpark Quick Start."""
+    det = _nemotron_lightning_detected()
+    cands = ac.extract_serve_candidates(_NEMOTRON_LIVE_SHAPED_CARD, detected=det)
+    assert cands
+    best = cands[0]
+    w4 = next(c for c in cands if "w4a16" in (c.section or "").lower())
+    blob = f"{best.section} {best.raw}".lower()
+    assert "spark" in blob or "dspark" in blob, (
+        f"expected Spark/DSpark winner, got section={best.section!r} score={best.score}"
+    )
+    assert best.score > w4.score, (
+        f"Spark/DSpark {best.score} must beat W4A16 (vLLM) {w4.score} "
+        f"(section={best.section!r} vs {w4.section!r})"
+    )
+    # Duplicate Spark cmd should keep the hardware heading, not only Quick Start.
+    assert "spark" in (best.section or "").lower()
+
+
+def test_recommend_nemotron_resolves_dspark_and_strips_humming(monkeypatch):
+    """Winning Spark recipe must resolve $DSPARK_CKPT and drop leftover humming."""
+    det_cfg = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "max_position_embeddings": 1048576,
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "a": {"quant_algo": "FP8"},
+                "b": {"quant_algo": "W4A16_NVFP4"},
+            },
+        },
+    }
+
+    def fake_fetch(model_id: str, timeout: float = 20.0) -> dict:
+        return {
+            "model_id": model_id,
+            "readme": _NEMOTRON_LIVE_SHAPED_CARD,
+            "config": det_cfg,
+            "api": None,
+            "card_url": f"https://huggingface.co/{model_id}",
+            "errors": [],
+            "fetched": ["fixture://nemotron-live-shaped"],
+        }
+
+    monkeypatch.setattr(ac, "fetch_hf_card", fake_fetch)
+    monkeypatch.setattr(
+        ac,
+        "_cluster_topology",
+        lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
+    )
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.1)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
+    monkeypatch.setattr(
+        ac,
+        "load_local_fallback",
+        lambda model_id: {"config": None, "readme": None, "notes": []},
+    )
+    rec = ac.recommend(
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4", fetch_remote=True
+    )
+    cfg = rec["config"]
+    extra = cfg.get("extra_flags") or ""
+    assert "spark" in (rec.get("label") or "").lower(), rec.get("label")
+    assert "W4A16" not in (rec.get("label") or "")
+    assert "$" not in extra
+    assert "--model " not in extra
+    assert "humming" not in extra.lower()
+    assert (cfg.get("moe_backend") or "") != "humming"
+    assert "--linear-backend" not in extra
+    assert "--speculative_config.model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark" in extra
+    assert "--speculative_config.method dspark" in extra
 
 
 def test_config_quant_overrides_ampere_prose_modelopt_fp4():
@@ -3446,7 +3620,7 @@ def test_recommend_gemma4_nvfp4_ignores_nvidia_qwen_playbook(monkeypatch):
 
 
 def test_recommend_gemma4_31b_ignores_unsloth_26b_moe_spark(monkeypatch):
-    """Official 31B recipe must beat Unsloth 26B-A4B Spark --moe-backend flashinfer_b12x."""
+    """Official 31B extras survive the parsers-only overlay; 26B-A4B Spark MoE does not win."""
     hf_config = {
         "architectures": ["Gemma4ForConditionalGeneration"],
         "model_type": "gemma4",
@@ -3476,7 +3650,6 @@ def test_recommend_gemma4_31b_ignores_unsloth_26b_moe_spark(monkeypatch):
         readme="# google/gemma-4-31B-it\nNo serve recipe.\n",
         config=hf_config,
     )
-    monkeypatch.setattr(ac, "_family_overlay", lambda *a, **k: None)
 
     def fake_cookbook(url: str, **kwargs):
         if "unsloth.ai/docs/models/gemma-4" in url:
@@ -3489,6 +3662,9 @@ def test_recommend_gemma4_31b_ignores_unsloth_26b_moe_spark(monkeypatch):
 
     monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
 
+    ov = ac._family_overlay("google/gemma-4-31B-it", {"family": "gemma4"})
+    assert ov is not None and ov["family_key"] == "gemma4"
+
     for mid in ("google/gemma-4-31B-it", "unsloth/gemma-4-31B-it-NVFP4"):
         rec = ac.recommend(mid, fetch_remote=True)
         cfg = rec["config"]
@@ -3497,7 +3673,9 @@ def test_recommend_gemma4_31b_ignores_unsloth_26b_moe_spark(monkeypatch):
         assert cfg.get("reasoning_parser") == "gemma4", (mid, rec.get("rationale"))
         assert cfg.get("tool_call_parser") == "gemma4"
         assert cfg.get("moe_backend") != "flashinfer_b12x", (mid, rec.get("rationale"))
-        assert "--chat-template" in extras or "--async-scheduling" in extras, extras
+        assert "--chat-template" in extras, extras
+        assert "--async-scheduling" in extras, extras
+        assert "--limit-mm-per-prompt" in extras, extras
         assert "26B-A4B" not in " ".join(rec.get("rationale") or [])
 
 

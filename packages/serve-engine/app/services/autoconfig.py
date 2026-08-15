@@ -401,6 +401,32 @@ def _section_at(heads: list[tuple[int, str]], pos: int) -> str:
     return cur
 
 
+def _section_is_spark(sec: str) -> bool:
+    s = (sec or "").lower()
+    return any(k in s for k in ("dgx spark", "gb10"))
+
+
+def _section_is_other_silicon(sec: str) -> bool:
+    """True when the heading names a non-Spark GPU path (incl. W4A16 Ampere)."""
+    s = (sec or "").lower()
+    return any(
+        k in s
+        for k in ("ampere", "w4a16", "a100", "h100", "h200", "gb200", "b200", "rtx", "l40")
+    )
+
+
+def _section_spark_rank(sec: str) -> int:
+    """Specificity for de-dup: prefer a later GB10 heading over generic Quick Start."""
+    if _section_is_spark(sec):
+        return 3
+    s = (sec or "").lower()
+    if "quick start" in s or "quickstart" in s:
+        return 2
+    if "vllm" in s and not _section_is_other_silicon(s):
+        return 1
+    return 0
+
+
 def _extract_code_blocks(readme: str) -> list[tuple[int, str, str]]:
     """Return (start_offset, lang, body) for fenced blocks."""
     out: list[tuple[int, str, str]] = []
@@ -743,6 +769,17 @@ def _load_overlays() -> list[dict[str, Any]]:
     except Exception:
         pass
     return overlays
+
+
+def _overlay_gap_only(overlay: Optional[dict[str, Any]]) -> bool:
+    """True when overlay only fills gaps and must not discard card/vendor extras.
+
+    MiniMax / DSpark / playbook overlays own the Spark path (card is known-wrong).
+    Parsers-only (Gemma 4) and last-mile fill (Qwen3.8 NVFP4) do not.
+    """
+    if not overlay:
+        return False
+    return bool(overlay.get("gap_only")) or overlay.get("family_key") == "qwen38_nvfp4"
 
 
 def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1894,6 +1931,16 @@ def _strip_spark_unsafe_flags(
         )
         rationale.append("SAFETY: humming moe-backend → empty (auto) on GB10")
 
+    # Ampere W4A16 snippets pair --linear-backend humming with moe humming.
+    # Clearing only moe leaves a leftover that still fails on GB10.
+    if re.search(r"--linear-backend\s+humming\b", ex, re.I):
+        ex = _strip_flag_from_extra(ex, "--linear-backend")
+        cfg["extra_flags"] = ex
+        warnings.append(
+            "Cleared --linear-backend humming (Ampere / non-GB10 recipe; leave auto on Spark)."
+        )
+        rationale.append("SAFETY: humming linear-backend → stripped on GB10")
+
     env = list(cfg.get("docker_env") or [])
     kept = []
     env_drop = []
@@ -2931,7 +2978,20 @@ def extract_serve_candidates(
         return []
     heads = _section_map(readme)
     candidates: list[ServeCandidate] = []
-    seen_raw: set[str] = set()
+    seen_raw: dict[str, ServeCandidate] = {}
+
+    def _keep_or_upgrade(cand: ServeCandidate, section: str) -> None:
+        key = re.sub(r"\s+", " ", cand.raw)[:200]
+        prev = seen_raw.get(key)
+        if prev:
+            # Same command later under #### 1x DGX Spark — keep the hardware heading
+            # so scoring/label use Spark, not the earlier generic Quick Start.
+            if _section_spark_rank(section) > _section_spark_rank(prev.section):
+                prev.section = section
+            return
+        cand.section = section
+        seen_raw[key] = cand
+        candidates.append(cand)
 
     # 1) Fenced code blocks
     for start, _lang, body in _extract_code_blocks(readme):
@@ -2945,12 +3005,7 @@ def extract_serve_candidates(
             cand = _parse_one_serve_command(frag)
             if not cand:
                 continue
-            key = re.sub(r"\s+", " ", cand.raw)[:200]
-            if key in seen_raw:
-                continue
-            seen_raw.add(key)
-            cand.section = _section_at(heads, start)
-            candidates.append(cand)
+            _keep_or_upgrade(cand, _section_at(heads, start))
 
     # 2) Unfenced inline `vllm serve …` lines in prose
     for m in re.finditer(r"(?m)^(?:export\s+\S+\s*\n)*[^\n]*\bvllm\s+serve\b[^\n]*(?:\n[^\n]*\\[^\n]*)*", readme):
@@ -2960,12 +3015,7 @@ def extract_serve_candidates(
         cand = _parse_one_serve_command(frag)
         if not cand:
             continue
-        key = re.sub(r"\s+", " ", cand.raw)[:200]
-        if key in seen_raw:
-            continue
-        seen_raw.add(key)
-        cand.section = _section_at(heads, m.start())
-        candidates.append(cand)
+        _keep_or_upgrade(cand, _section_at(heads, m.start()))
 
     # 3) Notebook-style shell lines (`!vllm serve …`) after cell flatten
     for m in re.finditer(r"(?m)^!\s*vllm\s+serve\b[^\n]*(?:\n[^\n]*\\[^\n]*)*", readme):
@@ -2973,12 +3023,7 @@ def extract_serve_candidates(
         cand = _parse_one_serve_command(frag)
         if not cand:
             continue
-        key = re.sub(r"\s+", " ", cand.raw)[:200]
-        if key in seen_raw:
-            continue
-        seen_raw.add(key)
-        cand.section = _section_at(heads, m.start()) or "notebook"
-        candidates.append(cand)
+        _keep_or_upgrade(cand, _section_at(heads, m.start()) or "notebook")
 
     for c in candidates:
         c.score, c.reasons = score_candidate(c, readme, detected=detected)
@@ -3016,24 +3061,27 @@ def score_candidate(
     cfg = c.config
     det = detected or {}
 
-    # Prefer dedicated vLLM sections near the top of the card
-    if "vllm run" in sec or sec.strip() in ("vllm", "vllm run instructions") or "dgx spark" in sec:
+    # Cards ship per-GPU recipes. One headed for other silicon is the wrong path on a
+    # Spark even when its flag list scores well (NVFP4 cards carry a W4A16 Ampere
+    # fallback whose flags out-score the real GB10 recipe). Live heading
+    # "W4A16 (vLLM)" used to take the +35 vLLM bonus and skip the Ampere penalty.
+    spark_section = _section_is_spark(sec)
+    other_silicon = _section_is_other_silicon(sec)
+
+    # Prefer dedicated vLLM / Spark sections — not "W4A16 (vLLM)" / "8x H100 (vLLM)".
+    if not other_silicon and (
+        "vllm run" in sec or sec.strip() in ("vllm", "vllm run instructions") or spark_section
+    ):
         score += 50
         reasons.append(f"in section «{c.section}»")
-    elif "vllm" in sec:
+    elif "vllm" in sec and not other_silicon:
         score += 35
         reasons.append(f"in section «{c.section}»")
-    elif any(k in sec for k in ("deploy", "inference", "serving", "quickstart", "usage")):
+    elif any(k in sec for k in ("deploy", "inference", "serving", "quickstart", "quick start", "usage")):
         score += 15
         reasons.append(f"in section «{c.section}»")
 
-    # Cards ship per-GPU recipes. One headed for other silicon is the wrong path on a
-    # Spark even when its flag list scores well (NVFP4 cards carry a W4A16 Ampere
-    # fallback whose flags out-score the real GB10 recipe).
-    spark_section = any(k in sec for k in ("dgx spark", "gb10"))
-    if not spark_section and any(
-        k in sec for k in ("ampere", "a100", "h100", "h200", "gb200", "b200", "rtx", "l40")
-    ):
+    if not spark_section and other_silicon:
         score -= 30
         reasons.append(f"section «{c.section}» targets non-Spark hardware")
 
@@ -3042,7 +3090,12 @@ def score_candidate(
     flashinfer_unsafe = _flashinfer_b12x_unsafe_for_checkpoint(det, cfg.get("image"))
     marlin_unsafe = _marlin_unsafe_for_checkpoint(det, cfg.get("image"))
     if moe:
-        if moe == "flashinfer_b12x" and flashinfer_unsafe:
+        if moe == "humming":
+            # Ampere leftover — stripped on GB10; do not let it out-score Spark/DSpark.
+            reasons.append(
+                "--moe-backend humming (Ampere / non-GB10 — will be cleared on Spark)"
+            )
+        elif moe == "flashinfer_b12x" and flashinfer_unsafe:
             reasons.append(f"--moe-backend {moe} (will be stripped — unsafe for checkpoint)")
         elif moe == "marlin" and marlin_unsafe:
             reasons.append(
@@ -4662,7 +4715,9 @@ def recommend(
         vendor_bodies=vendor_bodies,
     )
     if readme or candidates:
-        if overlay:
+        # Parsers-only / last-mile overlays must still apply official extras
+        # (Gemma 4 31B --chat-template / --async-scheduling / --limit-mm-per-prompt).
+        if overlay and not _overlay_gap_only(overlay):
             if candidates:
                 rationale.append(
                     f"Family overlay owns serve flags; also found {len(candidates)} "
@@ -4759,9 +4814,9 @@ def recommend(
     # checkpoint's Spark path (DeepSeek DSpark: custom image + b12x + nvfp4_ds_mla).
     if overlay:
         overlay_cfg = overlay["config"]
-        # Qwen3.8 NVFP4 overlay is last-mile fill. MiniMax / DSpark still own
-        # flags because the card recipe is known-wrong for those Spark paths.
-        gap_only = overlay.get("family_key") == "qwen38_nvfp4"
+        # Qwen3.8 NVFP4 / Gemma 4 overlays are last-mile fill. MiniMax / DSpark
+        # still own flags because the card recipe is known-wrong for those Spark paths.
+        gap_only = _overlay_gap_only(overlay)
         for k, v in overlay_cfg.items():
             if k == "docker_env":
                 cfg["docker_env"] = _dedupe_env(list(cfg.get("docker_env") or []) + list(v))

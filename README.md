@@ -57,7 +57,7 @@ Configure default model, or use `auto`. If the name is `default` / `auto` / empt
 
 ## Quick start
 
-A new clone is **one local node** (this host). Multi-node is opt-in via `LAIL_CLUSTER_JSON` — see [`.env.example`](./.env.example).
+A new clone is **this host**, plus any QSFP/RoCE peers that answer ping. Pin topology with `LAIL_CLUSTER_JSON` or gitignored `data/cluster.json` — see [`.env.example`](./.env.example).
 
 ### Prerequisites
 
@@ -108,7 +108,7 @@ nvidia-smi && docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvi
 
 Then in the UI:
 
-1. **Status** — controller up; one local node unless you set `LAIL_CLUSTER_JSON`.
+1. **Status** — controller up; this host plus live RoCE peers (or the topology you pinned).
 2. **Serve** — paste an HF model id.
 3. **Auto-configure** — researches the HF card plus Unsloth / NVIDIA / GitHub / vLLM recipes and sizes flags for this host.
 4. **Start** — launches the vLLM container. Watch the job dock.
@@ -172,7 +172,7 @@ See [`.env.example`](./.env.example).
 | `LAIL_API_PORT` / `LAIL_WEB_PORT` / `LAIL_SERVE_ENGINE_PORT` | Ports |
 | `LAIL_DATA_DIR` / `LAIL_WORKSPACES_DIR` | Data + project roots |
 | `HF_TOKEN` | Optional gated HF access |
-| `LAIL_CLUSTER_JSON` | Optional. Unset = one local node. See `.env.example` for a 2-node EXAMPLE |
+| `LAIL_CLUSTER_JSON` | Optional pin. Unset = this host + live RoCE peers. See `.env.example` |
 | `LAIL_HOST` | Bind address. Default `127.0.0.1`. Off-loopback requires `LAIL_TOKEN` |
 | `LAIL_TOKEN` | Shared secret when bound off-loopback (`Authorization: Bearer` or `X-Lail-Token`) |
 | `LAIL_CORS_ORIGINS` | Extra CORS origins when the UI is not on localhost |

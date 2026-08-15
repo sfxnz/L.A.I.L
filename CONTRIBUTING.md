@@ -41,3 +41,7 @@ CI (`.github/workflows/ci.yml`) runs the same three.
 5. Do not use `--no-verify` to skip hooks.
 
 Agents follow the same rules — see [AGENTS.md](./AGENTS.md). Surgical diffs; no drive-by refactors.
+
+## Debugging
+
+Name the mechanism, then change that mechanism. Symptom-only patches (restart loops, cache bumps, hardcoding the missing node) are not a fix.

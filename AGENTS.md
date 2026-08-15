@@ -5,6 +5,7 @@ Serve & eval console for local vLLM / llama.cpp. Hermes (or any OpenAI client) i
 ## Working rules
 
 - **Think first.** State assumptions. Ask on real ambiguity. Do not pick an interpretation silently.
+- **Root cause, not symptoms.** Debugging is not done until the actual mechanism is named and that mechanism is what you change. Workarounds, stale-cache bumps, and “kick it until the UI looks right” are not a fix. Non-negotiable.
 - **Simplicity.** Minimum code that solves the request. No speculative features or abstractions.
 - **Surgical.** Every changed line traces to the request. No drive-by refactors or reformatting. Clean up only your own orphans.
 - **Plan Mode first** for anything non-trivial: multi-file work, auth/bind, serve-engine placement, CSS architecture, infra, or unclear requirements. Propose a plan, wait for approval, then implement.

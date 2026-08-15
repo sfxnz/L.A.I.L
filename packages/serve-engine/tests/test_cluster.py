@@ -343,6 +343,7 @@ def test_parse_ssh_config_maps_ip_to_alias():
 
 
 def test_discover_fabric_peers_from_neigh(monkeypatch):
+    cluster._clear_peer_cache()
     local = {"id": "testhost", "qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"}
 
     def fake_run(cmd, timeout=12):
@@ -360,6 +361,44 @@ def test_discover_fabric_peers_from_neigh(monkeypatch):
     assert peers[0]["local"] is False
     assert peers[0]["qsfp_ip"] == "192.0.2.8"
     assert peers[0]["ssh_host"] == "workerbox"
+
+
+def test_discover_fabric_peers_scans_subnet_when_neigh_empty(monkeypatch):
+    """After a reboot the ARP table is empty; still find a pingable QSFP peer."""
+    cluster._clear_peer_cache()
+    local = {"id": "testhost", "qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"}
+    pinged: list[str] = []
+
+    def fake_run(cmd, timeout=12):
+        if cmd[0] == "ip" and "neigh" in cmd:
+            return 0, "", ""
+        if cmd[0] == "ip" and "-o" in cmd:
+            return 0, "4: roce0    inet 192.0.2.1/24 brd 192.0.2.255 scope global roce0\n", ""
+        if cmd[0] == "getent" and cmd[-1] == "192.0.2.8":
+            return 0, "192.0.2.8 workerbox\n", ""
+        return 1, "", ""
+
+    def fake_ping(ip, timeout_s=1.0):
+        pinged.append(ip)
+        return {"ok": ip == "192.0.2.8", "rtt_ms": 0.2}
+
+    monkeypatch.setattr(cluster, "_run", fake_run)
+    monkeypatch.setattr(cluster, "_ping_ok", fake_ping)
+    peers = cluster._discover_fabric_peers(local)
+    assert "192.0.2.8" in pinged
+    assert len(peers) == 1
+    assert peers[0]["id"] == "workerbox"
+    assert peers[0]["qsfp_ip"] == "192.0.2.8"
+    assert peers[0]["local"] is False
+
+
+def test_subnet_hosts_skips_wide_prefixes():
+    assert cluster._subnet_hosts("10.0.0.1", 16) == []
+    hosts = cluster._subnet_hosts("192.0.2.1", 24)
+    assert "192.0.2.1" not in hosts
+    assert "192.0.2.8" in hosts
+    assert "192.0.2.0" not in hosts
+    assert "192.0.2.255" not in hosts
 
 
 def test_default_cluster_is_probed_host_plus_roce_peer(monkeypatch, tmp_path):

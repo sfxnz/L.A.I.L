@@ -1,7 +1,8 @@
 """Cluster health for L.A.I.L Status (source of truth).
 
 Default topology is this machine as probed (hostname, LAN, Tailscale, RoCE)
-plus any RoCE L2 neighbors that answer ping. LAIL_CLUSTER_JSON or
+plus any RoCE peers that answer ping (ARP table, or a /24-or-tighter QSFP
+scan when the table is cold after reboot). LAIL_CLUSTER_JSON or
 gitignored data/cluster.json still override.
 
 Probes:
@@ -12,12 +13,15 @@ Probes:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import platform
 import re
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import metadata
@@ -184,6 +188,39 @@ def _parse_ip_addrs(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _parse_ip_cidrs(text: str) -> list[tuple[str, str, int]]:
+    out: list[tuple[str, str, int]] = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)", line)
+        if m:
+            out.append((m.group(1), m.group(2), int(m.group(3))))
+    return out
+
+
+def _subnet_hosts(ip: str, prefix: int) -> list[str]:
+    """Usable hosts on a tight QSFP prefix. Refuse /16-and-wider scans."""
+    if prefix < 24 or prefix > 30:
+        return []
+    try:
+        net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+    except ValueError:
+        return []
+    self = str(ipaddress.ip_address(ip))
+    return [str(h) for h in net.hosts() if str(h) != self]
+
+
+_PEER_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_PEER_CACHE_SEC = 90.0
+
+
+def _clear_peer_cache() -> None:
+    _PEER_CACHE.clear()
+
+
+def _peer_cache_key(local: dict[str, Any]) -> str:
+    return f"{local.get('qsfp_if')}|{local.get('qsfp_ip')}"
+
+
 def _parse_roce_up(text: str) -> list[str]:
     up: list[str] = []
     for line in (text or "").splitlines():
@@ -291,41 +328,77 @@ def _hostname_for_ip(ip: str) -> str | None:
     return _ssh_alias_for_ip(ip)
 
 
-def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
-    """RoCE L2 neighbors that answer ping become remote nodes."""
-    qsfp_if = local.get("qsfp_if")
-    self_ip = local.get("qsfp_ip")
-    if not qsfp_if:
-        return []
-    code, neigh_txt, _ = _run(["ip", "neigh", "show", "dev", str(qsfp_if)], timeout=4)
-    if code != 0:
-        return []
-    peers: list[dict[str, Any]] = []
+def _candidate_qsfp_ips(qsfp_if: str, self_ip: str | None, neigh_txt: str) -> list[str]:
     seen: set[str] = set()
+    out: list[str] = []
     for ip in _parse_neigh(neigh_txt):
         if ip == self_ip or ip in seen:
             continue
         seen.add(ip)
-        ping = _ping_ok(ip, 1.0)
-        if not ping.get("ok"):
+        out.append(ip)
+    if out:
+        return out
+    code, addr_txt, _ = _run(["ip", "-4", "-o", "addr", "show", "dev", str(qsfp_if)], timeout=4)
+    if code != 0:
+        return []
+    for iface, ip, prefix in _parse_ip_cidrs(addr_txt):
+        if iface != qsfp_if:
             continue
-        name = _hostname_for_ip(ip)
-        if name == local.get("id"):
-            continue
-        ssh_host = name or ip
-        node_id = name or ip.replace(".", "-")
-        peers.append(
-            {
-                "id": node_id,
-                "label": node_id,
-                "role": "worker",
-                "local": False,
-                "ssh_host": ssh_host,
-                "qsfp_ip": ip,
-                "qsfp_if": qsfp_if,
-                "vllm_url": "http://127.0.0.1:8000",
-            }
-        )
+        for host in _subnet_hosts(ip, prefix):
+            if host == self_ip or host in seen:
+                continue
+            seen.add(host)
+            out.append(host)
+    return out
+
+
+def _peer_from_ip(local: dict[str, Any], ip: str) -> dict[str, Any] | None:
+    name = _hostname_for_ip(ip)
+    if name == local.get("id"):
+        return None
+    ssh_host = name or ip
+    node_id = name or ip.replace(".", "-")
+    return {
+        "id": node_id,
+        "label": node_id,
+        "role": "worker",
+        "local": False,
+        "ssh_host": ssh_host,
+        "qsfp_ip": ip,
+        "qsfp_if": local.get("qsfp_if"),
+        "vllm_url": "http://127.0.0.1:8000",
+    }
+
+
+def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
+    """RoCE peers that answer ping become remote nodes.
+
+    `ip neigh` is empty after a reboot until something talks on the link, so
+    when the table is cold we ping the QSFP prefix (/24 or tighter) in parallel.
+    """
+    qsfp_if = local.get("qsfp_if")
+    self_ip = local.get("qsfp_ip")
+    if not qsfp_if:
+        return []
+    key = _peer_cache_key(local)
+    hit = _PEER_CACHE.get(key)
+    if hit and (time.monotonic() - hit[0]) < _PEER_CACHE_SEC:
+        return [dict(p) for p in hit[1]]
+
+    code, neigh_txt, _ = _run(["ip", "neigh", "show", "dev", str(qsfp_if)], timeout=4)
+    candidates = _candidate_qsfp_ips(str(qsfp_if), str(self_ip) if self_ip else None, neigh_txt if code == 0 else "")
+    peers: list[dict[str, Any]] = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(64, max(4, len(candidates)))) as pool:
+            results = list(pool.map(lambda ip: (ip, _ping_ok(ip, 1.0)), candidates))
+        for ip, ping in results:
+            if not ping.get("ok"):
+                continue
+            peer = _peer_from_ip(local, ip)
+            if peer:
+                peers.append(peer)
+
+    _PEER_CACHE[key] = (time.monotonic(), [dict(p) for p in peers])
     return peers
 
 

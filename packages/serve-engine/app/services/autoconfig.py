@@ -3148,7 +3148,10 @@ def _parse_one_sglang_command(text: str) -> Optional[ServeCandidate]:
             else:
                 cfg[key] = val
             continue
-        if t == "--speculative-algorithm" or t.startswith("--speculative-algorithm="):
+        # Unsloth cards use --speculative-algo; some docs use --speculative-algorithm.
+        if t in ("--speculative-algorithm", "--speculative-algo") or t.startswith(
+            "--speculative-algorithm="
+        ) or t.startswith("--speculative-algo="):
             val = t.split("=", 1)[1] if "=" in t else (nxt or "")
             i += 1 if "=" in t else 2
             cfg["spec_algorithm"] = val
@@ -5627,7 +5630,8 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
     if cfg.get("reasoning_parser"):
         parts += ["--reasoning-parser", str(cfg["reasoning_parser"])]
     if cfg.get("spec_algorithm"):
-        parts += ["--speculative-algorithm", str(cfg["spec_algorithm"])]
+        # Emit the Unsloth/card spelling; --speculative-algorithm is accepted on parse.
+        parts += ["--speculative-algo", str(cfg["spec_algorithm"])]
         if cfg.get("spec_num_steps") is not None:
             parts += ["--speculative-num-steps", str(int(cfg["spec_num_steps"]))]
         if cfg.get("spec_eagle_topk") is not None:

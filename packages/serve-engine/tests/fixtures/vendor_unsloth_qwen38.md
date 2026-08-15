@@ -13,6 +13,6 @@ vllm serve unsloth/Qwen3.8-27B-NVFP4 --kv-cache-dtype fp8 --reasoning-parser qwe
 #### **SGLang:**
 
 ```shell
-python -m sglang.launch_server --model-path unsloth/Qwen3.8-27B-NVFP4 --speculative-algorithm NEXTN \
+python -m sglang.launch_server --model-path unsloth/Qwen3.8-27B-NVFP4 --speculative-algo NEXTN \
      --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```

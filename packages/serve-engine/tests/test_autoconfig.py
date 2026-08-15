@@ -4300,6 +4300,52 @@ def test_extract_sglang_candidates_from_unsloth_fixture():
     assert "vllm serve" not in raw
 
 
+def test_parse_sglang_speculative_algo_alias():
+    """Unsloth cards spell --speculative-algo, not --speculative-algorithm."""
+    line = (
+        "python -m sglang.launch_server --model-path Qwen/Qwen3.6-35B-A3B "
+        "--port 8000 --tp-size 8 --mem-fraction-static 0.8 --context-length 262144 "
+        "--reasoning-parser qwen3 --speculative-algo NEXTN --speculative-num-steps 3 "
+        "--speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
+    )
+    cand = ac._parse_one_sglang_command(line)
+    assert cand is not None
+    assert (cand.config.get("spec_algorithm") or "").upper() == "NEXTN"
+    assert cand.config.get("spec_num_steps") == 3
+    assert cand.score >= 30
+
+
+def test_recommend_sglang_unsloth35b_corpus_card(monkeypatch):
+    """Shipped recommend(backend=sglang) on the real Unsloth 35B corpus card.
+
+    The card's MTP line uses --speculative-algo NEXTN (not --speculative-algorithm).
+    That recipe must win over the generic tp=8 serve, and argv must contain NEXTN
+    for the pasted unsloth id on this 1-Spark cluster.
+    """
+    case_dir = Path(__file__).resolve().parent / "corpus" / "unsloth__Qwen3.6-35B-A3B-NVFP4"
+    card = (case_dir / "card.md").read_text()
+    cfg = json.loads((case_dir / "config.json").read_text())
+    case = json.loads((case_dir / "case.json").read_text())
+    assert "--speculative-algo NEXTN" in card
+    assert "--speculative-algorithm NEXTN" not in card
+    _patch_offline_recommend(monkeypatch, readme=card, config=cfg)
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline corpus"))
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: float(case["weights_gib"]))
+    rec = ac.recommend(case["model"], backend="sglang", fetch_remote=True)
+    assert rec["engine"] == "sglang"
+    assert rec["serve_blocked"] is False
+    argv = rec["argv"]
+    assert argv.startswith("python -m sglang.launch_server")
+    assert "NEXTN" in argv
+    assert "--speculative-algo NEXTN" in argv
+    assert rec["config"]["model_path"] == case["model"]
+    assert int(rec["config"]["tp_size"]) == 1
+    assert int(rec["config"]["port"]) == 30000
+    assert "$" not in argv
+    # Generic 8-GPU official-Qwen line must not win.
+    assert "--tp-size 8" not in argv
+
+
 def test_recommend_sglang_from_vendor_doc(monkeypatch):
     """Public recommend(backend=sglang) emits an SGLang launch, not vllm serve."""
     readme = "# Qwen3.8 NVFP4\n\nBare card. See Unsloth.\n"
@@ -4336,7 +4382,8 @@ def test_recommend_sglang_from_vendor_doc(monkeypatch):
     assert rec["config"]["model_path"] == "unsloth/Qwen3.8-27B-NVFP4"
     assert int(rec["config"]["tp_size"]) <= 2
     assert int(rec["config"]["port"]) == 30000
-    assert "--speculative-algorithm NEXTN" in argv
+    assert "NEXTN" in argv
+    assert "--speculative-algo NEXTN" in argv or "--speculative-algorithm NEXTN" in argv
     assert "--speculative-num-steps 3" in argv
     assert "--speculative-num-draft-tokens 4" in argv
     assert "$" not in argv

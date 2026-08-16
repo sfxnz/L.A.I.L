@@ -2369,8 +2369,9 @@ _FAMILY_RECIPES_VLLM_ORG = {
     "gemma4": "Google",
     "qwen": "Qwen",
 }
+# Trailing quant token only. Do not swallow -Fast (or any later tag) after NVFP4.
 _QUANT_NAME_SUFFIX_RE = re.compile(
-    r"-(?:NVFP4|FP8|GGUF|GPTQ|AWQ|BNB-4BIT|INT4|INT8)(?:-.*)?$",
+    r"-(?:NVFP4|FP8|GGUF|GPTQ|AWQ|BNB-4BIT|INT4|INT8)$",
     re.I,
 )
 
@@ -2826,6 +2827,13 @@ def _vendor_candidate_family_mismatch(cand: ServeCandidate, want_fam: str) -> bo
 _MODEL_SIZE_TOKEN_RE = re.compile(
     r"(?i)(?:e\d+b|\d+(?:\.\d+)?[bt](?:-a\d+[bt])?)"
 )
+# Qwen3.8 / Gemma-4 / Llama-3.1 — generation, not the trailing 27B/31B size.
+_MODEL_GENERATION_RE = re.compile(r"(?i)(?:qwen|gemma|llama|glm)-?\d+(?:\.\d+)?")
+_PLACEHOLDER_MODEL_RE = re.compile(r"^\$[A-Z][A-Z0-9_]*$")
+_HF_REPO_ID_RE = re.compile(
+    r"\b([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+)\b"
+)
+_WEIGHT_FORK_ORGS = frozenset({"nvidia", "unsloth", "bartowski", "lmstudio-community"})
 
 
 def _model_size_tokens(model_id: str) -> frozenset[str]:
@@ -2834,38 +2842,139 @@ def _model_size_tokens(model_id: str) -> frozenset[str]:
     return frozenset(m.group(0).lower() for m in _MODEL_SIZE_TOKEN_RE.finditer(name))
 
 
+def _model_generation_tokens(model_id: str) -> frozenset[str]:
+    """Generation stems from a HF id (qwen3.8, qwen3.6, gemma-4). Empty if none."""
+    name = (model_id or "").split("/")[-1]
+    return frozenset(m.group(0).lower() for m in _MODEL_GENERATION_RE.finditer(name))
+
+
+_IQ_QUANT_SUFFIX_RE = re.compile(r"(?i)-iq\d+[a-z0-9_]*$")
+
+
+def _model_core_name(model_id: str) -> str:
+    """Repo name minus org and trailing quant/pack suffixes (nvfp4, fp8, gguf, iq*).
+
+    Empty when the token is not a resolvable HF name (flags, ``...``, ``$VAR``).
+    Does not strip instruction ``-it`` (gemma-4-31B-it vs gemma-4-31B-it-NVFP4)
+    or checkpoint tags after a quant (``-NVFP4-Fast`` keeps ``-fast``).
+    Repeats when several quant tokens trail (``-GPTQ-INT4``).
+    """
+    raw = (model_id or "").strip().strip("\"'")
+    name = raw.split("/")[-1].strip()
+    if (
+        not name
+        or name.startswith("-")
+        or name.startswith("$")
+        or name in {".", "..", "..."}
+        or not re.search(r"[A-Za-z]", name)
+    ):
+        return ""
+    stripped = name
+    while True:
+        nxt = _QUANT_NAME_SUFFIX_RE.sub("", stripped)
+        nxt = _IQ_QUANT_SUFFIX_RE.sub("", nxt)
+        if nxt == stripped:
+            break
+        stripped = nxt
+    return stripped.lower()
+
+
+def _core_names_compatible(a: str, b: str) -> bool:
+    """Equal cores, or a delimited prefix whose extra tokens are omitted size/gen.
+
+    ``gemma-4`` vs ``gemma-4-31b-it`` is compatible (missing size).
+    ``qwen3.6-35b-a3b`` vs ``qwen3.6-35b-a3b-fast`` is not (distinct checkpoint).
+    """
+    if not a or not b or a == b:
+        return True
+    lo, hi = (a, b) if len(a) <= len(b) else (b, a)
+    if not (hi.startswith(lo) and hi[len(lo) : len(lo) + 1] in "-_."):
+        return False
+    extra = hi[len(lo) + 1 :]
+    return bool(_MODEL_SIZE_TOKEN_RE.search(extra) or _MODEL_GENERATION_RE.search(extra))
+
+
+def _is_placeholder_model_id(mid: str) -> bool:
+    s = (mid or "").strip().strip("\"'")
+    return (not s) or bool(_PLACEHOLDER_MODEL_RE.match(s))
+
+
+def _hf_repo_ids_in_text(text: str) -> list[str]:
+    return [m.group(1) for m in _HF_REPO_ID_RE.finditer(text or "")]
+
+
 def _candidate_model_id(cand: ServeCandidate) -> str:
-    if cand.model:
-        return cand.model
-    m = re.search(r"vllm\s+serve\s+(\S+)", cand.raw or "", re.I)
-    return m.group(1).strip("\"'") if m else ""
+    """Resolve the snippet's HF id; skip empty / $MODEL placeholders.
+
+    When ``cand.model`` is empty or a shell placeholder, scan ``vllm serve <id>``
+    and ``--model-path <id>`` (SGLang / vendor templates).
+    """
+    mid = (cand.model or "").strip().strip("\"'")
+    if mid and not _is_placeholder_model_id(mid):
+        return mid
+    raw = cand.raw or ""
+    for cre in (
+        re.compile(r"vllm\s+serve\s+(\S+)", re.I),
+        re.compile(r"--model-path(?:\s+|=)(\S+)", re.I),
+    ):
+        m = cre.search(raw)
+        if not m:
+            continue
+        tok = m.group(1).strip("\"'")
+        if tok and not _is_placeholder_model_id(tok):
+            return tok
+    return ""
+
+
+def _model_ids_sibling_mismatch(other: str, model_id: str) -> bool:
+    """True when two HF ids are not publisher/quant twins of the same model.
+
+    SAME: Qwen/Qwen3.8-27B vs unsloth/Qwen3.8-27B-NVFP4 (publisher/quant).
+    DIFFERENT: core name (Widget-Chat vs Gadget-Instruct), size, generation
+    (Qwen3.6 vs Qwen3.8), MoE variant, weight forks.
+    Missing tokens on one side do not invent a mismatch.
+    """
+    if not other or not model_id:
+        return False
+    if "/" in model_id and "/" in other:
+        pa = model_id.split("/")[0].lower()
+        pb = other.split("/")[0].lower()
+        if pa != pb and pa in _WEIGHT_FORK_ORGS and pb in _WEIGHT_FORK_ORGS:
+            return True
+    want_c = _model_core_name(model_id)
+    got_c = _model_core_name(other)
+    if want_c and got_c and not _core_names_compatible(want_c, got_c):
+        return True
+    want = _model_size_tokens(model_id)
+    got = _model_size_tokens(other)
+    if want and got and want != got:
+        return True
+    want_g = _model_generation_tokens(model_id)
+    got_g = _model_generation_tokens(other)
+    if want_g and got_g and want_g != got_g:
+        return True
+    return False
 
 
 def _vendor_candidate_sibling_mismatch(cand: ServeCandidate, model_id: str) -> bool:
-    """True when a vendor snippet is a different size/variant of the same family.
+    """True when a vendor snippet is a different size/generation/variant.
 
     Unsloth's Gemma-4 page scores the 26B-A4B Spark MoE line (flashinfer_b12x)
     above the official dense 31B recipe. That backend is wrong for 31B.
     NVIDIA Agent-Ready lines name nvidia/… and must not win for unsloth/….
+    Qwen3.6-27B must not win for a Qwen3.8-27B paste (same size, new generation).
+    Fail-closed: raw naming a different org/name drops even when cand.model is
+    empty or ``$MODEL``.
     """
     if not model_id:
         return False
     other = _candidate_model_id(cand)
-    if not other:
+    if other:
+        return _model_ids_sibling_mismatch(other, model_id)
+    named = _hf_repo_ids_in_text(cand.raw or "")
+    if not named:
         return False
-    # Competing weight forks (Unsloth vs NVIDIA NVFP4 of the same 35B) must not
-    # steal each other's parsers. Official catalog orgs (Google, Qwen, …) stay.
-    _weight_forks = frozenset({"nvidia", "unsloth", "bartowski", "lmstudio-community"})
-    if "/" in model_id and "/" in other:
-        pa = model_id.split("/")[0].lower()
-        pb = other.split("/")[0].lower()
-        if pa != pb and pa in _weight_forks and pb in _weight_forks:
-            return True
-    want = _model_size_tokens(model_id)
-    got = _model_size_tokens(other)
-    if not want or not got:
-        return False
-    return want != got
+    return any(_model_ids_sibling_mismatch(hid, model_id) for hid in named)
 
 
 def _drop_family_mismatched_hints(hints: dict[str, Any], detected: dict[str, Any] | None) -> None:
@@ -4077,7 +4186,11 @@ def _apply_card_candidate(base: dict[str, Any], cand: ServeCandidate) -> list[st
 
     Image is *not* copied here — it is resolved via ``_resolve_image_for_gates``
     (lab floor + stock raise only; Anemll never replaced) before safety/marlin.
+    Refuses a snippet that names a different model than ``base['model']``.
     """
+    want = str(base.get("model") or "")
+    if want and _vendor_candidate_sibling_mismatch(cand, want):
+        return []
     applied: list[str] = []
     cfg = cand.config
     for k, v in cfg.items():
@@ -4945,6 +5058,10 @@ def recommend(
                         "notes": f"score={best.score:.0f}; section={best.section or 'n/a'}",
                     },
                 )
+            elif _vendor_candidate_sibling_mismatch(best, model):
+                rationale.append(
+                    "Skipped vendor recipe naming a different model than the paste"
+                )
             else:
                 applied = _apply_card_candidate(cfg, best)
                 rationale.append(
@@ -5300,7 +5417,7 @@ def recommend(
                 "score": c.score,
                 "section": c.section,
                 "raw": c.raw[:400],
-                "selected": i == 0,
+                "selected": i == 0 and not _vendor_candidate_sibling_mismatch(c, model),
                 "reasons": c.reasons,
                 "config": c.config,
             }
@@ -5547,7 +5664,7 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
         "spec_draft_tokens": None,
         "extra_flags": "",
     }
-    if candidates:
+    if candidates and not _vendor_candidate_sibling_mismatch(candidates[0], model):
         best = candidates[0]
         for k, v in (best.config or {}).items():
             if k in ("engine", "model"):
@@ -5697,7 +5814,7 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
                 "score": c.score,
                 "section": c.section,
                 "raw": (c.raw or "")[:400],
-                "selected": i == 0,
+                "selected": i == 0 and not _vendor_candidate_sibling_mismatch(c, model),
                 "reasons": c.reasons,
                 "config": c.config,
             }

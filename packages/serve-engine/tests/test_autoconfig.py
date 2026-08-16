@@ -3446,6 +3446,46 @@ def test_vendor_candidate_sibling_mismatch_drops_26b_moe_for_31b_dense():
     )
 
 
+def test_vendor_mismatch_drops_generation_twins():
+    """Same size token (27B) must not keep a Qwen3.6 snippet for a Qwen3.8 paste."""
+    snip = ac.ServeCandidate(
+        raw="vllm serve unsloth/Qwen3.6-27B-NVFP4 --kv-cache-dtype fp8",
+        model="unsloth/Qwen3.6-27B-NVFP4",
+        config={"kv_cache_dtype": "fp8"},
+    )
+    assert ac._vendor_candidate_sibling_mismatch(snip, "unsloth/Qwen3.8-27B-NVFP4") is True
+    assert ac._vendor_candidate_sibling_mismatch(snip, "Qwen/Qwen3.8-27B") is True
+    official = ac.ServeCandidate(
+        raw="vllm serve Qwen/Qwen3.8-27B --reasoning-parser qwen3",
+        model="Qwen/Qwen3.8-27B",
+        config={"reasoning_parser": "qwen3"},
+    )
+    assert (
+        ac._vendor_candidate_sibling_mismatch(official, "unsloth/Qwen3.8-27B-NVFP4")
+        is False
+    )
+
+
+def test_vendor_mismatch_fail_closed_unresolved_id():
+    """Raw naming a different HF id drops even when cand.model is empty or $MODEL."""
+    paste = "unsloth/Qwen3.8-27B-NVFP4"
+    empty = ac.ServeCandidate(
+        raw="vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4-Fast --moe-backend flashinfer_b12x",
+        model="",
+        config={"moe_backend": "flashinfer_b12x"},
+    )
+    placeholder = ac.ServeCandidate(
+        raw=(
+            "vllm serve $MODEL --moe-backend flashinfer_b12x\n"
+            "# unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+        ),
+        model="$MODEL",
+        config={"moe_backend": "flashinfer_b12x"},
+    )
+    assert ac._vendor_candidate_sibling_mismatch(empty, paste) is True
+    assert ac._vendor_candidate_sibling_mismatch(placeholder, paste) is True
+
+
 def test_discover_recipe_urls_gemma4_official_catalog_not_nvidia_qwen():
     """Unsloth Gemma-4 NVFP4: official Google catalog page, not NVIDIA Qwen cookbooks.
 
@@ -3755,6 +3795,141 @@ def test_recommend_vendor_fetch_error_still_returns(monkeypatch):
     assert rec["serve_blocked"] is False
     # Overlay / config detection still fills parsers when vendor fetch fails.
     assert rec["config"].get("reasoning_parser") == "qwen3"
+
+
+def _selected_card_recipe(rec: dict) -> dict | None:
+    for c in rec.get("card_recipes") or []:
+        if c.get("selected"):
+            return c
+    return None
+
+
+def _mixed_nvfp4_cookbook(url: str, **kwargs):
+    """nvfp4 slug → mixed 35B-Fast Spark page; qwen3.8 slug → 27B-only guide."""
+    if "unsloth.ai/docs/basics/nvfp4" in url:
+        return (FIX / "vendor_unsloth_nvfp4_mixed.md").read_text(), None
+    if "unsloth.ai" in url and "qwen3.8" in url:
+        return (FIX / "vendor_unsloth_qwen38.md").read_text(), None
+    return None, f"unmocked {url}"
+
+
+def test_recommend_pasted_qwen38_27b_never_selects_35b_fast_spark(monkeypatch):
+    """Paste 27B NVFP4 must not select the generic nvfp4 page's 35B-Fast Spark line."""
+    paste = "unsloth/Qwen3.8-27B-NVFP4"
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# unsloth/Qwen3.8-27B-NVFP4\nNo serve recipe.\n",
+        config=_Q38_VL_CFG,
+    )
+    monkeypatch.setattr(ac, "fetch_cookbook_text", _mixed_nvfp4_cookbook)
+
+    rec = ac.recommend(paste, fetch_remote=True)
+    cfg = rec["config"]
+    assert cfg["model"] == paste
+    selected = _selected_card_recipe(rec)
+    raw = (selected or {}).get("raw") or ""
+    assert "Qwen3.6-35B-A3B" not in raw
+    assert "NVFP4-Fast" not in raw
+    rats = "".join(rec.get("rationale") or [])
+    assert "35B-A3B" not in rats
+    assert cfg.get("moe_backend") != "flashinfer_b12x"
+    assert cfg.get("reasoning_parser") == "qwen3"
+    assert cfg.get("tool_call_parser") == "qwen3_coder"
+    assert cfg.get("kv_cache_dtype") == "fp8"
+    extras = cfg.get("extra_flags") or ""
+    assert "language-model-only" not in extras
+    assert "--limit-mm-per-prompt" in extras
+    assert cfg.get("max_model_len") == 262144
+
+
+_Q36_35B_CFG = {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "model_type": "qwen3_moe",
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "max_position_embeddings": 262144,
+    "quantization_config": {"quant_method": "compressed-tensors"},
+}
+
+_GEMMA31_CFG = {
+    "architectures": ["Gemma4ForCausalLM"],
+    "model_type": "gemma4",
+    "hidden_size": 5376,
+    "num_hidden_layers": 46,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 16,
+    "max_position_embeddings": 131072,
+    "quantization_config": {"quant_method": "compressed-tensors"},
+}
+
+_GEMMA_MIXED_PAGE = (
+    "## DGX Spark with NVFP4 quants\n"
+    "```bash\n"
+    "export CUTE_DSL_ARCH=sm_121a\n"
+    "vllm serve unsloth/gemma-4-26B-A4B-it-NVFP4 --moe-backend flashinfer_b12x\n"
+    "```\n"
+    "#### vLLM\n"
+    "```\n"
+    "vllm serve google/gemma-4-31B-it --reasoning-parser gemma4 --tool-call-parser gemma4\n"
+    "```\n"
+)
+
+
+@pytest.mark.parametrize(
+    "paste,hf,page,forbidden,must_keep",
+    [
+        (
+            "unsloth/Qwen3.8-27B-NVFP4",
+            _Q38_VL_CFG,
+            None,
+            ("Qwen3.6-35B-A3B", "NVFP4-Fast"),
+            "Qwen3.8-27B",
+        ),
+        (
+            "unsloth/Qwen3.6-35B-A3B-NVFP4",
+            _Q36_35B_CFG,
+            None,
+            ("Qwen3.8-27B",),
+            "Qwen3.6-35B-A3B",
+        ),
+        (
+            "unsloth/gemma-4-31B-it-NVFP4",
+            _GEMMA31_CFG,
+            _GEMMA_MIXED_PAGE,
+            ("26B-A4B",),
+            "31B",
+        ),
+    ],
+)
+def test_recommend_selected_recipe_is_same_model_as_paste(
+    monkeypatch, paste, hf, page, forbidden, must_keep
+):
+    """Selected serve snippet must be the pasted model, never a sibling on the same page."""
+    mixed = page if page is not None else (FIX / "vendor_unsloth_nvfp4_mixed.md").read_text()
+    _patch_offline_recommend(monkeypatch, readme=f"# {paste}\nNo serve recipe.\n", config=hf)
+
+    def fake_cookbook(url: str, **kwargs):
+        if page is not None:
+            if "unsloth.ai" in url or "recipes.vllm.ai" in url:
+                return mixed, None
+            return None, f"unmocked {url}"
+        if "unsloth.ai/docs/basics/nvfp4" in url or "unsloth.ai/docs/models/qwen3.6" in url:
+            return mixed, None
+        if "unsloth.ai" in url and "qwen3.8" in url:
+            return (FIX / "vendor_unsloth_qwen38.md").read_text(), None
+        return None, f"unmocked {url}"
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    rec = ac.recommend(paste, fetch_remote=True)
+    assert rec["config"]["model"] == paste
+    selected = _selected_card_recipe(rec)
+    raw = (selected or {}).get("raw") or ""
+    for bad in forbidden:
+        assert bad not in raw, (paste, raw)
+    if selected:
+        assert must_keep in raw, raw
 
 
 def test_recommend_uses_native_window_not_262k_default(monkeypatch):

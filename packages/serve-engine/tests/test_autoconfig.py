@@ -3486,6 +3486,39 @@ def test_vendor_mismatch_fail_closed_unresolved_id():
     assert ac._vendor_candidate_sibling_mismatch(placeholder, paste) is True
 
 
+def test_vendor_mismatch_drops_unrelated_ids_without_size_tokens():
+    """Two HF ids with no size/generation tokens still mismatch when cores differ."""
+    assert ac._model_ids_sibling_mismatch("acme/Gadget-Instruct", "acme/Widget-Chat") is True
+    assert (
+        ac._model_ids_sibling_mismatch("otherorg/Widget-Chat-NVFP4", "acme/Widget-Chat")
+        is False
+    )
+    assert (
+        ac._model_ids_sibling_mismatch("mystery-vl-nvfp4", "unsloth/Qwen3.8-27B-NVFP4")
+        is True
+    )
+    gadget = ac.ServeCandidate(
+        raw="vllm serve acme/Gadget-Instruct --trust-remote-code",
+        model="acme/Gadget-Instruct",
+        config={"trust_remote_code": True},
+    )
+    twin = ac.ServeCandidate(
+        raw="vllm serve otherorg/Widget-Chat-NVFP4 --kv-cache-dtype fp8",
+        model="otherorg/Widget-Chat-NVFP4",
+        config={"kv_cache_dtype": "fp8"},
+    )
+    mystery = ac.ServeCandidate(
+        raw="vllm serve mystery-vl-nvfp4 --trust-remote-code",
+        model="mystery-vl-nvfp4",
+    )
+    assert ac._vendor_candidate_sibling_mismatch(gadget, "acme/Widget-Chat") is True
+    assert ac._vendor_candidate_sibling_mismatch(twin, "acme/Widget-Chat") is False
+    assert (
+        ac._vendor_candidate_sibling_mismatch(mystery, "unsloth/Qwen3.8-27B-NVFP4")
+        is True
+    )
+
+
 def test_discover_recipe_urls_gemma4_official_catalog_not_nvidia_qwen():
     """Unsloth Gemma-4 NVFP4: official Google catalog page, not NVIDIA Qwen cookbooks.
 
@@ -3930,6 +3963,37 @@ def test_recommend_selected_recipe_is_same_model_as_paste(
         assert bad not in raw, (paste, raw)
     if selected:
         assert must_keep in raw, raw
+
+
+def test_recommend_unrelated_vendor_snippet_not_selected(monkeypatch):
+    """Cookbook for a different vendor model must not be selected for the paste."""
+    paste = "acme/Widget-Chat"
+    _patch_offline_recommend(
+        monkeypatch,
+        readme="# acme/Widget-Chat\nNo serve recipe.\n",
+        config={
+            "architectures": ["WidgetForCausalLM"],
+            "model_type": "widget",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "max_position_embeddings": 8192,
+        },
+    )
+
+    def fake_cookbook(url: str, **kwargs):
+        return (
+            "```bash\nvllm serve acme/Gadget-Instruct --kv-cache-dtype fp8\n```\n",
+            None,
+        )
+
+    monkeypatch.setattr(ac, "fetch_cookbook_text", fake_cookbook)
+    rec = ac.recommend(paste, fetch_remote=True)
+    assert rec["config"]["model"] == paste
+    selected = _selected_card_recipe(rec)
+    raw = (selected or {}).get("raw") or ""
+    assert "Gadget-Instruct" not in raw
 
 
 def test_recommend_uses_native_window_not_262k_default(monkeypatch):

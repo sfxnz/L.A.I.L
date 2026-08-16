@@ -2847,6 +2847,38 @@ def _model_generation_tokens(model_id: str) -> frozenset[str]:
     return frozenset(m.group(0).lower() for m in _MODEL_GENERATION_RE.finditer(name))
 
 
+_IQ_QUANT_SUFFIX_RE = re.compile(r"(?i)-iq\d+[a-z0-9_]*$")
+
+
+def _model_core_name(model_id: str) -> str:
+    """Repo name minus org and trailing quant/pack suffixes (nvfp4, fp8, gguf, iq*).
+
+    Empty when the token is not a resolvable HF name (flags, ``...``, ``$VAR``).
+    Does not strip instruction ``-it`` (gemma-4-31B-it vs gemma-4-31B-it-NVFP4).
+    """
+    raw = (model_id or "").strip().strip("\"'")
+    name = raw.split("/")[-1].strip()
+    if (
+        not name
+        or name.startswith("-")
+        or name.startswith("$")
+        or name in {".", "..", "..."}
+        or not re.search(r"[A-Za-z]", name)
+    ):
+        return ""
+    stripped = _QUANT_NAME_SUFFIX_RE.sub("", name)
+    stripped = _IQ_QUANT_SUFFIX_RE.sub("", stripped)
+    return stripped.lower()
+
+
+def _core_names_compatible(a: str, b: str) -> bool:
+    """Equal cores, or one is a delimited prefix (missing tokens do not invent a mismatch)."""
+    if not a or not b or a == b:
+        return True
+    lo, hi = (a, b) if len(a) <= len(b) else (b, a)
+    return hi.startswith(lo) and hi[len(lo) : len(lo) + 1] in "-_."
+
+
 def _is_placeholder_model_id(mid: str) -> bool:
     s = (mid or "").strip().strip("\"'")
     return (not s) or bool(_PLACEHOLDER_MODEL_RE.match(s))
@@ -2883,7 +2915,8 @@ def _model_ids_sibling_mismatch(other: str, model_id: str) -> bool:
     """True when two HF ids are not publisher/quant twins of the same model.
 
     SAME: Qwen/Qwen3.8-27B vs unsloth/Qwen3.8-27B-NVFP4 (publisher/quant).
-    DIFFERENT: size, generation (Qwen3.6 vs Qwen3.8), MoE variant, weight forks.
+    DIFFERENT: core name (Widget-Chat vs Gadget-Instruct), size, generation
+    (Qwen3.6 vs Qwen3.8), MoE variant, weight forks.
     Missing tokens on one side do not invent a mismatch.
     """
     if not other or not model_id:
@@ -2893,6 +2926,10 @@ def _model_ids_sibling_mismatch(other: str, model_id: str) -> bool:
         pb = other.split("/")[0].lower()
         if pa != pb and pa in _WEIGHT_FORK_ORGS and pb in _WEIGHT_FORK_ORGS:
             return True
+    want_c = _model_core_name(model_id)
+    got_c = _model_core_name(other)
+    if want_c and got_c and not _core_names_compatible(want_c, got_c):
+        return True
     want = _model_size_tokens(model_id)
     got = _model_size_tokens(other)
     if want and got and want != got:

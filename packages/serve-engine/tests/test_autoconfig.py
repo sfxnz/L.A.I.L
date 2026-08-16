@@ -3519,6 +3519,25 @@ def test_vendor_mismatch_drops_unrelated_ids_without_size_tokens():
     )
 
 
+def test_vendor_mismatch_fast_is_not_same_as_non_fast():
+    """-Fast is a different checkpoint; stripping NVFP4 must not also eat -Fast."""
+    non_fast = "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    fast = "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert ac._model_ids_sibling_mismatch(fast, non_fast) is True
+    assert ac._model_ids_sibling_mismatch(non_fast, fast) is True
+    assert (
+        ac._model_ids_sibling_mismatch("nvidia/Qwen3.6-35B-A3B-NVFP4", non_fast)
+        is True
+    )
+    assert ac._model_ids_sibling_mismatch(non_fast, non_fast) is False
+    fast_cand = ac.ServeCandidate(
+        raw="vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4-Fast --moe-backend flashinfer_b12x",
+        model=fast,
+        config={"moe_backend": "flashinfer_b12x"},
+    )
+    assert ac._vendor_candidate_sibling_mismatch(fast_cand, non_fast) is True
+
+
 def test_discover_recipe_urls_gemma4_official_catalog_not_nvidia_qwen():
     """Unsloth Gemma-4 NVFP4: official Google catalog page, not NVIDIA Qwen cookbooks.
 
@@ -3924,7 +3943,7 @@ _GEMMA_MIXED_PAGE = (
             "unsloth/Qwen3.6-35B-A3B-NVFP4",
             _Q36_35B_CFG,
             None,
-            ("Qwen3.8-27B",),
+            ("Qwen3.8-27B", "NVFP4-Fast"),
             "Qwen3.6-35B-A3B",
         ),
         (

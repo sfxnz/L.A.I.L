@@ -2369,8 +2369,9 @@ _FAMILY_RECIPES_VLLM_ORG = {
     "gemma4": "Google",
     "qwen": "Qwen",
 }
+# Trailing quant token only. Do not swallow -Fast (or any later tag) after NVFP4.
 _QUANT_NAME_SUFFIX_RE = re.compile(
-    r"-(?:NVFP4|FP8|GGUF|GPTQ|AWQ|BNB-4BIT|INT4|INT8)(?:-.*)?$",
+    r"-(?:NVFP4|FP8|GGUF|GPTQ|AWQ|BNB-4BIT|INT4|INT8)$",
     re.I,
 )
 
@@ -2854,7 +2855,9 @@ def _model_core_name(model_id: str) -> str:
     """Repo name minus org and trailing quant/pack suffixes (nvfp4, fp8, gguf, iq*).
 
     Empty when the token is not a resolvable HF name (flags, ``...``, ``$VAR``).
-    Does not strip instruction ``-it`` (gemma-4-31B-it vs gemma-4-31B-it-NVFP4).
+    Does not strip instruction ``-it`` (gemma-4-31B-it vs gemma-4-31B-it-NVFP4)
+    or checkpoint tags after a quant (``-NVFP4-Fast`` keeps ``-fast``).
+    Repeats when several quant tokens trail (``-GPTQ-INT4``).
     """
     raw = (model_id or "").strip().strip("\"'")
     name = raw.split("/")[-1].strip()
@@ -2866,17 +2869,29 @@ def _model_core_name(model_id: str) -> str:
         or not re.search(r"[A-Za-z]", name)
     ):
         return ""
-    stripped = _QUANT_NAME_SUFFIX_RE.sub("", name)
-    stripped = _IQ_QUANT_SUFFIX_RE.sub("", stripped)
+    stripped = name
+    while True:
+        nxt = _QUANT_NAME_SUFFIX_RE.sub("", stripped)
+        nxt = _IQ_QUANT_SUFFIX_RE.sub("", nxt)
+        if nxt == stripped:
+            break
+        stripped = nxt
     return stripped.lower()
 
 
 def _core_names_compatible(a: str, b: str) -> bool:
-    """Equal cores, or one is a delimited prefix (missing tokens do not invent a mismatch)."""
+    """Equal cores, or a delimited prefix whose extra tokens are omitted size/gen.
+
+    ``gemma-4`` vs ``gemma-4-31b-it`` is compatible (missing size).
+    ``qwen3.6-35b-a3b`` vs ``qwen3.6-35b-a3b-fast`` is not (distinct checkpoint).
+    """
     if not a or not b or a == b:
         return True
     lo, hi = (a, b) if len(a) <= len(b) else (b, a)
-    return hi.startswith(lo) and hi[len(lo) : len(lo) + 1] in "-_."
+    if not (hi.startswith(lo) and hi[len(lo) : len(lo) + 1] in "-_."):
+        return False
+    extra = hi[len(lo) + 1 :]
+    return bool(_MODEL_SIZE_TOKEN_RE.search(extra) or _MODEL_GENERATION_RE.search(extra))
 
 
 def _is_placeholder_model_id(mid: str) -> bool:

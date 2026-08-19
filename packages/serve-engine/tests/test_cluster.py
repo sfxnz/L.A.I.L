@@ -218,6 +218,140 @@ def test_serving_worker_detection_unchanged():
     assert summary["multi"]["tensor_parallel_hint"] == 2
 
 
+def test_dspark_worker_is_serving_worker():
+    head = {
+        "id": "head",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "org/model",
+        "containers": [{"name": "deepseek-v4-flash-vllm-dspark-0", "status": "Up 3 minutes"}],
+        "tensor_parallel_size": 2,
+    }
+    worker = {
+        "id": "worker",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [{"name": "deepseek-v4-flash-vllm-dspark-1", "status": "Up 3 minutes"}],
+    }
+    assert cluster._node_state(worker) == "serving_worker"
+    summary = cluster._summarize([head, worker], {"ok": True, "links": []})
+    assert worker["state"] == "serving_worker"
+    assert worker.get("headless_worker") is True
+    assert worker.get("model_id") == "org/model"
+    assert summary["nodes_serving"] == 2
+    assert summary["multi"]["mode"] == "multi_aligned"
+
+
+def test_dspark_rank0_is_not_serving_worker():
+    head = {
+        "id": "head",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [{"name": "deepseek-v4-flash-vllm-dspark-0", "status": "Up 3 minutes"}],
+    }
+    assert cluster._node_state(head) != "serving_worker"
+    assert cluster._node_state(head) in {"loading", "idle"}
+
+
+def test_remote_probe_script_uses_node_vllm_url():
+    live = cluster._remote_probe_script({"vllm_url": "http://127.0.0.1:8888"})
+    assert "http://127.0.0.1:8888" in live or ":8888" in live
+    assert "8888" in live
+    default = cluster._remote_probe_script({})
+    assert "http://127.0.0.1:8000" in default
+    unset = cluster._remote_probe_script({"id": "worker"})
+    assert "http://127.0.0.1:8000" in unset
+
+
+def test_peer_from_ip_inherits_local_vllm_url(monkeypatch):
+    monkeypatch.setattr(cluster, "_hostname_for_ip", lambda ip: "workerbox")
+    peer = cluster._peer_from_ip(
+        {"id": "testhost", "qsfp_if": "roce0", "vllm_url": "http://127.0.0.1:8888"},
+        "192.0.2.8",
+    )
+    assert peer is not None
+    assert peer["vllm_url"] == "http://127.0.0.1:8888"
+    peer_default = cluster._peer_from_ip(
+        {"id": "testhost", "qsfp_if": "roce0"},
+        "192.0.2.8",
+    )
+    assert peer_default is not None
+    assert peer_default["vllm_url"] == "http://127.0.0.1:8000"
+
+
+def test_api_cluster_dspark_worker_serving(isolated_cluster, monkeypatch):
+    """GET /api/cluster reports a headless Anemll DSpark worker as serving."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    cfg = {
+        "name": "lab",
+        "nodes": [
+            {
+                "id": "head",
+                "label": "head",
+                "role": "head",
+                "local": True,
+                "vllm_url": "http://127.0.0.1:8888",
+            },
+            {
+                "id": "worker",
+                "label": "worker",
+                "role": "worker",
+                "local": False,
+                "ssh_host": "worker.invalid",
+                "vllm_url": "http://127.0.0.1:8888",
+            },
+        ],
+    }
+    monkeypatch.setenv("LAIL_CLUSTER_JSON", json.dumps(cfg))
+
+    def fake_local(node, base_url=None):
+        return _probed(
+            node,
+            local=True,
+            online=True,
+            endpoint_healthy=True,
+            model_id="org/model",
+            containers=[{"name": "deepseek-v4-flash-vllm-dspark-0", "status": "Up 3 minutes"}],
+            tensor_parallel_size=2,
+        )
+
+    def fake_remote(node):
+        return _probed(
+            node,
+            local=False,
+            online=True,
+            endpoint_healthy=False,
+            model_id=None,
+            containers=[{"name": "deepseek-v4-flash-vllm-dspark-1", "status": "Up 3 minutes"}],
+        )
+
+    monkeypatch.setattr(cluster, "_probe_local", fake_local)
+    monkeypatch.setattr(cluster, "_probe_remote_ssh", fake_remote)
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True, "rtt_ms": 0.1})
+    monkeypatch.setattr("app.db.init_db", lambda: None)
+
+    client = TestClient(app)
+    resp = client.get("/api/cluster")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    worker = next(n for n in data["nodes"] if n["id"] == "worker")
+    assert worker["state"] in {"serving_worker", "serving"}
+    assert worker.get("model_id") == "org/model"
+    assert worker.get("headless_worker") is True
+    assert data["summary"]["nodes_serving"] == 2
+    assert data["summary"]["multi"]["mode"] == "multi_aligned"
+    script = cluster._remote_probe_script(worker)
+    assert ":8888" in script
+    assert "http://127.0.0.1:8888" in script
+
+
 def test_invalid_cluster_json_falls_back_to_local(isolated_cluster, monkeypatch):
     monkeypatch.setenv("LAIL_CLUSTER_JSON", "{not-json")
     cfg = cluster._load_cluster_config()

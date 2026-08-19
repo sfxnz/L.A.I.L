@@ -45,6 +45,11 @@ _FALLBACK_CLUSTER = {
 _SKIP_IFACES = {"lo", "docker0", "tailscale0"}
 _SKIP_IFACE_PREFIXES = ("br-", "veth", "virbr", "cni", "flannel", "wg")
 
+# Official LAIL multi-node name, plus community/Anemll/Mia DSpark-style ranks.
+_OFFICIAL_VLLM_NAME_RE = re.compile(r"^spark-vllm-n(\d+)$")
+_DSPARK_VLLM_NAME_RE = re.compile(r"(?:^|[-_])dspark[-_](\d+)$", re.I)
+_DEFAULT_VLLM_PORTS = (8000, 8888)
+
 _REMOTE_PROBE_PY = r"""
 import json, platform, re, subprocess, urllib.request
 
@@ -73,6 +78,71 @@ def mem_total():
         return None
     return None
 
+def ports_from_bindings(obj):
+    out = []
+    if not isinstance(obj, dict):
+        return out
+    for _k, bindings in obj.items():
+        if not bindings:
+            continue
+        for b in bindings:
+            if not isinstance(b, dict):
+                continue
+            hp = b.get("HostPort")
+            if hp and str(hp).isdigit():
+                out.append(int(hp))
+    return out
+
+def enrich(c):
+    raw = run(["docker", "inspect", c["name"]], t=8)
+    if not raw.strip():
+        return
+    try:
+        data = json.loads(raw)[0]
+    except Exception:
+        return
+    cfg = data.get("Config") or {}
+    cmd = cfg.get("Cmd") or []
+    args = data.get("Args") or []
+    env = cfg.get("Env") or []
+    joined = " ".join(
+        [*(cmd if isinstance(cmd, list) else [str(cmd)]),
+         *(args if isinstance(args, list) else [str(args)]),
+         *(e for e in env if isinstance(e, str) and ("RANK" in e or e.startswith("VLLM_") or e.startswith("--")))]
+    )
+    c["cmd_blob"] = joined
+    ports = []
+    for m in re.finditer(r"--port[=\s]+(\d+)", joined):
+        ports.append(int(m.group(1)))
+    ns = data.get("NetworkSettings") or {}
+    hc = data.get("HostConfig") or {}
+    ports += ports_from_bindings(ns.get("Ports") or {})
+    ports += ports_from_bindings(hc.get("PortBindings") or {})
+    # uniq preserve order
+    seen = set()
+    uniq = []
+    for p in ports:
+        if p not in seen and 1 <= p <= 65535:
+            seen.add(p)
+            uniq.append(p)
+    c["ports"] = uniq
+    rank = None
+    m = re.search(r"--node-rank[=\s]+(\d+)", joined)
+    if m:
+        rank = int(m.group(1))
+    else:
+        for e in env:
+            if isinstance(e, str) and e.startswith("NODE_RANK="):
+                try:
+                    rank = int(e.split("=", 1)[1].strip())
+                except Exception:
+                    pass
+    c["node_rank"] = rank
+    c["headless"] = bool(re.search(r"--headless\b", joined))
+    m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", joined)
+    if m:
+        c["tensor_parallel_size"] = int(m.group(1))
+
 gpu = "unknown"
 smi = run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
 if smi.strip():
@@ -87,21 +157,47 @@ for line in dout.splitlines():
     if len(parts) < 3:
         continue
     name, status, image = parts[0], parts[1], parts[2]
-    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama", name, re.I) or "vllm" in image.lower() or "ray" in image.lower():
-        containers.append({"name": name, "status": status, "image": image})
+    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower():
+        rec = {"name": name, "status": status, "image": image}
+        enrich(rec)
+        containers.append(rec)
+
+# Candidate OpenAI ports: configured URL, published/--port from containers, then common defaults.
+port_candidates = []
+def add_port(p):
+    try:
+        p = int(p)
+    except Exception:
+        return
+    if 1 <= p <= 65535 and p not in port_candidates:
+        port_candidates.append(p)
+
+m = re.search(r":(\d+)(?:/|$)", str(vllm_url or ""))
+if m:
+    add_port(m.group(1))
+for c in containers:
+    for p in c.get("ports") or []:
+        add_port(p)
+for p in (8000, 8888):
+    add_port(p)
 
 model_id = None
 healthy = False
 models = []
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=2.5) as r:
-        body = json.loads(r.read().decode())
-        models = body.get("data") or []
-        if models:
-            model_id = models[0].get("id")
-            healthy = True
-except Exception:
-    pass
+live_url = str(vllm_url or "http://127.0.0.1:8000")
+for port in port_candidates:
+    url = "http://127.0.0.1:%d" % port
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/v1/models", timeout=2.5) as r:
+            body = json.loads(r.read().decode())
+            models = body.get("data") or []
+            if models:
+                model_id = models[0].get("id")
+                healthy = True
+                live_url = url
+                break
+    except Exception:
+        continue
 
 # detect TP from running container cmd
 tp = None
@@ -109,17 +205,8 @@ ray_like = False
 for c in containers:
     if "ray" in c["name"].lower() or "ray" in c["image"].lower():
         ray_like = True
-    insp = run(["docker", "inspect", "--format", "{{json .Config.Cmd}}", c["name"]], t=5)
-    if not insp.strip():
-        continue
-    try:
-        cmd = json.loads(insp)
-    except Exception:
-        cmd = []
-    joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-    m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", joined)
-    if m:
-        tp = int(m.group(1))
+    if c.get("tensor_parallel_size") is not None:
+        tp = c["tensor_parallel_size"]
 
 # fabric carrier/speed for the node-configured iface (injected as qsfp_if)
 carrier = None
@@ -159,6 +246,7 @@ print(json.dumps({
     "qsfp_carrier": carrier,
     "qsfp_speed_mbps": speed if speed and speed > 0 else None,
     "roce_up_ifs": up_ifs,
+    "vllm_url": live_url,
     "tailscale_ip": run(["tailscale", "ip", "-4"]).strip().split("\n")[0] if run(["tailscale", "ip", "-4"]).strip() else None,
 }))
 """
@@ -177,6 +265,182 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
         return 124, "", "timeout"
     except Exception as e:
         return 1, "", str(e)
+
+
+def _rank_from_container_name(name: str) -> int | None:
+    """Worker/head rank encoded in the container name, if any.
+
+    Official LAIL: spark-vllm-nN. Community/Anemll/Mia: …-vllm-dspark-N (or …-dspark-N).
+    """
+    n = (name or "").strip()
+    if not n:
+        return None
+    m = _OFFICIAL_VLLM_NAME_RE.match(n)
+    if m:
+        return int(m.group(1))
+    m = _DSPARK_VLLM_NAME_RE.search(n)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _ports_from_host_bindings(obj: Any) -> list[int]:
+    out: list[int] = []
+    if not isinstance(obj, dict):
+        return out
+    for _k, bindings in obj.items():
+        if not bindings:
+            continue
+        for b in bindings:
+            if not isinstance(b, dict):
+                continue
+            hp = b.get("HostPort")
+            if hp is None:
+                continue
+            try:
+                port = int(hp)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                out.append(port)
+    return out
+
+
+def _cmd_blob_from_inspect(insp: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("cmd", "args"):
+        val = insp.get(key)
+        if isinstance(val, list):
+            parts.extend(str(x) for x in val)
+        elif val:
+            parts.append(str(val))
+    for e in insp.get("env") or []:
+        if not isinstance(e, str):
+            continue
+        if e.startswith("NODE_RANK=") or "RANK=" in e or e.startswith("VLLM_") or e.startswith("--"):
+            parts.append(e)
+    return " ".join(parts)
+
+
+def _ports_from_cmd_blob(blob: str) -> list[int]:
+    return [int(m.group(1)) for m in re.finditer(r"--port[=\s]+(\d+)", blob or "")]
+
+
+def _node_rank_from_blob_and_env(blob: str, env: list[Any] | None) -> int | None:
+    m = re.search(r"--node-rank[=\s]+(\d+)", blob or "")
+    if m:
+        return int(m.group(1))
+    for e in env or []:
+        if isinstance(e, str) and e.startswith("NODE_RANK="):
+            try:
+                return int(e.split("=", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _uniq_ports(*groups: list[int]) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for group in groups:
+        for p in group:
+            try:
+                port = int(p)
+            except (TypeError, ValueError):
+                continue
+            if port in seen or not (1 <= port <= 65535):
+                continue
+            seen.add(port)
+            out.append(port)
+    return out
+
+
+def _candidate_vllm_ports(configured_url: str | None, containers: list[dict[str, Any]]) -> list[int]:
+    """Ports to probe for /v1/models: configured URL, container publish/--port, then defaults."""
+    configured: list[int] = []
+    if configured_url:
+        m = re.search(r":(\d+)(?:/|$)", str(configured_url))
+        if m:
+            configured.append(int(m.group(1)))
+    discovered: list[int] = []
+    for c in containers:
+        for p in c.get("ports") or []:
+            try:
+                discovered.append(int(p))
+            except (TypeError, ValueError):
+                continue
+    return _uniq_ports(configured, discovered, list(_DEFAULT_VLLM_PORTS))
+
+
+def _enrich_local_container(c: dict[str, Any]) -> None:
+    """Attach ports / node_rank / headless / TP from docker inspect onto a container dict."""
+    name = c.get("name") or ""
+    if not name:
+        return
+    insp = metadata.docker_inspect_flags(name)
+    if not insp:
+        # Name-only fallback still helps worker detection for known layouts.
+        rank = _rank_from_container_name(name)
+        if rank is not None:
+            c["node_rank"] = rank
+        return
+    blob = _cmd_blob_from_inspect(insp)
+    c["cmd_blob"] = blob
+    ports = _uniq_ports(
+        _ports_from_cmd_blob(blob),
+        list(insp.get("ports") or []),
+    )
+    c["ports"] = ports
+    rank = _node_rank_from_blob_and_env(blob, insp.get("env"))
+    if rank is None:
+        rank = _rank_from_container_name(name)
+    c["node_rank"] = rank
+    c["headless"] = bool(re.search(r"--headless\b", blob))
+    m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", blob)
+    if m:
+        c["tensor_parallel_size"] = int(m.group(1))
+
+
+def _probe_models_on_ports(ports: list[int], *, prefer_url: str | None = None) -> dict[str, Any]:
+    """Try /v1/models on each candidate port; return first healthy hit."""
+    import httpx
+
+    urls: list[str] = []
+    if prefer_url:
+        urls.append(prefer_url.rstrip("/"))
+    for port in ports:
+        u = f"http://127.0.0.1:{port}"
+        if u not in urls:
+            urls.append(u)
+
+    last_error: str | None = None
+    with httpx.Client(timeout=2.5) as client:
+        for url in urls:
+            try:
+                m = client.get(f"{url.rstrip('/')}/v1/models")
+                if m.status_code != 200:
+                    continue
+                body = m.json()
+                models = body.get("data") or []
+                if not models:
+                    continue
+                return {
+                    "healthy": True,
+                    "models": models,
+                    "model_id": models[0].get("id") if isinstance(models[0], dict) else None,
+                    "vllm_url": url,
+                    "error": None,
+                }
+            except Exception as e:
+                last_error = str(e)
+                continue
+    return {
+        "healthy": False,
+        "models": [],
+        "model_id": None,
+        "vllm_url": (prefer_url or f"http://127.0.0.1:{ports[0] if ports else 8000}").rstrip("/"),
+        "error": last_error,
+    }
 
 
 def _parse_ip_addrs(text: str) -> list[tuple[str, str]]:
@@ -473,7 +737,10 @@ def _node_is_local(node: dict[str, Any], n_cfg: int) -> bool:
 
 
 def _remote_probe_script(node: dict[str, Any]) -> str:
-    prefix = f"qsfp_if = {json.dumps(str(node.get('qsfp_if') or ''))}\n"
+    prefix = (
+        f"qsfp_if = {json.dumps(str(node.get('qsfp_if') or ''))}\n"
+        f"vllm_url = {json.dumps(str(node.get('vllm_url') or 'http://127.0.0.1:8000'))}\n"
+    )
     return prefix + _REMOTE_PROBE_PY
 
 
@@ -492,10 +759,10 @@ def _ping_ok(ip: str, timeout_s: float = 1.0) -> dict[str, Any]:
 
 
 def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str, Any]:
-    url = base_url or node.get("vllm_url") or "http://127.0.0.1:8000"
+    configured_url = base_url or node.get("vllm_url") or "http://127.0.0.1:8000"
     hw = metadata.collect_hardware()
     containers = metadata.list_vllm_containers()
-    # also catch ray containers
+    # also catch ray / dspark containers the name filter might miss
     code, dout, _ = _run(
         ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
         timeout=8,
@@ -509,26 +776,18 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
             name, status, image = parts[0], parts[1], parts[2]
             if name in seen:
                 continue
-            if re.search(r"ray|vllm", name + image, re.I):
+            if re.search(r"ray|vllm|dspark", name + image, re.I):
                 containers.append({"name": name, "status": status, "image": image})
 
-    import httpx
+    for c in containers:
+        _enrich_local_container(c)
 
-    probe: dict[str, Any] = {"healthy": False, "models": [], "error": None}
-    try:
-        with httpx.Client(timeout=2.5) as client:
-            m = client.get(f"{url.rstrip('/')}/v1/models")
-            if m.status_code == 200:
-                body = m.json()
-                probe["models"] = body.get("data") or []
-                probe["healthy"] = True
-    except Exception as e:
-        probe["error"] = str(e)
+    ports = _candidate_vllm_ports(configured_url, containers)
+    probe = _probe_models_on_ports(ports, prefer_url=configured_url)
+    url = probe.get("vllm_url") or configured_url
 
-    model_id = None
+    model_id = probe.get("model_id")
     models = probe.get("models") or []
-    if models:
-        model_id = models[0].get("id")
 
     tp = None
     ray_hint = False
@@ -536,6 +795,10 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         blob = f"{c.get('name','')} {c.get('image','')}"
         if "ray" in blob.lower():
             ray_hint = True
+        if c.get("tensor_parallel_size") is not None:
+            tp = c["tensor_parallel_size"]
+            continue
+        # Fallback if enrich missed TP (older inspect path).
         insp = metadata.docker_inspect_flags(c.get("name") or "")
         cmd = insp.get("cmd") or []
         joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
@@ -695,23 +958,39 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
             "qsfp_speed_mbps": data.get("qsfp_speed_mbps"),
             "roce_up_ifs": data.get("roce_up_ifs") or [],
             "tailscale_ip": data.get("tailscale_ip") or node.get("tailscale_ip"),
+            "vllm_url": data.get("vllm_url") or node.get("vllm_url"),
         }
     )
     return base
 
 
 def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
-    """Rank of a running headless multi-node worker container (spark-vllm-nN, N>=1).
+    """Rank of a running headless / TP worker container (rank >= 1).
 
     Headless workers intentionally expose no /v1/models endpoint, so they can never
-    be detected via endpoint health — they must be identified by their container.
+    be detected via endpoint health — they must be identified by container name,
+    --headless / --node-rank, or NODE_RANK.
     """
     for c in n.get("containers") or []:
-        m = re.match(r"spark-vllm-n(\d+)$", str(c.get("name", "")))
-        if m and "up" in str(c.get("status", "")).lower():
-            rank = int(m.group(1))
-            if rank >= 1:
-                return rank
+        if "up" not in str(c.get("status", "")).lower():
+            continue
+        rank: int | None = None
+        if c.get("node_rank") is not None:
+            try:
+                rank = int(c["node_rank"])
+            except (TypeError, ValueError):
+                rank = None
+        if rank is None:
+            rank = _rank_from_container_name(str(c.get("name", "")))
+        headless = bool(c.get("headless"))
+        if not headless:
+            blob = str(c.get("cmd_blob") or "")
+            headless = bool(re.search(r"--headless\b", blob))
+        # Explicit worker markers win even when name rank is ambiguous.
+        if headless:
+            return rank if rank is not None and rank >= 1 else 1
+        if rank is not None and rank >= 1:
+            return rank
     return None
 
 

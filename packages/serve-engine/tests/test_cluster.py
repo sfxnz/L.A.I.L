@@ -218,6 +218,185 @@ def test_serving_worker_detection_unchanged():
     assert summary["multi"]["tensor_parallel_hint"] == 2
 
 
+def test_dspark_named_worker_is_serving_worker_with_head_model():
+    """Community/Anemll/Mia layout: …-vllm-dspark-1 on spark2 must not stay LOADING."""
+    head = {
+        "id": "spark1",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "containers": [
+            {
+                "name": "deepseek-v4-flash-vllm-dspark-0",
+                "status": "Up 10 minutes",
+                "ports": [8888],
+                "node_rank": 0,
+            }
+        ],
+        "tensor_parallel_size": 2,
+        "vllm_url": "http://127.0.0.1:8888",
+    }
+    worker = {
+        "id": "spark2",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [
+            {
+                "name": "deepseek-v4-flash-vllm-dspark-1",
+                "status": "Up 10 minutes",
+                "node_rank": 1,
+                "headless": True,
+            }
+        ],
+    }
+    assert cluster._rank_from_container_name("deepseek-v4-flash-vllm-dspark-1") == 1
+    assert cluster._multinode_worker_rank(worker) == 1
+    assert cluster._node_state(worker) == "serving_worker"
+    summary = cluster._summarize([head, worker], {"ok": True, "links": []})
+    assert worker["state"] == "serving_worker"
+    assert worker.get("model_id") == "deepseek-ai/DeepSeek-V4-Flash-0731"
+    assert summary["nodes_serving"] == 2
+    assert summary["multi"]["mode"] == "multi_aligned"
+    assert summary["multi"]["model_id"] == "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+
+def test_headless_flag_detects_worker_without_known_name():
+    worker = {
+        "id": "worker",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [
+            {
+                "name": "custom-vllm-worker",
+                "status": "Up 1 minute",
+                "headless": True,
+                "node_rank": 1,
+                "cmd_blob": "vllm serve m --headless --node-rank 1",
+            }
+        ],
+    }
+    assert cluster._node_state(worker) == "serving_worker"
+
+
+def test_candidate_vllm_ports_prefers_configured_then_discovered():
+    ports = cluster._candidate_vllm_ports(
+        "http://127.0.0.1:8000",
+        [{"ports": [8888, 8000]}],
+    )
+    assert ports[0] == 8000
+    assert 8888 in ports
+    # Non-8000 only published port still includes defaults for robustness.
+    ports2 = cluster._candidate_vllm_ports(None, [{"ports": [8888]}])
+    assert ports2[0] == 8888
+    assert 8000 in ports2
+
+
+def test_probe_models_on_ports_finds_non_8000(monkeypatch):
+    calls: list[str] = []
+
+    class FakeResp:
+        def __init__(self, code, body):
+            self.status_code = code
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class FakeClient:
+        def __init__(self, timeout=2.5):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url):
+            calls.append(url)
+            if url.endswith(":8888/v1/models"):
+                return FakeResp(200, {"data": [{"id": "org/live-on-8888"}]})
+            raise ConnectionError("refused")
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    out = cluster._probe_models_on_ports([8000, 8888], prefer_url="http://127.0.0.1:8000")
+    assert out["healthy"] is True
+    assert out["model_id"] == "org/live-on-8888"
+    assert out["vllm_url"] == "http://127.0.0.1:8888"
+    assert any(":8888/" in u for u in calls)
+
+
+def test_official_and_dspark_status_summaries_both_serving():
+    """Required layouts: spark-vllm-nN:8000 and dspark-style + non-8000 both SERVING."""
+    official_head = {
+        "id": "spark1",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "org/official",
+        "containers": [{"name": "spark-vllm-n0", "status": "Up", "ports": [8000]}],
+        "vllm_url": "http://127.0.0.1:8000",
+        "tensor_parallel_size": 2,
+    }
+    official_worker = {
+        "id": "spark2",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [{"name": "spark-vllm-n1", "status": "Up"}],
+    }
+    s1 = cluster._summarize([official_head, official_worker], {"ok": True})
+    assert s1["multi"]["mode"] == "multi_aligned"
+    assert official_worker["state"] == "serving_worker"
+    assert official_worker["model_id"] == "org/official"
+
+    dspark_head = {
+        "id": "spark1",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "org/dspark",
+        "containers": [
+            {
+                "name": "deepseek-v4-flash-vllm-dspark-0",
+                "status": "Up",
+                "ports": [8888],
+                "node_rank": 0,
+            }
+        ],
+        "vllm_url": "http://127.0.0.1:8888",
+        "tensor_parallel_size": 2,
+    }
+    dspark_worker = {
+        "id": "spark2",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [
+            {
+                "name": "deepseek-v4-flash-vllm-dspark-1",
+                "status": "Up",
+                "node_rank": 1,
+                "headless": True,
+            }
+        ],
+    }
+    s2 = cluster._summarize([dspark_head, dspark_worker], {"ok": True})
+    assert s2["multi"]["mode"] == "multi_aligned"
+    assert dspark_worker["state"] == "serving_worker"
+    assert dspark_worker["model_id"] == "org/dspark"
+    assert s2["multi"]["model_id"] == "org/dspark"
+
+
 def test_invalid_cluster_json_falls_back_to_local(isolated_cluster, monkeypatch):
     monkeypatch.setenv("LAIL_CLUSTER_JSON", "{not-json")
     cfg = cluster._load_cluster_config()

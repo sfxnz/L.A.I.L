@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_FROM_DISK
+"""Cluster health for L.A.I.L Status (source of truth).\n\nSEE_WORKSPACE_FILE"""\n

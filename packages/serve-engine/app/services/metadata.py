@@ -105,8 +105,9 @@ def list_vllm_containers() -> list[dict[str, Any]]:
             continue
         name, status, image = parts[0], parts[1], parts[2]
         if not (
-            re.search(r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama", name, re.I)
+            re.search(r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark", name, re.I)
             or "vllm" in image.lower()
+            or "dspark" in image.lower()
         ):
             continue
         containers.append(
@@ -129,11 +130,39 @@ def docker_inspect_flags(name: str) -> dict[str, Any]:
     except Exception:
         return {}
     cfg = data.get("Config") or {}
+    ns = data.get("NetworkSettings") or {}
+    hc = data.get("HostConfig") or {}
+
+    def _host_ports(obj: Any) -> list[int]:
+        out: list[int] = []
+        if not isinstance(obj, dict):
+            return out
+        for _k, bindings in obj.items():
+            if not bindings:
+                continue
+            for b in bindings:
+                if not isinstance(b, dict):
+                    continue
+                hp = b.get("HostPort")
+                if hp is None:
+                    continue
+                try:
+                    port = int(hp)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= port <= 65535:
+                    out.append(port)
+        return out
+
+    ports = sorted({*_host_ports(ns.get("Ports") or {}), *_host_ports(hc.get("PortBindings") or {})})
     return {
         "image": cfg.get("Image"),
         "cmd": cfg.get("Cmd") or [],
+        "args": data.get("Args") or [],
         "env": [e for e in (cfg.get("Env") or []) if not e.startswith("HF_TOKEN") and "TOKEN" not in e],
         "state": (data.get("State") or {}).get("Status"),
+        "ports": ports,
+        "network_mode": hc.get("NetworkMode"),
     }
 
 

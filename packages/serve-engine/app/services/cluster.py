@@ -46,8 +46,9 @@ _SKIP_IFACES = {"lo", "docker0", "tailscale0"}
 _SKIP_IFACE_PREFIXES = ("br-", "veth", "virbr", "cni", "flannel", "wg")
 
 # Official LAIL multi-node name, plus community/Anemll/Mia DSpark-style ranks.
+# DSpark must include the vllm-dspark token — bare "…-dspark-N" is not enough.
 _OFFICIAL_VLLM_NAME_RE = re.compile(r"^spark-vllm-n(\d+)$")
-_DSPARK_VLLM_NAME_RE = re.compile(r"(?:^|[-_])dspark[-_](\d+)$", re.I)
+_DSPARK_VLLM_NAME_RE = re.compile(r"(?i)^(?:.+[-_])?vllm[-_]dspark[-_](\d+)$")
 _DEFAULT_VLLM_PORTS = (8000, 8888)
 
 _REMOTE_PROBE_PY = r"""
@@ -162,7 +163,8 @@ for line in dout.splitlines():
         enrich(rec)
         containers.append(rec)
 
-# Candidate OpenAI ports: configured URL, published/--port from containers, then common defaults.
+# Candidate OpenAI ports: published/--port from containers first, then configured URL, then defaults.
+# Discovered ports must beat a stale configured :8000 when Anemll serves on :8888.
 port_candidates = []
 def add_port(p):
     try:
@@ -172,12 +174,12 @@ def add_port(p):
     if 1 <= p <= 65535 and p not in port_candidates:
         port_candidates.append(p)
 
-m = re.search(r":(\d+)(?:/|$)", str(vllm_url or ""))
-if m:
-    add_port(m.group(1))
 for c in containers:
     for p in c.get("ports") or []:
         add_port(p)
+m = re.search(r":(\d+)(?:/|$)", str(vllm_url or ""))
+if m:
+    add_port(m.group(1))
 for p in (8000, 8888):
     add_port(p)
 
@@ -268,9 +270,9 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
 
 
 def _rank_from_container_name(name: str) -> int | None:
-    """Worker/head rank encoded in the container name, if any.
+    """Worker/head rank encoded in a known vLLM container name, if any.
 
-    Official LAIL: spark-vllm-nN. Community/Anemll/Mia: …-vllm-dspark-N (or …-dspark-N).
+    Official LAIL: spark-vllm-nN. Community/Anemll/Mia: …-vllm-dspark-N (vllm token required).
     """
     n = (name or "").strip()
     if not n:
@@ -278,10 +280,34 @@ def _rank_from_container_name(name: str) -> int | None:
     m = _OFFICIAL_VLLM_NAME_RE.match(n)
     if m:
         return int(m.group(1))
-    m = _DSPARK_VLLM_NAME_RE.search(n)
+    m = _DSPARK_VLLM_NAME_RE.match(n)
     if m:
         return int(m.group(1))
     return None
+
+
+def _container_serve_family(name: str) -> str | None:
+    """Stable serve-family key for pairing head/worker containers."""
+    n = (name or "").strip()
+    if not n:
+        return None
+    if _OFFICIAL_VLLM_NAME_RE.match(n):
+        return "spark-vllm"
+    m = _DSPARK_VLLM_NAME_RE.match(n)
+    if m:
+        return re.sub(r"[-_]\d+$", "", n).lower()
+    return None
+
+
+def _node_serve_families(n: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for c in n.get("containers") or []:
+        if "up" not in str(c.get("status", "")).lower():
+            continue
+        fam = _container_serve_family(str(c.get("name", "")))
+        if fam:
+            out.add(fam)
+    return out
 
 
 def _ports_from_host_bindings(obj: Any) -> list[int]:
@@ -356,7 +382,11 @@ def _uniq_ports(*groups: list[int]) -> list[int]:
 
 
 def _candidate_vllm_ports(configured_url: str | None, containers: list[dict[str, Any]]) -> list[int]:
-    """Ports to probe for /v1/models: configured URL, container publish/--port, then defaults."""
+    """Ports to probe for /v1/models.
+
+    Order: published/--port from running containers, then configured URL, then defaults.
+    Discovered ports must win over a stale configured :8000 when the live serve is elsewhere.
+    """
     configured: list[int] = []
     if configured_url:
         m = re.search(r":(\d+)(?:/|$)", str(configured_url))
@@ -369,7 +399,7 @@ def _candidate_vllm_ports(configured_url: str | None, containers: list[dict[str,
                 discovered.append(int(p))
             except (TypeError, ValueError):
                 continue
-    return _uniq_ports(configured, discovered, list(_DEFAULT_VLLM_PORTS))
+    return _uniq_ports(discovered, configured, list(_DEFAULT_VLLM_PORTS))
 
 
 def _enrich_local_container(c: dict[str, Any]) -> None:
@@ -401,15 +431,16 @@ def _enrich_local_container(c: dict[str, Any]) -> None:
         c["tensor_parallel_size"] = int(m.group(1))
 
 
-def _probe_models_on_ports(ports: list[int], *, prefer_url: str | None = None) -> dict[str, Any]:
-    """Try /v1/models on each candidate port; return first healthy hit."""
+def _probe_models_on_ports(ports: list[int], *, fallback_url: str | None = None) -> dict[str, Any]:
+    """Try /v1/models on each candidate port in order; return first healthy hit.
+
+    Callers must pass ports already ordered (discovered before configured/defaults).
+    """
     import httpx
 
     urls: list[str] = []
-    if prefer_url:
-        urls.append(prefer_url.rstrip("/"))
     for port in ports:
-        u = f"http://127.0.0.1:{port}"
+        u = f"http://127.0.0.1:{int(port)}"
         if u not in urls:
             urls.append(u)
 
@@ -438,7 +469,7 @@ def _probe_models_on_ports(ports: list[int], *, prefer_url: str | None = None) -
         "healthy": False,
         "models": [],
         "model_id": None,
-        "vllm_url": (prefer_url or f"http://127.0.0.1:{ports[0] if ports else 8000}").rstrip("/"),
+        "vllm_url": (fallback_url or f"http://127.0.0.1:{ports[0] if ports else 8000}").rstrip("/"),
         "error": last_error,
     }
 
@@ -783,7 +814,7 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         _enrich_local_container(c)
 
     ports = _candidate_vllm_ports(configured_url, containers)
-    probe = _probe_models_on_ports(ports, prefer_url=configured_url)
+    probe = _probe_models_on_ports(ports, fallback_url=configured_url)
     url = probe.get("vllm_url") or configured_url
 
     model_id = probe.get("model_id")
@@ -965,15 +996,21 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
 
 
 def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
-    """Rank of a running headless / TP worker container (rank >= 1).
+    """Rank of a running headless / TP worker container (rank >= 1), or None.
 
     Headless workers intentionally expose no /v1/models endpoint, so they can never
-    be detected via endpoint health — they must be identified by container name,
-    --headless / --node-rank, or NODE_RANK.
+    be detected via endpoint health — they must be identified by a known worker
+    name (spark-vllm-nN / …-vllm-dspark-N) or by --headless with an explicit rank >= 1.
+    Never coerce unknown/0 rank to 1.
     """
     for c in n.get("containers") or []:
         if "up" not in str(c.get("status", "")).lower():
             continue
+        name = str(c.get("name", ""))
+        name_rank = _rank_from_container_name(name)
+        if name_rank is not None and name_rank >= 1:
+            return name_rank
+
         rank: int | None = None
         if c.get("node_rank") is not None:
             try:
@@ -981,17 +1018,32 @@ def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
             except (TypeError, ValueError):
                 rank = None
         if rank is None:
-            rank = _rank_from_container_name(str(c.get("name", "")))
+            rank = _node_rank_from_blob_and_env(str(c.get("cmd_blob") or ""), None)
+
         headless = bool(c.get("headless"))
         if not headless:
-            blob = str(c.get("cmd_blob") or "")
-            headless = bool(re.search(r"--headless\b", blob))
-        # Explicit worker markers win even when name rank is ambiguous.
-        if headless:
-            return rank if rank is not None and rank >= 1 else 1
-        if rank is not None and rank >= 1:
+            headless = bool(re.search(r"--headless\b", str(c.get("cmd_blob") or "")))
+
+        # Explicit headless worker only when rank is known and >= 1.
+        if headless and rank is not None and rank >= 1:
             return rank
     return None
+
+
+def _worker_aligned_with_head(worker: dict[str, Any], head: dict[str, Any], rank: int) -> bool:
+    """True when a TP worker plausibly belongs to the same live serve as head."""
+    tp = head.get("tensor_parallel_size")
+    if tp is not None:
+        try:
+            if rank >= int(tp):
+                return False
+        except (TypeError, ValueError):
+            pass
+    hk = _node_serve_families(head)
+    wk = _node_serve_families(worker)
+    if not hk or not wk:
+        return False
+    return bool(hk & wk)
 
 
 def _node_state(n: dict[str, Any]) -> str:
@@ -1018,11 +1070,34 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
 
     online = sum(1 for n in nodes if n.get("state") != "offline")
     head_serving = [n for n in nodes if n.get("state") == "serving"]
-    workers_serving = [n for n in nodes if n.get("state") == "serving_worker"]
-    # A headless worker serves the head's model — attribute it for display.
+    # Drop workers that do not share a serve family with a live head (or exceed TP).
+    workers_serving: list[dict[str, Any]] = []
+    for w in nodes:
+        if w.get("state") != "serving_worker":
+            continue
+        rank = _multinode_worker_rank(w)
+        if rank is None:
+            w["state"] = "loading"
+            continue
+        if not head_serving:
+            workers_serving.append(w)
+            continue
+        if any(_worker_aligned_with_head(w, h, rank) for h in head_serving):
+            workers_serving.append(w)
+            continue
+        # Leftover / unrelated Up container — do not paint as TP worker.
+        up = any("up" in str(c.get("status", "")).lower() for c in w.get("containers") or [])
+        w["state"] = "loading" if up else "idle"
+
+    # A headless worker serves the head's model — attribute only when aligned.
     if head_serving and workers_serving:
         head_model = head_serving[0].get("model_id")
         for w in workers_serving:
+            rank = _multinode_worker_rank(w)
+            if rank is None:
+                continue
+            if not any(_worker_aligned_with_head(w, h, rank) for h in head_serving):
+                continue
             if not w.get("model_id"):
                 w["model_id"] = head_model
             w["headless_worker"] = True

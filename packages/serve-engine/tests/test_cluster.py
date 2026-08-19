@@ -231,7 +231,6 @@ def test_dspark_named_worker_is_serving_worker_with_head_model():
                 "name": "deepseek-v4-flash-vllm-dspark-0",
                 "status": "Up 10 minutes",
                 "ports": [8888],
-                "node_rank": 0,
             }
         ],
         "tensor_parallel_size": 2,
@@ -247,8 +246,6 @@ def test_dspark_named_worker_is_serving_worker_with_head_model():
             {
                 "name": "deepseek-v4-flash-vllm-dspark-1",
                 "status": "Up 10 minutes",
-                "node_rank": 1,
-                "headless": True,
             }
         ],
     }
@@ -263,7 +260,15 @@ def test_dspark_named_worker_is_serving_worker_with_head_model():
     assert summary["multi"]["model_id"] == "deepseek-ai/DeepSeek-V4-Flash-0731"
 
 
-def test_headless_flag_detects_worker_without_known_name():
+def test_dspark_name_requires_vllm_token():
+    assert cluster._rank_from_container_name("deepseek-v4-flash-vllm-dspark-1") == 1
+    assert cluster._rank_from_container_name("vllm-dspark-2") == 2
+    assert cluster._rank_from_container_name("backup-dspark-1") is None
+    assert cluster._rank_from_container_name("my-dspark-3") is None
+    assert cluster._rank_from_container_name("dspark-1") is None
+
+
+def test_headless_with_explicit_rank_is_worker():
     worker = {
         "id": "worker",
         "local": False,
@@ -280,23 +285,102 @@ def test_headless_flag_detects_worker_without_known_name():
             }
         ],
     }
+    assert cluster._multinode_worker_rank(worker) == 1
     assert cluster._node_state(worker) == "serving_worker"
 
 
-def test_candidate_vllm_ports_prefers_configured_then_discovered():
+def test_headless_rank_none_or_zero_not_forced_to_one():
+    for rank in (None, 0):
+        node = {
+            "id": "worker",
+            "online": True,
+            "endpoint_healthy": False,
+            "containers": [
+                {
+                    "name": "custom-vllm-worker",
+                    "status": "Up 1 minute",
+                    "headless": True,
+                    "node_rank": rank,
+                    "cmd_blob": "vllm serve m --headless"
+                    + ("" if rank is None else f" --node-rank {rank}"),
+                }
+            ],
+        }
+        assert cluster._multinode_worker_rank(node) is None
+        assert cluster._node_state(node) == "loading"
+
+
+def test_unrelated_up_container_is_not_serving_worker():
+    head = {
+        "id": "spark1",
+        "local": True,
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "org/live",
+        "containers": [{"name": "spark-vllm-n0", "status": "Up"}],
+        "tensor_parallel_size": 2,
+    }
+    leftover = {
+        "id": "spark2",
+        "local": False,
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [{"name": "backup-dspark-1", "status": "Up 2 days"}],
+    }
+    assert cluster._multinode_worker_rank(leftover) is None
+    assert cluster._node_state(leftover) == "loading"
+    summary = cluster._summarize([head, leftover], {"ok": True})
+    assert leftover["state"] == "loading"
+    assert leftover.get("model_id") is None
+    assert summary["nodes_serving"] == 1
+    assert summary["multi"]["mode"] == "multi_partial" or summary["multi"]["mode"] == "single"
+
+
+def test_leftover_higher_dspark_rank_not_attributed():
+    """…-vllm-dspark-2 must not paint as TP worker when head TP=2."""
+    head = {
+        "id": "spark1",
+        "online": True,
+        "endpoint_healthy": True,
+        "model_id": "org/live",
+        "containers": [{"name": "deepseek-v4-flash-vllm-dspark-0", "status": "Up"}],
+        "tensor_parallel_size": 2,
+    }
+    leftover = {
+        "id": "spark2",
+        "online": True,
+        "endpoint_healthy": False,
+        "model_id": None,
+        "containers": [{"name": "deepseek-v4-flash-vllm-dspark-2", "status": "Up"}],
+    }
+    assert cluster._multinode_worker_rank(leftover) == 2
+    summary = cluster._summarize([head, leftover], {"ok": True})
+    assert leftover["state"] == "loading"
+    assert leftover.get("model_id") is None
+    assert summary["nodes_serving"] == 1
+
+
+def test_candidate_vllm_ports_prefers_discovered_over_configured_8000():
     ports = cluster._candidate_vllm_ports(
         "http://127.0.0.1:8000",
-        [{"ports": [8888, 8000]}],
+        [{"ports": [8888]}],
     )
-    assert ports[0] == 8000
-    assert 8888 in ports
-    # Non-8000 only published port still includes defaults for robustness.
+    assert ports[0] == 8888
+    assert 8000 in ports
+    # Official path: discovered 8000 stays first.
+    ports_official = cluster._candidate_vllm_ports(
+        "http://127.0.0.1:8000",
+        [{"ports": [8000]}],
+    )
+    assert ports_official[0] == 8000
     ports2 = cluster._candidate_vllm_ports(None, [{"ports": [8888]}])
     assert ports2[0] == 8888
     assert 8000 in ports2
 
 
-def test_probe_models_on_ports_finds_non_8000(monkeypatch):
+def test_live_8888_beats_stale_healthy_8000(monkeypatch):
+    """Discovered :8888 must win even when a leftover :8000 also returns /v1/models."""
     calls: list[str] = []
 
     class FakeResp:
@@ -321,16 +405,59 @@ def test_probe_models_on_ports_finds_non_8000(monkeypatch):
             calls.append(url)
             if url.endswith(":8888/v1/models"):
                 return FakeResp(200, {"data": [{"id": "org/live-on-8888"}]})
+            if url.endswith(":8000/v1/models"):
+                return FakeResp(200, {"data": [{"id": "org/stale-on-8000"}]})
             raise ConnectionError("refused")
 
     import httpx
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
-    out = cluster._probe_models_on_ports([8000, 8888], prefer_url="http://127.0.0.1:8000")
+    ports = cluster._candidate_vllm_ports(
+        "http://127.0.0.1:8000",
+        [{"name": "deepseek-v4-flash-vllm-dspark-0", "ports": [8888]}],
+    )
+    assert ports[0] == 8888
+    out = cluster._probe_models_on_ports(ports, fallback_url="http://127.0.0.1:8000")
     assert out["healthy"] is True
     assert out["model_id"] == "org/live-on-8888"
     assert out["vllm_url"] == "http://127.0.0.1:8888"
-    assert any(":8888/" in u for u in calls)
+    assert calls[0].endswith(":8888/v1/models")
+
+
+def test_official_spark_vllm_8000_still_selected(monkeypatch):
+    class FakeResp:
+        def __init__(self, code, body):
+            self.status_code = code
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class FakeClient:
+        def __init__(self, timeout=2.5):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url):
+            if url.endswith(":8000/v1/models"):
+                return FakeResp(200, {"data": [{"id": "org/official"}]})
+            raise ConnectionError("refused")
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    ports = cluster._candidate_vllm_ports(
+        "http://127.0.0.1:8000",
+        [{"name": "spark-vllm-n0", "ports": [8000]}],
+    )
+    out = cluster._probe_models_on_ports(ports)
+    assert out["model_id"] == "org/official"
+    assert out["vllm_url"] == "http://127.0.0.1:8000"
 
 
 def test_official_and_dspark_status_summaries_both_serving():
@@ -369,7 +496,6 @@ def test_official_and_dspark_status_summaries_both_serving():
                 "name": "deepseek-v4-flash-vllm-dspark-0",
                 "status": "Up",
                 "ports": [8888],
-                "node_rank": 0,
             }
         ],
         "vllm_url": "http://127.0.0.1:8888",
@@ -385,8 +511,6 @@ def test_official_and_dspark_status_summaries_both_serving():
             {
                 "name": "deepseek-v4-flash-vllm-dspark-1",
                 "status": "Up",
-                "node_rank": 1,
-                "headless": True,
             }
         ],
     }
@@ -395,6 +519,97 @@ def test_official_and_dspark_status_summaries_both_serving():
     assert dspark_worker["state"] == "serving_worker"
     assert dspark_worker["model_id"] == "org/dspark"
     assert s2["multi"]["model_id"] == "org/dspark"
+
+
+def test_remote_probe_script_exec_prefers_discovered_8888(monkeypatch):
+    """Execute _REMOTE_PROBE_PY so the embedded port loop cannot drift from local order."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    inspect_json = json.dumps(
+        [
+            {
+                "Config": {
+                    "Cmd": ["vllm", "serve", "m", "--port", "8888", "--host", "0.0.0.0"],
+                    "Env": ["NODE_RANK=0"],
+                    "Args": [],
+                },
+                "Args": [],
+                "NetworkSettings": {
+                    "Ports": {"8888/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8888"}]}
+                },
+                "HostConfig": {"PortBindings": {}, "NetworkMode": "bridge"},
+            }
+        ]
+    )
+
+    def fake_check_output(cmd, text=True, stderr=None, timeout=8):
+        if cmd[:2] == ["docker", "ps"]:
+            return "deepseek-v4-flash-vllm-dspark-0\tUp 5 minutes\tghcr.io/anemll/dspark-vllm-gx10:0.1.1\n"
+        if cmd[:2] == ["docker", "inspect"]:
+            return inspect_json
+        if cmd[0] == "nvidia-smi":
+            return "NVIDIA GB10, 128288 MiB\n"
+        if cmd[0] == "free":
+            return "              total        used        free      shared  buff/cache   available\nMem:            120          10          20           0          90          80\n"
+        if cmd[0] == "ibdev2netdev":
+            return ""
+        if cmd[0] == "tailscale":
+            return ""
+        return ""
+
+    probed: list[str] = []
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(url, timeout=2.5):
+        probed.append(str(url))
+        if str(url).startswith("http://127.0.0.1:8888/"):
+            return FakeResp(json.dumps({"data": [{"id": "org/live-8888"}]}).encode())
+        if str(url).startswith("http://127.0.0.1:8000/"):
+            return FakeResp(json.dumps({"data": [{"id": "org/stale-8000"}]}).encode())
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(cluster.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    # meminfo / carrier opens inside the script — tolerate missing paths.
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        p = str(path)
+        if p == "/proc/meminfo":
+            return io.StringIO("MemTotal:       126000000 kB\n")
+        if "/sys/class/net/" in p:
+            raise FileNotFoundError(p)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    script = cluster._remote_probe_script(
+        {"qsfp_if": "", "vllm_url": "http://127.0.0.1:8000"}
+    )
+    buf = io.StringIO()
+    monkeypatch.setattr("sys.stdout", buf)
+    exec(compile(script, "<remote-probe>", "exec"), {})
+    data = json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert data["endpoint_healthy"] is True
+    assert data["model_id"] == "org/live-8888"
+    assert data["vllm_url"] == "http://127.0.0.1:8888"
+    assert probed[0].startswith("http://127.0.0.1:8888/")
+    assert data["containers"][0]["ports"] == [8888]
 
 
 def test_invalid_cluster_json_falls_back_to_local(isolated_cluster, monkeypatch):

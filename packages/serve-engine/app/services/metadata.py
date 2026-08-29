@@ -313,11 +313,19 @@ def parse_prometheus(text: str) -> dict[str, float]:
     return live_token_rates(out)
 
 
-_LIVE_RATE: dict[str, float | None] = {"t": None, "prompt": None, "gen": None}
+_LIVE_RATE: dict[str, float | None] = {
+    "t": None,
+    "prompt": None,
+    "gen": None,
+    "last_gen_rate": None,
+    "last_prompt_rate": None,
+}
 
 
 def reset_live_rate_state() -> None:
-    _LIVE_RATE.update(t=None, prompt=None, gen=None)
+    _LIVE_RATE.update(
+        t=None, prompt=None, gen=None, last_gen_rate=None, last_prompt_rate=None
+    )
 
 
 def _positive_rate(value: float | None) -> float | None:
@@ -326,40 +334,74 @@ def _positive_rate(value: float | None) -> float | None:
     return round(float(value), 2)
 
 
+def _counter_delta(now_val: float | None, prev_val: float | None, dt: float) -> float | None:
+    if now_val is None or prev_val is None or dt < 0.2:
+        return None
+    return (float(now_val) - float(prev_val)) / dt
+
+
 def live_token_rates(metrics: dict[str, float], *, now: float | None = None) -> dict[str, float]:
     """Fill gen_tok_per_s / prompt_tok_per_s from gauges or counter deltas.
 
-    Newer vLLM drops avg_*_throughput gauges. Counters still move while a
-    request is in flight. A zero or missing rate stays absent, never a fake 0.
+    Newer vLLM drops avg_*_throughput gauges. `generation_tokens_total` and
+    `prompt_tokens_total` still move. Prefill is a burst at request start, so
+    the last positive prefill rate sticks while decode tokens (or running
+    requests) show the serve is still in use. Zero stays absent, never a fake 0.
     """
     out = dict(metrics)
     now = time.monotonic() if now is None else now
     prompt = out.get("prompt_tokens_total")
     gen = out.get("generation_tokens_total")
     prev_t = _LIVE_RATE.get("t")
-    if prev_t is not None and gen is not None and prompt is not None:
+    d_gen = None
+    d_prompt = None
+    if prev_t is not None:
         dt = now - float(prev_t)
-        if dt >= 0.4:
-            prev_gen = _LIVE_RATE.get("gen")
-            prev_prompt = _LIVE_RATE.get("prompt")
-            if prev_gen is not None and "gen_tok_per_s" not in out:
-                out["gen_tok_per_s"] = (gen - float(prev_gen)) / dt
-            if prev_prompt is not None and "prompt_tok_per_s" not in out:
-                out["prompt_tok_per_s"] = (prompt - float(prev_prompt)) / dt
+        d_gen = _counter_delta(gen, _LIVE_RATE.get("gen"), dt)
+        d_prompt = _counter_delta(prompt, _LIVE_RATE.get("prompt"), dt)
+
+    if d_gen is not None and not out.get("gen_tok_per_s"):
+        out["gen_tok_per_s"] = d_gen
+    if d_prompt is not None and not out.get("prompt_tok_per_s"):
+        out["prompt_tok_per_s"] = d_prompt
+
     running = (out.get("requests_running") or 0) > 0
-    if "gen_tok_per_s" not in out and running:
+    if not out.get("gen_tok_per_s") and running:
         decode_s = out.get("decode_time_s_sum")
         gen_sum = out.get("generation_tokens_sum")
         if decode_s and gen_sum and decode_s > 0:
             out["gen_tok_per_s"] = gen_sum / decode_s
-    if "prompt_tok_per_s" not in out and running:
+    if not out.get("prompt_tok_per_s") and running:
         prefill_s = out.get("prefill_time_s_sum")
         prefill_tok = out.get("prefill_tokens_sum")
         if prefill_s and prefill_tok and prefill_s > 0:
             out["prompt_tok_per_s"] = prefill_tok / prefill_s
-    out["gen_tok_per_s"] = _positive_rate(out.get("gen_tok_per_s"))
-    out["prompt_tok_per_s"] = _positive_rate(out.get("prompt_tok_per_s"))
-    _LIVE_RATE.update(t=now, prompt=prompt, gen=gen)
+
+    gen_rate = _positive_rate(out.get("gen_tok_per_s"))
+    prompt_rate = _positive_rate(out.get("prompt_tok_per_s"))
+    in_flight = (
+        running
+        or (d_gen is not None and d_gen > 0)
+        or (d_prompt is not None and d_prompt > 0)
+    )
+    if prompt_rate is None and in_flight:
+        prompt_rate = _positive_rate(_LIVE_RATE.get("last_prompt_rate"))
+    if gen_rate is None and in_flight:
+        gen_rate = _positive_rate(_LIVE_RATE.get("last_gen_rate"))
+
+    out["gen_tok_per_s"] = gen_rate
+    out["prompt_tok_per_s"] = prompt_rate
+    _LIVE_RATE.update(
+        t=now,
+        prompt=prompt,
+        gen=gen,
+        last_gen_rate=gen_rate if gen_rate is not None else (
+            _LIVE_RATE.get("last_gen_rate") if in_flight else None
+        ),
+        last_prompt_rate=prompt_rate if prompt_rate is not None else (
+            _LIVE_RATE.get("last_prompt_rate") if in_flight else None
+        ),
+    )
     return out
 
 

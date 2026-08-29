@@ -84,6 +84,45 @@ def test_live_token_rates_from_counter_delta():
     assert second["prompt_tok_per_s"] == 30.0
 
 
+def test_live_token_rates_prompt_delta_does_not_need_gen_to_move():
+    metadata.reset_live_rate_state()
+    metadata.live_token_rates(
+        {"generation_tokens_total": 100.0, "prompt_tokens_total": 50.0},
+        now=10.0,
+    )
+    only_prompt = metadata.live_token_rates(
+        {"generation_tokens_total": 100.0, "prompt_tokens_total": 250.0},
+        now=12.0,
+    )
+    assert only_prompt["prompt_tok_per_s"] == 100.0
+    assert only_prompt.get("gen_tok_per_s") is None
+
+
+def test_live_token_rates_holds_prefill_while_decode_counters_move():
+    metadata.reset_live_rate_state()
+    metadata.live_token_rates(
+        {"generation_tokens_total": 10.0, "prompt_tokens_total": 20.0},
+        now=1.0,
+    )
+    prefill = metadata.live_token_rates(
+        {"generation_tokens_total": 10.0, "prompt_tokens_total": 220.0},
+        now=3.0,
+    )
+    assert prefill["prompt_tok_per_s"] == 100.0
+    decode = metadata.live_token_rates(
+        {"generation_tokens_total": 210.0, "prompt_tokens_total": 220.0},
+        now=5.0,
+    )
+    assert decode["gen_tok_per_s"] == 100.0
+    assert decode["prompt_tok_per_s"] == 100.0
+    idle = metadata.live_token_rates(
+        {"generation_tokens_total": 210.0, "prompt_tokens_total": 220.0},
+        now=7.0,
+    )
+    assert idle.get("gen_tok_per_s") is None
+    assert idle.get("prompt_tok_per_s") is None
+
+
 def test_parse_prometheus_zero_throughput_is_nil():
     metadata.reset_live_rate_state()
     parsed = metadata.parse_prometheus(

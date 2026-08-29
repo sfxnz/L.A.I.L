@@ -129,6 +129,7 @@ describe("shipped ClusterPanel render", () => {
     expect(html).toContain("41.2");
     expect(html).toContain("Prefill");
     expect(html).toContain("210");
+    expect(html).toContain("Live serve decode rate");
     expect(html).not.toContain("—");
   });
 

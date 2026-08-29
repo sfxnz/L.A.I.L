@@ -278,12 +278,18 @@ function NodeCard({ node }: { node: ClusterNode }) {
           </div>
         </Readout>
         <Readout label="tok/s">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+          <div
+            className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums"
+            title={serving ? "Live serve decode rate" : undefined}
+          >
             <TrafficValue serving={serving} value={node.gen_tok_per_s} format={fmtRate} />
           </div>
         </Readout>
         <Readout label="Prefill">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+          <div
+            className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums"
+            title={serving ? "Live serve prefill rate" : undefined}
+          >
             <TrafficValue serving={serving} value={node.prompt_tok_per_s} format={fmtRate} />
           </div>
         </Readout>
@@ -424,6 +430,9 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
   const nodes = cluster.nodes || [];
   const mode = multi?.mode || "none";
   const modelShort = multi?.model_id?.split("/").pop();
+  const live = nodes.find((n) => n.state === "serving" || n.state === "serving_worker");
+  const liveGen = live?.gen_tok_per_s;
+  const livePrefill = live?.prompt_tok_per_s;
 
   return (
     <div
@@ -453,6 +462,16 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
           {multi?.tensor_parallel_hint != null && (
             <span className="shrink-0 font-mono text-[10px] tabular-nums text-lab-line-bright">
               TP={multi.tensor_parallel_hint}
+            </span>
+          )}
+          {(liveGen != null || livePrefill != null) && (
+            <span
+              className="shrink-0 font-mono text-[10px] tabular-nums text-lab-text-dim"
+              title="Endpoint rate, shown on every in-use Spark"
+            >
+              {liveGen != null ? `${fmtRate(liveGen)} tok/s` : null}
+              {liveGen != null && livePrefill != null ? " · " : null}
+              {livePrefill != null ? `${fmtRate(livePrefill)} prefill` : null}
             </span>
           )}
         </div>

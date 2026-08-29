@@ -374,10 +374,12 @@ export function LogView({
   text,
   empty = "Waiting for output…",
   live,
+  className,
 }: {
   text: string;
   empty?: string;
   live?: boolean;
+  className?: string;
 }) {
   const ref = useRef<HTMLPreElement>(null);
 
@@ -391,8 +393,8 @@ export function LogView({
       ref={ref}
       className={cn(
         "max-h-72 overflow-auto rounded-[2px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap",
-        // Streaming output grows the crimson leading edge.
         live && "border-l-2 border-l-lab-accent",
+        className,
       )}
       aria-live={live ? "polite" : undefined}
     >

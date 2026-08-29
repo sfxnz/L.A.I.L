@@ -68,6 +68,32 @@ def test_attach_live_rates_only_on_in_use_sparks():
     assert info["nodes"][2]["prompt_tok_per_s"] is None
 
 
+def test_live_token_rates_from_counter_delta():
+    metadata.reset_live_rate_state()
+    first = metadata.live_token_rates(
+        {"generation_tokens_total": 100.0, "prompt_tokens_total": 50.0},
+        now=10.0,
+    )
+    assert first.get("gen_tok_per_s") is None
+    assert first.get("prompt_tok_per_s") is None
+    second = metadata.live_token_rates(
+        {"generation_tokens_total": 250.0, "prompt_tokens_total": 110.0},
+        now=12.0,
+    )
+    assert second["gen_tok_per_s"] == 75.0
+    assert second["prompt_tok_per_s"] == 30.0
+
+
+def test_parse_prometheus_zero_throughput_is_nil():
+    metadata.reset_live_rate_state()
+    parsed = metadata.parse_prometheus(
+        "vllm:avg_generation_throughput_toks_per_s 0\n"
+        "vllm:avg_prompt_throughput_toks_per_s 0\n"
+    )
+    assert parsed.get("gen_tok_per_s") is None
+    assert parsed.get("prompt_tok_per_s") is None
+
+
 def test_attach_live_rates_missing_metrics_are_nil_not_zero():
     info = {"nodes": [{"id": "a", "state": "serving"}]}
     cluster.attach_live_rates(info, {})

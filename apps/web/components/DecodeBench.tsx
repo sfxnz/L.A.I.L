@@ -263,7 +263,7 @@ export function DecodeBench({
             indeterminate={jobRunning && !(jobProgress > 0)}
             label={jobMsg || "Running…"}
           />
-          <LogView text={logs} live={jobRunning} />
+          <LogView text={logs} live={jobRunning} className="max-h-40" />
         </div>
       )}
     </Panel>

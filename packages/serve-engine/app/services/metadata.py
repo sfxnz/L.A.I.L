@@ -291,6 +291,10 @@ def parse_prometheus(text: str) -> dict[str, float]:
         "vllm:avg_prompt_throughput_toks_per_s": "prompt_tok_per_s",
         "vllm:avg_generation_throughput_toks_per_s": "gen_tok_per_s",
         "vllm:kv_cache_usage_perc": "gpu_kv_cache_usage",
+        "vllm:request_decode_time_seconds_sum": "decode_time_s_sum",
+        "vllm:request_generation_tokens_sum": "generation_tokens_sum",
+        "vllm:request_prefill_time_seconds_sum": "prefill_time_s_sum",
+        "vllm:request_prefill_kv_computed_tokens_sum": "prefill_tokens_sum",
     }
     out: dict[str, float] = {}
     for line in text.splitlines():
@@ -306,6 +310,56 @@ def parse_prometheus(text: str) -> dict[str, float]:
             out[keys[name]] = val
     if "prefix_cache_hits" in out and "prefix_cache_queries" in out and out["prefix_cache_queries"] > 0:
         out["prefix_cache_hit_rate"] = out["prefix_cache_hits"] / out["prefix_cache_queries"]
+    return live_token_rates(out)
+
+
+_LIVE_RATE: dict[str, float | None] = {"t": None, "prompt": None, "gen": None}
+
+
+def reset_live_rate_state() -> None:
+    _LIVE_RATE.update(t=None, prompt=None, gen=None)
+
+
+def _positive_rate(value: float | None) -> float | None:
+    if value is None or value <= 0:
+        return None
+    return round(float(value), 2)
+
+
+def live_token_rates(metrics: dict[str, float], *, now: float | None = None) -> dict[str, float]:
+    """Fill gen_tok_per_s / prompt_tok_per_s from gauges or counter deltas.
+
+    Newer vLLM drops avg_*_throughput gauges. Counters still move while a
+    request is in flight. A zero or missing rate stays absent, never a fake 0.
+    """
+    out = dict(metrics)
+    now = time.monotonic() if now is None else now
+    prompt = out.get("prompt_tokens_total")
+    gen = out.get("generation_tokens_total")
+    prev_t = _LIVE_RATE.get("t")
+    if prev_t is not None and gen is not None and prompt is not None:
+        dt = now - float(prev_t)
+        if dt >= 0.4:
+            prev_gen = _LIVE_RATE.get("gen")
+            prev_prompt = _LIVE_RATE.get("prompt")
+            if prev_gen is not None and "gen_tok_per_s" not in out:
+                out["gen_tok_per_s"] = (gen - float(prev_gen)) / dt
+            if prev_prompt is not None and "prompt_tok_per_s" not in out:
+                out["prompt_tok_per_s"] = (prompt - float(prev_prompt)) / dt
+    running = (out.get("requests_running") or 0) > 0
+    if "gen_tok_per_s" not in out and running:
+        decode_s = out.get("decode_time_s_sum")
+        gen_sum = out.get("generation_tokens_sum")
+        if decode_s and gen_sum and decode_s > 0:
+            out["gen_tok_per_s"] = gen_sum / decode_s
+    if "prompt_tok_per_s" not in out and running:
+        prefill_s = out.get("prefill_time_s_sum")
+        prefill_tok = out.get("prefill_tokens_sum")
+        if prefill_s and prefill_tok and prefill_s > 0:
+            out["prompt_tok_per_s"] = prefill_tok / prefill_s
+    out["gen_tok_per_s"] = _positive_rate(out.get("gen_tok_per_s"))
+    out["prompt_tok_per_s"] = _positive_rate(out.get("prompt_tok_per_s"))
+    _LIVE_RATE.update(t=now, prompt=prompt, gen=gen)
     return out
 
 

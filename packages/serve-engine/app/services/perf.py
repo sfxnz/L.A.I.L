@@ -325,8 +325,11 @@ def run_workflow_bench(
             log.write(f"=== concurrency {c} · {kind} ===")
         arm = run_wave(base, model_id, c, kind=kind)
         if log:
-            slim = {k: arm[k] for k in arm if k != "per_request"}
-            log.write(json.dumps(slim, indent=2))
+            log.write(
+                f"decode {arm.get('decode_tok_per_s_median')} tok/s · "
+                f"prefill {arm.get('prefill_tok_per_s_median')} tok/s · "
+                f"ok {arm.get('ok')}/{arm.get('requests')}"
+            )
         return arm
 
     idx = {"n": 0}

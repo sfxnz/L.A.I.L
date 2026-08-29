@@ -290,8 +290,12 @@ def attach_live_rates(
 ) -> dict[str, Any]:
     """Map endpoint-wide vLLM tok/s onto in-use Sparks. Idle nodes stay None."""
     metrics = metrics or {}
-    gen = metrics["gen_tok_per_s"] if "gen_tok_per_s" in metrics else None
-    prompt = metrics["prompt_tok_per_s"] if "prompt_tok_per_s" in metrics else None
+    gen = metrics.get("gen_tok_per_s")
+    prompt = metrics.get("prompt_tok_per_s")
+    if gen is not None and gen <= 0:
+        gen = None
+    if prompt is not None and prompt <= 0:
+        prompt = None
     for node in cluster_info.get("nodes") or []:
         serving = node.get("state") in ("serving", "serving_worker")
         node["gen_tok_per_s"] = gen if serving else None

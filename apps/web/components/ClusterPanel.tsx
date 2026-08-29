@@ -124,6 +124,51 @@ function multiLabel(mode?: string): string {
   }
 }
 
+function fmtTemp(v: number) {
+  return `${Math.round(v)}°C`;
+}
+
+function fmtPct(v: number) {
+  return `${Math.round(v)}%`;
+}
+
+function fmtWatts(v: number) {
+  return Number.isInteger(v) ? `${v} W` : `${v.toFixed(1)} W`;
+}
+
+function fmtRate(v: number) {
+  return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
+}
+
+function HardwareValue({
+  value,
+  format,
+  warn,
+}: {
+  value: number | null | undefined;
+  format: (n: number) => string;
+  warn?: boolean;
+}) {
+  if (value == null) return <Nil />;
+  return (
+    <span className={warn ? "text-lab-warn" : "text-lab-text-dim"}>{format(value)}</span>
+  );
+}
+
+function TrafficValue({
+  serving,
+  value,
+  format,
+}: {
+  serving: boolean;
+  value: number | null | undefined;
+  format: (n: number) => string;
+}) {
+  if (!serving) return <Nil word="None" />;
+  if (value == null) return <Nil />;
+  return <span className="text-lab-ok">{format(value)}</span>;
+}
+
 function NodeCard({ node }: { node: ClusterNode }) {
   const modelShort = node.model_id?.split("/").pop() || null;
   const free = node.available_gib;
@@ -142,7 +187,7 @@ function NodeCard({ node }: { node: ClusterNode }) {
       className={cn(
         // Cut corners, not radius. The chamfer clips box-shadow, so the serving
         // tell is an INSET bloom rather than an outer glow.
-        "animus-chamfer animus-bracketed relative flex min-h-[172px] flex-col border bg-[color:var(--animus-glass)] p-3.5",
+        "animus-chamfer animus-bracketed relative flex min-h-[220px] flex-col border bg-[color:var(--animus-glass)] p-3.5",
         // The chamfer clip-path would shear brackets sitting on the -1px edge —
         // inset them so all four corners actually render (same trick as Panel).
         "before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!",
@@ -203,15 +248,43 @@ function NodeCard({ node }: { node: ClusterNode }) {
         )}
       </Readout>
 
-      <div className="mt-auto grid grid-cols-2 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
+      <div className="mt-auto grid grid-cols-3 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
+        <Readout label="Temperature">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <HardwareValue
+              value={node.temperature_c}
+              format={fmtTemp}
+              warn={node.temperature_c != null && node.temperature_c >= 80}
+            />
+          </div>
+        </Readout>
+        <Readout label="Usage">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <HardwareValue value={node.gpu_util_pct} format={fmtPct} />
+          </div>
+        </Readout>
+        <Readout label="Power">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <HardwareValue value={node.power_w} format={fmtWatts} />
+          </div>
+        </Readout>
         <Readout label="Free">
-          <div
-            className={cn(
-              "font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums",
-              free != null && free < 15 ? "text-lab-warn" : "text-lab-text-dim",
-            )}
-          >
-            {free != null ? `${free} GiB` : <Nil />}
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <HardwareValue
+              value={free}
+              format={(n) => `${n} GiB`}
+              warn={free != null && free < 15}
+            />
+          </div>
+        </Readout>
+        <Readout label="tok/s">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <TrafficValue serving={serving} value={node.gen_tok_per_s} format={fmtRate} />
+          </div>
+        </Readout>
+        <Readout label="Prefill">
+          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+            <TrafficValue serving={serving} value={node.prompt_tok_per_s} format={fmtRate} />
           </div>
         </Readout>
         <Readout label="QSFP">
@@ -279,7 +352,7 @@ function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
 
   return (
     <div
-      className="flex min-h-[172px] flex-col items-center justify-center gap-3 px-1 py-4 lg:w-[172px]"
+      className="flex min-h-[220px] flex-col items-center justify-center gap-3 px-1 py-4 lg:w-[172px]"
       role="img"
       aria-label={
         ok
@@ -442,9 +515,9 @@ export function ClusterPanel({
             </div>
           </div>
           <div className="grid grid-cols-1 gap-3 p-3.5 sm:p-4 lg:grid-cols-[1fr_auto_1fr]">
-            <Skeleton className="min-h-[172px]" />
-            <Skeleton className="hidden min-h-[172px] w-[172px] lg:block" />
-            <Skeleton className="min-h-[172px]" />
+            <Skeleton className="min-h-[220px]" />
+            <Skeleton className="hidden min-h-[220px] w-[172px] lg:block" />
+            <Skeleton className="min-h-[220px]" />
           </div>
         </div>
       </Panel>

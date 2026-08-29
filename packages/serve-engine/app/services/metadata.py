@@ -49,11 +49,79 @@ def free_h() -> str:
     return _run(["free", "-h"]).strip()
 
 
+GPU_SMI_QUERY = (
+    "name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total"
+)
+_GPU_NA = {"[n/a]", "n/a", "na", ""}
+GPU_TELEMETRY_FIELDS = (
+    "temperature_c",
+    "gpu_util_pct",
+    "power_w",
+    "memory_used_mib",
+    "memory_total_mib",
+)
+
+
+def _smi_num(raw: str) -> float | None:
+    s = (raw or "").strip().lower()
+    if s in _GPU_NA:
+        return None
+    for suffix in (" mib", "°c", "w", "%", "c"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+            break
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_gpu_telemetry(csv_text: str) -> dict[str, Any]:
+    """Parse one nvidia-smi csv line. Missing and N/A fields stay None, never 0."""
+    empty: dict[str, Any] = {
+        "gpu_sku": None,
+        "temperature_c": None,
+        "gpu_util_pct": None,
+        "power_w": None,
+        "memory_used_mib": None,
+        "memory_total_mib": None,
+    }
+    lines = (csv_text or "").strip().splitlines()
+    if not lines:
+        return empty
+    parts = [p.strip() for p in lines[0].split(",")]
+    sku = parts[0] or None
+    if len(parts) >= 6:
+        return {
+            "gpu_sku": sku,
+            "temperature_c": _smi_num(parts[1]),
+            "gpu_util_pct": _smi_num(parts[2]),
+            "power_w": _smi_num(parts[3]),
+            "memory_used_mib": _smi_num(parts[4]),
+            "memory_total_mib": _smi_num(parts[5]),
+        }
+    if len(parts) == 2:
+        empty["gpu_sku"] = sku
+        empty["memory_total_mib"] = _smi_num(parts[1])
+        return empty
+    empty["gpu_sku"] = sku
+    return empty
+
+
+def collect_gpu_telemetry() -> dict[str, Any]:
+    raw = _run(
+        [
+            "nvidia-smi",
+            f"--query-gpu={GPU_SMI_QUERY}",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    return parse_gpu_telemetry(raw)
+
+
 def collect_hardware() -> dict[str, Any]:
-    gpu = "unknown"
-    smi = _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
-    if smi.strip():
-        gpu = smi.strip().split("\n")[0].strip()
+    tel = collect_gpu_telemetry()
+    gpu = tel.get("gpu_sku") or "unknown"
     cpu = platform.processor() or platform.machine()
     # better CPU model on Linux
     try:
@@ -74,8 +142,13 @@ def collect_hardware() -> dict[str, Any]:
         pass
     return {
         "gpu_sku": gpu,
+        "temperature_c": tel.get("temperature_c"),
+        "gpu_util_pct": tel.get("gpu_util_pct"),
+        "power_w": tel.get("power_w"),
+        "memory_used_mib": tel.get("memory_used_mib"),
+        "memory_total_mib": tel.get("memory_total_mib"),
         "memory_capacity_gib": mem_total,
-        "bandwidth": "UMA" if "GB10" in gpu or "Spark" in gpu else "unknown",
+        "bandwidth": "UMA" if "GB10" in str(gpu) or "Spark" in str(gpu) else "unknown",
         "interconnect": "n/a",
         "cpu": cpu,
         "ram_gib": mem_total,

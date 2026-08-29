@@ -39,6 +39,7 @@ async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
         model_id = probe["models"][0].get("id")
     try:
         cluster_info = cluster.collect_cluster()
+        cluster.attach_live_rates(cluster_info, probe.get("metrics") or {})
     except Exception as e:
         cluster_info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
     return {
@@ -419,7 +420,8 @@ class PerfRequest(BaseModel):
     model: Optional[str] = None
     intent: str = "attach"
     runner: Literal["workflow", "prefill", "concurrency"] = "workflow"
-    concurrencies: list[int] = Field(default_factory=lambda: [1, 2, 4])
+    workload: Literal["structured", "prose", "code", "json"] = "prose"
+    concurrencies: list[int] = Field(default_factory=lambda: [1])
     concurrency: int = 4
     dollars_per_hour: float = 0.5
 
@@ -433,6 +435,7 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 base_url=body.base_url,
                 model=body.model,
                 concurrencies=body.concurrencies,
+                workload=body.workload,
                 intent=body.intent,
                 dollars_per_hour=body.dollars_per_hour,
                 log=log,

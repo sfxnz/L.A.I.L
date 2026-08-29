@@ -122,32 +122,94 @@ def stream_one(
         )
 
 
-def jobs_for_workflow() -> list[tuple[str, str, int]]:
-    short = "Reply in one sentence: what is NVFP4 on Blackwell?"
-    med = (
-        "You are a local AI lab assistant. Explain how continuous batching changes "
-        "per-user vs aggregate tokens/s on a single DGX Spark. Be concrete. "
-        + ("Include practical caveats for unified memory. " * 6)
-    )
-    long_notes = (
-        "Summarize these agent lab notes into 6 bullets, then one recommended next experiment.\n\n"
-        + (
-            "Session log: user runs vLLM with MTP speculative decoding on Qwen3.6-27B NVFP4. "
-            "Target: multi-turn coding agent with long system + tools + retrieved files. "
-            "Measure TTFT under concurrent chat tabs, decode under sustained generation, "
-            "and whether prefix caching helps when the system prompt is shared. "
-            "Context budget is the product decision — do not starve KV for vanity util. "
-        )
-        * 40
-    )
-    return [
-        ("short_chat", short, 128),
-        ("med_explain", med, 384),
-        ("long_prefill_agent", long_notes, 256),
-        ("short_chat", short, 128),
-        ("med_explain", med, 384),
-        ("long_prefill_agent", long_notes, 256),
-    ]
+WORKLOAD_KINDS = ("structured", "prose", "code", "json")
+
+_WORKLOAD_FAMILY: dict[str, tuple[str, str, int]] = {
+    "structured": (
+        "structured_fields",
+        (
+            "Fill every field. Use the labels exactly. No preamble.\n"
+            "model: \nquant: \ncontext_len: \ntp: \nprefill_tok_s: \n"
+            "decode_tok_s: \nkv_policy: \nheadroom_gib: \nnotes: \n"
+            "Repeat the block three times with different plausible Spark-lab values."
+        ),
+        256,
+    ),
+    "prose": (
+        "prose_essay",
+        (
+            "Write a flowing essay on how decode throughput and time-to-first-token "
+            "feel different when a coding agent shares a long system prompt across "
+            "tabs on a DGX Spark with unified memory. Be concrete about KV cache, "
+            "continuous batching, and what the operator should watch. "
+            + ("Stay in prose; no bullets, no headings, no lists. " * 8)
+        ),
+        384,
+    ),
+    "code": (
+        "code_impl",
+        (
+            "Write a complete Python module (no markdown fences) that implements "
+            "an in-memory token-bucket rate limiter with acquire(n), available(), "
+            "and a background refill. Include type hints, a docstring on each "
+            "public function, and a tiny self-check under if __name__ == '__main__'."
+        ),
+        384,
+    ),
+    "json": (
+        "json_object",
+        (
+            "Return only a JSON object, no markdown, no commentary, with keys "
+            "spark_id, hostname, serving, model_id, temperature_c, gpu_util_pct, "
+            "power_w, decode_tok_per_s, prefill_tok_per_s, notes. Invent realistic "
+            "values for two-node TP on GB10. Nested key 'peers' is an array of two "
+            "objects with the same fields except peers."
+        ),
+        256,
+    ),
+}
+
+
+def jobs_for_kind(kind: str) -> list[tuple[str, str, int]]:
+    if kind not in _WORKLOAD_FAMILY:
+        raise ValueError(f"unknown workload kind: {kind}")
+    job = _WORKLOAD_FAMILY[kind]
+    return [job]
+
+
+def normalize_concurrencies(raw: list[int] | None) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for n in raw or [1]:
+        if not isinstance(n, int) or isinstance(n, bool):
+            continue
+        if 1 <= n <= 32 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    out.sort()
+    return out or [1]
+
+
+def expand_wave_jobs(
+    jobs: list[tuple[str, str, int]], concurrency: int
+) -> list[tuple[str, str, int]]:
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    if not jobs:
+        raise ValueError("jobs must be non-empty")
+    work: list[tuple[str, str, int]] = []
+    i = 0
+    while len(work) < concurrency:
+        work.append(jobs[i % len(jobs)])
+        i += 1
+    return work
+
+
+def run_concurrency_levels(
+    concurrencies: list[int], run_level: Callable[[int], dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Run each concurrency in order. Each call is one wave."""
+    return [run_level(c) for c in concurrencies]
 
 
 def summarize(results: list[ReqResult], concurrency: int) -> dict[str, Any]:
@@ -198,18 +260,23 @@ def summarize(results: list[ReqResult], concurrency: int) -> dict[str, Any]:
     }
 
 
-def run_wave(base: str, model: str, concurrency: int) -> dict[str, Any]:
-    jobs = jobs_for_workflow()
-    work: list[tuple[str, str, int]] = []
-    while len(work) < max(concurrency * 2, len(jobs)):
-        work.extend(jobs)
-    work = work[: max(concurrency * 2, 6)]
+def run_wave(
+    base: str,
+    model: str,
+    concurrency: int,
+    *,
+    kind: str = "prose",
+    stream_fn: Callable[..., ReqResult] | None = None,
+) -> dict[str, Any]:
+    jobs = jobs_for_kind(kind)
+    work = expand_wave_jobs(jobs, concurrency)
+    send = stream_fn or stream_one
 
     t_batch0 = time.perf_counter()
     results: list[ReqResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = [
-            ex.submit(stream_one, base, model, prompt, mt, label)
+            ex.submit(send, base, model, prompt, mt, label)
             for label, prompt, mt in work
         ]
         for f in concurrent.futures.as_completed(futs):
@@ -242,6 +309,7 @@ def run_workflow_bench(
     base_url: str = DEFAULT_BASE_URL,
     model: str | None = None,
     concurrencies: list[int] | None = None,
+    workload: str = "prose",
     intent: str = "attach",
     dollars_per_hour: float = 0.5,
     log: Any = None,
@@ -249,19 +317,33 @@ def run_workflow_bench(
 ) -> dict[str, Any]:
     base = base_url.rstrip("/")
     model_id = resolve_model(base, model)
-    concs = concurrencies or [1, 2, 4]
-    arms = []
-    for i, c in enumerate(concs):
+    kind = workload if workload in WORKLOAD_KINDS else "prose"
+    concs = normalize_concurrencies(concurrencies)
+
+    def run_level(c: int) -> dict[str, Any]:
         if log:
-            log.write(f"=== concurrency {c} ===")
-        if progress:
-            progress((i) / max(len(concs), 1), f"concurrency={c}")
-        arm = run_wave(base, model_id, c)
-        arms.append({k: v for k, v in arm.items() if k != "per_request"})
-        arms[-1]["per_request"] = arm.get("per_request")
+            log.write(f"=== concurrency {c} · {kind} ===")
+        arm = run_wave(base, model_id, c, kind=kind)
         if log:
             slim = {k: arm[k] for k in arm if k != "per_request"}
             log.write(json.dumps(slim, indent=2))
+        return arm
+
+    idx = {"n": 0}
+
+    def run_level_tracked(c: int) -> dict[str, Any]:
+        if progress:
+            progress(idx["n"] / max(len(concs), 1), f"concurrency={c}")
+        idx["n"] += 1
+        return run_level(c)
+
+    raw_arms = run_concurrency_levels(concs, run_level_tracked)
+
+    arms = []
+    for arm in raw_arms:
+        slim = {k: v for k, v in arm.items() if k != "per_request"}
+        slim["per_request"] = arm.get("per_request")
+        arms.append(slim)
 
     # headline metrics from c=1 arm
     c1 = next((a for a in arms if a["concurrency"] == 1), arms[0] if arms else {})
@@ -272,6 +354,8 @@ def run_workflow_bench(
     metrics = {
         "arms": [{k: v for k, v in a.items() if k != "per_request"} for a in arms],
         "headline": {
+            "workload": kind,
+            "concurrencies": concs,
             "decode_tok_per_s_median_c1": decode,
             "ttft_p50_s_c1": (c1.get("ttft_s") or {}).get("p50"),
             "ttft_p95_s_c1": (c1.get("ttft_s") or {}).get("p95"),
@@ -291,8 +375,9 @@ def run_workflow_bench(
         model_id=model_id,
         kind="perf_workflow",
         workload={
-            "type": "workflow_mixed",
-            "prompts": ["short_chat", "med_explain", "long_prefill_agent"],
+            "type": f"decode_{kind}",
+            "kind": kind,
+            "prompts": [jobs_for_kind(kind)[0][0]],
             "concurrencies": concs,
             "streaming": True,
             "thinking": False,

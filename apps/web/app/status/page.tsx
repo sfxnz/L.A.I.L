@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type LabStatus, type RunRow } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
 import { ClusterPanel } from "@/components/ClusterPanel";
+import { DecodeBench } from "@/components/DecodeBench";
 import {
   Badge,
   Btn,
@@ -217,7 +218,7 @@ export default function StatusPage() {
           </div>
           <h1 className="page-title">Status</h1>
           <p className="page-sub">
-            Cluster health, model load map, hardware headroom, and recent runs.
+            Sparks, live instruments, and a decode bench on this page.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -231,7 +232,7 @@ export default function StatusPage() {
             href="/evals"
             className="px-1 font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-muted transition-colors hover:text-lab-text"
           >
-            Evals →
+            Tool eval →
           </Link>
         </div>
       </div>
@@ -277,12 +278,35 @@ export default function StatusPage() {
       <section className="space-y-2.5">
         <Band index="01" label="Fabric" meta={fabricMeta} />
         <div className="lab-rise">
-          <ClusterPanel cluster={cluster} loading={loading} />
+          {needToken ? (
+            <Panel title="Cluster" padded>
+              <EmptyState title="Token required">
+                Paste LAIL_TOKEN in the banner to load Spark instruments.
+              </EmptyState>
+            </Panel>
+          ) : (
+            <ClusterPanel cluster={cluster} loading={loading} />
+          )}
         </div>
       </section>
 
       <section className="space-y-2.5">
-        <Band index="02" label="Endpoint" meta={loading ? "probing" : "6s poll"} />
+        <Band
+          index="02"
+          label="Decode bench"
+          meta={healthy ? "armed" : loading ? "probing" : "locked"}
+        />
+        <div className="lab-rise lab-rise-1">
+          <DecodeBench
+            healthy={healthy}
+            runs={runs}
+            onSettled={() => void refresh({ soft: true })}
+          />
+        </div>
+      </section>
+
+      <section className="space-y-2.5">
+        <Band index="03" label="Endpoint" meta={loading ? "probing" : "6s poll"} />
         <div className="bento lab-rise lab-rise-1">
           <div className="bento-span-3">
             <Metric
@@ -343,7 +367,7 @@ export default function StatusPage() {
 
       <section className="space-y-2.5">
         <Band
-          index="03"
+          index="04"
           label="Runtime"
           meta={
             loading
@@ -555,7 +579,7 @@ export default function StatusPage() {
                               </Link>
                             }
                           >
-                            Use Serve → Perf / Smoke when an endpoint is healthy.
+                            Run a decode bench above when an endpoint is healthy.
                           </EmptyState>
                         </td>
                       </tr>

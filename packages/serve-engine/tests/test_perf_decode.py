@@ -76,6 +76,42 @@ def test_summarize_decode_and_prefill_from_request_timing():
     assert s["prefill_tok_per_s_median"] == 200.0
 
 
+def test_decode_tok_s_uses_model_usage_over_first_to_last_token():
+    r = perf.ReqResult(
+        ok=True,
+        wall_s=3.0,
+        ttft_s=0.5,
+        prompt_tokens=80,
+        completion_tokens=150,
+        label="structured_fields",
+        last_s=2.0,
+    )
+    assert perf.decode_tok_per_s(r) == 100.0
+    assert perf.prefill_tok_per_s(r) == 160.0
+    s = perf.summarize([r], concurrency=1)
+    assert s["decode_tok_per_s_median"] == 100.0
+
+
+def test_decode_tok_s_absent_without_usage_counts():
+    r = perf.ReqResult(
+        ok=True,
+        wall_s=2.0,
+        ttft_s=0.5,
+        prompt_tokens=None,
+        completion_tokens=None,
+        label="x",
+        last_s=1.5,
+    )
+    assert perf.decode_tok_per_s(r) is None
+    assert perf.prefill_tok_per_s(r) is None
+
+
+def test_output_piece_counts_reasoning_as_model_output():
+    assert perf.output_piece({"content": "hi"}) == "hi"
+    assert perf.output_piece({"reasoning_content": "think"}) == "think"
+    assert perf.output_piece({}) == ""
+
+
 def test_summarize_does_not_invent_zero_rates_when_timing_is_missing():
     r = perf.ReqResult(
         ok=True,

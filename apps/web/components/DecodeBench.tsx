@@ -6,6 +6,7 @@ import {
   CONCURRENCY_LEVELS,
   WORKLOAD_KINDS,
   WORKLOAD_LABELS,
+  decodeRunLabel,
   sortConcurrencies,
   type WorkloadKind,
 } from "@/lib/decode-bench";
@@ -53,13 +54,12 @@ export function DecodeBench({
   const jobDone = jobStatus === "done" || jobStatus === "completed";
 
   const latest = useMemo(
-    () => runs.find((r) => String(r.kind || "").startsWith("perf_")) || null,
+    () => runs.find((r) => decodeRunLabel(r.summary) != null) || null,
     [runs],
   );
   const decode = rate(latest?.summary?.decode_tok_per_s_median_c1);
   const prefill = rate(latest?.summary?.prefill_tok_per_s_median_c1);
-  const lastKind =
-    typeof latest?.summary?.workload === "string" ? latest.summary.workload : null;
+  const lastKind = decodeRunLabel(latest?.summary);
   const lastConcs = Array.isArray(latest?.summary?.concurrencies)
     ? (latest.summary.concurrencies as number[]).join(" → ")
     : null;
@@ -86,10 +86,9 @@ export function DecodeBench({
     setJobProgress(0);
     try {
       const { job_id } = await api.benchPerf({
-        runner: "workflow",
+        runner: "decode",
         workload: kind,
         concurrencies: levels,
-        intent: "attach",
       });
       watchJob(
         job_id,
@@ -122,10 +121,10 @@ export function DecodeBench({
 
   return (
     <Panel
-      title="Decode bench"
+      title="Bench"
       action={
         <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
-          {healthy ? "armed" : "locked"}
+          {healthy ? "ready" : "start a model"}
         </span>
       }
     >
@@ -193,7 +192,7 @@ export function DecodeBench({
               })}
             </div>
             <p className="mt-2 text-[11px] leading-snug text-lab-muted">
-              Selected levels run in order. Each level opens that many parallel streams.
+              Pick a kind. How many at once. Run.
             </p>
           </div>
 
@@ -206,7 +205,7 @@ export function DecodeBench({
                 !healthy ? "Start a model on Serve first" : busy ? "Job in progress" : undefined
               }
             >
-              Run decode
+              Run
             </Btn>
             {err ? (
               <span className="text-[12px] text-lab-danger" role="alert">
@@ -233,9 +232,9 @@ export function DecodeBench({
             <div className="col-span-2 bg-lab-panel px-4 py-3">
               <div className="animus-eyebrow">Last run</div>
               <div className="mt-1.5 font-mono text-[11px] text-lab-text-dim">
-                {latest ? (
+                {latest && lastKind ? (
                   <>
-                    {lastKind || latest.kind}
+                    {lastKind}
                     {lastConcs ? ` · ${lastConcs}` : ""}
                   </>
                 ) : (
@@ -250,12 +249,12 @@ export function DecodeBench({
       {(jobStatus || logs) && (
         <div className="space-y-3 border-t border-lab-border-subtle p-4">
           <div className="flex items-center justify-between gap-2">
-            <span className="animus-eyebrow">Job telemetry</span>
+            <span className="animus-eyebrow">Run</span>
             <Badge
               tone={jobDone ? "ok" : jobFailed ? "danger" : "accent"}
               dot={jobRunning}
             >
-              {jobStatus || "idle"}
+              {jobDone ? "done" : jobFailed ? "failed" : jobStatus || "idle"}
             </Badge>
           </div>
           <ProgressBar

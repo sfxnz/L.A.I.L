@@ -1,4 +1,4 @@
-"""Performance benchmarks — workflow concurrency + optional external scripts."""
+"""Decode bench: structured / prose / code / JSON, sequential concurrency waves."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -44,6 +44,45 @@ class ReqResult:
     label: str
     error: str | None = None
     snippet: str = ""
+    last_s: float | None = None
+
+
+def output_piece(delta: dict[str, Any]) -> str:
+    """Tokens the model actually emitted in this chunk, including reasoning."""
+    return str(
+        delta.get("content")
+        or delta.get("reasoning")
+        or delta.get("reasoning_content")
+        or ""
+    )
+
+
+def decode_time_s(r: ReqResult) -> float | None:
+    """Time from first emitted token to last. Trailing usage frames are not decode."""
+    if r.ttft_s is None:
+        return None
+    end = r.last_s
+    if end is None or end <= r.ttft_s:
+        end = r.wall_s
+    ds = end - r.ttft_s
+    if ds <= 0:
+        return None
+    return ds
+
+
+def decode_tok_per_s(r: ReqResult) -> float | None:
+    ds = decode_time_s(r)
+    n = r.completion_tokens
+    if ds is None or not n or n <= 0:
+        return None
+    return n / ds
+
+
+def prefill_tok_per_s(r: ReqResult) -> float | None:
+    n = r.prompt_tokens
+    if not n or n <= 0 or not r.ttft_s or r.ttft_s <= 0:
+        return None
+    return n / r.ttft_s
 
 
 def completion_body(
@@ -89,11 +128,13 @@ def stream_one(
     )
     t0 = time.perf_counter()
     ttft: float | None = None
+    last_s: float | None = None
     usage: dict[str, Any] | None = None
     pieces: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=1800) as resp:
             for raw in resp:
+                now = time.perf_counter() - t0
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -106,33 +147,41 @@ def stream_one(
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
-                delta = choices[0].get("delta") or {}
-                piece = delta.get("content") or ""
+                piece = output_piece(choices[0].get("delta") or {})
                 if piece:
                     if ttft is None:
-                        ttft = time.perf_counter() - t0
+                        ttft = now
+                    last_s = now
                     pieces.append(piece)
         wall = time.perf_counter() - t0
+        prompt_n = (usage or {}).get("prompt_tokens")
+        comp_n = (usage or {}).get("completion_tokens")
+        if usage is None or comp_n is None:
+            return ReqResult(
+                False, wall, ttft, prompt_n, comp_n, label, error="no_usage", last_s=last_s
+            )
         text = "".join(pieces)
         if text and set(text.strip()) <= {"!", "?", ".", " "}:
             return ReqResult(
                 False,
                 wall,
                 ttft,
-                (usage or {}).get("prompt_tokens"),
-                (usage or {}).get("completion_tokens"),
+                prompt_n,
+                comp_n,
                 label,
                 error="garbage_output",
                 snippet=text[:80],
+                last_s=last_s,
             )
         return ReqResult(
             ok=True,
             wall_s=wall,
             ttft_s=ttft,
-            prompt_tokens=(usage or {}).get("prompt_tokens"),
-            completion_tokens=(usage or {}).get("completion_tokens"),
+            prompt_tokens=prompt_n,
+            completion_tokens=comp_n,
             label=label,
             snippet=text[:120].replace("\n", " "),
+            last_s=last_s,
         )
     except Exception as e:
         return ReqResult(
@@ -238,13 +287,14 @@ def summarize(results: list[ReqResult], concurrency: int) -> dict[str, Any]:
     prefill_rates: list[float] = []
     tpot_ms: list[float] = []
     for r in ok:
-        if r.completion_tokens and r.ttft_s and r.wall_s > r.ttft_s:
-            ds = r.wall_s - r.ttft_s
-            if ds > 0 and r.completion_tokens > 0:
-                decode_rates.append(r.completion_tokens / ds)
-                tpot_ms.append((ds / r.completion_tokens) * 1000)
-        if r.prompt_tokens and r.ttft_s and r.ttft_s > 0:
-            prefill_rates.append(r.prompt_tokens / r.ttft_s)
+        rate = decode_tok_per_s(r)
+        ds = decode_time_s(r)
+        if rate is not None and ds is not None and r.completion_tokens:
+            decode_rates.append(rate)
+            tpot_ms.append((ds / r.completion_tokens) * 1000)
+        pre = prefill_tok_per_s(r)
+        if pre is not None:
+            prefill_rates.append(pre)
 
     return {
         "concurrency": concurrency,
@@ -340,13 +390,12 @@ def run_workflow_bench(
 
     def run_level(c: int) -> dict[str, Any]:
         if log:
-            log.write(f"=== concurrency {c} · {kind} ===")
+            log.write(f"{kind} · {c}")
         arm = run_wave(base, model_id, c, kind=kind)
         if log:
             log.write(
-                f"decode {arm.get('decode_tok_per_s_median')} tok/s · "
-                f"prefill {arm.get('prefill_tok_per_s_median')} tok/s · "
-                f"ok {arm.get('ok')}/{arm.get('requests')}"
+                f"{kind} · {c} · {arm.get('decode_tok_per_s_median')} decode tok/s · "
+                f"{arm.get('prefill_tok_per_s_median')} prefill tok/s"
             )
         return arm
 
@@ -354,7 +403,7 @@ def run_workflow_bench(
 
     def run_level_tracked(c: int) -> dict[str, Any]:
         if progress:
-            progress(idx["n"] / max(len(concs), 1), f"concurrency={c}")
+            progress(idx["n"] / max(len(concs), 1), f"{kind} · {c}")
         idx["n"] += 1
         return run_level(c)
 
@@ -394,9 +443,9 @@ def run_workflow_bench(
         run_id=run_id,
         intent=intent,
         model_id=model_id,
-        kind="perf_workflow",
+        kind="decode",
         workload={
-            "type": f"decode_{kind}",
+            "type": kind,
             "kind": kind,
             "prompts": [jobs_for_kind(kind)[0][0]],
             "concurrencies": concs,
@@ -413,16 +462,16 @@ def run_workflow_bench(
     db.insert_run(
         run_id=run_id,
         created_at=envelope["created_at"],
-        kind="perf_workflow",
+        kind="decode",
         intent=intent,
         model_id=model_id,
         summary=metrics["headline"],
         path=str(out),
     )
     if progress:
-        progress(1.0, f"saved {out}")
+        progress(1.0, "done")
     if log:
-        log.write(f"wrote {out}")
+        log.write("done")
     return envelope
 
 

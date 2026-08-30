@@ -46,6 +46,27 @@ class ReqResult:
     snippet: str = ""
 
 
+def completion_body(
+    *,
+    model: str,
+    user_content: str,
+    max_tokens: int,
+    thinking: bool = False,
+) -> dict[str, Any]:
+    """Decode-bench chat body. Force `max_tokens` output so EOS cannot end the wave early."""
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "max_tokens": max_tokens,
+        "min_tokens": max_tokens,
+        "ignore_eos": True,
+        "temperature": 0.2,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+
+
 def stream_one(
     base: str,
     model: str,
@@ -54,15 +75,12 @@ def stream_one(
     label: str,
     thinking: bool = False,
 ) -> ReqResult:
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": user_content}],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "chat_template_kwargs": {"enable_thinking": thinking},
-    }
+    body = completion_body(
+        model=model,
+        user_content=user_content,
+        max_tokens=max_tokens,
+        thinking=thinking,
+    )
     req = urllib.request.Request(
         f"{base.rstrip('/')}/v1/chat/completions",
         data=json.dumps(body).encode(),
@@ -128,42 +146,42 @@ _WORKLOAD_FAMILY: dict[str, tuple[str, str, int]] = {
     "structured": (
         "structured_fields",
         (
-            "Fill every field. Use the labels exactly. No preamble.\n"
-            "model: \nquant: \ncontext_len: \ntp: \nprefill_tok_s: \n"
-            "decode_tok_s: \nkv_policy: \nheadroom_gib: \nnotes: \n"
-            "Repeat the block three times with different plausible Spark-lab values."
+            "Repeat the following labeled fields over and over. Do not stop.\n\n"
+            "model: Qwen3.6-27B-NVFP4\nquant: nvfp4\ncontext_len: 32768\ntp: 2\n"
+            "prefill_tok_s: 410\ndecode_tok_s: 61\nkv_policy: prefix_cache\n"
+            "headroom_gib: 18\nnotes: GB10 UMA, QSFP RoCE up\n"
         ),
         256,
     ),
     "prose": (
         "prose_essay",
         (
-            "Write a flowing essay on how decode throughput and time-to-first-token "
-            "feel different when a coding agent shares a long system prompt across "
-            "tabs on a DGX Spark with unified memory. Be concrete about KV cache, "
-            "continuous batching, and what the operator should watch. "
-            + ("Stay in prose; no bullets, no headings, no lists. " * 8)
+            "Continue this essay in the same voice. Do not stop.\n\n"
+            "Decode throughput and time-to-first-token feel different when a coding "
+            "agent shares a long system prompt across tabs on a DGX Spark with unified "
+            "memory. The KV cache is the product, not a leftover after util. "
         ),
-        384,
+        256,
     ),
     "code": (
         "code_impl",
         (
-            "Write a complete Python module (no markdown fences) that implements "
-            "an in-memory token-bucket rate limiter with acquire(n), available(), "
-            "and a background refill. Include type hints, a docstring on each "
-            "public function, and a tiny self-check under if __name__ == '__main__'."
+            "Continue this Python module. No markdown fences. Do not stop.\n\n"
+            "from __future__ import annotations\n\n"
+            "class TokenBucket:\n"
+            "    def __init__(self, rate: float, burst: int) -> None:\n"
+            "        self.rate = rate\n"
+            "        self.burst = burst\n"
+            "        self.tokens = float(burst)\n"
         ),
-        384,
+        256,
     ),
     "json": (
         "json_object",
         (
-            "Return only a JSON object, no markdown, no commentary, with keys "
-            "spark_id, hostname, serving, model_id, temperature_c, gpu_util_pct, "
-            "power_w, decode_tok_per_s, prefill_tok_per_s, notes. Invent realistic "
-            "values for two-node TP on GB10. Nested key 'peers' is an array of two "
-            "objects with the same fields except peers."
+            "Continue this JSON array. Valid JSON only. Do not stop.\n\n"
+            '[{"spark_id":"spark1","serving":true,"temperature_c":47,'
+            '"gpu_util_pct":12,"decode_tok_per_s":61.2},'
         ),
         256,
     ),

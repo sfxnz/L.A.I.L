@@ -175,7 +175,7 @@ for line in dout.splitlines():
     if len(parts) < 3:
         continue
     name, status, image = parts[0], parts[1], parts[2]
-    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower():
+    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark|glm", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower() or "glm" in image.lower():
         rec = {"name": name, "status": status, "image": image}
         enrich(rec)
         containers.append(rec)
@@ -856,7 +856,7 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
             name, status, image = parts[0], parts[1], parts[2]
             if name in seen:
                 continue
-            if re.search(r"ray|vllm|dspark", name + image, re.I):
+            if metadata.is_serve_container(name, image) or re.search(r"ray", name + image, re.I):
                 containers.append({"name": name, "status": status, "image": image})
 
     for c in containers:

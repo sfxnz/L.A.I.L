@@ -419,7 +419,7 @@ class PerfRequest(BaseModel):
     base_url: str = DEFAULT_BASE_URL
     model: Optional[str] = None
     intent: str = "attach"
-    runner: Literal["workflow", "prefill", "concurrency"] = "workflow"
+    runner: Literal["decode", "workflow", "prefill", "concurrency"] = "decode"
     workload: Literal["structured", "prose", "code", "json"] = "prose"
     concurrencies: list[int] = Field(default_factory=lambda: [1])
     concurrency: int = 4
@@ -428,7 +428,7 @@ class PerfRequest(BaseModel):
 
 @router.post("/bench/perf")
 async def bench_perf(body: PerfRequest) -> dict[str, str]:
-    if body.runner == "workflow":
+    if body.runner in ("decode", "workflow"):
 
         def work(log, progress, **kw):
             return perf.run_workflow_bench(
@@ -465,7 +465,10 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 progress=progress,
             )
 
-    job_id = await jobs.start_job(f"perf_{body.runner}", work)
+    job_kind = (
+        f"decode_{body.workload}" if body.runner in ("decode", "workflow") else f"perf_{body.runner}"
+    )
+    job_id = await jobs.start_job(job_kind, work)
     return {"job_id": job_id}
 
 

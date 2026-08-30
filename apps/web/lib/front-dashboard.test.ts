@@ -13,6 +13,7 @@ import {
   CONCURRENCY_LEVELS,
   WORKLOAD_KINDS,
   WORKLOAD_LABELS,
+  decodeRunLabel,
   sortConcurrencies,
 } from "./decode-bench";
 
@@ -36,6 +37,12 @@ describe("decode bench domain", () => {
 
   test("selected concurrencies run in ascending order", () => {
     expect(sortConcurrencies(new Set([16, 1, 4]))).toEqual([1, 4, 16]);
+  });
+
+  test("last-run label is Structured not perf_workflow", () => {
+    expect(decodeRunLabel({ workload: "structured" })).toBe("Structured");
+    expect(decodeRunLabel({ workload: "perf_workflow" })).toBeNull();
+    expect(decodeRunLabel({ kind: "perf_workflow" })).toBeNull();
   });
 });
 
@@ -64,7 +71,7 @@ describe("shipped front-page decode bench", () => {
 
   test("decode bench is mounted on Status, not only /evals", () => {
     expect(status).toContain("DecodeBench");
-    expect(status).toContain('label="Decode bench"');
+    expect(status).toContain('label="Bench"');
     expect(status).toContain("Token required");
     expect(status).not.toContain('href="/evals" className={btnClass("primary"');
   });
@@ -84,6 +91,8 @@ describe("shipped front-page decode bench", () => {
     expect(bench).toContain("Concurrency 1 to 32");
     expect(bench).toContain("workload: kind");
     expect(bench).toContain("concurrencies: levels");
+    expect(bench).not.toContain("perf_workflow");
+    expect(bench).toContain('runner: "decode"');
   });
 });
 
@@ -167,6 +176,7 @@ describe("shipped DecodeBench render", () => {
     for (const n of CONCURRENCY_LEVELS) {
       expect(html).toContain(`>${n}<`);
     }
-    expect(html).toContain("Run decode");
+    expect(html).toContain(">Run<");
+    expect(html).not.toContain("perf_workflow");
   });
 });

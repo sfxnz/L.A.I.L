@@ -293,7 +293,7 @@ export default function StatusPage() {
       <section className="space-y-2.5">
         <Band
           index="02"
-          label="Decode bench"
+          label="Bench"
           meta={healthy ? "armed" : loading ? "probing" : "locked"}
         />
         <div className="lab-rise lab-rise-1">

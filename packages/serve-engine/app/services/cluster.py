@@ -345,6 +345,8 @@ def _container_serve_family(name: str) -> str | None:
     m = _DSPARK_VLLM_NAME_RE.match(n)
     if m:
         return re.sub(r"[-_]\d+$", "", n).lower()
+    if metadata.is_serve_container(n):
+        return n.lower()
     return None
 
 

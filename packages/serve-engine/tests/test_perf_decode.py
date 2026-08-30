@@ -7,6 +7,14 @@ import time
 from app.services import perf
 
 
+def test_completion_body_forces_full_decode_length():
+    body = perf.completion_body(model="m", user_content="x", max_tokens=256)
+    assert body["max_tokens"] == 256
+    assert body["min_tokens"] == 256
+    assert body["ignore_eos"] is True
+    assert body["stream"] is True
+
+
 def test_each_workload_kind_has_a_distinct_prompt_family():
     families = {k: perf.jobs_for_kind(k) for k in perf.WORKLOAD_KINDS}
     assert set(families) == {"structured", "prose", "code", "json"}

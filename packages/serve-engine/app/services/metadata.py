@@ -49,11 +49,79 @@ def free_h() -> str:
     return _run(["free", "-h"]).strip()
 
 
+GPU_SMI_QUERY = (
+    "name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total"
+)
+_GPU_NA = {"[n/a]", "n/a", "na", ""}
+GPU_TELEMETRY_FIELDS = (
+    "temperature_c",
+    "gpu_util_pct",
+    "power_w",
+    "memory_used_mib",
+    "memory_total_mib",
+)
+
+
+def _smi_num(raw: str) -> float | None:
+    s = (raw or "").strip().lower()
+    if s in _GPU_NA:
+        return None
+    for suffix in (" mib", "°c", "w", "%", "c"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+            break
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_gpu_telemetry(csv_text: str) -> dict[str, Any]:
+    """Parse one nvidia-smi csv line. Missing and N/A fields stay None, never 0."""
+    empty: dict[str, Any] = {
+        "gpu_sku": None,
+        "temperature_c": None,
+        "gpu_util_pct": None,
+        "power_w": None,
+        "memory_used_mib": None,
+        "memory_total_mib": None,
+    }
+    lines = (csv_text or "").strip().splitlines()
+    if not lines:
+        return empty
+    parts = [p.strip() for p in lines[0].split(",")]
+    sku = parts[0] or None
+    if len(parts) >= 6:
+        return {
+            "gpu_sku": sku,
+            "temperature_c": _smi_num(parts[1]),
+            "gpu_util_pct": _smi_num(parts[2]),
+            "power_w": _smi_num(parts[3]),
+            "memory_used_mib": _smi_num(parts[4]),
+            "memory_total_mib": _smi_num(parts[5]),
+        }
+    if len(parts) == 2:
+        empty["gpu_sku"] = sku
+        empty["memory_total_mib"] = _smi_num(parts[1])
+        return empty
+    empty["gpu_sku"] = sku
+    return empty
+
+
+def collect_gpu_telemetry() -> dict[str, Any]:
+    raw = _run(
+        [
+            "nvidia-smi",
+            f"--query-gpu={GPU_SMI_QUERY}",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    return parse_gpu_telemetry(raw)
+
+
 def collect_hardware() -> dict[str, Any]:
-    gpu = "unknown"
-    smi = _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
-    if smi.strip():
-        gpu = smi.strip().split("\n")[0].strip()
+    tel = collect_gpu_telemetry()
+    gpu = tel.get("gpu_sku") or "unknown"
     cpu = platform.processor() or platform.machine()
     # better CPU model on Linux
     try:
@@ -74,8 +142,13 @@ def collect_hardware() -> dict[str, Any]:
         pass
     return {
         "gpu_sku": gpu,
+        "temperature_c": tel.get("temperature_c"),
+        "gpu_util_pct": tel.get("gpu_util_pct"),
+        "power_w": tel.get("power_w"),
+        "memory_used_mib": tel.get("memory_used_mib"),
+        "memory_total_mib": tel.get("memory_total_mib"),
         "memory_capacity_gib": mem_total,
-        "bandwidth": "UMA" if "GB10" in gpu or "Spark" in gpu else "unknown",
+        "bandwidth": "UMA" if "GB10" in str(gpu) or "Spark" in str(gpu) else "unknown",
         "interconnect": "n/a",
         "cpu": cpu,
         "ram_gib": mem_total,
@@ -84,6 +157,21 @@ def collect_hardware() -> dict[str, Any]:
         "hostname": platform.node(),
         "platform": platform.platform(),
     }
+
+
+_SERVE_CONTAINER_RE = re.compile(
+    r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark|glm",
+    re.I,
+)
+
+
+def is_serve_container(name: str, image: str = "") -> bool:
+    """True for a lab vLLM/llama.cpp-style serve container, including GLM image names."""
+    blob = f"{name} {image}"
+    if _SERVE_CONTAINER_RE.search(blob):
+        return True
+    img = image.lower()
+    return "vllm" in img or "dspark" in img or "ray" in img
 
 
 def list_vllm_containers() -> list[dict[str, Any]]:
@@ -104,11 +192,7 @@ def list_vllm_containers() -> list[dict[str, Any]]:
         if len(parts) < 3:
             continue
         name, status, image = parts[0], parts[1], parts[2]
-        if not (
-            re.search(r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark", name, re.I)
-            or "vllm" in image.lower()
-            or "dspark" in image.lower()
-        ):
+        if not is_serve_container(name, image):
             continue
         containers.append(
             {
@@ -218,6 +302,10 @@ def parse_prometheus(text: str) -> dict[str, float]:
         "vllm:avg_prompt_throughput_toks_per_s": "prompt_tok_per_s",
         "vllm:avg_generation_throughput_toks_per_s": "gen_tok_per_s",
         "vllm:kv_cache_usage_perc": "gpu_kv_cache_usage",
+        "vllm:request_decode_time_seconds_sum": "decode_time_s_sum",
+        "vllm:request_generation_tokens_sum": "generation_tokens_sum",
+        "vllm:request_prefill_time_seconds_sum": "prefill_time_s_sum",
+        "vllm:request_prefill_kv_computed_tokens_sum": "prefill_tokens_sum",
     }
     out: dict[str, float] = {}
     for line in text.splitlines():
@@ -233,6 +321,98 @@ def parse_prometheus(text: str) -> dict[str, float]:
             out[keys[name]] = val
     if "prefix_cache_hits" in out and "prefix_cache_queries" in out and out["prefix_cache_queries"] > 0:
         out["prefix_cache_hit_rate"] = out["prefix_cache_hits"] / out["prefix_cache_queries"]
+    return live_token_rates(out)
+
+
+_LIVE_RATE: dict[str, float | None] = {
+    "t": None,
+    "prompt": None,
+    "gen": None,
+    "last_gen_rate": None,
+    "last_prompt_rate": None,
+}
+
+
+def reset_live_rate_state() -> None:
+    _LIVE_RATE.update(
+        t=None, prompt=None, gen=None, last_gen_rate=None, last_prompt_rate=None
+    )
+
+
+def _positive_rate(value: float | None) -> float | None:
+    if value is None or value <= 0:
+        return None
+    return round(float(value), 2)
+
+
+def _counter_delta(now_val: float | None, prev_val: float | None, dt: float) -> float | None:
+    if now_val is None or prev_val is None or dt < 0.2:
+        return None
+    return (float(now_val) - float(prev_val)) / dt
+
+
+def live_token_rates(metrics: dict[str, float], *, now: float | None = None) -> dict[str, float]:
+    """Fill gen_tok_per_s / prompt_tok_per_s from gauges or counter deltas.
+
+    Newer vLLM drops avg_*_throughput gauges. `generation_tokens_total` and
+    `prompt_tokens_total` still move. Prefill is a burst at request start, so
+    the last positive prefill rate sticks while decode tokens (or running
+    requests) show the serve is still in use. Zero stays absent, never a fake 0.
+    """
+    out = dict(metrics)
+    now = time.monotonic() if now is None else now
+    prompt = out.get("prompt_tokens_total")
+    gen = out.get("generation_tokens_total")
+    prev_t = _LIVE_RATE.get("t")
+    d_gen = None
+    d_prompt = None
+    if prev_t is not None:
+        dt = now - float(prev_t)
+        d_gen = _counter_delta(gen, _LIVE_RATE.get("gen"), dt)
+        d_prompt = _counter_delta(prompt, _LIVE_RATE.get("prompt"), dt)
+
+    if d_gen is not None and not out.get("gen_tok_per_s"):
+        out["gen_tok_per_s"] = d_gen
+    if d_prompt is not None and not out.get("prompt_tok_per_s"):
+        out["prompt_tok_per_s"] = d_prompt
+
+    running = (out.get("requests_running") or 0) > 0
+    if not out.get("gen_tok_per_s") and running:
+        decode_s = out.get("decode_time_s_sum")
+        gen_sum = out.get("generation_tokens_sum")
+        if decode_s and gen_sum and decode_s > 0:
+            out["gen_tok_per_s"] = gen_sum / decode_s
+    if not out.get("prompt_tok_per_s") and running:
+        prefill_s = out.get("prefill_time_s_sum")
+        prefill_tok = out.get("prefill_tokens_sum")
+        if prefill_s and prefill_tok and prefill_s > 0:
+            out["prompt_tok_per_s"] = prefill_tok / prefill_s
+
+    gen_rate = _positive_rate(out.get("gen_tok_per_s"))
+    prompt_rate = _positive_rate(out.get("prompt_tok_per_s"))
+    in_flight = (
+        running
+        or (d_gen is not None and d_gen > 0)
+        or (d_prompt is not None and d_prompt > 0)
+    )
+    if prompt_rate is None and in_flight:
+        prompt_rate = _positive_rate(_LIVE_RATE.get("last_prompt_rate"))
+    if gen_rate is None and in_flight:
+        gen_rate = _positive_rate(_LIVE_RATE.get("last_gen_rate"))
+
+    out["gen_tok_per_s"] = gen_rate
+    out["prompt_tok_per_s"] = prompt_rate
+    _LIVE_RATE.update(
+        t=now,
+        prompt=prompt,
+        gen=gen,
+        last_gen_rate=gen_rate if gen_rate is not None else (
+            _LIVE_RATE.get("last_gen_rate") if in_flight else None
+        ),
+        last_prompt_rate=prompt_rate if prompt_rate is not None else (
+            _LIVE_RATE.get("last_prompt_rate") if in_flight else None
+        ),
+    )
     return out
 
 

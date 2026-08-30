@@ -6,8 +6,24 @@ import json
 import pytest
 
 from app.services import autoconfig as ac
-from app.services import cluster
+from app.services import cluster, metadata
 from app.services.autoconfig import plan_placement
+
+
+def test_glm_flash_container_counts_as_a_serve():
+    assert metadata.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
+    assert metadata.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
+    assert not metadata.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
+    assert "glm" in cluster._REMOTE_PROBE_PY
+    assert cluster._container_serve_family("glm53-flash-nvfp4") == "glm53-flash-nvfp4"
+    head = {
+        "tensor_parallel_size": 2,
+        "containers": [{"name": "glm53-flash-nvfp4", "status": "Up 15 hours"}],
+    }
+    worker = {
+        "containers": [{"name": "glm53-flash-nvfp4", "status": "Up 15 hours"}],
+    }
+    assert cluster._worker_aligned_with_head(worker, head, rank=1) is True
 
 
 _BANNED_DEFAULTS = (

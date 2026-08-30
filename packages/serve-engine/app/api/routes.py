@@ -39,6 +39,7 @@ async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
         model_id = probe["models"][0].get("id")
     try:
         cluster_info = cluster.collect_cluster()
+        cluster.attach_live_rates(cluster_info, probe.get("metrics") or {})
     except Exception as e:
         cluster_info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
     return {
@@ -418,21 +419,23 @@ class PerfRequest(BaseModel):
     base_url: str = DEFAULT_BASE_URL
     model: Optional[str] = None
     intent: str = "attach"
-    runner: Literal["workflow", "prefill", "concurrency"] = "workflow"
-    concurrencies: list[int] = Field(default_factory=lambda: [1, 2, 4])
+    runner: Literal["decode", "workflow", "prefill", "concurrency"] = "decode"
+    workload: Literal["structured", "prose", "code", "json"] = "prose"
+    concurrencies: list[int] = Field(default_factory=lambda: [1])
     concurrency: int = 4
     dollars_per_hour: float = 0.5
 
 
 @router.post("/bench/perf")
 async def bench_perf(body: PerfRequest) -> dict[str, str]:
-    if body.runner == "workflow":
+    if body.runner in ("decode", "workflow"):
 
         def work(log, progress, **kw):
             return perf.run_workflow_bench(
                 base_url=body.base_url,
                 model=body.model,
                 concurrencies=body.concurrencies,
+                workload=body.workload,
                 intent=body.intent,
                 dollars_per_hour=body.dollars_per_hour,
                 log=log,
@@ -462,7 +465,10 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 progress=progress,
             )
 
-    job_id = await jobs.start_job(f"perf_{body.runner}", work)
+    job_kind = (
+        f"decode_{body.workload}" if body.runner in ("decode", "workflow") else f"perf_{body.runner}"
+    )
+    job_id = await jobs.start_job(job_kind, work)
     return {"job_id": job_id}
 
 

@@ -145,9 +145,26 @@ def enrich(c):
         c["tensor_parallel_size"] = int(m.group(1))
 
 gpu = "unknown"
-smi = run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
+temperature_c = None
+gpu_util_pct = None
+power_w = None
+smi = run(["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total", "--format=csv,noheader,nounits"])
 if smi.strip():
-    gpu = smi.strip().split("\n")[0].strip()
+    parts = [p.strip() for p in smi.strip().split("\n")[0].split(",")]
+    if parts and parts[0]:
+        gpu = parts[0]
+    def _num(x):
+        s = (x or "").strip().lower()
+        if s in ("[n/a]", "n/a", "na", ""):
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+    if len(parts) >= 4:
+        temperature_c = _num(parts[1])
+        gpu_util_pct = _num(parts[2])
+        power_w = _num(parts[3])
 
 containers = []
 dout = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])
@@ -158,7 +175,7 @@ for line in dout.splitlines():
     if len(parts) < 3:
         continue
     name, status, image = parts[0], parts[1], parts[2]
-    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower():
+    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark|glm", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower() or "glm" in image.lower():
         rec = {"name": name, "status": status, "image": image}
         enrich(rec)
         containers.append(rec)
@@ -236,6 +253,9 @@ print(json.dumps({
     "hostname": platform.node(),
     "reachable": True,
     "gpu_sku": gpu,
+    "temperature_c": temperature_c,
+    "gpu_util_pct": gpu_util_pct,
+    "power_w": power_w,
     "ram_gib": mem_total(),
     "available_gib": avail(),
     "model_id": model_id,
@@ -252,6 +272,35 @@ print(json.dumps({
     "tailscale_ip": run(["tailscale", "ip", "-4"]).strip().split("\n")[0] if run(["tailscale", "ip", "-4"]).strip() else None,
 }))
 """
+
+
+def apply_gpu_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy probe GPU fields onto a node. Absent/N/A stay None (never a fake 0)."""
+    tel = tel or {}
+    sku = tel.get("gpu_sku")
+    if sku:
+        node["gpu_sku"] = sku
+    for key in metadata.GPU_TELEMETRY_FIELDS:
+        node[key] = tel.get(key)
+    return node
+
+
+def attach_live_rates(
+    cluster_info: dict[str, Any], metrics: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Map endpoint-wide vLLM tok/s onto in-use Sparks. Idle nodes stay None."""
+    metrics = metrics or {}
+    gen = metrics.get("gen_tok_per_s")
+    prompt = metrics.get("prompt_tok_per_s")
+    if gen is not None and gen <= 0:
+        gen = None
+    if prompt is not None and prompt <= 0:
+        prompt = None
+    for node in cluster_info.get("nodes") or []:
+        serving = node.get("state") in ("serving", "serving_worker")
+        node["gen_tok_per_s"] = gen if serving else None
+        node["prompt_tok_per_s"] = prompt if serving else None
+    return cluster_info
 
 
 def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
@@ -296,6 +345,8 @@ def _container_serve_family(name: str) -> str | None:
     m = _DSPARK_VLLM_NAME_RE.match(n)
     if m:
         return re.sub(r"[-_]\d+$", "", n).lower()
+    if metadata.is_serve_container(n):
+        return n.lower()
     return None
 
 
@@ -807,7 +858,7 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
             name, status, image = parts[0], parts[1], parts[2]
             if name in seen:
                 continue
-            if re.search(r"ray|vllm|dspark", name + image, re.I):
+            if metadata.is_serve_container(name, image) or re.search(r"ray", name + image, re.I):
                 containers.append({"name": name, "status": status, "image": image})
 
     for c in containers:
@@ -869,7 +920,7 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
     if code == 0 and ts_out.strip():
         ts_ip = ts_out.strip().splitlines()[0]
 
-    return {
+    out = {
         "id": node["id"],
         "label": node.get("label") or node["id"],
         "role": node.get("role") or "node",
@@ -895,6 +946,8 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         "roce_up_ifs": up_ifs,
         "vllm_url": url,
     }
+    apply_gpu_telemetry(out, hw)
+    return out
 
 
 def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
@@ -911,6 +964,9 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
         "tailscale_ip": node.get("tailscale_ip"),
         "qsfp_ip": node.get("qsfp_ip"),
         "gpu_sku": None,
+        "temperature_c": None,
+        "gpu_util_pct": None,
+        "power_w": None,
         "ram_gib": None,
         "available_gib": None,
         "endpoint_healthy": False,
@@ -992,6 +1048,7 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
             "vllm_url": data.get("vllm_url") or node.get("vllm_url"),
         }
     )
+    apply_gpu_telemetry(base, data)
     return base
 
 

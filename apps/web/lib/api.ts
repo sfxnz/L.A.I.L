@@ -36,6 +36,11 @@ export type ClusterNode = {
   tailscale_ip?: string | null;
   qsfp_ip?: string | null;
   gpu_sku?: string | null;
+  temperature_c?: number | null;
+  gpu_util_pct?: number | null;
+  power_w?: number | null;
+  gen_tok_per_s?: number | null;
+  prompt_tok_per_s?: number | null;
   ram_gib?: number | null;
   available_gib?: number | null;
   endpoint_healthy?: boolean;

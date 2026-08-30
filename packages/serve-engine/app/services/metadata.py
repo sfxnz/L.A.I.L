@@ -159,6 +159,21 @@ def collect_hardware() -> dict[str, Any]:
     }
 
 
+_SERVE_CONTAINER_RE = re.compile(
+    r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark|glm",
+    re.I,
+)
+
+
+def is_serve_container(name: str, image: str = "") -> bool:
+    """True for a lab vLLM/llama.cpp-style serve container, including GLM image names."""
+    blob = f"{name} {image}"
+    if _SERVE_CONTAINER_RE.search(blob):
+        return True
+    img = image.lower()
+    return "vllm" in img or "dspark" in img or "ray" in img
+
+
 def list_vllm_containers() -> list[dict[str, Any]]:
     out = _run(
         [
@@ -177,11 +192,7 @@ def list_vllm_containers() -> list[dict[str, Any]]:
         if len(parts) < 3:
             continue
         name, status, image = parts[0], parts[1], parts[2]
-        if not (
-            re.search(r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark", name, re.I)
-            or "vllm" in image.lower()
-            or "dspark" in image.lower()
-        ):
+        if not is_serve_container(name, image):
             continue
         containers.append(
             {

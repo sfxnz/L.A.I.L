@@ -6,8 +6,15 @@ import json
 import pytest
 
 from app.services import autoconfig as ac
-from app.services import cluster
+from app.services import cluster, metadata
 from app.services.autoconfig import plan_placement
+
+
+def test_glm_flash_container_counts_as_a_serve():
+    assert metadata.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
+    assert metadata.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
+    assert not metadata.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
+    assert "glm" in cluster._REMOTE_PROBE_PY
 
 
 _BANNED_DEFAULTS = (

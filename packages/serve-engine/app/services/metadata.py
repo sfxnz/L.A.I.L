@@ -1,6 +1,7 @@
 """Collect model / engine / hardware / metrics metadata for Run Envelopes."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import platform
@@ -251,6 +252,12 @@ def docker_inspect_flags(name: str) -> dict[str, Any]:
 
 
 async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0) -> dict[str, Any]:
+    """Probe /health, /v1/models, /version, /metrics concurrently.
+
+    Parsing /metrics feeds the live tok/s counter deltas (`_LIVE_RATE`), so this
+    must have one caller at a fixed cadence: the status sampler. Bench threads
+    read the sampler's cached probe instead of calling this.
+    """
     base = base_url.rstrip("/")
     result: dict[str, Any] = {
         "base_url": base,
@@ -260,32 +267,48 @@ async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0)
         "metrics": {},
         "error": None,
     }
+    health_ok = False
+    errors: dict[str, str] = {}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            h = await client.get(f"{base}/health")
-            result["healthy"] = h.status_code == 200
-        except Exception as e:
-            result["error"] = f"health: {e}"
-        try:
-            m = await client.get(f"{base}/v1/models")
-            if m.status_code == 200:
-                body = m.json()
-                result["models"] = body.get("data") or []
-                result["healthy"] = True
-        except Exception as e:
-            result["error"] = (result.get("error") or "") + f" models: {e}"
-        try:
-            v = await client.get(f"{base}/version")
-            if v.status_code == 200:
-                result["version"] = v.json() if "application/json" in v.headers.get("content-type", "") else v.text
-        except Exception:
-            pass
-        try:
-            met = await client.get(f"{base}/metrics")
-            if met.status_code == 200:
-                result["metrics"] = parse_prometheus(met.text)
-        except Exception:
-            pass
+
+        async def health() -> None:
+            nonlocal health_ok
+            try:
+                h = await client.get(f"{base}/health")
+                health_ok = h.status_code == 200
+            except Exception as e:
+                errors["health"] = f"health: {e}"
+
+        async def models() -> None:
+            try:
+                m = await client.get(f"{base}/v1/models")
+                if m.status_code == 200:
+                    body = m.json()
+                    result["models"] = body.get("data") or []
+                    result["healthy"] = True
+            except Exception as e:
+                errors["models"] = f" models: {e}"
+
+        async def version() -> None:
+            try:
+                v = await client.get(f"{base}/version")
+                if v.status_code == 200:
+                    result["version"] = v.json() if "application/json" in v.headers.get("content-type", "") else v.text
+            except Exception:
+                pass
+
+        async def metrics() -> None:
+            try:
+                met = await client.get(f"{base}/metrics")
+                if met.status_code == 200:
+                    result["metrics"] = parse_prometheus(met.text)
+            except Exception:
+                pass
+
+        await asyncio.gather(health(), models(), version(), metrics())
+    result["healthy"] = result["healthy"] or health_ok
+    if errors:
+        result["error"] = errors.get("health", "") + errors.get("models", "")
     return result
 
 

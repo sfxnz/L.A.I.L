@@ -11,8 +11,7 @@ from typing import Any, Callable
 
 from ..config import DEFAULT_BASE_URL, RUNS_DIR
 from .. import db
-from .metadata import build_envelope, make_run_id, probe_endpoint
-import asyncio
+from .metadata import build_envelope, make_run_id
 
 
 GOLDEN_TOOLS_DEF = [
@@ -173,6 +172,7 @@ def run_golden_tools(
     intent: str = "attach",
     log: Any = None,
     progress: Callable | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = base_url.rstrip("/")
     with urllib.request.urlopen(f"{base}/v1/models", timeout=30) as r:
@@ -225,7 +225,6 @@ def run_golden_tools(
         "cases": results,
     }
     run_id = make_run_id()
-    probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
         intent=intent,
@@ -296,6 +295,7 @@ def run_tool_eval_bench(
     no_think: bool = True,
     log: Any = None,
     progress: Callable | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     info = tool_eval_available()
     if not info.get("available"):
@@ -416,7 +416,6 @@ def run_tool_eval_bench(
         "raw_path": str(json_out),
         "exit_code": code,
     }
-    probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
         intent=intent,

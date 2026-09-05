@@ -1524,9 +1524,16 @@ def _apply_topology(
     # Multi-node: TP across the QSFP RoCE fabric, sized to the nodes actually needed.
     tp = plan["tensor_parallel_size"]
     cfg["tensor_parallel_size"] = tp
-    head_if = head.get("qsfp_if") or "enp1s0f1np1"
+    head_if = head.get("qsfp_if")
     head_ip = head.get("qsfp_ip")
     worker_ips = [w.get("qsfp_ip") for w in workers if w.get("qsfp_ip")]
+    roce_ip = head_ip or (worker_ips[0] if worker_ips else None)
+    if not head_if or not roce_ip:
+        # Fill gaps from this host's discovered RoCE link — never a baked lab NIC/prefix.
+        net = _discovered_roce()
+        head_if = head_if or net.get("qsfp_if")
+        roce_ip = roce_ip or net.get("qsfp_ip")
+    prefix_hint = _roce_prefix_hint(roce_ip)
 
     dist_flags = (
         f"--tensor-parallel-size {tp} --pipeline-parallel-size {plan['pipeline_parallel_size']} --nnodes {n} "
@@ -1541,10 +1548,18 @@ def _apply_topology(
         env.append(f"VLLM_HOST_IP={head_ip}")
     if worker_ips:
         env.append(f"WORKER_VLLM_HOST_IP={','.join(worker_ips)}")
+    if head_if:
+        env += [
+            f"NCCL_SOCKET_IFNAME={head_if}",
+            f"TP_SOCKET_IFNAME={head_if}",
+            f"GLOO_SOCKET_IFNAME={head_if}",
+        ]
+    else:
+        warnings.append(
+            "RoCE interface not discovered on this host — set NCCL_SOCKET_IFNAME / "
+            "TP_SOCKET_IFNAME / GLOO_SOCKET_IFNAME in docker env before Start."
+        )
     env += [
-        f"NCCL_SOCKET_IFNAME={head_if}",
-        f"TP_SOCKET_IFNAME={head_if}",
-        f"GLOO_SOCKET_IFNAME={head_if}",
         "NCCL_NET=IB",
         "NCCL_IB_DISABLE=0",
         "NCCL_CROSS_NIC=1",
@@ -1552,11 +1567,11 @@ def _apply_topology(
     ]
     # Pin the RoCE HCA: GB10 exposes 4 HCAs (2 DOWN). Unpinned, NCCL picks a dead
     # one and fails init_device with "unhandled system error".
-    hca = _ib_hca_for_iface(head_if)
+    hca = _ib_hca_for_iface(head_if) if head_if else None
     if hca:
         env.append(f"NCCL_IB_HCA={hca}")
         rationale.append(f"NCCL_IB_HCA={hca} pinned (RoCE HCA for {head_if}; other HCAs are DOWN)")
-    else:
+    elif head_if:
         warnings.append(
             f"Could not resolve the RoCE HCA for {head_if}. If NCCL fails with "
             "'unhandled system error', set NCCL_IB_HCA manually in docker env."
@@ -1566,21 +1581,39 @@ def _apply_topology(
     wtxt = f"~{weights_gib} GiB weights" if weights_gib else "weights unknown"
     rationale.append(
         f"Placement: {wtxt} over {plan['node_ram_gib']:.0f} GiB nodes → needs {n} node(s); "
-        f"TP={tp} across QSFP RoCE ({head_if})"
+        f"TP={tp} across QSFP RoCE ({head_if or 'interface not discovered'})"
         + (f"; head={head_ip}" if head_ip else "")
         + (f", workers={','.join(worker_ips)}" if worker_ips else "")
     )
     if not fabric_ok:
         warnings.append(
             "Multi-node serve planned but the QSFP RoCE fabric check did not pass. "
-            "Verify enp1s0f1np1 carrier + 10.100.8.x reachability on all nodes before Start."
+            f"Verify {head_if or 'RoCE interface'} carrier + {prefix_hint or 'RoCE IP'} "
+            "reachability on all nodes before Start."
         )
     if not head_ip or len(worker_ips) < (n - 1):
         warnings.append(
             "RoCE IPs not fully discovered — VLLM_HOST_IP / WORKER_VLLM_HOST_IP may need "
-            "manual entry (10.100.8.x on this lab)."
+            f"manual entry ({prefix_hint + ' on this lab' if prefix_hint else 'RoCE IPs on the QSFP interface'})."
         )
     cfg["topology_plan"] = plan
+
+
+def _discovered_roce() -> dict[str, Any]:
+    """This host's RoCE interface/IP as discovered by cluster.py (`qsfp_if`, `qsfp_ip`)."""
+    try:
+        from . import cluster as _cluster
+
+        return _cluster._detect_local_net() or {}
+    except Exception:
+        return {}
+
+
+def _roce_prefix_hint(ip: Optional[str]) -> Optional[str]:
+    """`10.0.0.x`-style hint from a discovered RoCE IPv4; None when nothing was discovered."""
+    if ip and re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
+        return ip.rsplit(".", 1)[0] + ".x"
+    return None
 
 
 def _strip_flag_from_extra(extra: str, flag: str) -> str:

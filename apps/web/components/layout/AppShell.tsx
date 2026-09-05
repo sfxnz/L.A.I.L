@@ -5,110 +5,86 @@ import { usePathname } from "next/navigation";
 import {
   Activity,
   FlaskConical,
+  Gauge,
   LayoutDashboard,
   Server,
   Settings2,
+  Waves,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
-import { isUnauthorizedError, setClientToken } from "@/lib/auth-token";
-import { useLabStore } from "@/lib/store";
-import { WORKSPACE_NAV } from "@/lib/ide-chrome";
+import { setClientToken } from "@/lib/auth-token";
+import { serveHealthy, startLabStatusPolling, useLabStatusStore } from "@/lib/lab-status-store";
+import { WORKSPACE_NAV, isProseRoute } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
-import { Badge, StatusDot } from "@/components/ui";
+import { Eyebrow, SyncRing, Tick, type SyncState } from "@/components/ui";
 import { AnimusField } from "@/components/animus/AnimusField";
 import { ThemeToggle } from "@/components/animus/ThemeToggle";
 
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   Status: LayoutDashboard,
   Serve: Server,
+  Bench: Gauge,
+  Streams: Waves,
   Evals: FlaskConical,
   Configure: Settings2,
 };
 
-const PAGE_TITLES: Array<{ match: (p: string) => boolean; title: string }> = [
-  { match: (p) => p.startsWith("/evals/tool"), title: "Tool Eval" },
-  { match: (p) => p.startsWith("/evals"), title: "Evals" },
-  { match: (p) => p.startsWith("/server"), title: "Serve" },
-  { match: (p) => p.startsWith("/configure"), title: "Configure" },
-  { match: (p) => p.startsWith("/status") || p === "/", title: "Status" },
-  { match: (p) => p.startsWith("/connect"), title: "Connect" },
-  { match: (p) => p.startsWith("/models"), title: "Models" },
-  { match: (p) => p.startsWith("/lab"), title: "Lab" },
-  { match: (p) => p.startsWith("/workbench"), title: "Workbench" },
-];
+const TOKEN_COPY = "LAIL_TOKEN required — paste it to synchronize.";
 
-/** Hairline divider between readout cells. */
-function Tick({ className }: { className?: string }) {
-  return (
-    <span
-      aria-hidden
-      className={cn(
-        "h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]",
-        className,
-      )}
-    />
-  );
+function fmtRate(v: number) {
+  return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const { modelLabel, setModelLabel } = useLabStore();
-  const [healthy, setHealthy] = useState<boolean | null>(null);
-  const [serveOk, setServeOk] = useState<boolean | null>(null);
-  const [avail, setAvail] = useState<string | null>(null);
-  const [probeNote, setProbeNote] = useState("Checking lab…");
-  const [needToken, setNeedToken] = useState(false);
+  const { status, loading, needToken, unreachable, strands } = useLabStatusStore();
   const [tokenDraft, setTokenDraft] = useState("");
 
-  useEffect(() => {
-    const hit = PAGE_TITLES.find((t) => t.match(pathname || "/"));
-    document.title = hit ? `${hit.title} · L.A.I.L` : "L.A.I.L — Serve & Evals";
-  }, [pathname]);
+  // The ONE lab-status poll: 2s while visible, paused while hidden.
+  useEffect(() => startLabStatusPolling(), []);
 
-  useEffect(() => {
-    const tick = () => {
-      api
-        .labStatus()
-        .then((s) => {
-          setNeedToken(false);
-          setHealthy(true);
-          const ok = !!(s.serve && !s.serve.unreachable && s.serve.healthy);
-          setServeOk(ok);
-          const servedId = s.serve?.model_id;
-          if (ok && servedId && servedId !== "auto" && servedId !== "default") {
-            setModelLabel(servedId);
-          } else {
-            setModelLabel("");
-          }
-          if (s.serve?.hardware?.available_gib != null) {
-            setAvail(`${s.serve.hardware.available_gib} GiB free`);
-          } else {
-            setAvail(null);
-          }
-          setProbeNote(
-            ok
-              ? `Controller up · vLLM serving${servedId ? ` ${String(servedId).split("/").pop()}` : ""}`
-              : "Controller up · no vLLM serve",
-          );
-        })
-        .catch((e: unknown) => {
-          const unauthorized = isUnauthorizedError(e);
-          setHealthy(false);
-          setServeOk(false);
-          setAvail(null);
-          setNeedToken(unauthorized);
-          setProbeNote(
-            unauthorized
-              ? "LAIL_TOKEN required — enter it below"
-              : "Controller offline — start bun run dev",
-          );
-        });
-    };
-    tick();
-    const t = setInterval(tick, 6000);
-    return () => clearInterval(t);
-  }, [setModelLabel]);
+  const serve = status?.serve;
+  const healthy = serveHealthy(status);
+  const servedId = serve?.model_id;
+  const model =
+    healthy && servedId && servedId !== "auto" && servedId !== "default" ? servedId : null;
+  const cluster = status?.cluster || serve?.cluster;
+  const liveNode = cluster?.nodes?.find(
+    (n) => n.state === "serving" || n.state === "serving_worker",
+  );
+  const tokS = healthy ? liveNode?.gen_tok_per_s : null;
+  const freeGib = serve?.hardware?.available_gib;
+
+  const ring: SyncState | null = needToken
+    ? "token"
+    : unreachable
+      ? "offline"
+      : loading
+        ? null
+        : healthy
+          ? "serving"
+          : "idle";
+  const word = needToken
+    ? "token"
+    : unreachable
+      ? "unreachable"
+      : loading
+        ? "…"
+        : healthy
+          ? "serving"
+          : "idle";
+  const probeNote = needToken
+    ? TOKEN_COPY
+    : unreachable
+      ? "Controller unreachable on :8787 — bun run dev."
+      : loading
+        ? "Checking lab…"
+        : healthy
+          ? `Controller up · serving ${model ? model.split("/").pop() : "a model"}`
+          : "Controller up · no model loaded";
+
+  // Instrument pages get the 1440px bento; prose pages keep the 1152px measure.
+  const measure = isProseRoute(pathname || "/") ? "max-w-6xl" : "max-w-[1440px]";
 
   return (
     <div className="relative isolate flex h-full min-h-0 flex-col bg-lab-bg text-lab-text">
@@ -120,7 +96,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </a>
 
       <header className="sticky top-0 z-20 shrink-0 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-xl backdrop-saturate-150">
-        <div className="animus-bracketed relative mx-auto flex h-14 max-w-6xl items-center gap-3 px-4 md:gap-5 md:px-6">
+        <div
+          className={cn(
+            "animus-bracketed relative mx-auto flex h-14 items-center gap-3 px-4 md:gap-5 md:px-6",
+            measure,
+          )}
+        >
           <Link
             href="/status"
             className="group flex shrink-0 items-center gap-2.5 focus-visible:outline-offset-4"
@@ -142,13 +123,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
           <nav
             // Navigation is primary chrome: it must NEVER be the thing that
-            // gives way. This was `min-w-0 flex-1 overflow-x-auto` against a
-            // `shrink-0` status cluster, so once a model started serving the
-            // cluster grew (controller + vLLM badge + model + memory) and the
-            // nav absorbed the entire squeeze — 343px of links crushed into
-            // 176px, silently scroll-clipping EVALS and CONFIGURE off-screen
-            // with no scrollbar to hint they existed. Secondary telemetry
-            // truncates instead; see the status cluster below.
+            // gives way. The instrument strip on the right is `min-w-0 flex-1`
+            // and truncates instead; see below.
             className="flex shrink-0 items-center gap-1"
             aria-label="Main"
           >
@@ -187,72 +163,73 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </nav>
 
           <div
-            // Secondary telemetry: this is the side that yields. `min-w-0`
-            // + `flex-1` lets it soak up the remaining space and truncate
-            // (its children already hide progressively at sm/lg/xl), so the
-            // nav above always renders in full.
-            className="flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
+            // Instrument strip: SyncRing · model · live tok/s · strands · free GiB.
+            // This is the side that yields — `min-w-0 flex-1` soaks up the
+            // remaining space and its cells hide progressively at md/lg/xl, so
+            // the nav above always renders in full.
+            className="lab-num flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
             aria-live="polite"
             aria-atomic="true"
           >
             <span className="sr-only">{probeNote}</span>
 
             <span className="flex items-center gap-1.5" title={probeNote}>
-              <StatusDot
-                live={needToken ? null : healthy}
+              <SyncRing
+                state={ring}
                 label={
-                  healthy === null
-                    ? "Controller status unknown"
-                    : needToken
-                      ? "Token required"
-                      : healthy
-                        ? "Controller online"
-                        : "Controller offline"
+                  needToken
+                    ? "Token required"
+                    : unreachable
+                      ? "Controller unreachable"
+                      : loading
+                        ? "Controller status unknown"
+                        : healthy
+                          ? "Serving"
+                          : "Idle"
                 }
               />
-              <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted lg:inline">
-                {healthy === null ? "…" : needToken ? "token" : healthy ? "controller" : "offline"}
-              </span>
+              <Eyebrow className="hidden tracking-[0.18em] lg:inline">{word}</Eyebrow>
             </span>
 
-            <Tick className="hidden sm:block" />
-
-            <span className="hidden sm:inline-flex">
-              {serveOk === null ? (
-                <Badge tone="muted">checking…</Badge>
-              ) : (
-                <span
-                  className={cn(
-                    "inline-flex transition-shadow duration-300",
-                    serveOk &&
-                      "shadow-[0_0_14px_color-mix(in_srgb,var(--color-lab-ok)_32%,transparent)]",
-                  )}
-                >
-                  <Badge tone={serveOk ? "ok" : "muted"} dot={serveOk}>
-                    {serveOk ? "vLLM serving" : "idle"}
-                  </Badge>
-                </span>
-              )}
-            </span>
-
-            {modelLabel && (
+            {model && (
               <>
                 <Tick className="hidden xl:block" />
                 <span
-                  className="hidden max-w-[128px] truncate font-mono text-[10px] tabular-nums text-lab-text-dim xl:inline"
-                  title={modelLabel}
+                  className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim xl:inline"
+                  title={model}
                 >
-                  {modelLabel.split("/").pop()}
+                  {model.split("/").pop()}
                 </span>
               </>
             )}
 
-            {avail && (
+            {tokS != null && (
+              <>
+                <Tick className="hidden md:block" />
+                <span
+                  className="hidden shrink-0 font-mono text-[10px] text-lab-text md:inline"
+                  title="Live aggregate decode rate on the endpoint"
+                >
+                  {fmtRate(tokS)} <span className="text-lab-muted">tok/s</span>
+                </span>
+              </>
+            )}
+
+            {!loading && !needToken && !unreachable && (
               <>
                 <Tick className="hidden lg:block" />
-                <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.12em] tabular-nums text-lab-muted lg:inline">
-                  {avail}
-                </span>
+                <Eyebrow className="hidden shrink-0 lg:inline" title="Strands running / waiting">
+                  {strands.running} running / {strands.waiting} waiting
+                </Eyebrow>
+              </>
+            )}
+
+            {freeGib != null && (
+              <>
+                <Tick className="hidden lg:block" />
+                <Eyebrow className="hidden shrink-0 tracking-[0.12em] lg:inline">
+                  {freeGib} GiB free
+                </Eyebrow>
               </>
             )}
           </div>
@@ -265,42 +242,46 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       {needToken && (
         <form
-          className="relative z-20 flex shrink-0 items-center gap-2 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] px-4 py-2 md:px-6"
+          className="relative z-20 flex shrink-0 flex-wrap items-center gap-2 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] px-4 py-2 md:px-6"
           onSubmit={(e) => {
             e.preventDefault();
             setClientToken(tokenDraft);
-            setNeedToken(false);
             window.location.reload();
           }}
         >
-          <label className="font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-lab-muted">
-            Token
-          </label>
+          <SyncRing state="token" />
+          <span className="text-[12px] text-lab-text-dim">{TOKEN_COPY}</span>
           <input
             type="password"
             autoComplete="off"
             value={tokenDraft}
             onChange={(e) => setTokenDraft(e.target.value)}
             placeholder="LAIL_TOKEN"
-            className="min-w-0 flex-1 border border-[color:var(--animus-hairline)] bg-transparent px-2 py-1 font-mono text-[12px]"
+            aria-label="LAIL_TOKEN"
+            className="min-w-[10rem] flex-1 border border-[color:var(--animus-hairline)] bg-transparent px-2 py-1 font-mono text-[12px]"
           />
           <button
             type="submit"
             className="shrink-0 bg-lab-accent px-2 py-1 font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-white"
           >
-            Store
+            Synchronize
           </button>
         </form>
       )}
 
       <main id="main" className="relative z-10 min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
-        <div className="mx-auto max-w-6xl px-4 py-5 md:px-6 md:py-6">{children}</div>
+        <div className={cn("mx-auto px-4 py-5 md:px-6 md:py-6", measure)}>{children}</div>
       </main>
 
       <footer className="relative z-10 shrink-0 border-t border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-md">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6">
+        <div
+          className={cn(
+            "mx-auto flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6",
+            measure,
+          )}
+        >
           <span className="font-[family-name:var(--font-display)] text-[10px] font-medium uppercase leading-none tracking-[0.18em] text-lab-muted">
-            Serve · eval · Hermes
+            Serve · bench · streams · Hermes
           </span>
         </div>
       </footer>

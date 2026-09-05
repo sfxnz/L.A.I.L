@@ -13,10 +13,8 @@ import {
   inputCls,
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
-import { usePageTitle } from "@/lib/usePageTitle";
 
 export default function ConfigurePage() {
-  usePageTitle("Configure");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);

@@ -2,23 +2,25 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, watchJob, type LabStatus, type RunRow } from "@/lib/api";
-import { isUnauthorizedError } from "@/lib/auth-token";
+import { api, type RunRow } from "@/lib/api";
+import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useJobWatch } from "@/lib/use-job-watch";
 import {
   Badge,
   Btn,
   Callout,
   EmptyState,
+  Eyebrow,
   Field,
   Input,
   LogView,
   Panel,
   ProgressBar,
   Skeleton,
-  inputCls,
+  SyncRing,
   btnClass,
+  eyebrowClass,
 } from "@/components/ui";
-import { usePageTitle } from "@/lib/usePageTitle";
 import { cn } from "@/lib/utils";
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -29,11 +31,7 @@ import { cn } from "@/lib/utils";
 
 /** An absent reading is a deliberate HUD state — never a bare em-dash. */
 function Absent({ children = "none" }: { children?: ReactNode }) {
-  return (
-    <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted">
-      {children}
-    </span>
-  );
+  return <Eyebrow className="tracking-[0.18em]">{children}</Eyebrow>;
 }
 
 /**
@@ -159,48 +157,50 @@ function scoreTone(score: number | null | undefined) {
 }
 
 export default function EvalsPage() {
-  usePageTitle("Evals");
-  const [status, setStatus] = useState<LabStatus | null>(null);
+  const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
   const [runs, setRuns] = useState<RunRow[]>([]);
-  const [logs, setLogs] = useState("");
-  const [jobMsg, setJobMsg] = useState("");
-  const [jobStatus, setJobStatus] = useState("");
-  const [jobProgress, setJobProgress] = useState(0);
+  const [runsLoaded, setRunsLoaded] = useState(false);
   const [smokeOut, setSmokeOut] = useState<string | null>(null);
   const [smokeOk, setSmokeOk] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
-  const [runner, setRunner] = useState<"workflow" | "prefill" | "concurrency">("workflow");
   const [conc, setConc] = useState("1,2,4");
   const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  const refresh = useCallback(async (opts?: { soft?: boolean }) => {
-    if (!opts?.soft) setRefreshing(true);
+  // Lab status comes from the shell's shared poll; runs load on mount and
+  // re-load when a job settles or the operator asks.
+  const loadRuns = useCallback(
+    () =>
+      api
+        .runs()
+        .then(setRuns)
+        .catch(() => {})
+        .finally(() => setRunsLoaded(true)),
+    [],
+  );
+  useEffect(() => {
+    void loadRuns();
+  }, [loadRuns]);
+
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
     try {
-      const [s, r] = await Promise.all([
-        api.labStatus(),
-        api.runs().catch(() => [] as RunRow[]),
-      ]);
-      setStatus(s);
-      setRuns(r);
-      setErr(null);
-    } catch (e) {
-      if (!isUnauthorizedError(e)) setErr(String((e as Error).message || e));
+      await Promise.all([refreshStatus(), loadRuns()]);
     } finally {
-      setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [refreshStatus, loadRuns]);
 
-  useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh({ soft: true }), 8000);
-    return () => clearInterval(t);
-  }, [refresh]);
+  const { job, track, cancel, running: jobRunning, done: jobDone, failed: jobFailed } = useJobWatch({
+    onSettled: () => {
+      setBusy(false);
+      void loadRuns();
+    },
+  });
+  const { logs, message: jobMsg, status: jobStatus, progress: jobProgress } = job;
 
-  const healthy = !!(status?.serve && !status.serve.unreachable && status.serve.healthy);
-  const jobRunning = jobStatus === "running" || jobStatus === "queued";
+  const loading = statusLoading || !runsLoaded;
+  const healthy = serveHealthy(status);
 
   /* Purely derived from the runs already in state — no extra fetch. */
   const latestTool = useMemo(
@@ -218,31 +218,6 @@ export default function EvalsPage() {
       : null;
   const latestRating =
     typeof latestTool?.summary?.rating === "string" ? (latestTool.summary.rating as string) : null;
-
-  function track(jobId: string) {
-    setBusy(true);
-    setLogs("");
-    setJobMsg("starting…");
-    setJobStatus("running");
-    setJobProgress(0);
-    watchJob(
-      jobId,
-      (chunk) => setLogs((l) => (l + chunk).slice(-80_000)),
-      (s) => {
-        setJobStatus(s.status);
-        setJobMsg(s.message);
-        setJobProgress(s.progress ?? 0);
-        if (s.status === "done" || s.status === "error" || s.status === "failed") {
-          setBusy(false);
-          void refresh({ soft: true });
-        }
-      },
-      () => {
-        setBusy(false);
-        void refresh({ soft: true });
-      },
-    );
-  }
 
   async function runSmoke() {
     setErr(null);
@@ -269,10 +244,11 @@ export default function EvalsPage() {
         .split(/[,\s]+/)
         .map((x) => parseInt(x, 10))
         .filter((n) => Number.isFinite(n) && n > 0);
+      // Only the in-repo workflow sweep runs here; the external prefill /
+      // single-N runners are not installed on this host and live in /bench.
       const { job_id } = await api.benchPerf({
-        runner,
+        runner: "workflow",
         concurrencies: concurrencies.length ? concurrencies : [1, 2, 4],
-        concurrency: concurrencies[0] || 4,
         intent: "attach",
       });
       track(job_id);
@@ -329,14 +305,13 @@ export default function EvalsPage() {
           label="Last verdict"
           meta={
             <span className="flex items-center gap-2">
-              <span
-                className={cn("lab-dot", healthy ? "lab-dot-live" : "lab-dot-idle")}
-                role="img"
-                aria-label={healthy ? "Endpoint healthy" : "Endpoint idle"}
+              <SyncRing
+                state={healthy ? "serving" : "idle"}
+                label={healthy ? "Endpoint healthy" : "Endpoint idle"}
               />
-              <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted">
+              <Eyebrow className="tracking-[0.18em]">
                 {healthy ? "endpoint live" : "endpoint idle"}
-              </span>
+              </Eyebrow>
             </span>
           }>
 
@@ -370,7 +345,7 @@ export default function EvalsPage() {
                     <Badge tone={scoreTone(latestScore)}>{latestRating || "scored"}</Badge>
                     <Link
                       href={`/evals/tool/${latestTool?.run_id}`}
-                      className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-accent-bright underline-offset-4 hover:underline"
+                      className={eyebrowClass("text-lab-accent-bright underline-offset-4 hover:underline")}
                     >
                       Open run →
                     </Link>
@@ -431,10 +406,7 @@ export default function EvalsPage() {
                   <Skeleton className="h-3.5 w-20" />
                 ) : (
                   <span className="inline-flex items-center gap-2">
-                    <span
-                      className={cn("lab-dot", healthy ? "lab-dot-live" : "lab-dot-idle")}
-                      aria-hidden
-                    />
+                    <SyncRing state={healthy ? "serving" : "idle"} />
                     <span className="font-[family-name:var(--font-display)] text-[12px] font-semibold uppercase tracking-[0.14em]">
                       {healthy ? "serving" : "no serve"}
                     </span>
@@ -450,9 +422,9 @@ export default function EvalsPage() {
       <Section className="lab-rise lab-rise-2 space-y-3"
           label="Instruments"
           meta={
-            <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted">
+            <Eyebrow className="tracking-[0.18em]">
               {healthy ? "armed" : "locked · start a model"}
-            </span>
+            </Eyebrow>
           }>
 
         <div className="grid gap-4 lg:grid-cols-2">
@@ -475,9 +447,9 @@ export default function EvalsPage() {
                   className="animus-chamfer-sm flex flex-wrap items-center gap-2.5 border border-lab-border-subtle bg-lab-editor px-3 py-2.5"
                   role="status"
                 >
-                  <span
-                    className={cn("lab-dot", smokeOk ? "bg-lab-ok" : "bg-lab-danger")}
-                    aria-hidden
+                  <SyncRing
+                    state={smokeOk ? "serving" : "offline"}
+                    label={smokeOk ? "Smoke passed" : "Smoke failed"}
                   />
                   <Badge tone={smokeOk ? "ok" : "danger"}>{smokeOk ? "PASS" : "FAIL"}</Badge>
                   <span className="min-w-0 break-all font-mono text-[12px] text-lab-text-dim">
@@ -490,19 +462,10 @@ export default function EvalsPage() {
 
           <Panel title="Perf bench" className="flex h-full flex-col">
             <div className="flex flex-1 flex-col gap-3.5 p-4">
-              <Field label="Runner" htmlFor="eval-runner">
-                <select
-                  id="eval-runner"
-                  className={inputCls}
-                  value={runner}
-                  onChange={(e) => setRunner(e.target.value as typeof runner)}
-                  disabled={busy}
-                >
-                  <option value="workflow">workflow (concurrency sweep)</option>
-                  <option value="prefill">prefill</option>
-                  <option value="concurrency">concurrency (single N)</option>
-                </select>
-              </Field>
+              <p className="text-[13px] leading-relaxed text-lab-muted">
+                Workflow concurrency sweep on the live endpoint. Decode and prefill instruments live
+                on <Link href="/bench" className="text-lab-accent-bright underline-offset-4 hover:underline">Bench</Link>.
+              </p>
               <Field
                 label="Concurrencies (comma-separated)"
                 htmlFor="eval-conc"
@@ -516,16 +479,27 @@ export default function EvalsPage() {
                   disabled={busy}
                 />
               </Field>
-              <Btn
-                onClick={() => void runPerf()}
-                disabled={!healthy || busy}
-                loading={busy && jobRunning}
-                title={
-                  !healthy ? "Start a model on Serve first" : busy ? "Job in progress" : undefined
-                }
-              >
-                Start perf job
-              </Btn>
+              <div className="flex flex-wrap items-center gap-2">
+                <Btn
+                  onClick={() => void runPerf()}
+                  disabled={!healthy || busy}
+                  loading={busy && jobRunning}
+                  title={
+                    !healthy ? "Start a model on Serve first" : busy ? "Job in progress" : undefined
+                  }
+                >
+                  Start perf job
+                </Btn>
+                {jobRunning && (
+                  <Btn
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void cancel().catch((e) => setErr(String(e)))}
+                  >
+                    Stop
+                  </Btn>
+                )}
+              </div>
             </div>
           </Panel>
         </div>
@@ -536,16 +510,7 @@ export default function EvalsPage() {
           <Panel
             title="Job log"
             action={
-              <Badge
-                tone={
-                  jobStatus === "done"
-                    ? "ok"
-                    : jobStatus === "error" || jobStatus === "failed"
-                      ? "danger"
-                      : "accent"
-                }
-                dot={jobRunning}
-              >
+              <Badge tone={jobDone ? "ok" : jobFailed ? "danger" : "accent"} dot={jobRunning}>
                 {jobStatus || "idle"}
               </Badge>
             }
@@ -566,9 +531,9 @@ export default function EvalsPage() {
       <Section className="lab-rise lab-rise-3 space-y-3"
           label="Run log"
           meta={
-            <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted tabular-nums">
+            <Eyebrow className="lab-num tracking-[0.18em]">
               {loading ? "loading" : `${runs.length} recorded`}
-            </span>
+            </Eyebrow>
           }>
 
         <Panel>

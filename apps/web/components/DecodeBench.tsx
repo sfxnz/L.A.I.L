@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { api, watchJob, type RunRow } from "@/lib/api";
+import { api, type RunRow } from "@/lib/api";
 import {
   CONCURRENCY_LEVELS,
   WORKLOAD_KINDS,
@@ -10,20 +10,9 @@ import {
   sortConcurrencies,
   type WorkloadKind,
 } from "@/lib/decode-bench";
-import { Badge, Btn, LogView, Panel, ProgressBar } from "@/components/ui";
+import { useJobWatch } from "@/lib/use-job-watch";
+import { Badge, Btn, Eyebrow, LogView, Nil, Panel, ProgressBar } from "@/components/ui";
 import { cn } from "@/lib/utils";
-
-function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
-  return (
-    <span className="inline-flex items-center gap-1.5 align-middle">
-      <span
-        aria-hidden
-        className="h-[5px] w-[5px] shrink-0 rotate-45 border border-[color:var(--animus-hairline)]"
-      />
-      <span className="animus-eyebrow">{word}</span>
-    </span>
-  );
-}
 
 function rate(v: unknown): string | null {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
@@ -43,15 +32,22 @@ export function DecodeBench({
   const [selected, setSelected] = useState<Set<number>>(() => new Set([1]));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [logs, setLogs] = useState("");
-  const [jobMsg, setJobMsg] = useState("");
-  const [jobStatus, setJobStatus] = useState("");
-  const [jobProgress, setJobProgress] = useState(0);
+  const {
+    job,
+    track,
+    cancel,
+    running: jobRunning,
+    done: jobDone,
+    failed: jobFailed,
+  } = useJobWatch({
+    onSettled: () => {
+      setBusy(false);
+      onSettled?.();
+    },
+  });
+  const { logs, message: jobMsg, status: jobStatus, progress: jobProgress } = job;
 
   const levels = sortConcurrencies(selected);
-  const jobRunning = jobStatus === "running" || jobStatus === "queued";
-  const jobFailed = jobStatus === "error" || jobStatus === "failed";
-  const jobDone = jobStatus === "done" || jobStatus === "completed";
 
   const latest = useMemo(
     () => runs.find((r) => decodeRunLabel(r.summary) != null) || null,
@@ -80,53 +76,23 @@ export function DecodeBench({
   async function run() {
     setErr(null);
     setBusy(true);
-    setLogs("");
-    setJobMsg("starting…");
-    setJobStatus("running");
-    setJobProgress(0);
     try {
       const { job_id } = await api.benchPerf({
         runner: "decode",
         workload: kind,
         concurrencies: levels,
       });
-      watchJob(
-        job_id,
-        (chunk) => setLogs((l) => (l + chunk).slice(-80_000)),
-        (s) => {
-          setJobStatus(s.status);
-          setJobMsg(s.message);
-          setJobProgress(s.progress ?? 0);
-          if (
-            s.status === "done" ||
-            s.status === "completed" ||
-            s.status === "error" ||
-            s.status === "failed"
-          ) {
-            setBusy(false);
-            onSettled?.();
-          }
-        },
-        () => {
-          setBusy(false);
-          onSettled?.();
-        },
-      );
+      track(job_id);
     } catch (e) {
       setErr(String((e as Error).message || e));
       setBusy(false);
-      setJobStatus("error");
     }
   }
 
   return (
     <Panel
       title="Bench"
-      action={
-        <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
-          {healthy ? "ready" : "start a model"}
-        </span>
-      }
+      action={<Eyebrow>{healthy ? "ready" : "start a model"}</Eyebrow>}
     >
       <div className="grid gap-px bg-lab-border-subtle lg:grid-cols-[minmax(0,1fr)_16rem]">
         <div className="space-y-4 bg-lab-panel p-4">
@@ -207,6 +173,11 @@ export function DecodeBench({
             >
               Run
             </Btn>
+            {jobRunning && (
+              <Btn variant="ghost" size="sm" onClick={() => void cancel().catch((e) => setErr(String(e)))}>
+                Stop
+              </Btn>
+            )}
             {err ? (
               <span className="text-[12px] text-lab-danger" role="alert">
                 {err}
@@ -219,13 +190,13 @@ export function DecodeBench({
           <div className="grid grid-cols-2 gap-px bg-lab-border-subtle">
             <div className="bg-lab-panel px-4 py-3">
               <div className="animus-eyebrow">Decode tok/s</div>
-              <div className="mt-1.5 font-[family-name:var(--font-display)] text-[22px] font-semibold leading-none tabular-nums text-lab-text">
+              <div className="lab-num mt-1.5 font-[family-name:var(--font-display)] text-[22px] font-semibold leading-none text-lab-text">
                 {decode ?? <Nil />}
               </div>
             </div>
             <div className="bg-lab-panel px-4 py-3">
               <div className="animus-eyebrow">Prefill tok/s</div>
-              <div className="mt-1.5 font-[family-name:var(--font-display)] text-[22px] font-semibold leading-none tabular-nums text-lab-text">
+              <div className="lab-num mt-1.5 font-[family-name:var(--font-display)] text-[22px] font-semibold leading-none text-lab-text">
                 {prefill ?? <Nil />}
               </div>
             </div>
@@ -254,7 +225,7 @@ export function DecodeBench({
               tone={jobDone ? "ok" : jobFailed ? "danger" : "accent"}
               dot={jobRunning}
             >
-              {jobDone ? "done" : jobFailed ? "failed" : jobStatus || "idle"}
+              {jobStatus || "idle"}
             </Badge>
           </div>
           <ProgressBar

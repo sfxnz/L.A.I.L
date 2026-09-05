@@ -36,6 +36,8 @@ type Plate = {
 
 const TAU = Math.PI * 2;
 const MAX_DPR = 2;
+/** css px² above which the canvas renders at DPR 1 — a 4K field at DPR 2 is ~33 Mpx of fill per frame */
+const DPR1_AREA = 2.5e6;
 const AREA_PER_NODE = 16000;
 const MIN_NODES = 40;
 const MAX_NODES = 140;
@@ -152,9 +154,9 @@ export function AnimusField() {
     };
 
     const resize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
       w = canvas.clientWidth || window.innerWidth;
       h = canvas.clientHeight || window.innerHeight;
+      const dpr = w * h > DPR1_AREA ? 1 : Math.min(window.devicePixelRatio || 1, MAX_DPR);
       canvas.width = Math.max(1, Math.round(w * dpr));
       canvas.height = Math.max(1, Math.round(h * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -370,7 +372,7 @@ export function AnimusField() {
     <>
       {/*
         Volumetric haze — the breathing atmosphere the lattice floats in.
-        Three slow, offset radial blooms that drift and swell on their own
+        Two slow, offset radial blooms that drift and swell on their own
         clocks, so the field never settles into a static wallpaper. Kept in
         CSS rather than canvas: large soft gradients composite on the GPU for
         free, where per-frame canvas gradient fills of this size would not.
@@ -378,8 +380,6 @@ export function AnimusField() {
       <div className="animus-atmosphere" aria-hidden="true">
         <span className="animus-haze animus-haze-1" />
         <span className="animus-haze animus-haze-2" />
-        <span className="animus-haze animus-haze-3" />
-        <span className="animus-haze animus-haze-4" />
       </div>
       <canvas
         ref={ref}

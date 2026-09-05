@@ -116,9 +116,9 @@ export default function ModelsPage() {
                     <span className="font-mono text-lab-text-dim">{id.slice(0, 8)}</span>
                     <span>{j.message}</span>
                   </div>
-                  <div className="h-1 overflow-hidden rounded-full bg-lab-hover">
+                  <div className="h-1 overflow-hidden bg-lab-hover">
                     <div
-                      className="h-full rounded-full bg-lab-accent transition-[width] duration-300"
+                      className="h-full bg-lab-accent transition-[width] duration-300"
                       style={{ width: `${Math.round(j.progress * 100)}%` }}
                     />
                   </div>
@@ -186,7 +186,7 @@ export default function ModelsPage() {
                     href={`https://huggingface.co/${selected.id}`}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex h-8 items-center rounded-[8px] border border-lab-border px-2.5 text-[11px] font-medium text-lab-text-dim transition-colors hover:bg-lab-hover hover:text-lab-text"
+                    className="inline-flex h-8 items-center rounded-[2px] border border-lab-border px-2.5 text-[11px] font-medium text-lab-text-dim transition-colors hover:bg-lab-hover hover:text-lab-text"
                   >
                     Open card
                   </a>

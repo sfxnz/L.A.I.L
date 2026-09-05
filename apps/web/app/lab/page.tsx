@@ -52,20 +52,20 @@ export default function LabGalleryPage() {
       </div>
 
       {err && (
-        <div className="rounded-xl border border-lab-danger/30 bg-lab-danger/10 px-3 py-2 text-sm text-lab-danger">
+        <div className="rounded-[2px] border border-lab-danger/30 bg-lab-danger/10 px-3 py-2 text-sm text-lab-danger">
           {err}
         </div>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
         <input
-          className="inputCls min-w-[200px] flex-1 rounded-lg border border-lab-border bg-lab-surface px-3 py-2 text-sm"
+          className="inputCls min-w-[200px] flex-1 rounded-[2px] border border-lab-border bg-lab-surface px-3 py-2 text-sm"
           placeholder="Filter title, model, tags…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
         <select
-          className="rounded-lg border border-lab-border bg-lab-surface px-3 py-2 text-sm"
+          className="rounded-[2px] border border-lab-border bg-lab-surface px-3 py-2 text-sm"
           value={task}
           onChange={(e) => setTask(e.target.value)}
         >
@@ -87,7 +87,7 @@ export default function LabGalleryPage() {
             <p className="mb-3 text-sm text-lab-muted">
               Import a Hermes-built HTML file (or any artifact folder) into the gallery.
             </p>
-            <pre className="overflow-x-auto rounded-lg bg-black/40 p-3 text-xs text-lab-muted">
+            <pre className="overflow-x-auto rounded-[2px] bg-black/40 p-3 text-xs text-lab-muted">
 {`curl -s http://127.0.0.1:8787/api/lab/runs/import \\
   -H 'Content-Type: application/json' \\
   -d '{
@@ -106,7 +106,7 @@ export default function LabGalleryPage() {
             <Link
               key={r.id}
               href={`/lab/${r.id}`}
-              className="group flex flex-col overflow-hidden rounded-2xl border border-lab-border bg-lab-surface transition hover:border-lab-accent/40 hover:shadow-[0_0_0_1px_rgba(10,132,255,0.15)]"
+              className="group flex flex-col overflow-hidden rounded-[2px] border border-lab-border bg-lab-surface transition hover:border-lab-accent/40 hover:shadow-[0_0_0_1px_color-mix(in_srgb,var(--color-lab-line)_25%,transparent)]"
             >
               <div className="relative aspect-[16/10] bg-black/50">
                 <iframe
@@ -130,7 +130,7 @@ export default function LabGalleryPage() {
                   {(r.tags || []).slice(0, 4).map((t) => (
                     <span
                       key={t}
-                      className="rounded-md bg-white/5 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-lab-muted"
+                      className="rounded-[2px] bg-white/5 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-lab-muted"
                     >
                       {t}
                     </span>

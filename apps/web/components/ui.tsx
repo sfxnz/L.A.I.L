@@ -1,9 +1,10 @@
 import type {
   ButtonHTMLAttributes,
+  CSSProperties,
   InputHTMLAttributes,
   ReactNode,
 } from "react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 /*
@@ -27,6 +28,395 @@ import { cn } from "@/lib/utils";
        carry its own INSET focus ring. Focusable things that can't afford that
        (inputs, tabs) get radius-2 instead of a chamfer.
 */
+
+/**
+ * The 10px eyebrow — condensed, uppercase, wide-tracked, muted. Every small
+ * label/meta/state word on every page is one of these. `eyebrowClass` is for
+ * elements that must stay a Link/button; `Eyebrow` for plain text.
+ */
+export function eyebrowClass(className?: string) {
+  return cn(
+    "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted",
+    className,
+  );
+}
+
+export function Eyebrow({
+  children,
+  className,
+  title,
+}: {
+  children: ReactNode;
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <span className={eyebrowClass(className)} title={title}>
+      {children}
+    </span>
+  );
+}
+
+/**
+ * The one null treatment: an absent value is a condensed STATE WORD behind a
+ * hollow diamond, never a bare em-dash (which reads as broken data).
+ * "Awaiting" = a live readout that hasn't reported yet; "None" = settled and
+ * genuinely empty.
+ */
+export function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 align-middle">
+      <span
+        aria-hidden
+        className="h-[5px] w-[5px] shrink-0 rotate-45 border border-[color:var(--animus-hairline)]"
+      />
+      <span className="animus-eyebrow">{word}</span>
+    </span>
+  );
+}
+
+/** Hairline divider between readout cells. */
+export function Tick({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]", className)}
+    />
+  );
+}
+
+/**
+ * Sync ring — the ONE status glyph, with fixed semantics:
+ *   serving  solid       (serving AND serving_worker — a headless TP worker is serving)
+ *   idle     hollow
+ *   loading  dashed
+ *   offline  notched, danger
+ *   token    hourglass   (LAIL_TOKEN required — never "offline")
+ *   null     faint hollow (not probed yet)
+ * Still by design. It blooms once, 700ms, on the transition TO serving.
+ */
+export type SyncState = "serving" | "idle" | "loading" | "offline" | "token";
+
+export function syncStateFromNode(state?: string | null): SyncState | null {
+  switch (state) {
+    case "serving":
+    case "serving_worker":
+      return "serving";
+    case "idle":
+    case "loading":
+    case "offline":
+      return state;
+    default:
+      return null;
+  }
+}
+
+const SYNC_LABEL: Record<SyncState, string> = {
+  serving: "Serving",
+  idle: "Idle",
+  loading: "Loading",
+  offline: "Offline",
+  token: "Token required",
+};
+
+export function SyncRing({
+  state,
+  label,
+  size = 16,
+  className,
+}: {
+  state: SyncState | null;
+  label?: string;
+  size?: number;
+  className?: string;
+}) {
+  const prev = useRef(state);
+  const [bloom, setBloom] = useState(false);
+
+  useEffect(() => {
+    const was = prev.current;
+    prev.current = state;
+    if (state !== "serving" || was === "serving") return;
+    setBloom(true);
+    const t = window.setTimeout(() => setBloom(false), 700);
+    return () => window.clearTimeout(t);
+  }, [state]);
+
+  const resolved = label ?? (state ? SYNC_LABEL[state] : "Unknown");
+  const D = "M8 1.5 14.5 8 8 14.5 1.5 8Z";
+  return (
+    <span
+      className={cn("sync-ring", bloom && "sync-ring-bloom", className)}
+      role="img"
+      aria-label={resolved}
+      title={resolved}
+      style={{ width: size, height: size }}
+    >
+      <svg viewBox="0 0 16 16" width={size} height={size} aria-hidden fill="none">
+        {state === "serving" && <path d={D} className="fill-lab-ok stroke-lab-ok" strokeWidth="1" />}
+        {state === "idle" && <path d={D} className="stroke-lab-muted" strokeWidth="1.25" />}
+        {state === "loading" && (
+          <path d={D} className="stroke-lab-warn" strokeWidth="1.25" strokeDasharray="2.6 1.8" />
+        )}
+        {state === "offline" && (
+          <path
+            d="M12.6 6.1 14.5 8 8 14.5 1.5 8 8 1.5 10.4 3.9"
+            className="stroke-lab-danger"
+            strokeWidth="1.25"
+          />
+        )}
+        {state === "token" && (
+          <>
+            <path d={D} className="stroke-lab-muted" strokeWidth="0.9" opacity="0.45" />
+            <path
+              d="M5.3 4.6h5.4L8 8l2.7 3.4H5.3L8 8Z"
+              className="stroke-lab-muted"
+              strokeWidth="1"
+              strokeLinejoin="round"
+            />
+          </>
+        )}
+        {state === null && <path d={D} className="stroke-lab-muted" strokeWidth="1" opacity="0.45" />}
+      </svg>
+    </span>
+  );
+}
+
+const EASE_OUT_EXPO = (t: number) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+
+function reducedMotion() {
+  return typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+/**
+ * Hero numeral — counts up over --dur-hero (700ms, easeOutExpo) into the value,
+ * snaps under reduced motion. Writes the DOM directly (one rAF loop, no
+ * re-renders). Renders `from` first so server and client agree, then animates.
+ */
+export function HeroNumber({
+  value,
+  from,
+  format = (n) => String(Math.round(n)),
+  className,
+  label,
+}: {
+  value: number;
+  /** start of the count-up on mount; defaults to `value` (no mount animation) */
+  from?: number;
+  format?: (n: number) => string;
+  className?: string;
+  label?: string;
+}) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const shown = useRef(from ?? value);
+  const fmt = useRef(format);
+  fmt.current = format;
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const start = shown.current;
+    if (start === value || reducedMotion()) {
+      shown.current = value;
+      el.textContent = fmt.current(value);
+      return;
+    }
+    const t0 = performance.now();
+    let raf = 0;
+    const step = (now: number) => {
+      const t = Math.min(1, (now - t0) / 700);
+      const v = start + (value - start) * EASE_OUT_EXPO(t);
+      shown.current = v;
+      el.textContent = fmt.current(v);
+      if (t < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+
+  return (
+    <span ref={ref} className={cn("animus-hero", className)} aria-label={label}>
+      {format(from ?? value)}
+    </span>
+  );
+}
+
+/**
+ * Sync bar — segmented progress with a % and a unit-bearing label. Anything
+ * that waits longer than a second shows one of these (or `indeterminate`).
+ */
+export function SyncBar({
+  value,
+  label,
+  unit,
+  segments = 20,
+  indeterminate,
+  tone = "line",
+  className,
+}: {
+  /** 0–100 */
+  value?: number | null;
+  label: string;
+  /** unit-bearing readout, e.g. "512 tok" or "3 / 8 levels" */
+  unit?: string;
+  segments?: number;
+  indeterminate?: boolean;
+  tone?: "line" | "accent" | "warn" | "danger";
+  className?: string;
+}) {
+  const pct = Math.max(0, Math.min(100, value ?? 0));
+  const filled = Math.round((pct / 100) * segments);
+  const fill = {
+    line: "bg-lab-line-2",
+    accent: "bg-lab-accent",
+    warn: "bg-lab-warn",
+    danger: "bg-lab-danger",
+  }[tone];
+  return (
+    <div className={cn("space-y-1.5", className)}>
+      <div className="flex items-center justify-between gap-2">
+        <Eyebrow className="truncate">{label}</Eyebrow>
+        <span className="lab-num flex shrink-0 items-baseline gap-2 font-mono text-[11px] text-lab-text-dim">
+          {unit ? <span className="text-lab-muted">{unit}</span> : null}
+          {!indeterminate && <span>{Math.round(pct)}%</span>}
+        </span>
+      </div>
+      <div
+        className="relative grid h-[4px] gap-px overflow-hidden"
+        style={{ gridTemplateColumns: `repeat(${segments}, minmax(0, 1fr))` }}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={indeterminate ? undefined : Math.round(pct)}
+        aria-label={label}
+        aria-busy={indeterminate || undefined}
+      >
+        {Array.from({ length: segments }).map((_, i) => (
+          <span
+            key={i}
+            className={cn(
+              "h-full transition-colors duration-[var(--dur-sync)] ease-[var(--ease-animus-out)]",
+              !indeterminate && i < filled ? fill : "bg-lab-hover",
+            )}
+          />
+        ))}
+        {indeterminate && (
+          <span
+            aria-hidden
+            className={cn("lab-progress-indeterminate absolute inset-y-0 left-0 w-1/3 opacity-70", fill)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Sparkline — one series, ≤120 points, SVG. Colour comes from `currentColor`,
+ * so pass a `text-lab-*` token class; never a literal.
+ */
+export function Sparkline({
+  points,
+  width = 120,
+  height = 28,
+  min,
+  max,
+  area = true,
+  label,
+  className,
+}: {
+  points: readonly number[];
+  width?: number;
+  height?: number;
+  min?: number;
+  max?: number;
+  area?: boolean;
+  label?: string;
+  className?: string;
+}) {
+  const pts = points.slice(-120);
+  const lo = min ?? Math.min(0, ...pts);
+  const hi = Math.max(max ?? -Infinity, ...pts, lo + 1e-9);
+  const n = pts.length;
+  const x = (i: number) => (n > 1 ? (i / (n - 1)) * width : width);
+  const y = (v: number) => height - 1 - ((v - lo) / (hi - lo)) * (height - 2);
+  const line = pts.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      width={width}
+      height={height}
+      preserveAspectRatio="none"
+      className={cn("block text-lab-line", className)}
+      role={label ? "img" : undefined}
+      aria-label={label}
+      aria-hidden={label ? undefined : true}
+    >
+      {n > 1 && area && (
+        <path
+          d={`${line} L${width} ${height} L0 ${height} Z`}
+          fill="currentColor"
+          fillOpacity="0.12"
+        />
+      )}
+      {n > 0 && (
+        <path
+          d={n > 1 ? line : `M0 ${y(pts[0]).toFixed(1)} L${width} ${y(pts[0]).toFixed(1)}`}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.25"
+          vectorEffect="non-scaling-stroke"
+        />
+      )}
+    </svg>
+  );
+}
+
+/**
+ * Corridor — the empty state when nothing is loaded: a horizon grid, six
+ * drifting fragments, and the instruction. "No memory loaded. Serve a model to
+ * begin synchronization."
+ */
+const FRAGMENTS = [
+  [12, 18],
+  [28, 62],
+  [46, 30],
+  [61, 70],
+  [77, 22],
+  [90, 56],
+] as const;
+
+export function Corridor({
+  title = "No memory loaded",
+  children = "Serve a model to begin synchronization.",
+  action,
+  className,
+}: {
+  title?: string;
+  children?: ReactNode;
+  action?: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("animus-corridor flex items-center justify-center px-6 py-10", className)}>
+      {FRAGMENTS.map(([l, t], i) => (
+        <span
+          key={i}
+          aria-hidden
+          className="animus-fragment"
+          style={{ left: `${l}%`, top: `${t}%`, "--i": i } as CSSProperties}
+        />
+      ))}
+      <div className="relative z-10 max-w-sm text-center">
+        <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase tracking-[0.18em] text-lab-text">
+          {title}
+        </div>
+        <p className="mt-2 text-[13px] leading-relaxed text-lab-muted">{children}</p>
+        {action ? <div className="mt-4 flex justify-center gap-2">{action}</div> : null}
+      </div>
+    </div>
+  );
+}
 
 export function Panel({
   children,
@@ -284,7 +674,7 @@ export function Metric({
         <>
           <div
             className={cn(
-              "mt-1.5 truncate font-[family-name:var(--font-display)] font-semibold leading-[1.05] tracking-[0.005em] tabular-nums",
+              "lab-num mt-1.5 truncate font-[family-name:var(--font-display)] font-semibold leading-[1.05] tracking-[0.005em]",
               large ? "text-[30px]" : "text-[26px]",
               valueTone,
             )}
@@ -292,7 +682,7 @@ export function Metric({
             {value}
           </div>
           {sub ? (
-            <div className="mt-1 truncate font-mono text-[11px] tabular-nums text-lab-muted" title={sub}>
+            <div className="lab-num mt-1 truncate font-mono text-[11px] text-lab-muted" title={sub}>
               {sub}
             </div>
           ) : null}
@@ -400,30 +790,6 @@ export function LogView({
     >
       {text || empty}
     </pre>
-  );
-}
-
-export function StatusDot({
-  live,
-  label,
-}: {
-  live: boolean | null;
-  /** Accessible name; defaults from live state */
-  label?: string;
-}) {
-  const resolved =
-    label ??
-    (live === true ? "Online" : live === false ? "Offline" : "Unknown");
-  return (
-    <span
-      className={cn(
-        "lab-dot",
-        live === true ? "lab-dot-live" : live === false ? "lab-dot-down" : "lab-dot-idle",
-      )}
-      role="img"
-      aria-label={resolved}
-      title={resolved}
-    />
   );
 }
 

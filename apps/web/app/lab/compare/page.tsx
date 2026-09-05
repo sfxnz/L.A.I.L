@@ -86,7 +86,7 @@ function CompareInner() {
                 key={r.id}
                 type="button"
                 onClick={() => toggle(r.id)}
-                className={`rounded-lg border px-2.5 py-1.5 text-xs ${
+                className={`rounded-[2px] border px-2.5 py-1.5 text-xs ${
                   on
                     ? "border-lab-accent bg-lab-accent/15 text-lab-text"
                     : "border-lab-border text-lab-muted"
@@ -120,7 +120,7 @@ function CompareInner() {
           {shown.map((r) => (
             <div
               key={r.id}
-              className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-lab-border bg-lab-surface"
+              className="flex min-h-0 flex-col overflow-hidden rounded-[2px] border border-lab-border bg-lab-surface"
             >
               <div className="flex items-center justify-between gap-2 border-b border-lab-border-subtle px-3 py-2">
                 <div className="min-w-0">

@@ -116,7 +116,7 @@ function isPlaceholderModel(model: string | undefined | null): boolean {
   return !m || m === "default" || m === "auto" || m === "none" || m === "mock-model";
 }
 
-async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
+export async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
   const base = openAiBase(kind);
   try {
     const r = await fetch(`${base}/models`, { signal: AbortSignal.timeout(5000) });
@@ -134,9 +134,10 @@ async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
  * Rule: if the backend is serving something, that is the model — full stop.
  * Configure "default model" is only a fallback when nothing is up (and a
  * mirror of the live id for the UI). Never 404 because Configure lagged Server.
+ * Pass `served` to reuse an already-fetched id list instead of probing again.
  */
-export async function resolveModelId(kind?: BackendKind): Promise<string> {
-  const served = await listServedModelIds(kind);
+export async function resolveModelId(kind?: BackendKind, served?: string[]): Promise<string> {
+  served ??= await listServedModelIds(kind);
   if (served[0]) {
     const id = served[0];
     // Keep Configure / sidebar in sync with live serve (best-effort)

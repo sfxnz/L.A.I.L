@@ -50,6 +50,23 @@ describe("LAIL_TOKEN middleware", () => {
     }
   });
 
+  test("query token is accepted on the stream-run EventSource path", async () => {
+    const prev = config.token;
+    config.token = "secret";
+    try {
+      const app = createApp();
+      const denied = await app.request("/api/streams/runs/x/events");
+      expect(denied.status).toBe(401);
+      // Unknown run → 404 from the route itself, i.e. the middleware let it through.
+      const passed = await app.request("/api/streams/runs/x/events?token=secret");
+      expect(passed.status).toBe(404);
+      const stop = await app.request("/api/streams/runs/x/stop?token=secret", { method: "POST" });
+      expect(stop.status).toBe(401);
+    } finally {
+      config.token = prev;
+    }
+  });
+
   test("public share GETs stay unauthed when a token is set", async () => {
     const prev = config.token;
     config.token = "secret";

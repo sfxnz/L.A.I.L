@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -24,14 +25,36 @@ from app.bind import (  # noqa: E402
     token_from_headers,
 )
 from app.config import APP_ROOT  # noqa: E402
+from app.services import status_sampler  # noqa: E402
 
 _LAIL_TOKEN = (os.environ.get("LAIL_TOKEN") or "").strip()
 _CORS_ORIGINS = cors_origins(os.environ.get("LAIL_CORS_ORIGINS"))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    host = os.environ.get("LAB_HOST") or os.environ.get("LAIL_HOST") or "127.0.0.1"
+    allow_insecure = (os.environ.get("LAIL_INSECURE_BIND") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    # Same policy as run() and the controller. Docker/compose set LAIL_HOST=0.0.0.0
+    # plus LAIL_INSECURE_BIND=1 because host ports stay on 127.0.0.1.
+    assert_safe_bind(host, os.environ.get("LAIL_TOKEN") or "", allow_insecure=allow_insecure)
+    db.init_db()
+    await status_sampler.SAMPLER.start()
+    try:
+        yield
+    finally:
+        await status_sampler.SAMPLER.stop()
+
 
 app = FastAPI(
     title="Local AI Lab",
     description="Serve, benchmark, and evaluate local LLMs on DGX Spark",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -64,20 +87,6 @@ async def _token_guard(request: Request, call_next):
 
 
 app.include_router(router, prefix="/api")
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    host = os.environ.get("LAB_HOST") or os.environ.get("LAIL_HOST") or "127.0.0.1"
-    allow_insecure = (os.environ.get("LAIL_INSECURE_BIND") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    # Same policy as run() and the controller. Docker/compose set LAIL_HOST=0.0.0.0
-    # plus LAIL_INSECURE_BIND=1 because host ports stay on 127.0.0.1.
-    assert_safe_bind(host, os.environ.get("LAIL_TOKEN") or "", allow_insecure=allow_insecure)
-    db.init_db()
 
 
 @app.get("/api/health")

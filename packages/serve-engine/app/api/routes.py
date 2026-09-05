@@ -13,8 +13,8 @@ from pydantic import BaseModel, Field  # Field used by ServeRequest
 from sse_starlette.sse import EventSourceResponse
 
 from .. import db
-from ..config import DEFAULT_BASE_URL, MODEL_PRESETS, RUNS_DIR, SERVE_EXAMPLES
-from ..services import agentic, autoconfig, cluster, jobs, metadata, perf, serve
+from ..config import DEFAULT_BASE_URL, RUNS_DIR, SERVE_EXAMPLES
+from ..services import agentic, autoconfig, cluster, jobs, metadata, perf, serve, status_sampler
 
 router = APIRouter()
 
@@ -23,41 +23,12 @@ router = APIRouter()
 
 
 @router.get("/status")
-async def status(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
-    probe = await metadata.probe_endpoint(base_url)
-    hw = metadata.collect_hardware()
-    containers = metadata.list_vllm_containers()
-    avail = hw.get("available_gib")
-    headroom = "ok"
-    if avail is not None:
-        if avail < 15:
-            headroom = "critical"
-        elif avail < 60:
-            headroom = "tight"
-    model_id = None
-    if probe.get("models"):
-        model_id = probe["models"][0].get("id")
-    try:
-        cluster_info = cluster.collect_cluster()
-        cluster.attach_live_rates(cluster_info, probe.get("metrics") or {})
-    except Exception as e:
-        cluster_info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
-    return {
-        "healthy": probe.get("healthy"),
-        "base_url": base_url,
-        "model_id": model_id,
-        "models": probe.get("models"),
-        "version": probe.get("version"),
-        "metrics": probe.get("metrics"),
-        "hardware": hw,
-        "containers": containers,
-        "headroom": headroom,
-        "error": probe.get("error"),
-        "presets": list(MODEL_PRESETS.keys()),
-        "serve_examples": SERVE_EXAMPLES,
-        "tool_eval": agentic.tool_eval_available(),
-        "cluster": cluster_info,
-    }
+async def status() -> dict[str, Any]:
+    """Cached snapshot from the background sampler, plus `sampled_at` (ISO) and `stale_s`.
+
+    Never runs collectors on the request path; waits (≤2 s) only for the first sample.
+    """
+    return await status_sampler.SAMPLER.status()
 
 
 @router.get("/cluster")
@@ -218,6 +189,21 @@ async def get_job(job_id: str) -> dict[str, Any]:
     return j
 
 
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str) -> dict[str, Any]:
+    """Request cancellation. Job states: queued → running → completed | failed | cancelled.
+
+    Sets the job's cancel flag; the runner writes `cancelled` at its next check
+    (between bench waves, per SSE chunk), so `status` here is usually still
+    `running`. A job with no runner in this process (orphaned by a restart) is
+    marked `cancelled` immediately. Already-terminal jobs are returned unchanged.
+    """
+    job = jobs.request_cancel(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return {"job_id": job_id, "status": job.get("status")}
+
+
 @router.get("/jobs/{job_id}/logs")
 async def job_logs_sse(job_id: str) -> EventSourceResponse:
     j = db.get_job(job_id)
@@ -243,7 +229,7 @@ async def job_logs_sse(job_id: str) -> EventSourceResponse:
                     }
                 ),
             }
-            if job.get("status") in ("completed", "failed"):
+            if job.get("status") in jobs.TERMINAL_STATES:
                 if job.get("result"):
                     yield {"event": "result", "data": json.dumps(job["result"])}
                 break
@@ -440,6 +426,8 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 dollars_per_hour=body.dollars_per_hour,
                 log=log,
                 progress=progress,
+                probe=status_sampler.SAMPLER.probe(),
+                cancel=kw.get("cancel"),
             )
 
     elif body.runner == "prefill":
@@ -451,6 +439,7 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 intent=body.intent,
                 log=log,
                 progress=progress,
+                probe=status_sampler.SAMPLER.probe(),
             )
 
     else:
@@ -463,6 +452,7 @@ async def bench_perf(body: PerfRequest) -> dict[str, str]:
                 intent=body.intent,
                 log=log,
                 progress=progress,
+                probe=status_sampler.SAMPLER.probe(),
             )
 
     job_kind = (
@@ -496,6 +486,7 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
                 intent=body.intent,
                 log=log,
                 progress=progress,
+                probe=status_sampler.SAMPLER.probe(),
             )
 
     else:
@@ -510,6 +501,7 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
                 context_pressure=body.context_pressure,
                 log=log,
                 progress=progress,
+                probe=status_sampler.SAMPLER.probe(),
             )
 
     job_id = await jobs.start_job(f"agentic_{body.suite}", work)
@@ -530,6 +522,52 @@ async def list_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[st
     if kind:
         rows = [r for r in rows if r.get("kind") == kind][:limit]
     return rows
+
+
+class RunImport(BaseModel):
+    """A bench run measured elsewhere (the controller's streams engine)."""
+
+    kind: Literal["decode", "prefill", "streams"]
+    model: Optional[str] = None
+    workload: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    source: str = "import"
+
+
+@router.post("/runs/import")
+async def import_run(body: RunImport) -> dict[str, str]:
+    """Wrap an external run in a Run Envelope (hardware snapshot attached as for
+    native runs), persist it to RUNS_DIR and the `runs` index; returns `{run_id}`."""
+    probe = status_sampler.SAMPLER.probe()
+
+    def persist() -> str:
+        envelope = metadata.build_envelope(
+            intent="attach",
+            model_id=body.model,
+            kind=body.kind,
+            workload=body.workload,
+            metrics=body.metrics,
+            probe=probe,
+        )
+        envelope["source"] = body.source
+        run_id = envelope["run_id"]
+        path = RUNS_DIR / f"{run_id}.json"
+        path.write_text(json.dumps(envelope, indent=2))
+        db.insert_run(
+            run_id=run_id,
+            created_at=envelope["created_at"],
+            kind=body.kind,
+            intent="attach",
+            model_id=envelope["model"].get("id"),
+            summary=body.summary,
+            path=str(path),
+        )
+        return run_id
+
+    # build_envelope shells out (docker ps, nvidia-smi): keep it off the loop.
+    run_id = await asyncio.to_thread(persist)
+    return {"run_id": run_id}
 
 
 @router.get("/runs/tool-eval/board")

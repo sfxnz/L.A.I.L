@@ -4,7 +4,10 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from app.services import perf
+from app.services.jobs import JobCancelled
 
 
 def test_completion_body_forces_full_decode_length():
@@ -130,7 +133,7 @@ def test_run_wave_uses_n_parallel_streams():
     lock = threading.Lock()
     in_flight = {"n": 0, "peak": 0}
 
-    def fake_stream(base, model, user_content, max_tokens, label):
+    def fake_stream(base, model, user_content, max_tokens, label, cancel=None):
         with lock:
             in_flight["n"] += 1
             in_flight["peak"] = max(in_flight["peak"], in_flight["n"])
@@ -158,3 +161,71 @@ def test_run_wave_uses_n_parallel_streams():
     assert in_flight["peak"] == 4
     assert summary["decode_tok_per_s_median"] is not None
     assert summary["prefill_tok_per_s_median"] is not None
+
+
+class _FakeSSE:
+    """Streams chunks forever-ish; flips the cancel flag on the 4th line."""
+
+    def __init__(self, cancel: threading.Event, seen: dict):
+        self.cancel = cancel
+        self.seen = seen
+
+    def __iter__(self):
+        for i in range(1000):
+            self.seen["lines"] += 1
+            if i == 3:
+                self.cancel.set()
+            yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n'
+        yield b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1000}}\n'
+        yield b"data: [DONE]\n"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_stream_one_stops_at_the_next_chunk_once_cancelled(monkeypatch):
+    cancel = threading.Event()
+    seen = {"lines": 0}
+    monkeypatch.setattr(perf.urllib.request, "urlopen", lambda req, timeout=None: _FakeSSE(cancel, seen))
+    r = perf.stream_one("http://vllm.invalid:8000", "m", "hi", 256, "prose_essay", cancel=cancel)
+    assert r.ok is False and r.error == "cancelled"
+    assert r.ttft_s is not None
+    assert seen["lines"] == 4, "kept reading after the cancel flag was set"
+
+
+@pytest.mark.parametrize(
+    "concurrencies,message",
+    [([1, 4], "cancelled before prose · 4"), ([1], "cancelled during prose · 1")],
+)
+def test_workflow_bench_raises_job_cancelled_at_wave_boundaries(monkeypatch, concurrencies, message):
+    cancel = threading.Event()
+    waves: list[int] = []
+
+    def fake_wave(base, model, c, *, kind, cancel=None):
+        waves.append(c)
+        cancel.set()  # cancelled while the first wave is in flight
+        return perf.summarize([perf.ReqResult(True, 1.0, 0.2, 60, 100, "l", last_s=0.9)], c)
+
+    monkeypatch.setattr(perf, "run_wave", fake_wave)
+    with pytest.raises(JobCancelled, match=message):
+        perf.run_workflow_bench(
+            base_url="http://vllm.invalid:8000", model="m", concurrencies=concurrencies, workload="prose", cancel=cancel
+        )
+    assert waves == [1]
+
+
+def test_external_runners_fail_fast_with_a_clear_message(monkeypatch, tmp_path):
+    monkeypatch.setattr(perf, "BENCH_PREFILL", tmp_path / "missing_prefill.py")
+    monkeypatch.setattr(perf, "BENCH_CONCURRENCY", tmp_path / "missing_concurrency.py")
+
+    def no_network(*a, **k):
+        raise AssertionError("resolve_model must not be reached")
+
+    monkeypatch.setattr(perf, "resolve_model", no_network)
+    with pytest.raises(RuntimeError, match=r"not installed on this host; use the in-app Bench \(.*missing_prefill\.py\)"):
+        perf.run_external_prefill(base_url="http://vllm.invalid:8000")
+    with pytest.raises(RuntimeError, match="not installed on this host; use the in-app Bench"):
+        perf.run_external_concurrency(base_url="http://vllm.invalid:8000", concurrency=2)

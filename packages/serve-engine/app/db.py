@@ -17,6 +17,9 @@ def _conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     with _conn() as c:
+        # WAL is persistent in the db file: the SSE loop reads jobs twice a second
+        # while worker threads upsert progress; readers must not block writers.
+        c.execute("PRAGMA journal_mode=WAL")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS runs (

@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import statistics
 import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -13,14 +14,17 @@ from typing import Any, Callable
 
 from ..config import BENCH_CONCURRENCY, BENCH_PREFILL, BENCH_WORKFLOW, DEFAULT_BASE_URL, RUNS_DIR
 from .. import db
+from .jobs import JobCancelled
 from .metadata import (
     build_envelope,
     cost_per_1m_tokens,
     make_run_id,
-    probe_endpoint,
     utc_now,
 )
-import asyncio
+
+EXTERNAL_RUNNERS_MISSING = (
+    "external benchmark scripts are not installed on this host; use the in-app Bench"
+)
 
 
 def pct(sorted_vals: list[float], p: float) -> float | None:
@@ -113,6 +117,7 @@ def stream_one(
     max_tokens: int,
     label: str,
     thinking: bool = False,
+    cancel: threading.Event | None = None,
 ) -> ReqResult:
     body = completion_body(
         model=model,
@@ -135,6 +140,9 @@ def stream_one(
         with urllib.request.urlopen(req, timeout=1800) as resp:
             for raw in resp:
                 now = time.perf_counter() - t0
+                if cancel is not None and cancel.is_set():
+                    # Leaving the `with` closes the socket; vLLM aborts the request.
+                    return ReqResult(False, now, ttft, None, None, label, error="cancelled", last_s=last_s)
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -335,6 +343,7 @@ def run_wave(
     *,
     kind: str = "prose",
     stream_fn: Callable[..., ReqResult] | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     jobs = jobs_for_kind(kind)
     work = expand_wave_jobs(jobs, concurrency)
@@ -344,7 +353,7 @@ def run_wave(
     results: list[ReqResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = [
-            ex.submit(send, base, model, prompt, mt, label)
+            ex.submit(send, base, model, prompt, mt, label, cancel=cancel)
             for label, prompt, mt in work
         ]
         for f in concurrent.futures.as_completed(futs):
@@ -382,16 +391,29 @@ def run_workflow_bench(
     dollars_per_hour: float = 0.5,
     log: Any = None,
     progress: Callable | None = None,
+    probe: dict[str, Any] | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
+    """Sequential concurrency waves against `base_url`.
+
+    `probe` is the status sampler's cached endpoint probe (this thread must not
+    call `probe_endpoint`: the live tok/s deltas have one writer). `cancel` is
+    checked between waves here and per SSE chunk in `stream_one`.
+    """
     base = base_url.rstrip("/")
     model_id = resolve_model(base, model)
     kind = workload if workload in WORKLOAD_KINDS else "prose"
     concs = normalize_concurrencies(concurrencies)
+    if probe and probe.get("base_url") != base:
+        probe = None  # cached probe describes another endpoint
+
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
 
     def run_level(c: int) -> dict[str, Any]:
         if log:
             log.write(f"{kind} · {c}")
-        arm = run_wave(base, model_id, c, kind=kind)
+        arm = run_wave(base, model_id, c, kind=kind, cancel=cancel)
         if log:
             log.write(
                 f"{kind} · {c} · {arm.get('decode_tok_per_s_median')} decode tok/s · "
@@ -402,12 +424,16 @@ def run_workflow_bench(
     idx = {"n": 0}
 
     def run_level_tracked(c: int) -> dict[str, Any]:
+        if cancelled():
+            raise JobCancelled(f"cancelled before {kind} · {c}")
         if progress:
             progress(idx["n"] / max(len(concs), 1), f"{kind} · {c}")
         idx["n"] += 1
         return run_level(c)
 
     raw_arms = run_concurrency_levels(concs, run_level_tracked)
+    if cancelled():
+        raise JobCancelled(f"cancelled during {kind} · {concs[-1]}")
 
     arms = []
     for arm in raw_arms:
@@ -437,8 +463,6 @@ def run_workflow_bench(
         "full_arms": arms,
     }
 
-    # async probe via sync bridge
-    probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
         intent=intent,
@@ -482,11 +506,12 @@ def run_external_prefill(
     intent: str = "attach",
     log: Any = None,
     progress: Callable | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not BENCH_PREFILL.exists():
+        raise RuntimeError(f"{EXTERNAL_RUNNERS_MISSING} ({BENCH_PREFILL})")
     base = base_url.rstrip("/")
     model_id = resolve_model(base, model)
-    if not BENCH_PREFILL.exists():
-        raise FileNotFoundError(str(BENCH_PREFILL))
     run_id = make_run_id()
     out = RUNS_DIR / f"{run_id}_prefill_decode.json"
     cmd = ["python3", str(BENCH_PREFILL), base, model_id, str(out)]
@@ -499,7 +524,6 @@ def run_external_prefill(
     if r.returncode != 0:
         raise RuntimeError(r.stderr or "prefill bench failed")
     raw = json.loads(out.read_text()) if out.exists() else {"stdout": r.stdout}
-    probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
         intent=intent,
@@ -533,11 +557,12 @@ def run_external_concurrency(
     intent: str = "attach",
     log: Any = None,
     progress: Callable | None = None,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not BENCH_CONCURRENCY.exists():
+        raise RuntimeError(f"{EXTERNAL_RUNNERS_MISSING} ({BENCH_CONCURRENCY})")
     base = base_url.rstrip("/")
     model_id = resolve_model(base, model)
-    if not BENCH_CONCURRENCY.exists():
-        raise FileNotFoundError(str(BENCH_CONCURRENCY))
     run_id = make_run_id()
     out = RUNS_DIR / f"{run_id}_concurrency.json"
     cmd = [
@@ -563,7 +588,6 @@ def run_external_concurrency(
     if r.returncode != 0:
         raise RuntimeError(r.stderr or "concurrency bench failed")
     raw = json.loads(out.read_text()) if out.exists() else {}
-    probe = asyncio.run(probe_endpoint(base, timeout=10))
     envelope = build_envelope(
         run_id=run_id,
         intent=intent,

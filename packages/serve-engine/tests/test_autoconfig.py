@@ -1110,6 +1110,63 @@ def test_topology_one_spark_strips_multinode_and_dp():
     assert any("single-node" in w or "1 Spark" in w for w in warnings)
 
 
+def _undiscovered_two_spark_topo():
+    """Two online nodes whose probes carry no RoCE iface/IP; fabric check failed."""
+    t = _two_spark_topo()
+    for n in t["node_list"]:
+        n.pop("qsfp_if")
+        n.pop("qsfp_ip")
+    t["fabric_ok"] = False
+    return t
+
+
+def _apply_multinode(monkeypatch, topo):
+    from app.services import cluster
+
+    monkeypatch.setattr(ac, "_ib_hca_for_iface", lambda iface: None)
+    cfg = ac._empty_config(DSV4)
+    warnings, rationale = [], []
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=topo, weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
+    return cfg, warnings, rationale, cluster
+
+
+def test_topology_fabric_warning_names_the_discovered_lab_values(monkeypatch):
+    """Discovery provided iface/IP → text identical to the former hard-coded lab strings."""
+    topo = _two_spark_topo()
+    topo["fabric_ok"] = False
+    cfg, warnings, _, _ = _apply_multinode(monkeypatch, topo)
+    assert any(e == "NCCL_SOCKET_IFNAME=enp1s0f1np1" for e in cfg["docker_env"])
+    assert any(w.endswith("Verify enp1s0f1np1 carrier + 10.100.8.x reachability on all nodes before Start.") for w in warnings)
+
+
+def test_topology_multinode_uses_discovered_roce_iface_not_a_lab_default(monkeypatch):
+    from app.services import cluster
+
+    monkeypatch.setattr(cluster, "_detect_local_net", lambda: {"qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"})
+    cfg, warnings, rationale, _ = _apply_multinode(monkeypatch, _undiscovered_two_spark_topo())
+    env = cfg["docker_env"]
+    assert cfg["tensor_parallel_size"] == 2
+    assert "NCCL_SOCKET_IFNAME=roce0" in env and "GLOO_SOCKET_IFNAME=roce0" in env
+    assert any("roce0 carrier + 192.0.2.x reachability" in w for w in warnings)
+    assert any("manual entry (192.0.2.x on this lab)" in w for w in warnings)
+    blob = " ".join(warnings + rationale + env + [cfg["extra_flags"]])
+    assert "enp1s0f1np1" not in blob and "10.100.8" not in blob
+
+
+def test_topology_multinode_without_roce_discovery_warns_instead_of_guessing(monkeypatch):
+    from app.services import cluster
+
+    monkeypatch.setattr(cluster, "_detect_local_net", lambda: {})
+    cfg, warnings, rationale, _ = _apply_multinode(monkeypatch, _undiscovered_two_spark_topo())
+    env = cfg["docker_env"]
+    assert not any(e.startswith(("NCCL_SOCKET_IFNAME=", "TP_SOCKET_IFNAME=", "GLOO_SOCKET_IFNAME=")) for e in env)
+    assert "NCCL_NET=IB" in env
+    assert any("RoCE interface not discovered" in w for w in warnings)
+    assert any("RoCE IPs on the QSFP interface" in w for w in warnings)
+    blob = " ".join(warnings + rationale + env + [cfg["extra_flags"]])
+    assert "enp1s0f1np1" not in blob and "10.100.8" not in blob and "None" not in " ".join(env)
+
+
 def test_recommend_dsv4_two_sparks_end_to_end(monkeypatch):
     """Full recommend: overlay + topology produce Mia's 2-node DSv4 recipe."""
     monkeypatch.setattr(ac, "_cluster_topology", _two_spark_topo)

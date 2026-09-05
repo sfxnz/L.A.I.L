@@ -28,6 +28,8 @@ import { approvalHub } from "./agent/approvals";
 import { getUsageSummary } from "./controller/usage";
 import { searchHuggingFace, hfSearchQuery, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
+import { streamsEngine } from "./streams/engine";
+import { createStreamsRoutes } from "./streams/routes";
 import { config } from "./config";
 import { allowQueryToken, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
@@ -275,38 +277,42 @@ export function createApp() {
     return c.json(job);
   });
 
-  // Merged lab status: controller + serve-engine + backends
+  // Merged lab status: controller + serve-engine + backends (all probed in parallel)
   app.get("/api/lab-status", async (c) => {
     const settings = getSettings();
     const backends: Record<string, { ok: boolean; url: string; error?: string }> = {};
-    for (const [k, v] of Object.entries(settings.backends)) {
-      if (!v.enabled) continue;
-      try {
-        const base = v.url.replace(/\/$/, "").replace(/\/v1$/, "");
-        const r = await fetch(`${base}/v1/models`, {
-          signal: AbortSignal.timeout(2000),
-        });
-        backends[k] = { ok: r.ok, url: v.url };
-      } catch (e) {
-        backends[k] = {
-          ok: false,
-          url: v.url,
-          error: e instanceof Error ? e.message : String(e),
-        };
-      }
-    }
+    const probeBackends = Object.entries(settings.backends)
+      .filter(([, v]) => v.enabled)
+      .map(async ([k, v]) => {
+        try {
+          const base = v.url.replace(/\/$/, "").replace(/\/v1$/, "");
+          const r = await fetch(`${base}/v1/models`, {
+            signal: AbortSignal.timeout(2000),
+          });
+          backends[k] = { ok: r.ok, url: v.url };
+        } catch (e) {
+          backends[k] = {
+            ok: false,
+            url: v.url,
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
+      });
 
     let serve: unknown = null;
-    try {
-      const r = await fetch(`${config.serveEngineUrl}/api/status`, {
-        signal: AbortSignal.timeout(3000),
-        headers: config.token ? { "x-lail-token": config.token } : undefined,
-      });
-      if (r.ok) serve = await r.json();
-      else serve = { error: `serve-engine ${r.status}` };
-    } catch (e) {
-      serve = { error: e instanceof Error ? e.message : String(e), unreachable: true };
-    }
+    const probeServe = (async () => {
+      try {
+        const r = await fetch(`${config.serveEngineUrl}/api/status`, {
+          signal: AbortSignal.timeout(3000),
+          headers: config.token ? { "x-lail-token": config.token } : undefined,
+        });
+        if (r.ok) serve = await r.json();
+        else serve = { error: `serve-engine ${r.status}` };
+      } catch (e) {
+        serve = { error: e instanceof Error ? e.message : String(e), unreachable: true };
+      }
+    })();
+    await Promise.all([...probeBackends, probeServe]);
 
     return c.json({
       controller: "ok",
@@ -483,6 +489,9 @@ export function createApp() {
     const rel = c.req.path.replace(`/p/${slug}/`, "");
     return c.redirect(`/api/lab/p/${slug}/${rel}`, 302);
   });
+
+  // Streams engine: controller-side fan-out, one SSE per subscriber
+  app.route("/api/streams", createStreamsRoutes(streamsEngine));
 
   // Legacy + serve proxy under /api
   app.route("/api", serveProxy);

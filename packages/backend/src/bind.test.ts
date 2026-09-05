@@ -53,9 +53,12 @@ describe("tokenMatches", () => {
 });
 
 describe("allowQueryToken / public paths / CORS", () => {
-  test("query token only on ws and job logs", () => {
+  test("query token only on ws, job logs and stream-run events", () => {
     expect(allowQueryToken("/ws")).toBe(true);
     expect(allowQueryToken("/api/jobs/abc/logs")).toBe(true);
+    expect(allowQueryToken("/api/streams/runs/abc/events")).toBe(true);
+    expect(allowQueryToken("/api/streams/runs/abc/stop")).toBe(false);
+    expect(allowQueryToken("/api/streams/runs")).toBe(false);
     expect(allowQueryToken("/api/serve/start")).toBe(false);
     expect(allowQueryToken("/api/bootstrap")).toBe(false);
   });

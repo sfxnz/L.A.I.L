@@ -1,4 +1,10 @@
 import { getClientToken, tokenQuery } from "./auth-token";
+import type {
+  StreamPack,
+  StreamRunRequest,
+  StreamRunRow,
+  StreamRunSnapshot,
+} from "./stream-run-types";
 
 const BASE = "";
 
@@ -362,6 +368,8 @@ export const api = {
       `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}`,
     ),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
+  cancelJob: (id: string) =>
+    req<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   jobs: () =>
     req<
       Array<{
@@ -466,7 +474,21 @@ export const api = {
         body: JSON.stringify({ public: makePublic }),
       }),
   },
+  /* Streams engine (controller) — PLAN.md A2. Events stream from
+     GET /api/streams/runs/:id/events (see lib/use-stream-run.ts). */
+  streamPacks: () => req<StreamPack[]>("/api/streams/packs"),
+  startStreamRun: (body: StreamRunRequest) =>
+    req<{ run_id: string }>("/api/streams/runs", { method: "POST", body: JSON.stringify(body) }),
+  stopStreamRun: (runId: string) =>
+    req<{ ok: boolean }>(`/api/streams/runs/${encodeURIComponent(runId)}/stop`, { method: "POST" }),
+  streamRunSnapshot: (runId: string) =>
+    req<StreamRunSnapshot>(`/api/streams/runs/${encodeURIComponent(runId)}`),
+  listStreamRuns: () => req<StreamRunRow[]>("/api/streams/runs"),
 };
+
+export function streamRunEventsUrl(runId: string): string {
+  return tokenQuery(`/api/streams/runs/${encodeURIComponent(runId)}/events`);
+}
 
 export function watchJob(
   jobId: string,

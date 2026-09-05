@@ -2,7 +2,17 @@
 
 import type { ReactNode } from "react";
 import type { ClusterNode, ClusterStatus } from "@/lib/api";
-import { Badge, EmptyState, Panel, Skeleton, StatusDot } from "@/components/ui";
+import {
+  Badge,
+  EmptyState,
+  Eyebrow,
+  Nil,
+  Panel,
+  Skeleton,
+  SyncRing,
+  Tick,
+  syncStateFromNode,
+} from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 /*
@@ -13,25 +23,11 @@ import { cn } from "@/lib/utils";
   slate hairlines as STRUCTURE, crimson reserved for the page's single accent
   (so TP hints ride lab-line, not lab-accent). All state colour goes through
   color-mix on a lab-* token so the light reconstruction plate resolves too.
-*/
 
-/**
- * The one null treatment on this surface, shared with app/status/page.tsx: an
- * absent value is a condensed STATE WORD, never a bare em-dash — an em-dash
- * reads as broken data. "Awaiting" = hasn't reported yet, "None" = settled and
- * genuinely empty. .animus-eyebrow supplies the muted colour and the caps.
- */
-function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
-  return (
-    <span className="inline-flex items-center gap-1.5 align-middle">
-      <span
-        aria-hidden
-        className="h-[5px] w-[5px] shrink-0 rotate-45 border border-[color:var(--animus-hairline)]"
-      />
-      <span className="animus-eyebrow">{word}</span>
-    </span>
-  );
-}
+  Null treatment is the shared <Nil/> from components/ui: an absent value is a
+  condensed STATE WORD, never a bare em-dash. "Awaiting" = hasn't reported yet,
+  "None" = settled and genuinely empty.
+*/
 
 /** Eyebrow + value stack. The unit every HUD readout on this panel is built from. */
 function Readout({
@@ -207,10 +203,7 @@ function NodeCard({ node }: { node: ClusterNode }) {
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
-            <StatusDot
-              live={serving ? true : node.state === "offline" ? false : null}
-              label={label}
-            />
+            <SyncRing state={syncStateFromNode(node.state)} label={label} />
             <span className="truncate font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
               {node.label || node.id}
             </span>
@@ -444,10 +437,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
         <div className="flex min-w-0 items-center gap-2.5">
           <span className="animus-eyebrow shrink-0">Load map</span>
-          <span
-            aria-hidden
-            className="h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]"
-          />
+          <Tick />
           <Badge tone={multiTone(mode)} dot>
             {multiLabel(mode)}
           </Badge>
@@ -497,9 +487,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
                   )}
                   title={`${n.id}: ${n.state === "serving_worker" ? "TP worker (headless)" : n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
                 />
-                <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-muted">
-                  {n.id}
-                </span>
+                <Eyebrow className="tracking-[0.14em]">{n.id}</Eyebrow>
               </div>
             );
           })}
@@ -573,16 +561,14 @@ export function ClusterPanel({
       title="Cluster"
       action={
         <span className="flex shrink-0 items-center gap-2">
-          <StatusDot live={healthy} label={healthy ? "Cluster healthy" : "Cluster issue"} />
-          <span
-            className={cn(
-              "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums",
-              healthy ? "text-lab-ok" : "text-lab-danger",
-            )}
-          >
+          <SyncRing
+            state={healthy ? "serving" : "offline"}
+            label={healthy ? "Cluster healthy" : "Cluster issue"}
+          />
+          <Eyebrow className={cn("lab-num", healthy ? "text-lab-ok" : "text-lab-danger")}>
             {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
             {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
-          </span>
+          </Eyebrow>
         </span>
       }
     >

@@ -17,10 +17,42 @@ import { api, type UsageSummary } from "@/lib/api";
 import { formatTokens } from "@/lib/utils";
 import { Metric, Panel } from "@/components/ui";
 
-const COLORS = ["#2dd4bf", "#a78bfa"];
+/*
+  recharts takes literal colour strings, so the chart palette is read from the
+  --color-lab-* tokens at runtime and re-read when <html data-theme> flips —
+  that is what makes the charts resolve in the White Room as well as the Helix.
+*/
+const PALETTE_VARS = {
+  series1: "--color-lab-chart-1",
+  series2: "--color-lab-chart-2",
+  grid: "--color-lab-border",
+  tick: "--color-lab-muted",
+  panel: "--color-lab-panel",
+} as const;
+
+type Palette = Record<keyof typeof PALETTE_VARS, string>;
+
+function readPalette(): Palette {
+  const cs = getComputedStyle(document.documentElement);
+  return Object.fromEntries(
+    Object.entries(PALETTE_VARS).map(([k, v]) => [k, cs.getPropertyValue(v).trim()]),
+  ) as Palette;
+}
+
+function useChartPalette(): Palette | null {
+  const [palette, setPalette] = useState<Palette | null>(null);
+  useEffect(() => {
+    setPalette(readPalette());
+    const obs = new MutationObserver(() => setPalette(readPalette()));
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => obs.disconnect();
+  }, []);
+  return palette;
+}
 
 export default function UsagePage() {
   const [u, setU] = useState<UsageSummary | null>(null);
+  const palette = useChartPalette();
 
   useEffect(() => {
     api.usage().then(setU).catch(console.error);
@@ -28,7 +60,14 @@ export default function UsagePage() {
     return () => clearInterval(t);
   }, []);
 
-  if (!u) return <div className="text-sm text-lab-muted">Loading usage…</div>;
+  if (!u || !palette) return <div className="text-sm text-lab-muted">Loading usage…</div>;
+
+  const COLORS = [palette.series1, palette.series2];
+  const tooltipStyle = {
+    background: palette.panel,
+    border: `1px solid ${palette.grid}`,
+    borderRadius: 2,
+  };
 
   const mixData = [
     { name: "Prompt", value: u.mix.prompt || 0 },
@@ -68,18 +107,12 @@ export default function UsagePage() {
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={u.daily}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 10 }} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 10 }} />
-                <Tooltip
-                  contentStyle={{
-                    background: "#18181b",
-                    border: "1px solid #27272a",
-                    borderRadius: 8,
-                  }}
-                />
-                <Bar dataKey="prompt" stackId="a" fill="#2dd4bf" />
-                <Bar dataKey="completion" stackId="a" fill="#a78bfa" />
+                <CartesianGrid strokeDasharray="3 3" stroke={palette.grid} />
+                <XAxis dataKey="date" tick={{ fill: palette.tick, fontSize: 10 }} />
+                <YAxis tick={{ fill: palette.tick, fontSize: 10 }} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="prompt" stackId="a" fill={palette.series1} />
+                <Bar dataKey="completion" stackId="a" fill={palette.series2} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -95,13 +128,7 @@ export default function UsagePage() {
                     <Cell key={i} fill={COLORS[i % COLORS.length]} />
                   ))}
                 </Pie>
-                <Tooltip
-                  contentStyle={{
-                    background: "#18181b",
-                    border: "1px solid #27272a",
-                    borderRadius: 8,
-                  }}
-                />
+                <Tooltip contentStyle={tooltipStyle} />
               </PieChart>
             </ResponsiveContainer>
           </div>
@@ -120,10 +147,8 @@ export default function UsagePage() {
               <div
                 key={h.date}
                 title={`${h.date}: ${h.tokens} tokens`}
-                className="h-4 w-4 rounded-sm"
-                style={{
-                  background: `rgba(45, 212, 191, ${0.15 + intensity * 0.85})`,
-                }}
+                className="h-4 w-4 rounded-[2px] bg-lab-chart-1"
+                style={{ opacity: 0.15 + intensity * 0.85 }}
               />
             );
           })}
@@ -136,7 +161,7 @@ export default function UsagePage() {
           {u.topModels.map((m) => (
             <div
               key={m.model}
-              className="flex items-center justify-between rounded-lg border border-lab-border/60 bg-lab-editor px-3 py-2 text-sm"
+              className="flex items-center justify-between rounded-[2px] border border-lab-border/60 bg-lab-editor px-3 py-2 text-sm"
             >
               <span className="truncate font-mono text-xs">{m.model}</span>
               <span className="text-lab-muted">

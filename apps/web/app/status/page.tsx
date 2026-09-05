@@ -2,23 +2,27 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { api, type LabStatus, type RunRow } from "@/lib/api";
-import { isUnauthorizedError } from "@/lib/auth-token";
+import { api, type RunRow } from "@/lib/api";
+import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import { DecodeBench } from "@/components/DecodeBench";
 import {
   Badge,
   Btn,
   Callout,
+  Corridor,
   EmptyState,
+  Eyebrow,
   Metric,
+  Nil,
   Panel,
   Skeleton,
-  StatusDot,
+  SyncRing,
+  Tick,
   btnClass,
+  eyebrowClass,
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
-import { usePageTitle } from "@/lib/usePageTitle";
 
 /*
   Status — the console's front page, read as ONE instrument cluster.
@@ -33,37 +37,15 @@ import { usePageTitle } from "@/lib/usePageTitle";
   every case on this surface:
     AWAITING · a live readout that hasn't reported yet
     NONE     · a settled state that genuinely has no value
-  Where the markup is ours, <Nil/> renders it muted at eyebrow scale behind a
-  hollow diamond glyph. Where a primitive owns the slot — Metric.value is typed
-  `string`, so no JSX — the same word goes in as the value; all-caps in a field
-  of mixed-case readings ("Healthy", "42 GiB") is what marks it as a state token
-  rather than data.
+  Where the markup is ours, <Nil/> (components/ui) renders it muted at eyebrow
+  scale behind a hollow diamond glyph. Where a primitive owns the slot —
+  Metric.value is typed `string`, so no JSX — the same word goes in as the
+  value; all-caps in a field of mixed-case readings ("Healthy", "42 GiB") is
+  what marks it as a state token rather than data.
 */
 
 const NIL_AWAITING = "AWAITING";
 const NIL_NONE = "NONE";
-
-function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
-  return (
-    <span className="inline-flex items-center gap-1.5 align-middle">
-      <span
-        aria-hidden
-        className="h-[5px] w-[5px] shrink-0 rotate-45 border border-[color:var(--animus-hairline)]"
-      />
-      <span className="animus-eyebrow">{word}</span>
-    </span>
-  );
-}
-
-/** Hairline divider between readout cells — the AppShell header idiom. */
-function Tick({ className }: { className?: string }) {
-  return (
-    <span
-      aria-hidden
-      className={cn("h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]", className)}
-    />
-  );
-}
 
 /** Band opener: index + label, then a hairline running to the right margin. */
 function Band({
@@ -80,11 +62,7 @@ function Band({
       <span className="animus-eyebrow shrink-0 tabular-nums text-lab-line!">{index}</span>
       <span className="animus-eyebrow shrink-0 text-lab-text-dim!">{label}</span>
       <div aria-hidden className="animus-rule min-w-6 flex-1" />
-      {meta ? (
-        <span className="shrink-0 font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums text-lab-muted">
-          {meta}
-        </span>
-      ) : null}
+      {meta ? <Eyebrow className="lab-num shrink-0">{meta}</Eyebrow> : null}
     </div>
   );
 }
@@ -96,48 +74,40 @@ function backendLabel(k: string) {
 }
 
 export default function StatusPage() {
-  usePageTitle("Status");
-  const [status, setStatus] = useState<LabStatus | null>(null);
+  const { status, loading, needToken, unreachable, error, refresh: refreshStatus } = useLabStatus();
   const [runs, setRuns] = useState<RunRow[]>([]);
-  const [err, setErr] = useState<string | null>(null);
-  const [needToken, setNeedToken] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const err = unreachable ? error : null;
 
-  const refresh = useCallback(async (opts?: { soft?: boolean }) => {
-    if (!opts?.soft) setRefreshing(true);
-    try {
-      const [s, r] = await Promise.all([
-        api.labStatus(),
-        api.runs().catch(() => [] as RunRow[]),
-      ]);
-      setStatus(s);
-      setRuns(r);
-      setErr(null);
-      setNeedToken(false);
-    } catch (e) {
-      if (isUnauthorizedError(e)) {
-        setNeedToken(true);
-        setErr(null);
-      } else {
-        setNeedToken(false);
-        setErr(String((e as Error).message || e));
-      }
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
-
+  // Lab status comes from the shell's shared poll; runs load on mount and
+  // re-load when a bench settles or the operator asks.
+  const loadRuns = useCallback(
+    () =>
+      api
+        .runs()
+        .then(setRuns)
+        .catch(() => {}),
+    [],
+  );
   useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh({ soft: true }), 6000);
-    return () => clearInterval(t);
-  }, [refresh]);
+    void loadRuns();
+  }, [loadRuns]);
+
+  const refresh = useCallback(
+    async (opts?: { soft?: boolean }) => {
+      if (!opts?.soft) setRefreshing(true);
+      try {
+        await Promise.all([refreshStatus(), loadRuns()]);
+      } finally {
+        setRefreshing(false);
+      }
+    },
+    [refreshStatus, loadRuns],
+  );
 
   const serve = status?.serve;
   const cluster = status?.cluster || serve?.cluster || null;
-  const healthy = !!(serve && !serve.unreachable && serve.healthy);
+  const healthy = serveHealthy(status);
   const modelShort = serve?.model_id?.split("/").pop() || NIL_NONE;
   const freeGib = serve?.hardware?.available_gib;
   const clusterHealthy = !!cluster?.summary?.healthy;
@@ -156,8 +126,18 @@ export default function StatusPage() {
             aria-live="polite"
           >
             <div className="flex items-center gap-2">
-              <StatusDot
-                live={loading || needToken ? null : healthy}
+              <SyncRing
+                state={
+                  needToken
+                    ? "token"
+                    : err
+                      ? "offline"
+                      : loading
+                        ? null
+                        : healthy
+                          ? "serving"
+                          : "idle"
+                }
                 label={
                   loading
                     ? "Checking endpoint"
@@ -170,9 +150,9 @@ export default function StatusPage() {
                           : "No model serving"
                 }
               />
-              <span
+              <Eyebrow
                 className={cn(
-                  "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em]",
+                  "tracking-[0.18em]",
                   loading || needToken
                     ? "text-lab-muted"
                     : healthy
@@ -189,21 +169,21 @@ export default function StatusPage() {
                     : healthy
                       ? "Endpoint live"
                       : err
-                        ? "Controller down"
+                        ? "Controller unreachable"
                         : "No model serving"}
-              </span>
+              </Eyebrow>
             </div>
             {!loading && cluster && (
               <>
                 <Tick />
                 <div className="flex items-center gap-2">
-                  <StatusDot
-                    live={clusterHealthy}
+                  <SyncRing
+                    state={clusterHealthy ? "serving" : "offline"}
                     label={clusterHealthy ? "Cluster fabric ok" : "Cluster issue"}
                   />
-                  <span
+                  <Eyebrow
                     className={cn(
-                      "font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em]",
+                      "tracking-[0.18em]",
                       clusterHealthy ? "text-lab-text-dim" : "text-lab-danger",
                     )}
                   >
@@ -211,7 +191,7 @@ export default function StatusPage() {
                     {multiMode && multiMode !== "none"
                       ? ` · ${multiMode.replace(/_/g, " ")}`
                       : ""}
-                  </span>
+                  </Eyebrow>
                 </div>
               </>
             )}
@@ -238,7 +218,7 @@ export default function StatusPage() {
       </div>
 
       {needToken && (
-        <Callout tone="warn" title="LAIL_TOKEN required">
+        <Callout tone="warn" title="LAIL_TOKEN required — paste it to synchronize">
           The controller is up. Paste the token in the banner — it stays in sessionStorage and is
           sent as <code className="text-lab-text">X-Lail-Token</code>.
         </Callout>
@@ -247,13 +227,12 @@ export default function StatusPage() {
       {err && (
         <Callout
           tone="danger"
-          title="Couldn’t reach the lab controller"
+          title="Controller unreachable on :8787"
           action={
             <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing}>
               Retry
             </Btn>
           }
-          onDismiss={() => setErr(null)}
         >
           {err}. Check that <code className="text-lab-text">bun run dev</code> is up on this host
           (ports 3000 / 8787 / 8765).
@@ -261,18 +240,18 @@ export default function StatusPage() {
       )}
 
       {!loading && !healthy && !err && !needToken && (
-        <Callout
-          tone="warn"
-          title="No model endpoint right now"
-          action={
-            <Link href="/server" className={btnClass("secondary", "sm")}>
-              Open Serve
-            </Link>
-          }
-        >
-          Status is up, but vLLM isn’t healthy. Load a model from Serve when you’re ready — cluster
-          fabric can still be fine with nothing loaded.
-        </Callout>
+        <Panel>
+          <Corridor
+            action={
+              <Link href="/server" className={btnClass("primary", "sm")}>
+                Serve a model
+              </Link>
+            }
+          >
+            No memory loaded. Serve a model to begin synchronization — cluster fabric can still be
+            fine with nothing loaded.
+          </Corridor>
+        </Panel>
       )}
 
       <section className="space-y-2.5">
@@ -297,16 +276,12 @@ export default function StatusPage() {
           meta={healthy ? "armed" : loading ? "probing" : "locked"}
         />
         <div className="lab-rise lab-rise-1">
-          <DecodeBench
-            healthy={healthy}
-            runs={runs}
-            onSettled={() => void refresh({ soft: true })}
-          />
+          <DecodeBench healthy={healthy} runs={runs} onSettled={() => void loadRuns()} />
         </div>
       </section>
 
       <section className="space-y-2.5">
-        <Band index="03" label="Endpoint" meta={loading ? "probing" : "6s poll"} />
+        <Band index="03" label="Endpoint" meta={loading ? "probing" : "2s poll"} />
         <div className="bento lab-rise lab-rise-1">
           <div className="bento-span-3">
             <Metric
@@ -381,9 +356,9 @@ export default function StatusPage() {
               className="flex h-full min-h-[212px] flex-col"
               title="Backends"
               action={
-                <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums text-lab-muted">
+                <Eyebrow className="lab-num">
                   {backendCount != null ? `${backendCount} registered` : <Nil />}
-                </span>
+                </Eyebrow>
               }
             >
               <div className="flex h-full flex-1 flex-col">
@@ -412,8 +387,8 @@ export default function StatusPage() {
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <StatusDot
-                            live={v.ok ? true : null}
+                          <SyncRing
+                            state={v.ok ? "serving" : "idle"}
                             label={`${backendLabel(k)} ${v.ok ? "up" : "idle"}`}
                           />
                           <span className="font-[family-name:var(--font-display)] text-[13px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
@@ -495,7 +470,7 @@ export default function StatusPage() {
                         className="animus-notch border-b border-lab-border-subtle px-4 py-3 transition-[background,box-shadow] last:border-b-0 hover:bg-[color:var(--animus-accent-wash)] hover:shadow-[inset_2px_0_0_var(--color-lab-accent)]"
                       >
                         <div className="flex items-center gap-2">
-                          <StatusDot live={up ? true : null} label={`${c.name} ${c.status}`} />
+                          <SyncRing state={up ? "serving" : "idle"} label={`${c.name} ${c.status}`} />
                           <span className="truncate font-[family-name:var(--font-display)] text-[13px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
                             {c.name}
                           </span>
@@ -525,7 +500,7 @@ export default function StatusPage() {
               action={
                 <Link
                   href="/evals"
-                  className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-accent-bright transition-colors hover:text-lab-accent"
+                  className={eyebrowClass("text-lab-accent-bright transition-colors hover:text-lab-accent")}
                 >
                   Open Evals →
                 </Link>

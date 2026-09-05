@@ -1,19 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  api,
-  watchJob,
-  type LabStatus,
-  type ServeExample,
-  type ServeRecommend,
-} from "@/lib/api";
+import { api, type LabStatus, type ServeExample, type ServeRecommend } from "@/lib/api";
 import {
   Badge,
   Btn,
   Callout,
   CheckboxRow,
   EmptyState,
+  Eyebrow,
   Field,
   Input,
   LogView,
@@ -21,13 +16,14 @@ import {
   ProgressBar,
   SegmentedControl,
   Skeleton,
-  StatusDot,
+  SyncRing,
+  Tick,
   inputCls,
   btnClass,
 } from "@/components/ui";
-import { isUnauthorizedError } from "@/lib/auth-token";
+import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useJobWatch } from "@/lib/use-job-watch";
 import { cn } from "@/lib/utils";
-import { usePageTitle } from "@/lib/usePageTitle";
 
 type Tab = "serve" | "perf" | "agentic" | "history";
 
@@ -44,26 +40,12 @@ const TAB_HINTS: Record<Tab, string> = {
    out deliberate. Nothing below owns behaviour.
    ------------------------------------------------------------------------- */
 
-/** Hairline divider between readout cells — same idiom as the app header. */
-function Tick({ className }: { className?: string }) {
-  return (
-    <span
-      aria-hidden
-      className={cn("h-3 w-px shrink-0 bg-[color:var(--animus-hairline)]", className)}
-    />
-  );
-}
-
 /**
  * Unset value. A bare em-dash reads as "broken"; a condensed muted word reads
  * as "nothing here yet, and that is the correct state".
  */
 function Unset({ children = "Awaiting" }: { children?: ReactNode }) {
-  return (
-    <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
-      {children}
-    </span>
-  );
+  return <Eyebrow>{children}</Eyebrow>;
 }
 
 /**
@@ -174,9 +156,8 @@ function Telem({
 }
 
 export default function ServerPage() {
-  usePageTitle("Serve");
   const [tab, setTab] = useState<Tab>("serve");
-  const [status, setStatus] = useState<LabStatus | null>(null);
+  const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
   const [model, setModel] = useState("");
   const [util, setUtil] = useState("");
   const [maxLen, setMaxLen] = useState("");
@@ -203,39 +184,24 @@ export default function ServerPage() {
   const [rec, setRec] = useState<ServeRecommend | null>(null);
   const [recBusy, setRecBusy] = useState(false);
   const [recError, setRecError] = useState<string | null>(null);
-  const [logs, setLogs] = useState("");
-  const [jobMsg, setJobMsg] = useState("");
-  const [jobProgress, setJobProgress] = useState(0);
-  const [jobStatus, setJobStatus] = useState("");
   const [startError, setStartError] = useState<string | null>(null);
-  const [statusLoading, setStatusLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [startBusy, setStartBusy] = useState(false);
   const [advOpen, setAdvOpen] = useState(false);
   const [formFlash, setFormFlash] = useState<string | null>(null);
   const [appliedExample, setAppliedExample] = useState<string | null>(null);
-  const unwatchRef = useRef<null | (() => void)>(null);
   const jobPanelRef = useRef<HTMLDivElement>(null);
 
+  // Lab status comes from the shell's shared 2s poll; Refresh forces one tick.
   const refresh = (opts?: { soft?: boolean }) => {
     if (!opts?.soft) setRefreshing(true);
-    return api
-      .labStatus()
-      .then(setStatus)
-      .catch((e) => {
-        if (!isUnauthorizedError(e)) setStartError(String((e as Error).message || e));
-      })
-      .finally(() => {
-        setStatusLoading(false);
-        setRefreshing(false);
-      });
+    return refreshStatus().finally(() => setRefreshing(false));
   };
 
-  useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh({ soft: true }), 8000);
-    return () => clearInterval(t);
-  }, []);
+  const jobWatch = useJobWatch({ onSettled: () => void refresh({ soft: true }) });
+  const { logs, message: jobMsg, progress: jobProgress } = jobWatch.job;
+  const jobStatus = jobWatch.job.status ?? "";
+  const jobRunning = jobWatch.running;
 
   const examples = (status?.serve?.serve_examples || {}) as Record<string, ServeExample>;
   const modelHints = status?.serve?.presets || [];
@@ -257,7 +223,6 @@ export default function ServerPage() {
       job: next(),
     };
   })();
-  const jobRunning = jobStatus === "running" || jobStatus === "queued";
 
   const advancedHasValues = useMemo(() => {
     return !!(
@@ -302,27 +267,11 @@ export default function ServerPage() {
   }, [advancedHasValues]);
 
   function track(jobId: string) {
-    unwatchRef.current?.();
-    setLogs("");
-    setJobMsg("starting…");
-    setJobProgress(0);
-    setJobStatus("running");
+    jobWatch.track(jobId);
     // Feedback is below the fold on Serve — pull the dock into view on start
     requestAnimationFrame(() => {
       jobPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     });
-    unwatchRef.current = watchJob(
-      jobId,
-      (chunk) => setLogs((l) => (l + chunk).slice(-80_000)),
-      (s) => {
-        setJobStatus(s.status);
-        setJobProgress(s.progress);
-        setJobMsg(s.message);
-      },
-      () => {
-        void refresh({ soft: true });
-      },
-    );
   }
 
   // Re-attach Job panel only to a *live* job (not orphaned sqlite rows)
@@ -353,8 +302,6 @@ export default function ServerPage() {
       .catch(() => {});
     return () => {
       cancelled = true;
-      unwatchRef.current?.();
-      unwatchRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only attach
   }, []);
@@ -405,14 +352,7 @@ export default function ServerPage() {
     window.setTimeout(() => setFormFlash(null), 3200);
   }
 
-  function clearJobPanel() {
-    unwatchRef.current?.();
-    unwatchRef.current = null;
-    setLogs("");
-    setJobMsg("");
-    setJobProgress(0);
-    setJobStatus("");
-  }
+  const clearJobPanel = jobWatch.clear;
 
   function applyRecipeConfig(cfg: Record<string, unknown> | undefined) {
     if (!cfg) return;
@@ -535,7 +475,7 @@ export default function ServerPage() {
   }
 
   const serve = status?.serve;
-  const healthy = Boolean(serve && !serve.unreachable && serve.healthy);
+  const healthy = serveHealthy(status);
   const avail = serve?.hardware?.available_gib;
   const headroom = serve?.headroom;
   const confTone =
@@ -606,9 +546,7 @@ export default function ServerPage() {
             ]}
           />
           <Tick className="hidden sm:block" />
-          <span className="hidden font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted sm:inline">
-            {TAB_HINTS[tab]}
-          </span>
+          <Eyebrow className="hidden tracking-[0.18em] sm:inline">{TAB_HINTS[tab]}</Eyebrow>
         </div>
         <div className="animus-rule" aria-hidden />
       </div>
@@ -888,8 +826,16 @@ export default function ServerPage() {
                   n="——"
                   label="Live endpoint"
                   action={
-                    <StatusDot
-                      live={statusLoading ? null : healthy}
+                    <SyncRing
+                      state={
+                        statusLoading
+                          ? null
+                          : healthy
+                            ? "serving"
+                            : serve?.unreachable
+                              ? "offline"
+                              : "idle"
+                      }
                       label={
                         statusLoading
                           ? "Checking endpoint"
@@ -1368,6 +1314,16 @@ export default function ServerPage() {
               hint="serve · stop · bench · agentic telemetry"
               action={
                 <>
+                  {jobRunning && (
+                    <Btn
+                      variant="danger"
+                      size="sm"
+                      onClick={() => void jobWatch.cancel().catch((e) => setStartError(String(e)))}
+                      title="Cancel the running job"
+                    >
+                      Cancel
+                    </Btn>
+                  )}
                   {(jobRunning || jobStatus || logs) && (
                     <Btn
                       variant="ghost"
@@ -1381,9 +1337,9 @@ export default function ServerPage() {
                   <span aria-live="polite" aria-atomic="true" className="inline-flex">
                     <Badge
                       tone={
-                        jobStatus === "done" || jobStatus === "completed"
+                        jobWatch.done
                           ? "ok"
-                          : jobStatus === "error" || jobStatus === "failed"
+                          : jobWatch.failed
                             ? "danger"
                             : jobRunning
                               ? "accent"
@@ -1404,9 +1360,9 @@ export default function ServerPage() {
                   <Telem
                     label="State"
                     tone={
-                      jobStatus === "done" || jobStatus === "completed"
+                      jobWatch.done
                         ? "ok"
-                        : jobStatus === "error" || jobStatus === "failed"
+                        : jobWatch.failed
                           ? "danger"
                           : jobRunning
                             ? "accent"

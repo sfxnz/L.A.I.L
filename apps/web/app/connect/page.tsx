@@ -1,27 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, type LabStatus } from "@/lib/api";
-import { Badge, Btn, Metric, Panel } from "@/components/ui";
-
-function hostFromBrowser(): string {
-  if (typeof window === "undefined") return "127.0.0.1";
-  return window.location.hostname || "127.0.0.1";
-}
+import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { Badge, Btn, Callout, Metric, Panel } from "@/components/ui";
 
 export default function ConnectPage() {
-  const [status, setStatus] = useState<LabStatus | null>(null);
+  const { status } = useLabStatus();
   const [copied, setCopied] = useState<string | null>(null);
-  const host = hostFromBrowser();
-
+  // The page host is browser-only state. Reading window.location during render
+  // made the server emit "127.0.0.1" while the client rendered the Tailscale
+  // host — a text mismatch that failed hydration on every off-loopback load.
+  // Render the loopback default on both sides, then adopt the real host.
+  const [host, setHost] = useState("127.0.0.1");
   useEffect(() => {
-    api.labStatus().then(setStatus).catch(() => {});
-    const t = setInterval(() => api.labStatus().then(setStatus).catch(() => {}), 8000);
-    return () => clearInterval(t);
+    setHost(window.location.hostname || "127.0.0.1");
   }, []);
 
   const serve = status?.serve;
-  const healthy = !!(serve && !serve.unreachable && serve.healthy);
+  const healthy = serveHealthy(status);
   const model = serve?.model_id || "auto";
   const port =
     (serve?.base_url || "").match(/:(\d+)/)?.[1] ||
@@ -127,10 +123,10 @@ export default function ConnectPage() {
             copied={copied === "ts"}
             onCopy={() => copy("ts", snippets.hermesTailscale)}
           />
-          <div className="rounded-[12px] border border-[rgba(255,214,10,0.22)] bg-[rgba(255,214,10,0.08)] px-3.5 py-2.5 text-[12px] text-lab-text-dim">
+          <Callout tone="warn">
             If curl from Mac fails but Spark localhost works, the docker publish is{" "}
-            <code className="rounded bg-lab-hover px-1.5 py-0.5 font-mono text-[11px] text-lab-warn">127.0.0.1:8000</code> only. Either SSH tunnel or re-serve with LAN/Tailscale bind intentionally.
-          </div>
+            <code className="rounded-[2px] bg-lab-hover px-1.5 py-0.5 font-mono text-[11px] text-lab-warn">127.0.0.1:8000</code> only. Either SSH tunnel or re-serve with LAN/Tailscale bind intentionally.
+          </Callout>
         </div>
       </Panel>
 
@@ -173,7 +169,7 @@ function CodeBlock({
           {copied ? "Copied" : "Copy"}
         </Btn>
       </div>
-      <pre className="overflow-x-auto rounded-[12px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[12px] leading-relaxed text-lab-text-dim whitespace-pre-wrap">
+      <pre className="overflow-x-auto rounded-[2px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[12px] leading-relaxed text-lab-text-dim whitespace-pre-wrap">
         {text}
       </pre>
     </div>

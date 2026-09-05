@@ -8,6 +8,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { ClusterPanel } from "../components/ClusterPanel";
 import { DecodeBench } from "../components/DecodeBench";
+import { Nil } from "../components/ui";
 import type { ClusterNode } from "./api";
 import {
   CONCURRENCY_LEVELS,
@@ -57,8 +58,9 @@ describe("shipped Spark card metric slots", () => {
   });
 
   test("keeps AWAITING / NONE nil treatment for missing readings", () => {
-    expect(panel).toContain('word = "Awaiting"');
-    expect(panel).toContain('word?: "Awaiting" | "None"');
+    // The shared <Nil/> renders the state word behind a hollow diamond.
+    expect(renderToStaticMarkup(createElement(Nil))).toContain("Awaiting");
+    expect(renderToStaticMarkup(createElement(Nil, { word: "None" }))).toContain("None");
     expect(panel).toContain("<Nil");
     expect(panel).toContain("TrafficValue");
     expect(panel).not.toContain('{"—"}');

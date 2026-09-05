@@ -108,14 +108,14 @@ export default function LabRunDetailPage() {
       </div>
 
       {err && (
-        <div className="rounded-xl border border-lab-danger/30 bg-lab-danger/10 px-3 py-2 text-sm text-lab-danger">
+        <div className="rounded-[2px] border border-lab-danger/30 bg-lab-danger/10 px-3 py-2 text-sm text-lab-danger">
           {err}
         </div>
       )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-2">
-          <div className="overflow-hidden rounded-2xl border border-lab-border bg-black">
+          <div className="overflow-hidden rounded-[2px] border border-lab-border bg-black">
             <iframe
               title={run.title}
               src={playUrl}
@@ -154,7 +154,7 @@ export default function LabRunDetailPage() {
                 {(run.tags || []).map((t: string) => (
                   <span
                     key={t}
-                    className="rounded-md bg-white/5 px-1.5 py-0.5 text-[10px] uppercase text-lab-muted"
+                    className="rounded-[2px] bg-white/5 px-1.5 py-0.5 text-[10px] uppercase text-lab-muted"
                   >
                     {t}
                   </span>
@@ -174,7 +174,7 @@ export default function LabRunDetailPage() {
               Same model as Wesche: publish <strong className="text-lab-text">static HTML</strong> to
               GitHub Pages. Spark stays private — X users hit CDN only.
             </p>
-            <pre className="mb-2 overflow-x-auto rounded-lg bg-black/40 p-2 text-[11px] text-lab-muted">
+            <pre className="mb-2 overflow-x-auto rounded-[2px] bg-black/40 p-2 text-[11px] text-lab-muted">
 {`# one-time: create public repo + Pages from gh-pages
 export LAIL_SITE_REPO=git@github.com:YOU/dgx-lab.git
 export LAIL_SITE_BASE=https://YOU.github.io/dgx-lab
@@ -191,7 +191,7 @@ bun run lab:site-deploy`}
             {publicUrl && (
               <div className="mt-3 space-y-2">
                 <div className="text-[11px] uppercase tracking-wide text-lab-muted">Play URL</div>
-                <code className="block break-all rounded-lg bg-black/40 p-2 text-[11px] text-lab-text">
+                <code className="block break-all rounded-[2px] bg-black/40 p-2 text-[11px] text-lab-text">
                   {publicUrl}
                 </code>
                 <Btn variant="ghost" onClick={() => copy("pub", publicUrl)}>

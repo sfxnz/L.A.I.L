@@ -680,6 +680,10 @@ export class StreamsEngine {
     } else if (s.state === "decode") {
       ev.tokens = Math.round(s.chunks * run.tpc);
       ev.peak_tok_s = s.peak_tok_s;
+      // Live too, not only at the end: the card's ITL sparkline and stall
+      // markers draw while the strand decodes. Copied so the 4 Hz emit is not
+      // mutated under the SSE writer.
+      ev.itl_ms = s.itl.slice();
     }
     return ev;
   }
@@ -890,6 +894,10 @@ export class StreamsEngine {
     const run = this.runs.get(id);
     if (!run) return null;
     const sub = new Subscriber();
+    // `s.text` already contains what is still sitting in `s.pending`; drain that to
+    // the current subscribers first, or the next flush re-sends it to this one and
+    // the transcript shows the join-point text twice ("YouYou have to…").
+    this.flush(run);
     sub.push(this.hello(run), true);
     for (const s of run.strands) {
       if (s.state === "waiting") continue;

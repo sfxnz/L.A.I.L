@@ -196,6 +196,8 @@ export type StreamHelloEvent = {
   levels?: number[];
   sizes?: number[];
   max_tokens: number;
+  /** `max_model_len` read from `GET {base_url}/v1/models`; null when the server does not report it. */
+  max_model_len: number | null;
   started_at: string;
   prompts: StreamPromptRef[];
 };
@@ -229,8 +231,11 @@ export type StreamStrandEvent = {
  * 4 Hz. `tok_s` = estimated tokens in the sliding 1 s window (live estimate; final numbers
  * come from `usage`). vLLM emits one chunk per scheduler step, and with speculative/MTP
  * decoding a chunk carries several tokens, so chunks are scaled by `tokens_per_chunk`:
- * 1 until a strand of this base_url+model has finished with a `usage` frame, then
- * Σ completion_tokens / Σ chunks over finished strands (remembered across runs).
+ * Σ `usage.completion_tokens` / Σ chunks over every strand that has reported usage.
+ * Requests ask for `continuous_usage_stats`, so on vLLM the first output chunk already
+ * carries usage and the estimate is calibrated within one chunk; servers that ignore
+ * the flag calibrate from the trailing usage frame of the first finished strand. The
+ * last value is remembered per base_url+model and seeds the next run.
  */
 export type StreamAggEvent = {
   type: "agg";
@@ -244,6 +249,8 @@ export type StreamAggEvent = {
   ttft_p50_ms?: number;
   ttft_p95_ms?: number;
   tokens_per_chunk: number;
+  /** True once a `usage.completion_tokens` frame has been observed in this run (false while seeded or assumed 1). */
+  calibrated: boolean;
 };
 
 /** Bench modes only, after each wave (or immediately for a skipped size). */
@@ -252,7 +259,10 @@ export type StreamLevelEvent = {
   index: number;
   concurrency?: number;
   size?: number;
+  /** Wall-clock: Σ completion_tokens / (max t_last − min t_start) over ok strands (perf.py definition; includes stragglers' tails). */
   aggregate_tok_s: number | null;
+  /** Steady-state upper bound: Σ of per-strand decode rates (completion_tokens / (t_last − t_first)) over ok strands. */
+  aggregate_steady_tok_s: number | null;
   per_stream_median_tok_s: number | null;
   ttft_p50_ms: number | null;
   ttft_p95_ms: number | null;
@@ -275,6 +285,10 @@ export type StreamRunSummary = {
   tokens: number;
   /** Peak of the live 1 s-window estimate (see `StreamAggEvent`). */
   peak_tok_s: number;
+  /**
+   * Over ok strands. For a `cancelled` run these are partial: aggregate over the window
+   * actually run, TTFT over strands that reached first token, `ok` = strands that produced output.
+   */
   aggregate_tok_s: number | null;
   per_stream_median_tok_s: number | null;
   ttft_p50_ms: number | null;
@@ -350,6 +364,8 @@ export type BenchArm = {
   requests: number;
   ttft_s: { p50: number | null; p95: number | null; p99: number | null };
   aggregate_tok_per_s: number | null;
+  /** See `StreamLevelEvent.aggregate_steady_tok_s`. */
+  aggregate_steady_tok_per_s?: number | null;
   decode_tok_per_s_median: number | null;
   tpot_s: number | null;
   errors: string[];

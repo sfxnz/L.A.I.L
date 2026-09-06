@@ -1,0 +1,342 @@
+/*
+  Streams — page-scoped CSS (imported by app/streams/page.tsx).
+  Tokens come from globals.css; nothing here defines a colour literal.
+  Motion: transform / opacity / clip-path only; enter ≤ 420 ms, exit ≤ 150 ms.
+*/
+
+/* ── Helix grid ───────────────────────────────────────────────────────────── */
+.strands-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 0.75rem;
+  grid-auto-flow: dense;
+}
+
+.strand-card {
+  --ease-glitch: steps(2, end);
+  position: relative;
+  height: 220px;
+  animation: lab-rise var(--dur-compile) var(--ease-animus-out) both;
+  animation-delay: calc(var(--stagger) * min(var(--k, 0), 8));
+}
+@media (min-width: 720px) {
+  .strand-card-focused {
+    grid-column: span 2;
+    grid-row: span 2;
+    height: auto;
+    min-height: calc(440px + 0.75rem);
+  }
+}
+.strand-card-hovered,
+.strand-card-focused {
+  border-color: var(--color-lab-border-strong);
+  box-shadow: var(--animus-panel-shadow-hover);
+}
+.strand-card-hovered::before,
+.strand-card-hovered::after,
+.strand-card-focused::before,
+.strand-card-focused::after {
+  opacity: 1;
+  border-color: var(--color-lab-line-bright);
+}
+.strand-card-waiting {
+  opacity: 0.72;
+}
+
+/* The strand's colour, shared with its band in the Helix and its Sequence row. */
+.strand-spine {
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  background: var(--strand-color);
+  opacity: var(--strand-alpha, 0.9);
+  pointer-events: none;
+}
+
+.strand-transcript {
+  font-size: 11.5px;
+  line-height: 1.5;
+  scrollbar-width: thin;
+  /* Pinned to the bottom, so the top line is always half-clipped: fade it instead of cutting it. */
+  mask-image: linear-gradient(to bottom, transparent 0, #000 10px);
+}
+.strand-thinking {
+  opacity: 0.62;
+}
+.strand-thinking-open {
+  opacity: 0.8;
+}
+.strand-live {
+  color: var(--color-lab-text);
+}
+
+/* Chips, key hints, steppers, links — HUD grammar, no pills. */
+.strand-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid var(--color-lab-border);
+  border-left: 2px solid var(--animus-hairline);
+  background: transparent;
+  padding: 2px 6px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-lab-text-dim);
+  cursor: pointer;
+  transition: border-color var(--dur-tap) linear, color var(--dur-tap) linear;
+}
+.strand-chip:hover {
+  border-color: var(--color-lab-line);
+  color: var(--color-lab-text);
+}
+.strand-chip-muted {
+  cursor: default;
+  color: var(--color-lab-muted);
+}
+.strand-chip-caret {
+  color: var(--color-lab-line);
+}
+.strand-kbd {
+  display: inline-block;
+  min-width: 14px;
+  padding: 0 3px;
+  border: 1px solid var(--animus-hairline);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 13px;
+  text-align: center;
+  text-transform: none;
+  color: var(--color-lab-muted);
+  opacity: 0.85;
+}
+.strand-step {
+  width: 26px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-lab-muted);
+  transition: color var(--dur-tap) linear, background var(--dur-tap) linear;
+}
+.strand-step:hover:not(:disabled) {
+  color: var(--color-lab-text);
+  background: var(--color-lab-hover);
+}
+.strand-step:disabled {
+  opacity: 0.35;
+}
+.strand-link {
+  padding: 2px 6px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-lab-accent-bright);
+  transition: color var(--dur-tap) linear;
+}
+.strand-link:hover:not(:disabled) {
+  color: var(--color-lab-accent);
+}
+.strand-link:disabled {
+  color: var(--color-lab-muted);
+  cursor: default;
+}
+.strand-hatch {
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--color-lab-warn) 0 1px,
+    transparent 1px 3px
+  );
+}
+
+/* Hover controls: compile in on hover / focus-within, exit ≤150 ms. */
+.strand-actions {
+  position: absolute;
+  right: 8px;
+  top: 34px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transform: translateY(-3px);
+  pointer-events: none;
+  transition: opacity var(--dur-exit) var(--ease-standard), transform var(--dur-exit) var(--ease-standard);
+}
+.strand-card:hover .strand-actions,
+.strand-card:focus-within .strand-actions {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+  transition-duration: var(--dur-reveal);
+  transition-timing-function: var(--ease-animus-out);
+}
+.strand-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--color-lab-border);
+  background: var(--color-lab-panel);
+  padding: 3px 7px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-lab-text-dim);
+}
+.strand-actions button:hover {
+  border-color: var(--color-lab-line);
+  color: var(--color-lab-text);
+}
+.strand-actions button[aria-pressed="true"] {
+  border-color: var(--color-lab-line);
+  color: var(--color-lab-line-bright);
+}
+
+/* Ghost preview: outlined strands before the first run. */
+.strand-ghost {
+  height: 220px;
+  border: 1px dashed var(--animus-hairline);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.7;
+  animation: lab-rise var(--dur-compile) var(--ease-animus-out) both;
+  animation-delay: calc(var(--stagger) * min(var(--k, 0), 8));
+}
+
+/* ── Desync: one tear, ≤300 ms, transform + clip-path only, never repeats ─ */
+@keyframes strand-glitch {
+  0% {
+    transform: translateX(0);
+    clip-path: inset(0);
+  }
+  30% {
+    transform: translateX(-4px);
+    clip-path: inset(8% 0 58% 0);
+  }
+  60% {
+    transform: translateX(3px);
+    clip-path: inset(52% 0 6% 0);
+  }
+  100% {
+    transform: translateX(0);
+    clip-path: inset(0);
+  }
+}
+.strand-card[data-desync="true"] {
+  animation: strand-glitch 280ms var(--ease-glitch) 1 both;
+  border-color: color-mix(in srgb, var(--color-lab-danger) 55%, var(--color-lab-border));
+}
+.strand-card[data-desync="true"]::before,
+.strand-card[data-desync="true"]::after {
+  border-color: var(--color-lab-danger);
+  opacity: 0.9;
+}
+
+/* ── Instrument bar: sticky under the app header (main is the scroller) ──── */
+/* `.lab-card` is an unlayered `position: relative`; it outranks Tailwind's layered
+   `sticky`/`fixed` utilities, so the two panels that must leave the flow say so here. */
+.streams-instrument.lab-card {
+  position: sticky;
+  top: 0;
+  z-index: 15;
+}
+
+/* ── Transcript sheet (radix dialog): compile in ≤420 ms, exit 150 ms ────── */
+@keyframes streams-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+    clip-path: inset(0 0 0 100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+    clip-path: inset(0);
+  }
+}
+@keyframes streams-sheet-out {
+  to {
+    opacity: 0;
+    transform: translateX(10px);
+  }
+}
+@keyframes streams-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes streams-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+.streams-sheet-overlay {
+  background: color-mix(in srgb, var(--color-lab-bg) 70%, transparent);
+  backdrop-filter: blur(4px);
+}
+.streams-sheet-overlay[data-state="open"] {
+  animation: streams-fade-in var(--dur-reveal) var(--ease-standard) both;
+}
+.streams-sheet-overlay[data-state="closed"] {
+  animation: streams-fade-out var(--dur-exit) var(--ease-standard) both;
+}
+.streams-sheet.lab-card {
+  position: fixed;
+}
+.streams-sheet[data-state="open"] {
+  animation: streams-sheet-in var(--dur-compile) var(--ease-animus-out) both;
+}
+.streams-sheet[data-state="closed"] {
+  animation: streams-sheet-out var(--dur-exit) var(--ease-standard) both;
+}
+
+/* ── Wall mode: ?wall=1 → html[data-wall]. Chrome hidden, type 1.4×, no hover. */
+html[data-wall] body > div > header,
+html[data-wall] body > div > footer,
+html[data-wall] .streams-controls-panel,
+html[data-wall] .streams-history,
+html[data-wall] .streams-page-header,
+html[data-wall] .strand-actions {
+  display: none;
+}
+html[data-wall] #main > div {
+  max-width: none;
+}
+html[data-wall] .streams-page {
+  zoom: 1.4;
+}
+html[data-wall] .lab-card:hover {
+  border-color: var(--color-lab-border);
+  box-shadow: var(--animus-panel-shadow);
+}
+html[data-wall] .animus-bracketed:hover::before,
+html[data-wall] .animus-bracketed:hover::after {
+  opacity: 0.55;
+  border-color: var(--color-lab-line);
+}
+html[data-wall] .strand-card-hovered {
+  border-color: var(--color-lab-border);
+  box-shadow: var(--animus-panel-shadow);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .strand-card,
+  .strand-ghost,
+  .strand-card[data-desync="true"],
+  .streams-sheet,
+  .streams-sheet-overlay {
+    animation: lab-opacity-in var(--dur-tap) linear both;
+    clip-path: none;
+    transform: none;
+  }
+}

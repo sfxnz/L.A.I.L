@@ -44,7 +44,9 @@ describe("stream run reducer", () => {
     expect(s.strands[1]).toMatchObject({ i: 1, title: "Code", pack: "code", state: "waiting", text: "" });
   });
 
-  test("delta appends text; reasoning goes to its own buffer", () => {
+  test("delta appends text; reasoning goes to its own buffer; chunks accumulate per delta", () => {
+    // `delta.chunks` is the number of upstream chunks folded into THIS delta
+    // (the engine resets its pending count after every flush), so it sums.
     const s = run([
       hello,
       { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1 },
@@ -53,7 +55,66 @@ describe("stream run reducer", () => {
     ]);
     expect(s.strands[0].text).toBe("Hello world");
     expect(s.strands[0].reasoning).toBe("thinking…");
-    expect(s.strands[0].chunks).toBe(3);
+    expect(s.strands[0].chunks).toBe(6);
+    expect(s.strands[0].reasoning_chunks).toBe(3);
+  });
+
+  test("hello starts every strand blank — the server replays retained text after it", () => {
+    const s = run([
+      hello,
+      { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1 },
+      hello, // EventSource reconnect: hello again, then a full replay
+      { type: "delta", i: 0, text: "Hello world", reasoning: false, chunks: 2 },
+    ]);
+    expect(s.strands[0].text).toBe("Hello world");
+    expect(s.strands[0].chunks).toBe(2);
+  });
+
+  test("stamped actions record observed transitions, stalls and the run clock", () => {
+    const s = run([
+      { ...hello, at: 1000 },
+      { type: "strand", i: 0, state: "prefill", at: 1010 },
+      { type: "strand", i: 0, state: "decode", ttft_ms: 400, at: 1410 },
+      { type: "delta", i: 0, text: "a", reasoning: false, chunks: 1, at: 1420 },
+      { type: "delta", i: 0, text: "b", reasoning: false, chunks: 1, at: 1500 },
+      { type: "delta", i: 0, text: "c", reasoning: false, chunks: 1, at: 4000 }, // 2.5 s gap → stall
+      { type: "agg", t_ms: 3200, tok_s: 12, peak_tok_s: 12, tokens: 3, running: 1, waiting: 1, done: 0, tokens_per_chunk: 1, at: 4100 },
+      { type: "strand", i: 0, state: "done", tokens: 3, at: 4200 },
+      { type: "strand", i: 0, state: "done", tokens: 3, at: 9999 }, // re-emit never moves the first stamp
+    ]);
+    expect(s.hello_at).toBe(1000);
+    expect(s.strands[0]).toMatchObject({ at_prefill: 1010, at_decode: 1410, at_end: 4200, at_last_delta: 4000 });
+    expect(s.strands[0].stalls).toEqual([{ from: 1500, to: 4000 }]);
+    expect(s.strands[0].samples.map((p) => p.chunks)).toEqual([1, 2, 3]);
+    expect(s.clock).toEqual({ t_ms: 3200, at: 4100 });
+    // unstamped actions leave the timeline alone
+    const plain = run([hello, { type: "strand", i: 1, state: "decode" }]);
+    expect(plain.strands[1].at_decode).toBeUndefined();
+    expect(plain.clock).toBeNull();
+  });
+
+  test("agg carries the client-observed per-strand split of the engine aggregate", () => {
+    const actions: StreamRunAction[] = [{ ...hello, at: 0 }];
+    for (const i of [0, 1]) actions.push({ type: "strand", i, state: "decode", at: 0 });
+    // strand 0 emits 3× as many chunks as strand 1 over the same second
+    for (let k = 1; k <= 10; k++) {
+      actions.push({ type: "delta", i: 0, text: "x", reasoning: false, chunks: 3, at: k * 100 });
+      actions.push({ type: "delta", i: 1, text: "y", reasoning: false, chunks: 1, at: k * 100 });
+    }
+    actions.push({ type: "agg", t_ms: 1000, tok_s: 80, peak_tok_s: 80, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 2, at: 1000 });
+    const s = run(actions);
+    expect(s.latest?.strand_tok_s).toEqual([60, 20]);
+    expect(s.agg[0].strand_tok_s?.reduce((a, b) => a + b, 0)).toBe(80);
+  });
+
+  test("done stamps at_end on strands still open (cancelled without a strand event)", () => {
+    const s = run([
+      { ...hello, at: 0 },
+      { type: "strand", i: 0, state: "decode", at: 10 },
+      { type: "done", run_id: "r1", summary, saved_run_id: null, at: 500 },
+    ]);
+    expect(s.strands[0].at_end).toBe(500);
+    expect(s.strands[1].at_end).toBe(500);
   });
 
   test("text ring buffer holds the last 8k chars", () => {

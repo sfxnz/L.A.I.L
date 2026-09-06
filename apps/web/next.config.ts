@@ -16,6 +16,9 @@ const allowedDevOrigins = [
 const nextConfig: NextConfig = {
   transpilePackages: ["@lail/shared"],
   allowedDevOrigins,
+  // A second `next dev` on the same tree (isolated verification stack on other
+  // ports) needs its own build dir or the two instances corrupt `.next`.
+  distDir: process.env.LAIL_NEXT_DIST || ".next",
   // The dev rewrite proxy honours the browser's `Accept-Encoding: gzip` and
   // compresses proxied responses — including `text/event-stream`. gzip buffers,
   // so an SSE connection delivers ZERO bytes to the browser until the stream

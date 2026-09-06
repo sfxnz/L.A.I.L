@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import { ClusterPanel } from "@/components/ClusterPanel";
-import { DecodeBench } from "@/components/DecodeBench";
+import { LastSyncCard } from "@/components/bench/LastSyncCard";
 import {
   Badge,
   Btn,
@@ -198,7 +198,7 @@ export default function StatusPage() {
           </div>
           <h1 className="page-title">Status</h1>
           <p className="page-sub">
-            Sparks, live instruments, and a decode bench on this page.
+            Sparks, live instruments, and the last synchronization on this page.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -276,7 +276,7 @@ export default function StatusPage() {
           meta={healthy ? "armed" : loading ? "probing" : "locked"}
         />
         <div className="lab-rise lab-rise-1">
-          <DecodeBench healthy={healthy} runs={runs} onSettled={() => void loadRuns()} />
+          <LastSyncCard runs={runs} loading={loading} />
         </div>
       </section>
 

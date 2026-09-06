@@ -35,6 +35,7 @@ export type WaveSummary = {
   errors: string[];
   tokens: number;
   aggregate_tok_s: number | null;
+  aggregate_steady_tok_s: number | null;
   per_stream_median_tok_s: number | null;
   ttft_s: { p50: number | null; p95: number | null; p99: number | null };
   tpot_s: number | null;
@@ -97,13 +98,27 @@ export function prefillTokPerS(r: StrandResult): number | null {
   return n / ttft;
 }
 
-/** Σ completion_tokens (ok strands) / (max t_last − min t_start). */
+/**
+ * Wave aggregate, wall-clock: Σ completion_tokens (ok strands) / (max t_last − min t_start).
+ * Same definition as perf.py. The window spans every strand's prefill and the slowest
+ * strand's tail, so at ×N it can read below ×1 when one straggler decodes alone at the end.
+ */
 export function aggregateTokPerS(results: StrandResult[]): number | null {
   const ok = results.filter((r) => r.ok && r.t_last !== null);
   if (!ok.length) return null;
   const tokens = ok.reduce((a, r) => a + (r.completion_tokens || 0), 0);
   const span = (Math.max(...ok.map((r) => r.t_last as number)) - Math.min(...ok.map((r) => r.t_start))) / 1000;
   return span > 0 && tokens > 0 ? tokens / span : null;
+}
+
+/**
+ * Wave aggregate, steady-state: Σ of per-strand decode rates (completion_tokens / (t_last − t_first)).
+ * Each strand is measured only over its own decode window, so this is what the server
+ * sustained while strands were decoding — an upper bound that excludes TTFT and straggler tails.
+ */
+export function aggregateSteadyTokPerS(results: StrandResult[]): number | null {
+  const rates = results.filter((r) => r.ok).map(decodeTokPerS).filter((v): v is number => v !== null);
+  return rates.length ? rates.reduce((a, b) => a + b, 0) : null;
 }
 
 const r2 = (v: number | null) => (v === null ? null : Math.round(v * 100) / 100);
@@ -123,6 +138,7 @@ export function summarizeWave(results: StrandResult[]): WaveSummary {
     errors: results.filter((r) => !r.ok).map((r) => `#${r.i}: ${r.error || "failed"}`),
     tokens: ok.reduce((a, r) => a + (r.completion_tokens || 0), 0),
     aggregate_tok_s: r2(aggregateTokPerS(results)),
+    aggregate_steady_tok_s: r2(aggregateSteadyTokPerS(results)),
     per_stream_median_tok_s: r2(median(rates)),
     ttft_s: { p50: r3(percentile(ttfts, 50)), p95: r3(percentile(ttfts, 95)), p99: r3(percentile(ttfts, 99)) },
     tpot_s: tpots.length ? Math.round(median(tpots)! * 1e6) / 1e6 : null,
@@ -137,6 +153,7 @@ export function toLevelEvent(index: number, key: WaveKey, ws: WaveSummary): Stre
     index,
     ...key,
     aggregate_tok_s: ws.aggregate_tok_s,
+    aggregate_steady_tok_s: ws.aggregate_steady_tok_s,
     per_stream_median_tok_s: ws.per_stream_median_tok_s,
     ttft_p50_ms: ms1(ws.ttft_s.p50),
     ttft_p95_ms: ms1(ws.ttft_s.p95),
@@ -156,6 +173,7 @@ export function skippedLevelEvent(index: number, key: WaveKey, reason: string): 
     index,
     ...key,
     aggregate_tok_s: null,
+    aggregate_steady_tok_s: null,
     per_stream_median_tok_s: null,
     ttft_p50_ms: null,
     ttft_p95_ms: null,
@@ -175,6 +193,7 @@ export function toArm(key: WaveKey, ws: WaveSummary | null, skipped?: string): B
     requests: ws?.requests ?? 0,
     ttft_s: ws?.ttft_s ?? { p50: null, p95: null, p99: null },
     aggregate_tok_per_s: ws?.aggregate_tok_s ?? null,
+    aggregate_steady_tok_per_s: ws?.aggregate_steady_tok_s ?? null,
     decode_tok_per_s_median: ws?.per_stream_median_tok_s ?? null,
     tpot_s: ws?.tpot_s ?? null,
     errors: ws?.errors ?? [],

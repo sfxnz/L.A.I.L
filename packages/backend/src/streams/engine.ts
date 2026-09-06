@@ -21,7 +21,7 @@ import type {
 } from "@lail/shared";
 import { config } from "../config";
 import { getSettings, openAiBase } from "../controller/settings";
-import { assignPrompts, getPack } from "./packs";
+import { assignPrompts, getPack, strandSystemPrompt } from "./packs";
 import { SseParser } from "./sse-parser";
 import {
   buildEnvelope,
@@ -148,6 +148,8 @@ type Strand = {
   textChunks: number;
   reasoningChunks: number;
   usage: { prompt_tokens?: number; completion_tokens?: number } | null;
+  /** Latest `usage.completion_tokens` and the chunk count at that moment (this strand's share of `tpc`). */
+  calib: { tokens: number; chunks: number } | null;
   finish_reason: string | null;
   error: string | null;
   token_times: number[];
@@ -178,8 +180,10 @@ type Run = {
   chunkTimes: number[];
   peak_tok_s: number;
   aggSeries: StreamAggEvent[];
-  /** Live token estimate: tokens per upstream chunk, calibrated from finished strands' `usage`. */
+  /** Live token estimate: tokens per upstream chunk = Σ strand.calib.tokens / Σ strand.calib.chunks. */
   tpc: number;
+  /** A `usage.completion_tokens` frame has been seen in this run (`tpc` is measured, not seeded). */
+  calibrated: boolean;
   calibTokens: number;
   calibChunks: number;
   summary: StreamRunSummary | null;
@@ -374,9 +378,9 @@ export class StreamsEngine {
     const pack = getPack(req.pack)!;
     const refs: StreamPromptRef[] = [];
     if (req.mode === "load") {
-      refs.push(...assignPrompts(pack, req.n, id));
+      refs.push(...assignPrompts(pack, req.n));
     } else if (req.mode === "bench-decode") {
-      for (const [level, c] of req.levels.entries()) refs.push(...assignPrompts(pack, c, `${id}-L${level}`, refs.length, level));
+      for (const [level, c] of req.levels.entries()) refs.push(...assignPrompts(pack, c, refs.length, level));
     } else {
       for (const [level, size] of req.sizes.entries()) {
         refs.push({ i: level, title: `prefill_${size}`, text: `unique-prefix filler, target ${size} tokens`, pack: req.pack, level });
@@ -405,6 +409,7 @@ export class StreamsEngine {
         textChunks: 0,
         reasoningChunks: 0,
         usage: null,
+        calib: null,
         finish_reason: null,
         error: null,
         token_times: [],
@@ -423,6 +428,7 @@ export class StreamsEngine {
       peak_tok_s: 0,
       aggSeries: [],
       tpc: this.tokensPerChunk.get(`${req.base_url} ${model}`) ?? 1,
+      calibrated: false,
       calibTokens: 0,
       calibChunks: 0,
       summary: null,
@@ -535,13 +541,23 @@ export class StreamsEngine {
   }
 
   private bodyFor(run: Run, s: Strand): Record<string, unknown> {
+    // Prefill prompts are already unique (nonce'd filler) and sized via /tokenize on the
+    // user turn alone, so they get no system message.
+    const messages = s.promptText
+      ? [{ role: "user", content: s.promptText }]
+      : [
+          { role: "system", content: strandSystemPrompt(run.id, s.ref.i) },
+          { role: "user", content: s.ref.text },
+        ];
     const body: Record<string, unknown> = {
       model: run.model,
-      messages: [{ role: "user", content: s.promptText ?? s.ref.text }],
+      messages,
       max_tokens: run.max_tokens,
       temperature: run.req.temperature,
       stream: true,
-      stream_options: { include_usage: true },
+      // continuous_usage_stats: vLLM puts `usage` on every chunk, so tokens-per-chunk is
+      // calibrated from the first output chunk instead of the first finished strand.
+      stream_options: { include_usage: true, continuous_usage_stats: true },
     };
     if (run.fill_to_max) {
       body.min_tokens = run.max_tokens;
@@ -585,7 +601,6 @@ export class StreamsEngine {
       if (finished) reader.cancel().catch(() => {});
       s.t_end = now();
       if (!s.error && s.chunks === 0) s.error = "no_output";
-      if (!s.error && typeof s.usage?.completion_tokens === "number") this.calibrate(run, s.usage.completion_tokens, s.chunks);
       this.setState(run, s, s.error ? "error" : "done");
     } catch (e) {
       s.t_end = now();
@@ -616,7 +631,10 @@ export class StreamsEngine {
     }
     if (obj.usage && typeof obj.usage === "object") s.usage = obj.usage;
     const choice = obj.choices?.[0];
-    if (!choice) return;
+    if (!choice) {
+      this.calibrate(run, s);
+      return;
+    }
     if (choice.finish_reason) s.finish_reason = choice.finish_reason;
     const delta = choice.delta ?? {};
     const str = (v: unknown) => (typeof v === "string" ? v : "");
@@ -637,6 +655,8 @@ export class StreamsEngine {
     s.token_times.push(r1(t - (s.t_start ?? t)));
     run.chunkTimes.push(t);
     s.dirty = true;
+    // Before the first `decode` emit so its `tokens` already uses this chunk's usage.
+    this.calibrate(run, s);
     if (first) this.setState(run, s, "decode");
     if (content) {
       s.textChunks++;
@@ -651,12 +671,23 @@ export class StreamsEngine {
     }
   }
 
-  /** Σ completion_tokens / Σ chunks over finished strands; remembered per base_url+model. */
-  private calibrate(run: Run, completionTokens: number, chunks: number) {
-    if (chunks <= 0 || completionTokens <= 0) return;
-    run.calibTokens += completionTokens;
-    run.calibChunks += chunks;
+  /**
+   * Fold the strand's latest `usage.completion_tokens` (per-chunk with continuous usage
+   * stats, else the trailing frame) into `tpc` = Σ tokens / Σ chunks over strands that
+   * reported usage; remembered per base_url+model.
+   */
+  private calibrate(run: Run, s: Strand) {
+    const tokens = s.usage?.completion_tokens;
+    if (typeof tokens !== "number" || tokens <= 0 || s.chunks <= 0) return;
+    if (s.calib) {
+      run.calibTokens -= s.calib.tokens;
+      run.calibChunks -= s.calib.chunks;
+    }
+    s.calib = { tokens, chunks: s.chunks };
+    run.calibTokens += tokens;
+    run.calibChunks += s.chunks;
     run.tpc = run.calibTokens / run.calibChunks;
+    run.calibrated = true;
     this.tokensPerChunk.set(`${run.req.base_url} ${run.model}`, run.tpc);
   }
 
@@ -742,6 +773,7 @@ export class StreamsEngine {
       waiting,
       done,
       tokens_per_chunk: Math.round(run.tpc * 100) / 100,
+      calibrated: run.calibrated,
     };
     const p50 = percentile(ttfts, 50);
     const p95 = percentile(ttfts, 95);
@@ -797,6 +829,10 @@ export class StreamsEngine {
       saved = await this.importEnvelope(envelope);
     }
     const results = run.strands.map(toResult);
+    // Cancelled: keep the numbers that were observed. A strand that produced output
+    // counts as ok, so aggregate spans the window actually run and TTFT percentiles
+    // cover every strand that reached first token.
+    if (cancelled) for (const r of results) if (r.t_first !== null && r.error === "cancelled") r.ok = true;
     const ws = summarizeWave(results);
     run.status = cancelled ? "cancelled" : "done";
     run.ended_at = new Date().toISOString();
@@ -884,12 +920,13 @@ export class StreamsEngine {
       ...(run.req.mode === "bench-decode" ? { levels: run.req.levels } : {}),
       ...(run.req.mode === "bench-prefill" ? { sizes: run.req.sizes } : {}),
       max_tokens: run.max_tokens,
+      max_model_len: run.max_model_len,
       started_at: run.started_at,
       prompts: run.strands.map((s) => s.ref),
     };
   }
 
-  /** `hello` + snapshot (strand states, retained text, levels, last agg) then live events. */
+  /** `hello` + snapshot (strand states, retained text, levels, retained agg history) then live events. */
   subscribe(id: string): Subscriber | null {
     const run = this.runs.get(id);
     if (!run) return null;
@@ -906,8 +943,9 @@ export class StreamsEngine {
       if (s.text) sub.push({ type: "delta", i: s.ref.i, text: s.text, reasoning: false, chunks: s.textChunks }, true);
     }
     for (const lvl of run.levels) sub.push(lvl, true);
-    const lastAgg = run.aggSeries[run.aggSeries.length - 1];
-    if (lastAgg) sub.push(lastAgg, true);
+    // The whole retained series (≤ AGG_KEEP), not just the last point, so a re-attached
+    // or finished run can draw its Helix / Sequence history.
+    for (const agg of run.aggSeries) sub.push(agg, true);
     if (run.status !== "running") {
       if (run.status === "error" && run.error) sub.push({ type: "error", message: run.error }, true);
       sub.push({ type: "done", run_id: run.id, summary: run.summary!, saved_run_id: run.saved_run_id }, true);

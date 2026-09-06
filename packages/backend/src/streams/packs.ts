@@ -123,29 +123,22 @@ export function getPack(id: string): Pack | undefined {
 }
 
 /**
- * Round-robin prompt assignment. Each strand gets a unique marker line so prefix
- * caching cannot share KV blocks between strands; the marker goes in front of the
- * family text (a trailing marker would leave the shared prefix cacheable and sit
- * between the "continue this…" fragment and the model's continuation).
+ * Round-robin prompt assignment. The user text is exactly the pack text; per-strand
+ * uniqueness (so prefix caching cannot share KV blocks between strands) lives in the
+ * `system` message built by `strandSystemPrompt`, which the model does not echo — a
+ * marker in the user turn was repeated as the first output line of every transcript.
  */
-export function assignPrompts(
-  pack: Pack,
-  count: number,
-  nonce: string,
-  startIndex = 0,
-  level?: number,
-): StreamPromptRef[] {
+export function assignPrompts(pack: Pack, count: number, startIndex = 0, level?: number): StreamPromptRef[] {
   const out: StreamPromptRef[] = [];
   for (let k = 0; k < count; k++) {
     const i = startIndex + k;
     const p = pack.prompts[k % pack.prompts.length];
-    out.push({
-      i,
-      title: p.title,
-      text: `[strand ${i} · ${nonce}]\n\n${p.text}`,
-      pack: p.pack,
-      ...(level === undefined ? {} : { level }),
-    });
+    out.push({ i, title: p.title, text: p.text, pack: p.pack, ...(level === undefined ? {} : { level }) });
   }
   return out;
+}
+
+/** Unique per (run, strand) so the shared prefix differs before the first user token. */
+export function strandSystemPrompt(runId: string, i: number): string {
+  return `Session ${runId}/${i}. Answer the user directly.`;
 }

@@ -246,9 +246,126 @@ def docker_inspect_flags(name: str) -> dict[str, Any]:
         "args": data.get("Args") or [],
         "env": [e for e in (cfg.get("Env") or []) if not e.startswith("HF_TOKEN") and "TOKEN" not in e],
         "state": (data.get("State") or {}).get("Status"),
+        "started_at": (data.get("State") or {}).get("StartedAt"),
         "ports": ports,
         "network_mode": hc.get("NetworkMode"),
     }
+
+
+# Flag *names* ending in a secret word: `--hf-token`, `--api-key`; not `--max-num-batched-tokens`.
+_SECRET_FLAG_RE = re.compile(r"(?:^|[-_])(?:token|secret|api[-_]?key|password)$", re.I)
+_SECRET_VALUE_RE = re.compile(r"^(hf_[A-Za-z0-9]{10,}|sk-[A-Za-z0-9_-]{10,})$")
+
+
+def redact_flags(cmd: list[Any]) -> list[str]:
+    """Container Cmd args with token-like values replaced. Flag names are kept."""
+    out: list[str] = []
+    hide_next = False
+    for raw in cmd:
+        arg = str(raw)
+        if hide_next:
+            out.append("<redacted>")
+            hide_next = False
+            continue
+        if arg.startswith("-") and "=" in arg:
+            name, _sep, _val = arg.partition("=")
+            if _SECRET_FLAG_RE.search(name):
+                out.append(f"{name}=<redacted>")
+                continue
+        elif arg.startswith("-") and _SECRET_FLAG_RE.search(arg):
+            hide_next = True
+        if _SECRET_VALUE_RE.match(arg):
+            out.append("<redacted>")
+            continue
+        out.append(arg)
+    return out
+
+
+def flags_fingerprint(flags: list[str]) -> str | None:
+    """First 8 hex of sha256 over the sorted (redacted) args; None when there are none."""
+    if not flags:
+        return None
+    return hashlib.sha256("\n".join(sorted(flags)).encode()).hexdigest()[:8]
+
+
+def _uptime_s(started_at: Any, now: datetime | None = None) -> float | None:
+    if not isinstance(started_at, str) or not started_at:
+        return None
+    s = started_at.strip()
+    # Docker prints nanoseconds; fromisoformat takes at most 6 fractional digits.
+    m = re.match(r"^(.*?\.\d{1,6})\d*(Z|[+-]\d\d:\d\d)?$", s)
+    if m:
+        s = m.group(1) + (m.group(2) or "")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        started = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    up = (now - started).total_seconds()
+    return round(up, 1) if up >= 0 else None
+
+
+def _num_or_none(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_engine(
+    probe: dict[str, Any] | None,
+    inspect: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """`serve.engine` for /api/status: vLLM gauges, KV geometry, container flags.
+
+    Every value is None when its source is absent (llama.cpp has no vllm:* metrics,
+    a bare process has no container) — nothing is fabricated.
+    """
+    probe = probe or {}
+    metrics = probe.get("metrics") or {}
+    inspect = inspect or {}
+    kv = metrics.get("gpu_kv_cache_usage")
+    block_size = metrics.get("block_size")
+    num_blocks = metrics.get("num_gpu_blocks")
+    # vLLM publishes the exact token capacity for hybrid (Mamba/attention) caches, where
+    # block_size × num_gpu_blocks over-counts; fall back to the product when it is absent.
+    capacity = metrics.get("kv_cache_size_tokens")
+    if capacity is None and block_size is not None and num_blocks is not None:
+        capacity = block_size * num_blocks
+    models = probe.get("models") or []
+    max_len = models[0].get("max_model_len") if models and isinstance(models[0], dict) else None
+    version = probe.get("version")
+    if isinstance(version, dict):
+        version = version.get("version")
+    flags = redact_flags(inspect.get("cmd") or [])
+    return {
+        "kv_usage_pct": None if kv is None else round(kv * 100, 2),
+        "requests_running": _int_or_none(metrics.get("requests_running")),
+        "requests_waiting": _int_or_none(metrics.get("requests_waiting")),
+        "block_size": _int_or_none(block_size),
+        "num_gpu_blocks": _int_or_none(num_blocks),
+        "kv_capacity_tokens": _int_or_none(capacity),
+        "max_model_len": _int_or_none(max_len),
+        "version": str(version) if version else None,
+        "prefix_cache_hit_rate": _num_or_none(metrics.get("prefix_cache_hit_rate_live")),
+        "preemptions_total": _int_or_none(metrics.get("preemptions_total")),
+        "uptime_s": _uptime_s(inspect.get("started_at"), now),
+        "flags_fingerprint": flags_fingerprint(flags),
+        "flags": flags,
+    }
+
+
+def _int_or_none(v: Any) -> int | None:
+    f = _num_or_none(v)
+    return None if f is None else int(f)
 
 
 async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0) -> dict[str, Any]:
@@ -318,6 +435,10 @@ def parse_prometheus(text: str) -> dict[str, float]:
         "vllm:gpu_cache_usage_perc": "gpu_kv_cache_usage",
         "vllm:prefix_cache_hits": "prefix_cache_hits",
         "vllm:prefix_cache_queries": "prefix_cache_queries",
+        # vLLM ≥ 0.10 exposes the counters with the Prometheus `_total` suffix.
+        "vllm:prefix_cache_hits_total": "prefix_cache_hits",
+        "vllm:prefix_cache_queries_total": "prefix_cache_queries",
+        "vllm:num_preemptions_total": "preemptions_total",
         "vllm:num_requests_running": "requests_running",
         "vllm:num_requests_waiting": "requests_waiting",
         "vllm:prompt_tokens_total": "prompt_tokens_total",
@@ -333,6 +454,13 @@ def parse_prometheus(text: str) -> dict[str, float]:
     out: dict[str, float] = {}
     for line in text.splitlines():
         if line.startswith("#") or not line.strip():
+            continue
+        if line.startswith("vllm:cache_config_info{"):
+            # KV geometry lives in the labels of this info gauge (value is always 1).
+            for label in ("block_size", "num_gpu_blocks", "kv_cache_size_tokens"):
+                lm = re.search(rf'\b{label}="(\d+)"', line)
+                if lm:
+                    out[label] = float(lm.group(1))
             continue
         # metric{labels} value
         m = re.match(r"^([a-zA-Z0-9_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)", line)
@@ -353,12 +481,15 @@ _LIVE_RATE: dict[str, float | None] = {
     "gen": None,
     "last_gen_rate": None,
     "last_prompt_rate": None,
+    "pc_hits": None,
+    "pc_queries": None,
 }
 
 
 def reset_live_rate_state() -> None:
     _LIVE_RATE.update(
-        t=None, prompt=None, gen=None, last_gen_rate=None, last_prompt_rate=None
+        t=None, prompt=None, gen=None, last_gen_rate=None, last_prompt_rate=None,
+        pc_hits=None, pc_queries=None,
     )
 
 
@@ -425,10 +556,18 @@ def live_token_rates(metrics: dict[str, float], *, now: float | None = None) -> 
 
     out["gen_tok_per_s"] = gen_rate
     out["prompt_tok_per_s"] = prompt_rate
+
+    # Prefix-cache hit rate over this window (counter deltas); absent while no queries happened.
+    hits, queries = out.get("prefix_cache_hits"), out.get("prefix_cache_queries")
+    prev_h, prev_q = _LIVE_RATE.get("pc_hits"), _LIVE_RATE.get("pc_queries")
+    if None not in (hits, queries, prev_h, prev_q) and queries > prev_q:  # type: ignore[operator]
+        out["prefix_cache_hit_rate_live"] = round((hits - prev_h) / (queries - prev_q), 4)  # type: ignore[operator]
     _LIVE_RATE.update(
         t=now,
         prompt=prompt,
         gen=gen,
+        pc_hits=hits,
+        pc_queries=queries,
         last_gen_rate=gen_rate if gen_rate is not None else (
             _LIVE_RATE.get("last_gen_rate") if in_flight else None
         ),

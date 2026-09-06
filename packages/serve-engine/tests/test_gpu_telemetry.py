@@ -40,6 +40,16 @@ def test_node_payload_includes_temperature_and_usage_from_smi():
     assert node["gpu_util_pct"] == 7
     assert node["power_w"] == 18.5
     assert node["memory_used_mib"] is None
+    # GB10 unified memory: nvidia-smi says [N/A] → null, never a fabricated 0
+    assert node["gpu_mem_used_gib"] is None and node["gpu_mem_total_gib"] is None
+
+
+def test_node_payload_gpu_memory_in_gib_when_smi_reports_it():
+    tel = metadata.parse_gpu_telemetry("NVIDIA RTX 6000, 50, 30, 120.0, 20480, 49140")
+    node = cluster.apply_gpu_telemetry({}, tel)
+    assert node["memory_used_mib"] == 20480
+    assert node["gpu_mem_used_gib"] == 20.0
+    assert node["gpu_mem_total_gib"] == 47.99
 
 
 def test_node_payload_nil_when_smi_returns_nothing():
@@ -47,6 +57,7 @@ def test_node_payload_nil_when_smi_returns_nothing():
     assert node["temperature_c"] is None
     assert node["gpu_util_pct"] is None
     assert node["power_w"] is None
+    assert node["gpu_mem_used_gib"] is None and node["gpu_mem_total_gib"] is None
     assert 0 not in (node["temperature_c"], node["gpu_util_pct"], node["power_w"])
 
 
@@ -146,7 +157,7 @@ def test_remote_probe_script_emits_temp_and_usage(monkeypatch):
 
     def fake_check_output(cmd, text=True, stderr=None, timeout=8):
         if cmd[0] == "nvidia-smi":
-            return "NVIDIA GB10, 52, 91, 44.2, [N/A], [N/A]\n"
+            return "NVIDIA GB10, 52, 91, 44.2, 1024, [N/A]\n"
         if cmd[:2] == ["docker", "ps"]:
             return ""
         if cmd[0] == "free":
@@ -198,3 +209,6 @@ def test_remote_probe_script_emits_temp_and_usage(monkeypatch):
     assert node["temperature_c"] == 52
     assert node["gpu_util_pct"] == 91
     assert node["power_w"] == 44.2
+    # remote probe now ships memory.used/total too; N/A stays null
+    assert node["gpu_mem_used_gib"] == 1.0
+    assert node["gpu_mem_total_gib"] is None

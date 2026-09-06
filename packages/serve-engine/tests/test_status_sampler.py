@@ -11,7 +11,7 @@ from app.services import agentic, cluster, metadata, perf, status_sampler
 from app.services.status_sampler import StatusSampler
 
 STATUS_KEYS = {
-    "healthy", "base_url", "model_id", "models", "version", "metrics", "hardware",
+    "healthy", "base_url", "model_id", "models", "version", "metrics", "engine", "hardware",
     "containers", "headroom", "error", "presets", "serve_examples", "tool_eval", "cluster",
 }
 
@@ -22,7 +22,10 @@ def _probe(base_url: str = "http://127.0.0.1:8000") -> dict:
         "healthy": True,
         "models": [{"id": "org/m", "max_model_len": 8192}],
         "version": {"version": "0.28.1"},
-        "metrics": {"gen_tok_per_s": 42.0, "prompt_tok_per_s": 300.0},
+        "metrics": {
+            "gen_tok_per_s": 42.0, "prompt_tok_per_s": 300.0, "gpu_kv_cache_usage": 0.125,
+            "requests_running": 2.0, "block_size": 16.0, "num_gpu_blocks": 100.0,
+        },
         "error": None,
     }
 
@@ -51,9 +54,14 @@ def _fake_collectors(monkeypatch, calls: Counter) -> None:
         calls["tool_eval"] += 1
         return {"available": False}
 
+    def fake_inspect(name):
+        calls["inspect"] += 1
+        return {"cmd": ["--port", "8000"], "started_at": "2026-09-05T15:53:25.963708557Z"}
+
     monkeypatch.setattr(metadata, "probe_endpoint", fake_probe)
     monkeypatch.setattr(metadata, "collect_hardware", fake_hw)
     monkeypatch.setattr(metadata, "list_vllm_containers", fake_containers)
+    monkeypatch.setattr(metadata, "docker_inspect_flags", fake_inspect)
     monkeypatch.setattr(cluster, "collect_cluster", fake_cluster)
     monkeypatch.setattr(agentic, "tool_eval_available", fake_tool_eval)
 
@@ -68,6 +76,7 @@ def _no_collectors(monkeypatch) -> None:
     monkeypatch.setattr(metadata, "probe_endpoint", aboom)
     monkeypatch.setattr(metadata, "collect_hardware", boom)
     monkeypatch.setattr(metadata, "list_vllm_containers", boom)
+    monkeypatch.setattr(metadata, "docker_inspect_flags", boom)
     monkeypatch.setattr(cluster, "collect_cluster", boom)
     monkeypatch.setattr(agentic, "tool_eval_available", boom)
 
@@ -178,9 +187,42 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
     assert snap["cluster"]["nodes"][0]["gen_tok_per_s"] == 42.0
     assert snap["cluster"]["nodes"][1]["gen_tok_per_s"] is None
     assert first["stale_s"] >= 0 and second["stale_s"] >= first["stale_s"]
+    # engine block: metrics + /v1/models + /version + cached docker inspect
+    assert snap["engine"]["kv_usage_pct"] == 12.5
+    assert snap["engine"]["requests_running"] == 2
+    assert snap["engine"]["kv_capacity_tokens"] == 1600
+    assert snap["engine"]["max_model_len"] == 8192
+    assert snap["engine"]["version"] == "0.28.1"
+    assert snap["engine"]["flags"] == ["--port", "8000"]
+    assert snap["engine"]["flags_fingerprint"] and snap["engine"]["uptime_s"] > 0
+    assert snap["engine"]["requests_waiting"] is None  # not in this probe → null, not 0
     # reads never re-run collectors
-    assert dict(calls) == {"probe": 1, "hw": 1, "containers": 1, "cluster": 1, "tool_eval": 1}
+    assert dict(calls) == {"probe": 1, "hw": 1, "containers": 1, "cluster": 1, "tool_eval": 1, "inspect": 1}
     assert s.probe() == _probe()
+
+
+def test_docker_inspect_runs_once_per_slow_interval_and_on_container_change(monkeypatch):
+    calls: Counter = Counter()
+    _fake_collectors(monkeypatch, calls)
+    s = StatusSampler("http://127.0.0.1:8000", slow_s=1000.0)
+
+    async def go():
+        await s.sample()
+        await s.sample()
+        await s.sample()
+        assert calls["inspect"] == 1
+        monkeypatch.setattr(
+            metadata, "list_vllm_containers",
+            lambda: [{"name": "other", "status": "Up 1 second", "image": "vllm/vllm-openai:latest", "id": "z"}],
+        )
+        await s.sample()
+        assert calls["inspect"] == 2
+        monkeypatch.setattr(metadata, "list_vllm_containers", lambda: [])
+        return await s.sample()
+
+    snap = asyncio.run(go())
+    assert snap["engine"]["flags"] == [] and snap["engine"]["uptime_s"] is None
+    assert calls["inspect"] == 2
 
 
 def test_status_before_the_first_sample_is_a_sane_placeholder():
@@ -189,6 +231,7 @@ def test_status_before_the_first_sample_is_a_sane_placeholder():
     assert set(body) == STATUS_KEYS | {"sampled_at", "stale_s"}
     assert body["healthy"] is None
     assert body["sampled_at"] is None and body["stale_s"] is None
+    assert body["engine"]["kv_usage_pct"] is None and body["engine"]["flags"] == []
     assert "warming up" in body["error"]
     assert body["cluster"]["nodes"] == [] and body["cluster"]["pending"] is True
     assert body["models"] == [] and body["containers"] == []

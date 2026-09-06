@@ -148,6 +148,8 @@ gpu = "unknown"
 temperature_c = None
 gpu_util_pct = None
 power_w = None
+memory_used_mib = None
+memory_total_mib = None
 smi = run(["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total", "--format=csv,noheader,nounits"])
 if smi.strip():
     parts = [p.strip() for p in smi.strip().split("\n")[0].split(",")]
@@ -165,6 +167,9 @@ if smi.strip():
         temperature_c = _num(parts[1])
         gpu_util_pct = _num(parts[2])
         power_w = _num(parts[3])
+    if len(parts) >= 6:
+        memory_used_mib = _num(parts[4])
+        memory_total_mib = _num(parts[5])
 
 containers = []
 dout = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])
@@ -256,6 +261,8 @@ print(json.dumps({
     "temperature_c": temperature_c,
     "gpu_util_pct": gpu_util_pct,
     "power_w": power_w,
+    "memory_used_mib": memory_used_mib,
+    "memory_total_mib": memory_total_mib,
     "ram_gib": mem_total(),
     "available_gib": avail(),
     "model_id": model_id,
@@ -282,6 +289,10 @@ def apply_gpu_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dic
         node["gpu_sku"] = sku
     for key in metadata.GPU_TELEMETRY_FIELDS:
         node[key] = tel.get(key)
+    # GiB view for the Status memory bar. GB10 unified memory reports [N/A] → None.
+    for src, dst in (("memory_used_mib", "gpu_mem_used_gib"), ("memory_total_mib", "gpu_mem_total_gib")):
+        mib = tel.get(src)
+        node[dst] = None if mib is None else round(float(mib) / 1024, 2)
     return node
 
 

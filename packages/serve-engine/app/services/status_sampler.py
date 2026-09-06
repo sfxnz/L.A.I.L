@@ -54,6 +54,11 @@ class StatusSampler:
         self._probe: dict[str, Any] | None = None
         self._hardware: dict[str, Any] = {}
         self._containers: list[dict[str, Any]] = []
+        # `docker inspect` of the serving container: once per slow interval (or when the
+        # serving container changes), read by every fast tick for `engine.flags` / uptime.
+        self._inspect: dict[str, Any] = {}
+        self._inspect_name: str | None = None
+        self._inspect_mono: float | None = None
         self._cluster: dict[str, Any] = _cluster_pending()
         self._tool_eval: dict[str, Any] | None = None
         self._snapshot: dict[str, Any] | None = None
@@ -105,6 +110,7 @@ class StatusSampler:
         self._probe = probe
         self._hardware = hardware
         self._containers = containers
+        await self._refresh_inspect()
         self._sampled_mono = time.monotonic()
         self._sampled_at = metadata.utc_now()
         self._publish()
@@ -125,6 +131,21 @@ class StatusSampler:
         if self._cluster_ready is not None:
             self._cluster_ready.set()
 
+    async def _refresh_inspect(self) -> None:
+        running = [c for c in self._containers if "Up" in str(c.get("status", ""))]
+        name = running[0].get("name") if running else None
+        if name != self._inspect_name:
+            self._inspect = {}
+            self._inspect_mono = None
+        self._inspect_name = name
+        if not name:
+            return
+        mono = time.monotonic()
+        if self._inspect_mono is not None and mono - self._inspect_mono < self.slow_s:
+            return
+        self._inspect = await asyncio.to_thread(metadata.docker_inspect_flags, name)
+        self._inspect_mono = mono
+
     def _publish(self) -> None:
         probe = self._probe or {}
         cluster.attach_live_rates(self._cluster, probe.get("metrics") or {})
@@ -138,6 +159,7 @@ class StatusSampler:
             "models": probe.get("models"),
             "version": probe.get("version"),
             "metrics": probe.get("metrics"),
+            "engine": metadata.build_engine(probe, self._inspect),
             "hardware": self._hardware,
             "containers": self._containers,
             "headroom": headroom_for(self._hardware.get("available_gib")),
@@ -172,6 +194,7 @@ class StatusSampler:
                 "models": [],
                 "version": None,
                 "metrics": {},
+                "engine": metadata.build_engine(None, None),
                 "hardware": {},
                 "containers": [],
                 "headroom": "ok",

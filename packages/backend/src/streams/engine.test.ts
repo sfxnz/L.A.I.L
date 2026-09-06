@@ -239,6 +239,8 @@ describe("load run", () => {
       expect(last.ttft_ms).toBeGreaterThan(0);
       expect(last.tok_s).toBeGreaterThan(0);
       expect(last.itl_ms).toHaveLength(7);
+      // live decode emits carry the gaps so far (the card draws ITL while decoding)
+      expect(strands.some((s) => s.state === "decode" && Array.isArray(s.itl_ms))).toBe(true);
     }
 
     const aggs = byType(events, "agg");
@@ -312,6 +314,23 @@ describe("load run", () => {
     const again = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 1 });
     expect(again.status).toBe(201);
     await collect(((await again.json()) as { run_id: string }).run_id);
+  });
+
+  test("subscribing mid-stream replays retained text once: no duplicate at the join point", async () => {
+    const run_id = await engine.createRun({ mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
+    const keep = engine.subscribe(run_id)!; // keeps the run alive; we never read from it
+    // Wait until text has been retained AND some of it is still pending (frames every 15 ms, flush every 80 ms).
+    while (!engine.snapshot(run_id)!.strands[0]?.text) await Bun.sleep(5);
+    await Bun.sleep(30);
+    const events = await collect(run_id);
+    engine.unsubscribe(run_id, keep);
+    const text = byType(events, "delta")
+      .filter((d) => d.i === 0 && !d.reasoning)
+      .map((d) => d.text)
+      .join("");
+    expect(text).toBe(engine.snapshot(run_id)!.strands[0].text);
+    const toks = text.trim().split(/\s+/);
+    expect(new Set(toks).size).toBe(toks.length); // tok0 … tok119, each exactly once
   });
 
   test("load run is aborted when its last subscriber leaves and nobody reattaches", async () => {

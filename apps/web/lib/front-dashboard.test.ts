@@ -1,5 +1,6 @@
 /**
- * Structural tests: front-page Spark instruments and decode-bench controls.
+ * Front page: Spark instruments and the "Last synchronization" card (the retired
+ * DecodeBench panel's replacement — the bench itself lives on /bench).
  */
 import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
@@ -7,43 +8,129 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { ClusterPanel } from "../components/ClusterPanel";
-import { DecodeBench } from "../components/DecodeBench";
+import { LastSyncCard } from "../components/bench/LastSyncCard";
 import { Nil } from "../components/ui";
-import type { ClusterNode } from "./api";
-import {
-  CONCURRENCY_LEVELS,
-  WORKLOAD_KINDS,
-  WORKLOAD_LABELS,
-  decodeRunLabel,
-  sortConcurrencies,
-} from "./decode-bench";
+import type { ClusterNode, RunRow } from "./api";
+import { lastSync, latestDecodeRuns } from "./bench/last-sync";
+import { CONCURRENCY_LEVELS, PACK_LABELS, sortConcurrencies } from "./bench/levels";
+import { decodeRunLabel, type DecodeResult } from "./bench/result";
 
 const webRoot = join(import.meta.dir, "..");
 
-describe("decode bench domain", () => {
-  test("workload kinds are structured, prose, code, json", () => {
-    expect([...WORKLOAD_KINDS]).toEqual(["structured", "prose", "code", "json"]);
-    expect(WORKLOAD_LABELS.structured).toBe("Structured");
-    expect(WORKLOAD_LABELS.json).toBe("JSON");
-  });
+const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}): RunRow => ({
+  run_id,
+  created_at,
+  kind,
+  intent: null,
+  model_id: "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  summary,
+  path: `${run_id}.json`,
+});
+const HEADLINE = (c1: number, peak: number, at: number) => ({
+  decode_tok_per_s_median_c1: c1,
+  aggregate_peak_tok_per_s: peak,
+  aggregate_peak_concurrency: at,
+  ttft_p50_s_c1: 0.21,
+  concurrencies: [1, 2, 4],
+});
 
-  test("concurrency levels range from 1 to 32 inclusive", () => {
-    expect(CONCURRENCY_LEVELS).toHaveLength(32);
-    expect(CONCURRENCY_LEVELS[0]).toBe(1);
-    expect(CONCURRENCY_LEVELS[31]).toBe(32);
-    expect(CONCURRENCY_LEVELS).toEqual(
-      Array.from({ length: 32 }, (_, i) => i + 1),
-    );
+describe("bench domain kept from the retired decode bench", () => {
+  test("concurrency levels 1..32 and packs structured/prose/code/json", () => {
+    expect(CONCURRENCY_LEVELS).toEqual(Array.from({ length: 32 }, (_, i) => i + 1));
+    expect(Object.keys(PACK_LABELS)).toEqual(expect.arrayContaining(["structured", "prose", "code", "json"]));
+    expect(PACK_LABELS.json).toBe("JSON");
   });
 
   test("selected concurrencies run in ascending order", () => {
     expect(sortConcurrencies(new Set([16, 1, 4]))).toEqual([1, 4, 16]);
   });
 
-  test("last-run label is Structured not perf_workflow", () => {
+  test("legacy run label reads summary.workload, never perf_workflow", () => {
     expect(decodeRunLabel({ workload: "structured" })).toBe("Structured");
     expect(decodeRunLabel({ workload: "perf_workflow" })).toBeNull();
     expect(decodeRunLabel({ kind: "perf_workflow" })).toBeNull();
+  });
+});
+
+describe("Last synchronization (Status card)", () => {
+  const rows = [
+    row("old-prefill", "2026-09-06T10:00:00Z", "prefill", { prefill_tok_per_s_sustained: 2874.9 }),
+    row("d1", "2026-09-06T11:00:00Z", "decode", HEADLINE(34.2, 71.8, 4)),
+    row("tool", "2026-09-06T11:30:00Z", "tool_eval"),
+    row("d2", "2026-09-06T12:00:00Z", "decode", HEADLINE(34.0, 80.5, 4)),
+  ];
+
+  test("picks the newest decode run and the one before it, ignoring other kinds", () => {
+    expect(latestDecodeRuns(rows).map((r) => r.run_id)).toEqual(["d2", "d1"]);
+  });
+
+  test("hero, delta vs previous and both hrefs come straight from the index rows", () => {
+    const s = lastSync(rows, { current: null, previous: null });
+    expect(s).not.toBeNull();
+    expect(s!.id).toBe("d2");
+    expect(s!.peak).toBe(80.5);
+    expect(s!.peakAt).toBe(4);
+    expect(s!.c1).toBe(34.0);
+    // (80.5 − 71.8) / 71.8 = +12.1 %
+    expect(s!.delta).toBeCloseTo(0.1212, 3);
+    expect(s!.openHref).toBe("/bench?run=d2");
+    expect(s!.runAgainHref).toBe("/bench?tab=decode&pack=prose&levels=1%2C2%2C4&tokens=512");
+  });
+
+  test("the envelope, when loaded, supplies pack, tokens and arms for the mini curve", () => {
+    const arm = (concurrency: number, aggregate: number, perStream: number) => ({
+      concurrency,
+      aggregate,
+      perStream,
+      ttftP50: 200,
+      ttftP95: 300,
+      ttftP99: 350,
+      tpotMs: 1000 / perStream,
+      ok: concurrency,
+      requests: concurrency,
+      errors: [],
+    });
+    const current: DecodeResult = {
+      kind: "decode",
+      id: "d2",
+      savedRunId: "d2",
+      model: "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      pack: "code",
+      maxTokens: 128,
+      createdAt: "2026-09-06T12:00:00Z",
+      durationMs: 16000,
+      engine: "vllm",
+      source: "history",
+      levels: [1, 2, 4],
+      arms: [arm(1, 34, 34), arm(2, 52, 26), arm(4, 80.5, 20.1)],
+    };
+    const s = lastSync(rows, { current, previous: null })!;
+    expect(s.pack).toBe("code");
+    expect(s.arms).toHaveLength(3);
+    expect(s.previousArms).toBeNull();
+    expect(s.delta).toBeCloseTo(0.1212, 3); // previous still from its index row
+    expect(s.runAgainHref).toBe("/bench?tab=decode&pack=code&levels=1%2C2%2C4&tokens=128");
+  });
+
+  test("no decode runs → null; a lone run has no delta", () => {
+    expect(lastSync([rows[0], rows[2]], { current: null, previous: null })).toBeNull();
+    const lone = lastSync([rows[3]], { current: null, previous: null })!;
+    expect(lone.delta).toBeNull();
+  });
+
+  test("renders the empty state with a Bench CTA, and the hero when a run exists", () => {
+    const empty = renderToStaticMarkup(createElement(LastSyncCard, { runs: [], loading: false }));
+    expect(empty).toContain("No sequences yet. Run a decode sync to draw the first slice.");
+    expect(empty).toContain('href="/bench"');
+    expect(empty).not.toContain("—");
+
+    const html = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false }));
+    expect(html).toContain("Last synchronization");
+    expect(html).toContain("80.5");
+    expect(html).toContain("peak aggregate @ ×4");
+    expect(html).toContain("+12 % vs previous");
+    expect(html).toContain('href="/bench?run=d2"');
+    expect(html).toContain("Run again");
   });
 });
 
@@ -64,37 +151,6 @@ describe("shipped Spark card metric slots", () => {
     expect(panel).toContain("<Nil");
     expect(panel).toContain("TrafficValue");
     expect(panel).not.toContain('{"—"}');
-  });
-});
-
-describe("shipped front-page decode bench", () => {
-  const status = readFileSync(join(webRoot, "app/status/page.tsx"), "utf8");
-  const bench = readFileSync(join(webRoot, "components/DecodeBench.tsx"), "utf8");
-
-  test("decode bench is mounted on Status, not only /evals", () => {
-    expect(status).toContain("DecodeBench");
-    expect(status).toContain('label="Bench"');
-    expect(status).toContain("Token required");
-    expect(status).not.toContain('href="/evals" className={btnClass("primary"');
-  });
-
-  test("workload buttons cover structured, prose, code, JSON", () => {
-    const kinds = readFileSync(join(webRoot, "lib/decode-bench.ts"), "utf8");
-    expect(kinds).toContain('"structured"');
-    expect(kinds).toContain('"prose"');
-    expect(kinds).toContain('"code"');
-    expect(kinds).toContain('"json"');
-    expect(bench).toContain("WORKLOAD_KINDS.map");
-    expect(bench).toContain("{WORKLOAD_LABELS[k]}");
-  });
-
-  test("concurrency buttons map CONCURRENCY_LEVELS 1 through 32", () => {
-    expect(bench).toContain("CONCURRENCY_LEVELS.map");
-    expect(bench).toContain("Concurrency 1 to 32");
-    expect(bench).toContain("workload: kind");
-    expect(bench).toContain("concurrencies: levels");
-    expect(bench).not.toContain("perf_workflow");
-    expect(bench).toContain('runner: "decode"');
   });
 });
 
@@ -163,22 +219,5 @@ describe("shipped ClusterPanel render", () => {
     expect(html).toContain("None");
     expect(html).not.toContain("0 tok");
     expect(html).not.toContain(">0%<");
-  });
-});
-
-describe("shipped DecodeBench render", () => {
-  test("renders structured/prose/code/JSON and buttons 1 through 32", () => {
-    const html = renderToStaticMarkup(
-      createElement(DecodeBench, { healthy: true, runs: [] }),
-    );
-    expect(html).toContain("Structured");
-    expect(html).toContain("Prose");
-    expect(html).toContain("Code");
-    expect(html).toContain("JSON");
-    for (const n of CONCURRENCY_LEVELS) {
-      expect(html).toContain(`>${n}<`);
-    }
-    expect(html).toContain(">Run<");
-    expect(html).not.toContain("perf_workflow");
   });
 });

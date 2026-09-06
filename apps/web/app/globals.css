@@ -1132,3 +1132,131 @@ input[type="checkbox"]:disabled {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ---- Bench ----  (/bench instrument + Status "Last synchronization")
+   Everything here animates transform / opacity / stroke-dashoffset only.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* A curve segment draws itself: pathLength="1" so one dash covers the segment. */
+@keyframes bench-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.bench-seg {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+  animation: bench-draw 700ms var(--ease-chime) both;
+}
+/* Ghost of the previous run: dashed, 40 %, drawn on top of the shading. */
+.bench-ghost {
+  stroke-dasharray: 4 3;
+  opacity: 0.4;
+}
+
+/* A level cell / point settles in 250 ms. */
+@keyframes bench-settle {
+  from {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.bench-settle {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: bench-settle 250ms var(--ease-standard) both;
+}
+
+/* Completion payoff. Hit-stop freezes every animation in the instrument. */
+.bench-hitstop,
+.bench-hitstop * {
+  animation-play-state: paused !important;
+  transition: none !important;
+}
+/* Ring closes over 500 ms (stroke-dashoffset 1 → 0 on pathLength="1"). */
+@keyframes bench-ring-close {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.bench-ring-close {
+  stroke-dasharray: 1;
+  animation: bench-ring-close 500ms var(--ease-chime) both;
+}
+/* Secondaries stagger in after the hero: ≤ 320 ms total. */
+@keyframes bench-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.bench-secondary {
+  opacity: 0;
+  animation: bench-reveal 300ms var(--ease-animus-out) both;
+  animation-delay: calc(var(--stagger) * var(--i, 0));
+}
+.bench-fade {
+  animation: lab-opacity-in var(--dur-reveal) var(--ease-standard) both;
+}
+
+/* Lanes fill left → right by transform, never width. */
+.bench-lane-fill {
+  transform-origin: left center;
+  transition: transform 220ms linear, background-color var(--dur-exit) var(--ease-standard);
+}
+/* Prefill: first-token flash on the fill bar. */
+@keyframes bench-flash {
+  0% {
+    opacity: 0;
+  }
+  30% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.bench-flash {
+  animation: bench-flash 320ms var(--ease-standard) both;
+}
+/* A skipped size: muted, hatched, never silently dropped. */
+.bench-hatched {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--animus-hairline) 0 1px,
+    transparent 1px 7px
+  );
+}
+/* Gauge needle pivots at the arc centre. */
+.bench-needle {
+  transform-box: view-box;
+  transform-origin: 100px 100px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bench-seg,
+  .bench-settle,
+  .bench-ring-close,
+  .bench-secondary,
+  .bench-fade {
+    animation: lab-opacity-in 150ms linear both;
+  }
+  .bench-flash {
+    animation: none;
+  }
+}

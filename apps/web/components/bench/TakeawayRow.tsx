@@ -1,34 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { benchJson, benchMarkdown } from "@/lib/bench/export";
 import type { BenchResult } from "@/lib/bench/result";
-import { Btn, Eyebrow } from "@/components/ui";
+import { Btn, Eyebrow, useCopy } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
 /** Copy as Markdown (⌘⇧C) · Copy JSON · Run ×16/×32 · Run again · Details (⌘/). */
-
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function useCopy(): [string | null, (label: string, text: string) => void] {
-  const [flash, setFlash] = useState<string | null>(null);
-  useEffect(() => {
-    if (!flash) return;
-    const t = setTimeout(() => setFlash(null), 1600);
-    return () => clearTimeout(t);
-  }, [flash]);
-  const copy = (label: string, text: string) => {
-    void copyText(text).then((ok) => setFlash(ok ? `${label} copied` : "Clipboard blocked — select the details table instead"));
-  };
-  return [flash, copy];
-}
 
 export function TakeawayRow({
   result,

@@ -1,6 +1,6 @@
 "use client";
 
-import { Badge, Eyebrow, HeroNumber, Nil, SyncRing, Tick, type SyncState } from "@/components/ui";
+import { Badge, Eyebrow, HeroNumber, Nil, Stat, SyncRing, Tick, type SyncState } from "@/components/ui";
 import type { StreamRunState } from "@/lib/use-stream-run";
 import { aggregateMethod } from "@/lib/streams/export";
 import { fmtDuration, fmtInt, fmtMs, fmtRate } from "@/lib/streams/format";
@@ -8,10 +8,9 @@ import { cn } from "@/lib/utils";
 
 function Cell({ label, children, title, className }: { label: string; children: React.ReactNode; title?: string; className?: string }) {
   return (
-    <div className={cn("flex min-w-0 flex-col gap-0.5", className)} title={title}>
-      <Eyebrow>{label}</Eyebrow>
-      <span className="lab-num truncate font-mono text-[13px] text-lab-text">{children}</span>
-    </div>
+    <Stat label={label} title={title} mono className={cn("gap-0.5", className)}>
+      {children}
+    </Stat>
   );
 }
 

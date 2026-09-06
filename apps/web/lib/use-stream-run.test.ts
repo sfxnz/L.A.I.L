@@ -25,6 +25,7 @@ const hello: StreamHelloEvent = {
   base_url: "http://127.0.0.1:8000",
   n: 2,
   max_tokens: 512,
+  max_model_len: 262144,
   started_at: "2026-09-05T18:00:00Z",
   prompts: [
     { i: 0, title: "Prose", text: "Write an essay", pack: "prose" },
@@ -78,7 +79,7 @@ describe("stream run reducer", () => {
       { type: "delta", i: 0, text: "a", reasoning: false, chunks: 1, at: 1420 },
       { type: "delta", i: 0, text: "b", reasoning: false, chunks: 1, at: 1500 },
       { type: "delta", i: 0, text: "c", reasoning: false, chunks: 1, at: 4000 }, // 2.5 s gap → stall
-      { type: "agg", t_ms: 3200, tok_s: 12, peak_tok_s: 12, tokens: 3, running: 1, waiting: 1, done: 0, tokens_per_chunk: 1, at: 4100 },
+      { type: "agg", t_ms: 3200, tok_s: 12, peak_tok_s: 12, tokens: 3, running: 1, waiting: 1, done: 0, tokens_per_chunk: 1, calibrated: true, at: 4100 },
       { type: "strand", i: 0, state: "done", tokens: 3, at: 4200 },
       { type: "strand", i: 0, state: "done", tokens: 3, at: 9999 }, // re-emit never moves the first stamp
     ]);
@@ -101,7 +102,7 @@ describe("stream run reducer", () => {
       actions.push({ type: "delta", i: 0, text: "x", reasoning: false, chunks: 3, at: k * 100 });
       actions.push({ type: "delta", i: 1, text: "y", reasoning: false, chunks: 1, at: k * 100 });
     }
-    actions.push({ type: "agg", t_ms: 1000, tok_s: 80, peak_tok_s: 80, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 2, at: 1000 });
+    actions.push({ type: "agg", t_ms: 1000, tok_s: 80, peak_tok_s: 80, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 2, calibrated: true, at: 1000 });
     const s = run(actions);
     expect(s.latest?.strand_tok_s).toEqual([60, 20]);
     expect(s.agg[0].strand_tok_s?.reduce((a, b) => a + b, 0)).toBe(80);
@@ -163,6 +164,7 @@ describe("stream run reducer", () => {
       waiting: 0,
       done: 0,
       tokens_per_chunk: 1,
+      calibrated: true,
     }));
     const s = run([hello, ...points]);
     expect(s.agg.map((p) => p.t_ms)).toEqual([30_000, 61_000, 89_000]);
@@ -176,6 +178,7 @@ describe("stream run reducer", () => {
       index,
       concurrency: 2 ** index,
       aggregate_tok_s,
+      aggregate_steady_tok_s: aggregate_tok_s,
       per_stream_median_tok_s: aggregate_tok_s / 2 ** index,
       ttft_p50_ms: 400,
       ttft_p95_ms: 600,
@@ -197,6 +200,7 @@ describe("stream run reducer", () => {
         index: 5,
         size: 262_144,
         aggregate_tok_s: 0,
+        aggregate_steady_tok_s: null,
         per_stream_median_tok_s: 0,
         ttft_p50_ms: 0,
         ttft_p95_ms: 0,
@@ -248,8 +252,8 @@ describe("stream run reducer", () => {
         { i: 1, state: "decode", tok_s: 44, chunks: 120, text: "", reasoning_text: "" },
       ],
       agg: [
-        { t_ms: 1000, tok_s: 40, peak_tok_s: 40, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 1 },
-        { t_ms: 70_000, tok_s: 90, peak_tok_s: 95, tokens: 900, running: 1, waiting: 0, done: 1, tokens_per_chunk: 1 },
+        { t_ms: 1000, tok_s: 40, peak_tok_s: 40, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 1, calibrated: true },
+        { t_ms: 70_000, tok_s: 90, peak_tok_s: 95, tokens: 900, running: 1, waiting: 0, done: 1, tokens_per_chunk: 1, calibrated: true },
       ],
       levels: [],
       done: null,

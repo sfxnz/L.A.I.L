@@ -19,6 +19,8 @@ import { cn } from "@/lib/utils";
 import { Eyebrow, SyncRing, Tick, type SyncState } from "@/components/ui";
 import { AnimusField } from "@/components/animus/AnimusField";
 import { ThemeToggle } from "@/components/animus/ThemeToggle";
+import { CommandPalette } from "@/components/command/CommandPalette";
+import { useGlobalShortcuts } from "@/lib/shortcuts";
 
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   Status: LayoutDashboard,
@@ -37,11 +39,12 @@ function fmtRate(v: number) {
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const { status, loading, needToken, unreachable, strands } = useLabStatusStore();
+  const { status, loading, needToken, unreachable, liveRun } = useLabStatusStore();
   const [tokenDraft, setTokenDraft] = useState("");
 
   // The ONE lab-status poll: 2s while visible, paused while hidden.
   useEffect(() => startLabStatusPolling(), []);
+  useGlobalShortcuts();
 
   const serve = status?.serve;
   const healthy = serveHealthy(status);
@@ -52,7 +55,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const liveNode = cluster?.nodes?.find(
     (n) => n.state === "serving" || n.state === "serving_worker",
   );
-  const tokS = healthy ? liveNode?.gen_tok_per_s : null;
+  // Header truth: while a run streams, the header shows the run's own aggregate
+  // (the number Streams/Bench show), labelled "run"; otherwise the endpoint
+  // counter rate, labelled "endpoint". Never two unexplained numbers.
+  const tokS = liveRun ? liveRun.tok_s : healthy ? liveNode?.gen_tok_per_s : null;
+  const rateSource = liveRun ? "run" : "endpoint";
+  const engine = serve?.engine;
+  const running = liveRun?.running ?? engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
+  const waiting = liveRun?.waiting ?? engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
+  const kvUsage = engine?.kv_usage_pct ?? serve?.metrics?.gpu_kv_cache_usage ?? null;
+  const kvPct = kvUsage == null ? null : Math.round(kvUsage > 1 ? kvUsage : kvUsage * 100);
   const freeGib = serve?.hardware?.available_gib;
 
   const ring: SyncState | null = needToken
@@ -207,19 +219,38 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <>
                 <Tick className="hidden md:block" />
                 <span
-                  className="hidden shrink-0 font-mono text-[10px] text-lab-text md:inline"
-                  title="Live aggregate decode rate on the endpoint"
+                  className="hidden shrink-0 items-baseline gap-1.5 font-mono text-[10px] text-lab-text md:inline-flex"
+                  title={
+                    liveRun
+                      ? `Live ${liveRun.source} run aggregate (usage-calibrated) · peak ${fmtRate(liveRun.peak)}`
+                      : "Endpoint counter rate from the serve-engine sampler (2 s)"
+                  }
                 >
-                  {fmtRate(tokS)} <span className="text-lab-muted">tok/s</span>
+                  <Eyebrow className={cn("text-[8px]", liveRun ? "text-lab-target" : undefined)}>{rateSource}</Eyebrow>
+                  <span>
+                    {fmtRate(tokS)} <span className="text-lab-muted">tok/s</span>
+                  </span>
                 </span>
               </>
             )}
 
-            {!loading && !needToken && !unreachable && (
+            {!loading && !needToken && !unreachable && (running != null || waiting != null) && (
               <>
                 <Tick className="hidden lg:block" />
-                <Eyebrow className="hidden shrink-0 lg:inline" title="Strands running / waiting">
-                  {strands.running} running / {strands.waiting} waiting
+                <Eyebrow
+                  className="hidden shrink-0 lg:inline"
+                  title={liveRun ? "Strands in the live run" : "Requests running / waiting on the engine"}
+                >
+                  {running ?? 0} running / {waiting ?? 0} waiting
+                </Eyebrow>
+              </>
+            )}
+
+            {kvPct != null && (
+              <>
+                <Tick className="hidden xl:block" />
+                <Eyebrow className="hidden shrink-0 xl:inline" title="KV cache in use">
+                  KV {kvPct}%
                 </Eyebrow>
               </>
             )}
@@ -236,6 +267,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
           <Tick className="hidden sm:block" />
 
+          <CommandPalette />
           <ThemeToggle />
         </div>
       </header>

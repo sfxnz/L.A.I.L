@@ -325,8 +325,8 @@ describe("formatting", () => {
 describe("result shaping", () => {
   test("live level rows become arms in ms", () => {
     const arms = decodeArmsFromLevels([
-      { index: 0, concurrency: 1, aggregate_tok_s: 54.4, per_stream_median_tok_s: 54.4, ttft_p50_ms: 160, ttft_p95_ms: 200, ttft_p99_ms: 210, tpot_ms: 18.4, ok: 1, requests: 1, errors: [] },
-      { index: 1, concurrency: 2, aggregate_tok_s: null, per_stream_median_tok_s: null, ttft_p50_ms: null, ttft_p95_ms: null, ttft_p99_ms: null, tpot_ms: null, ok: 0, requests: 2, errors: ["#1: HTTP 500", "#2: HTTP 500"] },
+      { index: 0, concurrency: 1, aggregate_tok_s: 54.4, aggregate_steady_tok_s: 54.4, per_stream_median_tok_s: 54.4, ttft_p50_ms: 160, ttft_p95_ms: 200, ttft_p99_ms: 210, tpot_ms: 18.4, ok: 1, requests: 1, errors: [] },
+      { index: 1, concurrency: 2, aggregate_tok_s: null, aggregate_steady_tok_s: null, per_stream_median_tok_s: null, ttft_p50_ms: null, ttft_p95_ms: null, ttft_p99_ms: null, tpot_ms: null, ok: 0, requests: 2, errors: ["#1: HTTP 500", "#2: HTTP 500"] },
     ]);
     expect(arms[0]).toMatchObject({ concurrency: 1, aggregate: 54.4, ttftP50: 160, tpotMs: 18.4 });
     expect(arms[1]).toMatchObject({ concurrency: 2, aggregate: null, ok: 0, requests: 2 });

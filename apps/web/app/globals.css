@@ -745,6 +745,7 @@ html.animus-theming .lab-card {
 .bento-span-3,
 .bento-span-4,
 .bento-span-6,
+.bento-span-8,
 .bento-span-12 {
   grid-column: span 12;
 }
@@ -764,6 +765,9 @@ html.animus-theming .lab-card {
   }
   .bento-span-6 {
     grid-column: span 6;
+  }
+  .bento-span-8 {
+    grid-column: span 8;
   }
 }
 

@@ -61,6 +61,31 @@ export type ClusterNode = {
   roce_up_ifs?: string[];
   vllm_url?: string | null;
   ssh_host?: string;
+  /** GPU memory (C2 contract; nullable — UMA hosts may not report it). */
+  gpu_mem_used_gib?: number | null;
+  gpu_mem_total_gib?: number | null;
+  memory_used_mib?: number | null;
+  memory_total_mib?: number | null;
+};
+
+/**
+ * Engine telemetry (C2 contract, additive on GET /api/status). Every field is
+ * optional/nullable — the UI renders <Nil/> when a value is absent.
+ */
+export type EngineStatus = {
+  kv_usage_pct?: number | null;
+  requests_running?: number | null;
+  requests_waiting?: number | null;
+  block_size?: number | null;
+  num_gpu_blocks?: number | null;
+  kv_capacity_tokens?: number | null;
+  max_model_len?: number | null;
+  version?: string | null;
+  prefix_cache_hit_rate?: number | null;
+  preemptions_total?: number | null;
+  uptime_s?: number | null;
+  flags_fingerprint?: string | null;
+  flags?: string[] | null;
 };
 
 export type ClusterStatus = {
@@ -115,6 +140,17 @@ export type LabStatus = {
     base_url?: string;
     model_id?: string | null;
     models?: Array<{ id: string }>;
+    /** vLLM /version, as sampled today. */
+    version?: { version?: string | null } | null;
+    /** /metrics deltas from the serve-engine sampler (pre-C2 fallback for engine.*). */
+    metrics?: {
+      requests_running?: number | null;
+      requests_waiting?: number | null;
+      gpu_kv_cache_usage?: number | null;
+      gen_tok_per_s?: number | null;
+      prompt_tok_per_s?: number | null;
+    } | null;
+    engine?: EngineStatus | null;
     hardware?: {
       gpu_sku?: string;
       ram_gib?: number;

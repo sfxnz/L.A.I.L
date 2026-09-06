@@ -1,7 +1,8 @@
 "use client";
 
-import type { ReactNode } from "react";
-import type { ClusterNode, ClusterStatus } from "@/lib/api";
+import type { ClusterNode, ClusterStatus, EngineStatus } from "@/lib/api";
+import type { NodeSample } from "@/lib/lab-status-store";
+import { forecastLine, kvForecast } from "@/lib/status/forecast";
 import {
   Badge,
   EmptyState,
@@ -9,10 +10,14 @@ import {
   Nil,
   Panel,
   Skeleton,
+  SparkStat,
+  Sparkline,
+  Stat,
   SyncRing,
   Tick,
   syncStateFromNode,
 } from "@/components/ui";
+import { MemoryBar } from "@/components/status/MemoryBar";
 import { cn } from "@/lib/utils";
 
 /*
@@ -29,23 +34,11 @@ import { cn } from "@/lib/utils";
   "None" = settled and genuinely empty.
 */
 
-/** Eyebrow + value stack. The unit every HUD readout on this panel is built from. */
-function Readout({
-  label,
-  children,
-  className,
-}: {
-  label: string;
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("min-w-0", className)}>
-      <div className="animus-eyebrow truncate">{label}</div>
-      <div className="mt-1">{children}</div>
-    </div>
-  );
-}
+/** Eyebrow + value stack — the shared Stat; the value type is the caller's. */
+const Readout = Stat;
+
+/** Display-face 15 px reading — the second rank of number on a node card. */
+const READING = "font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums";
 
 function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
   switch (state) {
@@ -129,7 +122,7 @@ function fmtPct(v: number) {
 }
 
 function fmtWatts(v: number) {
-  return Number.isInteger(v) ? `${v} W` : `${v.toFixed(1)} W`;
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
 }
 
 function fmtRate(v: number) {
@@ -165,9 +158,43 @@ function TrafficValue({
   return <span className="text-lab-ok">{format(value)}</span>;
 }
 
-function NodeCard({ node }: { node: ClusterNode }) {
+/** Used / total GiB for the memory bar: GPU memory when reported, else unified memory (total − available). */
+function nodeMemory(node: ClusterNode): { used: number | null; total: number | null; source: string } {
+  if (node.gpu_mem_used_gib != null && node.gpu_mem_total_gib != null) {
+    return { used: node.gpu_mem_used_gib, total: node.gpu_mem_total_gib, source: "GPU memory" };
+  }
+  if (node.memory_used_mib != null && node.memory_total_mib != null) {
+    return { used: node.memory_used_mib / 1024, total: node.memory_total_mib / 1024, source: "GPU memory" };
+  }
+  if (node.ram_gib != null && node.available_gib != null) {
+    return { used: Math.max(0, node.ram_gib - node.available_gib), total: node.ram_gib, source: "unified memory: total − available" };
+  }
+  return { used: null, total: null, source: "" };
+}
+
+function series(samples: NodeSample[] | undefined, pick: (s: NodeSample) => number | null): number[] {
+  const out: number[] = [];
+  for (const s of samples ?? []) {
+    const v = pick(s);
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
+function NodeCard({
+  node,
+  samples,
+  engine,
+}: {
+  node: ClusterNode;
+  samples?: NodeSample[];
+  engine?: EngineStatus | null;
+}) {
   const modelShort = node.model_id?.split("/").pop() || null;
-  const free = node.available_gib;
+  const mem = nodeMemory(node);
+  const tokHistory = series(samples, (s) => s.tok_s);
+  const powerHistory = series(samples, (s) => s.power);
+  const forecast = kvForecast(engine?.kv_capacity_tokens);
   const speed =
     node.qsfp_speed_mbps && node.qsfp_speed_mbps > 0
       ? node.qsfp_speed_mbps >= 1000
@@ -226,24 +253,67 @@ function NodeCard({ node }: { node: ClusterNode }) {
 
       <div aria-hidden className="animus-rule my-3" />
 
-      <Readout label="Model">
-        <div
-          className="truncate text-[13px] font-medium tracking-[-0.01em] text-lab-text"
-          title={node.model_id || undefined}
-        >
-          {modelShort ?? <Nil word="None" />}
-        </div>
+      {/* Rank 1: the endpoint rate on this Spark, hero weight, with its last 60 s. */}
+      <div className="flex items-end justify-between gap-3">
+        <Readout label="tok/s">
+          <div
+            className="lab-num flex items-baseline gap-1.5 font-[family-name:var(--font-display)] text-[30px] font-bold leading-none tabular-nums text-lab-text"
+            title={serving ? "Live serve decode rate (endpoint counters, 2 s)" : undefined}
+          >
+            <TrafficValue serving={serving} value={node.gen_tok_per_s} format={fmtRate} />
+            {serving && node.gen_tok_per_s != null && (
+              <span className="font-mono text-[10px] font-normal text-lab-muted">tok/s</span>
+            )}
+          </div>
+        </Readout>
+        <Sparkline
+          points={tokHistory}
+          width={120}
+          height={30}
+          min={0}
+          className="shrink-0 text-lab-line"
+          label="Decode rate over the last 60 s"
+        />
+        <Readout label="Prefill" className="items-end text-right">
+          <div className={cn("lab-num", READING)} title={serving ? "Live serve prefill rate" : undefined}>
+            <TrafficValue serving={serving} value={node.prompt_tok_per_s} format={fmtRate} />
+          </div>
+        </Readout>
+      </div>
+
+      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] items-end gap-3">
+        <Readout label="Model">
+          <div
+            className="truncate text-[13px] font-medium tracking-[-0.01em] text-lab-text"
+            title={node.model_id || undefined}
+          >
+            {modelShort ?? <Nil word="None" />}
+          </div>
+        </Readout>
         {node.tensor_parallel_size != null && (
-          <div className="mt-1 font-mono text-[10px] tabular-nums text-lab-line-bright">
+          <div className="font-mono text-[10px] tabular-nums text-lab-line-bright">
             TP={node.tensor_parallel_size}
             {node.ray_hint ? " · ray" : ""}
           </div>
         )}
-      </Readout>
+      </div>
+
+      {/* Rank 2: memory — used / free, KV pool as a sub-track, capacity forecast. */}
+      <MemoryBar
+        className="mt-3"
+        usedGib={mem.used}
+        totalGib={mem.total}
+        source={mem.source}
+        kvUsage={serving ? engine?.kv_usage_pct : null}
+        kvCapacityTokens={engine?.kv_capacity_tokens}
+      />
+      <div className="lab-num mt-1.5 font-mono text-[10px] text-lab-muted" title="Whole 32k-token sequences that fit the KV pool">
+        {forecast && serving ? forecastLine(forecast) : <Nil word={serving ? "Awaiting" : "None"} />}
+      </div>
 
       <div className="mt-auto grid grid-cols-3 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
         <Readout label="Temperature">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+          <div className={READING}>
             <HardwareValue
               value={node.temperature_c}
               format={fmtTemp}
@@ -252,42 +322,20 @@ function NodeCard({ node }: { node: ClusterNode }) {
           </div>
         </Readout>
         <Readout label="Usage">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
+          <div className={READING}>
             <HardwareValue value={node.gpu_util_pct} format={fmtPct} />
           </div>
         </Readout>
-        <Readout label="Power">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
-            <HardwareValue value={node.power_w} format={fmtWatts} />
-          </div>
-        </Readout>
-        <Readout label="Free">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums">
-            <HardwareValue
-              value={free}
-              format={(n) => `${n} GiB`}
-              warn={free != null && free < 15}
-            />
-          </div>
-        </Readout>
-        <Readout label="tok/s">
-          <div
-            className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums"
-            title={serving ? "Live serve decode rate" : undefined}
-          >
-            <TrafficValue serving={serving} value={node.gen_tok_per_s} format={fmtRate} />
-          </div>
-        </Readout>
-        <Readout label="Prefill">
-          <div
-            className="font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums"
-            title={serving ? "Live serve prefill rate" : undefined}
-          >
-            <TrafficValue serving={serving} value={node.prompt_tok_per_s} format={fmtRate} />
-          </div>
-        </Readout>
+        <SparkStat
+          label="Power"
+          unit=" W"
+          values={powerHistory.length ? powerHistory : node.power_w != null ? [node.power_w] : []}
+          tone="text-lab-line-2"
+          format={fmtWatts}
+          title="GPU power over the last 60 s"
+        />
         <Readout label="QSFP">
-          <div className="font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tabular-nums">
+          <div className={cn(READING, "uppercase")}>
             {node.qsfp_carrier === 1 ? (
               <span className="text-lab-ok">{speed || "up"}</span>
             ) : node.qsfp_carrier === 0 ? (
@@ -503,9 +551,15 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
 export function ClusterPanel({
   cluster,
   loading,
+  samples,
+  engine,
 }: {
   cluster: ClusterStatus | null | undefined;
   loading?: boolean;
+  /** per-node 60 s ring buffer from the lab-status store */
+  samples?: Record<string, NodeSample[]>;
+  /** engine telemetry (KV %, capacity) — C2 contract, optional */
+  engine?: EngineStatus | null;
 }) {
   if (loading) {
     return (
@@ -576,19 +630,23 @@ export function ClusterPanel({
 
       <div className="p-3.5 sm:p-4">
         <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-[1fr_auto_1fr]">
-          {nodes[0] ? <NodeCard node={nodes[0]} /> : <div />}
+          {nodes[0] ? <NodeCard node={nodes[0]} samples={samples?.[nodes[0].id]} engine={engine} /> : <div />}
           {nodes.length >= 2 ? (
             <FabricBridge cluster={cluster} />
           ) : (
             <div className="hidden lg:block" />
           )}
-          {nodes[1] ? <NodeCard node={nodes[1]} /> : nodes.length < 2 ? null : <div />}
+          {nodes[1] ? (
+            <NodeCard node={nodes[1]} samples={samples?.[nodes[1].id]} engine={engine} />
+          ) : nodes.length < 2 ? null : (
+            <div />
+          )}
         </div>
 
         {nodes.length > 2 && (
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {nodes.slice(2).map((n) => (
-              <NodeCard key={n.id} node={n} />
+              <NodeCard key={n.id} node={n} samples={samples?.[n.id]} engine={engine} />
             ))}
           </div>
         )}

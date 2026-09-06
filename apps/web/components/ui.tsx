@@ -5,6 +5,7 @@ import type {
   ReactNode,
 } from "react";
 import { useEffect, useRef, useState } from "react";
+import { copyText } from "@/lib/streams/clipboard";
 import { cn } from "@/lib/utils";
 
 /*
@@ -369,6 +370,145 @@ export function Sparkline({
         />
       )}
     </svg>
+  );
+}
+
+/**
+ * Stat — the eyebrow-over-value cell every instrument readout is built from
+ * (cluster node cards, the Streams instrument bar, the hardware strip, Status
+ * cards). `mono` wraps the value in the tabular mono telemetry style; without
+ * it the caller owns the value's type (hero digits, badges, stacked lines).
+ */
+export function Stat({
+  label,
+  children,
+  title,
+  mono,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  title?: string;
+  mono?: boolean;
+  className?: string;
+}) {
+  return (
+    <div className={cn("flex min-w-0 flex-col gap-1", className)} title={title}>
+      <Eyebrow className="truncate">{label}</Eyebrow>
+      {mono ? (
+        <span className="lab-num truncate font-mono text-[13px] text-lab-text">{children}</span>
+      ) : (
+        children
+      )}
+    </div>
+  );
+}
+
+/**
+ * SparkStat — a Stat with its 60 s history beside it: label, last value + unit,
+ * sparkline. Node cards (tok/s, power) and the bench hardware strip share it.
+ */
+export function SparkStat({
+  label,
+  unit = "",
+  values,
+  max,
+  tone = "text-lab-line",
+  format = (n) => String(Math.round(n)),
+  title,
+  width = 72,
+  height = 22,
+  className,
+}: {
+  label: string;
+  unit?: string;
+  values: readonly number[];
+  max?: number;
+  /** a text-lab-* token class; drives the sparkline colour via currentColor */
+  tone?: string;
+  format?: (n: number) => string;
+  title?: string;
+  width?: number;
+  height?: number;
+  className?: string;
+}) {
+  const last = values.length ? values[values.length - 1] : null;
+  return (
+    <div className={cn("flex min-w-0 items-center gap-2", className)} title={title}>
+      <div className="min-w-0">
+        <Eyebrow className="block text-[9px]">{label}</Eyebrow>
+        <div className="lab-num mt-0.5 font-mono text-[12px] text-lab-text">
+          {last !== null ? (
+            <>
+              {format(last)}
+              <span className="text-lab-muted">{unit}</span>
+            </>
+          ) : (
+            <Nil />
+          )}
+        </div>
+      </div>
+      <Sparkline
+        points={values}
+        width={width}
+        height={height}
+        min={0}
+        max={max}
+        className={cn("shrink-0", tone)}
+        label={`${label} over the last 60 s`}
+      />
+    </div>
+  );
+}
+
+/**
+ * Copy feedback: `copy(label, text)` writes to the clipboard (with the insecure-
+ * origin fallback) and flashes "<label> copied" for 1.6 s.
+ */
+export function useCopy(): [string | null, (label: string, text: string) => void] {
+  const [flash, setFlash] = useState<string | null>(null);
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(null), 1600);
+    return () => clearTimeout(t);
+  }, [flash]);
+  const copy = (label: string, text: string) => {
+    void copyText(text).then((ok) => setFlash(ok ? `${label} copied` : "Clipboard blocked — select the text instead"));
+  };
+  return [flash, copy];
+}
+
+/** Inline copy-to-clipboard control for ids, URLs and fingerprints. Flashes "copied" in place. */
+export function CopyButton({
+  text,
+  label = "Copy",
+  className,
+}: {
+  text: string;
+  /** what was copied, e.g. "Endpoint" → "Endpoint copied" */
+  label?: string;
+  className?: string;
+}) {
+  const [flash, copy] = useCopy();
+  return (
+    <button
+      type="button"
+      onClick={() => copy(label, text)}
+      aria-label={`Copy ${label.toLowerCase()}`}
+      title={flash ?? `Copy ${label.toLowerCase()}`}
+      className={cn(
+        "animus-chamfer-sm inline-flex h-6 shrink-0 items-center gap-1 border border-lab-border px-1.5 font-[family-name:var(--font-display)] text-[9px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-muted transition-colors duration-[var(--dur-tap)] hover:border-lab-line hover:text-lab-text",
+        "focus-visible:outline-none! focus-visible:shadow-[inset_0_0_0_2px_var(--color-lab-line)]!",
+        flash && "border-lab-ok text-lab-ok",
+        className,
+      )}
+    >
+      <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden fill="none" stroke="currentColor" strokeWidth="1.1">
+        <rect x="3.5" y="3.5" width="7" height="7" />
+        <path d="M1.5 8.5v-7h7" />
+      </svg>
+      {flash ? "copied" : "copy"}
+    </button>
   );
 }
 

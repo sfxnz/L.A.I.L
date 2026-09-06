@@ -4,6 +4,7 @@
  * the hardware strip. Pure, so the instrument stays a thin renderer.
  */
 import type { ClusterNode } from "../api";
+import type { NodeSample } from "../lab-status-store";
 import type { StrandView } from "../use-stream-run";
 
 export const PILL_MIN_TOKENS = 4;
@@ -99,22 +100,32 @@ export type HardwareSeries = { id: string; label: string; samples: HardwareSampl
 
 export const HARDWARE_KEEP = 120;
 
-/** Append one sample per node; nodes come and go, so series are keyed by id. */
-export function sampleHardware(prev: HardwareSeries[], nodes: ClusterNode[] | undefined, t: number): HardwareSeries[] {
+/**
+ * Fold the store's per-node ring buffer (the ONE sampler, lab-status-store)
+ * into the run's series: append every sample newer than what we hold and not
+ * older than `since` (the run start). Nodes come and go, so series are keyed by id.
+ */
+export function appendHardware(
+  prev: HardwareSeries[],
+  samples: Record<string, NodeSample[]>,
+  nodes: ClusterNode[] | undefined,
+  since: number,
+): HardwareSeries[] {
   if (!nodes?.length) return prev;
   const byId = new Map(prev.map((s) => [s.id, s]));
+  let changed = false;
   const next: HardwareSeries[] = [];
   for (const n of nodes) {
     const cur = byId.get(n.id) ?? { id: n.id, label: n.label || n.hostname || n.id, samples: [] };
-    const sample: HardwareSample = {
-      t,
-      util: typeof n.gpu_util_pct === "number" ? n.gpu_util_pct : null,
-      power: typeof n.power_w === "number" ? n.power_w : null,
-      temp: typeof n.temperature_c === "number" ? n.temperature_c : null,
-    };
-    const last = cur.samples[cur.samples.length - 1];
-    const samples = last && last.t === t ? cur.samples : [...cur.samples, sample].slice(-HARDWARE_KEEP);
-    next.push({ ...cur, samples });
+    const lastT = cur.samples[cur.samples.length - 1]?.t ?? since - 1;
+    const fresh = (samples[n.id] ?? []).filter((s) => s.t > lastT && s.t >= since);
+    if (!fresh.length) {
+      next.push(cur);
+      continue;
+    }
+    changed = true;
+    const add: HardwareSample[] = fresh.map((s) => ({ t: s.t, util: s.util, power: s.power, temp: s.temp }));
+    next.push({ ...cur, samples: [...cur.samples, ...add].slice(-HARDWARE_KEEP) });
   }
-  return next;
+  return changed || next.length !== prev.length ? next : prev;
 }

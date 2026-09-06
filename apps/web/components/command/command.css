@@ -1,0 +1,309 @@
+/* ⌘K palette + shortcut sheet — Animus surfaces on the shared tokens.
+   Motion: compile-in ≤ 240ms on --ease-animus-out, exit ≤ 150ms; transform/opacity/clip-path only. */
+
+.cmd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: color-mix(in srgb, var(--color-lab-bg) 60%, transparent);
+  backdrop-filter: blur(4px);
+}
+.cmd-overlay[data-state="open"] {
+  animation: cmd-fade-in var(--dur-reveal) var(--ease-standard) both;
+}
+.cmd-overlay[data-state="closed"] {
+  animation: cmd-fade-out var(--dur-exit) var(--ease-standard) both;
+}
+
+.cmd-surface {
+  position: fixed;
+  z-index: 50;
+  left: 50%;
+  top: 14vh;
+  width: min(640px, calc(100vw - 24px));
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: translateX(-50%);
+  background: var(--animus-glass);
+  border: 1px solid var(--animus-hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--animus-panel-shadow), 0 24px 60px -24px rgba(0, 0, 0, 0.6);
+  backdrop-filter: saturate(150%) blur(16px);
+}
+.cmd-surface.animus-bracketed::before {
+  top: 3px;
+  left: 3px;
+}
+.cmd-surface.animus-bracketed::after {
+  right: 3px;
+  bottom: 3px;
+}
+.cmd-surface[data-state="open"] {
+  animation: cmd-compile-in var(--dur-reveal) var(--ease-animus-out) both;
+}
+.cmd-surface[data-state="closed"] {
+  animation: cmd-compile-out var(--dur-exit) var(--ease-standard) both;
+}
+.cmd-sheet {
+  top: 10vh;
+  width: min(760px, calc(100vw - 24px));
+  max-height: min(80vh, 680px);
+}
+
+@keyframes cmd-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes cmd-fade-out {
+  to { opacity: 0; }
+}
+@keyframes cmd-compile-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px);
+    clip-path: inset(0 0 100% 0);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+    clip-path: inset(0 0 0 0);
+  }
+}
+@keyframes cmd-compile-out {
+  to {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px);
+  }
+}
+
+/* Input row — hairline below, crimson leading segment like .page-header. */
+.cmd-input-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--animus-hairline);
+}
+.cmd-input-row::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  width: 40px;
+  height: 1px;
+  background: var(--color-lab-accent);
+  box-shadow: 0 0 8px var(--animus-accent-edge);
+}
+.cmd-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font-size: 14px;
+  color: var(--color-lab-text);
+}
+.cmd-input::placeholder {
+  color: var(--color-lab-muted);
+}
+
+.cmd-list {
+  overflow-y: auto;
+  padding: 6px 6px 8px;
+  scroll-padding-block: 6px;
+}
+.cmd-list [cmdk-group-heading] {
+  padding: 8px 10px 4px;
+}
+.cmd-empty {
+  padding: 22px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--color-lab-muted);
+}
+
+/* Rows: the crimson notch + leading bar is the nav's active state. */
+.cmd-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 12px;
+  font-size: 13px;
+  color: var(--color-lab-text-dim);
+  cursor: default;
+  user-select: none;
+}
+.cmd-item[data-selected="true"] {
+  color: var(--color-lab-text);
+}
+.cmd-item-notch {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  background: var(--animus-selection-fade);
+  pointer-events: none;
+}
+.cmd-item[data-selected="true"] .cmd-item-notch {
+  opacity: 0.5;
+}
+.cmd-item-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--color-lab-accent);
+  opacity: 0;
+}
+.cmd-item[data-selected="true"] .cmd-item-bar {
+  opacity: 1;
+}
+.cmd-glyph {
+  position: relative;
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  transform: rotate(45deg);
+  border: 1px solid var(--animus-hairline);
+  transition: background-color var(--dur-tap) linear, border-color var(--dur-tap) linear;
+}
+.cmd-item[data-selected="true"] .cmd-glyph {
+  background: var(--color-lab-accent);
+  border-color: var(--color-lab-accent);
+}
+.cmd-label {
+  position: relative;
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+}
+.cmd-label > span:first-child {
+  white-space: nowrap;
+}
+.cmd-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--color-lab-muted);
+}
+
+/* Key caps */
+.cmd-keys {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.cmd-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--animus-hairline);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--color-lab-muted);
+  background: color-mix(in srgb, var(--color-lab-input) 60%, transparent);
+}
+.cmd-item[data-selected="true"] .cmd-kbd {
+  color: var(--color-lab-text-dim);
+  border-color: var(--animus-tick);
+}
+.cmd-then {
+  font-size: 9px;
+  color: var(--color-lab-muted);
+  padding: 0 1px;
+}
+
+.cmd-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--animus-hairline);
+  font-size: 11px;
+  color: var(--color-lab-muted);
+}
+.cmd-foot .cmd-kbd {
+  margin-right: 4px;
+}
+
+/* Toast — one still line, no bounce. */
+.cmd-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 44px;
+  z-index: 60;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border: 1px solid var(--animus-hairline);
+  background: var(--animus-glass);
+  backdrop-filter: blur(10px);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-lab-text-dim);
+  animation: cmd-fade-in var(--dur-tap) linear both;
+  pointer-events: none;
+}
+
+/* Shortcut sheet */
+.cmd-sheet-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 24px;
+  padding: 14px 16px 18px;
+  overflow-y: auto;
+}
+@media (max-width: 640px) {
+  .cmd-sheet-body {
+    grid-template-columns: 1fr;
+  }
+}
+.cmd-sheet-col h3 {
+  margin: 0 0 8px;
+}
+.cmd-sheet-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-lab-border-subtle);
+  font-size: 12.5px;
+  color: var(--color-lab-text-dim);
+}
+.cmd-sheet-row:last-child {
+  border-bottom: 0;
+}
+.cmd-sheet-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmd-overlay,
+  .cmd-surface,
+  .cmd-toast {
+    animation: cmd-fade-in var(--dur-tap) linear both;
+    clip-path: none;
+  }
+  .cmd-surface[data-state="closed"],
+  .cmd-overlay[data-state="closed"] {
+    animation: cmd-fade-out var(--dur-tap) linear both;
+  }
+}

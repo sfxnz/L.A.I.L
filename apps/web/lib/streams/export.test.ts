@@ -14,6 +14,7 @@ const hello: StreamRunAction = {
   base_url: "http://127.0.0.1:8000",
   n: 2,
   max_tokens: 96,
+  max_model_len: 262144,
   started_at: "2026-09-05T20:00:00Z",
   prompts: [
     { i: 0, title: "prose_essay", text: "Continue this | essay", pack: "prose" },
@@ -26,7 +27,7 @@ const live = build([
   { type: "strand", i: 0, state: "decode", ttft_ms: 412 },
   { type: "delta", i: 0, text: "Decode throughput", reasoning: false, chunks: 4 },
   { type: "delta", i: 0, text: "hmm", reasoning: true, chunks: 1 },
-  { type: "agg", t_ms: 2500, tok_s: 84.4, peak_tok_s: 90, tokens: 200, running: 1, waiting: 1, done: 0, tokens_per_chunk: 2.7, ttft_p50_ms: 412, ttft_p95_ms: 412 },
+  { type: "agg", t_ms: 2500, tok_s: 84.4, peak_tok_s: 90, tokens: 200, running: 1, waiting: 1, done: 0, tokens_per_chunk: 2.7, calibrated: true, ttft_p50_ms: 412, ttft_p95_ms: 412 },
 ]);
 
 const finished = build([
@@ -58,14 +59,14 @@ const finished = build([
 describe("export shapes", () => {
   test("aggregateMethod names the number it quotes", () => {
     expect(aggregateMethod(live)).toEqual({ value: 84.4, method: "live · usage-calibrated ×2.7 tok/chunk" });
-    expect(aggregateMethod(build([hello, { type: "agg", t_ms: 1, tok_s: 3, peak_tok_s: 3, tokens: 3, running: 1, waiting: 0, done: 0, tokens_per_chunk: 1 }])).method).toBe(
+    expect(aggregateMethod(build([hello, { type: "agg", t_ms: 1, tok_s: 3, peak_tok_s: 3, tokens: 3, running: 1, waiting: 0, done: 0, tokens_per_chunk: 1, calibrated: false }])).method).toBe(
       "live · chunk estimate",
     );
     expect(aggregateMethod(finished)).toEqual({ value: 52.1, method: "final · usage" });
     // Cancelled: the engine reports aggregate_tok_s null — keep the last live number, name it.
     const cancelled = build([
       hello,
-      { type: "agg", t_ms: 900, tok_s: 40, peak_tok_s: 41, tokens: 30, running: 1, waiting: 0, done: 0, tokens_per_chunk: 2.5 },
+      { type: "agg", t_ms: 900, tok_s: 40, peak_tok_s: 41, tokens: 30, running: 1, waiting: 0, done: 0, tokens_per_chunk: 2.5, calibrated: true },
       { type: "done", run_id: "r9", summary: { ...finished.done!.summary, status: "cancelled", aggregate_tok_s: null }, saved_run_id: null },
     ]);
     expect(aggregateMethod(cancelled)).toEqual({ value: 40, method: "last sample · usage-calibrated ×2.5 tok/chunk" });

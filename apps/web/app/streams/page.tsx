@@ -5,7 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { api } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
-import { serveHealthy, useLabStatus, useLabStatusStore } from "@/lib/lab-status-store";
+import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import type { StreamPack, StreamRunRow } from "@/lib/stream-run-types";
 import { copyText, downloadText } from "@/lib/streams/clipboard";
 import { exportStem, jsonSnapshot, markdownSummary, type RunControls } from "@/lib/streams/export";
@@ -60,19 +60,6 @@ function parseApiError(e: unknown): { error?: string; message: string; run_id?: 
   } catch {
     return { message: msg };
   }
-}
-
-/**
- * Write the header strand counts only when they change. The store is read via
- * useSyncExternalStore by this page and the shell; a fresh `{0,0}` object on every
- * mount effect counts as a store change during hydration, and with the Suspense
- * boundary above this component React retried hydration until "Maximum update
- * depth exceeded" (seen 1 in ~16 cold loads with ?run=). Same values → no write.
- */
-function publishStrands(running: number, waiting: number) {
-  const store = useLabStatusStore.getState();
-  if (store.strands.running === running && store.strands.waiting === waiting) return;
-  store.setStrands({ running, waiting });
 }
 
 export default function StreamsPage() {
@@ -176,13 +163,6 @@ function StreamsRoom() {
       setNotice({ tone: "muted", title: "Re-attached", body: `Run ${liveRun.run_id} was still live on ${liveRun.base_url}.` });
     }
   }, [runs, urlRun, attach]);
-
-  // ── Header instrument strip: strands n running / m waiting ───────────────
-  useEffect(() => {
-    if (live && state.latest) publishStrands(state.latest.running, state.latest.waiting);
-    else publishStrands(0, 0);
-  }, [live, state.latest]);
-  useEffect(() => () => publishStrands(0, 0), []);
 
   // ── Wall mode: attribute on <html> so streams.css can hide the shell ─────
   useEffect(() => {

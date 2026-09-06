@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, streamRunEventsUrl } from "./api";
+import { useLabStatusStore, type LiveRun } from "./lab-status-store";
 import {
   STREAM_EVENT_TYPES,
   type StrandState,
@@ -298,8 +299,32 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
 
 const EVENT_TYPES = new Set<string>(STREAM_EVENT_TYPES);
 
+/**
+ * What the header's instrument strip shows while this run is live: the run's
+ * own aggregate (the number Streams/Bench display), not the endpoint counter
+ * rate. Null once the run is done, errored, or detached.
+ */
+export function liveRunOf(state: StreamRunState): LiveRun | null {
+  if (!state.hello || state.done || state.error) return null;
+  const l = state.latest;
+  return {
+    tok_s: l?.tok_s ?? 0,
+    peak: l?.peak_tok_s ?? 0,
+    running: l?.running ?? 0,
+    waiting: l?.waiting ?? 0,
+    source: state.hello.mode === "load" ? "streams" : "bench",
+  };
+}
+
 export function useStreamRun(runId: string | null) {
   const [state, setState] = useState<StreamRunState>(initialStreamRunState);
+
+  // Publish the run aggregate to the shared store (the header reads it).
+  // setLiveRun is a no-op when nothing changed, so this cannot loop hydration.
+  useEffect(() => {
+    useLabStatusStore.getState().setLiveRun(runId ? liveRunOf(state) : null);
+  }, [runId, state]);
+  useEffect(() => () => useLabStatusStore.getState().setLiveRun(null), []);
 
   useEffect(() => {
     if (!runId) {

@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import { api, type LabStatus } from "./api";
+import { api, type ClusterNode, type LabStatus } from "./api";
 import { isUnauthorizedError } from "./auth-token";
 
 /**
@@ -9,11 +9,35 @@ import { isUnauthorizedError } from "./auth-token";
  * visible, paused while hidden); every page reads from here instead of
  * running its own interval. 401 (`needToken`) and unreachable are kept apart —
  * a fresh browser with no token is not an outage.
+ *
+ * The store also keeps the two derived things every instrument agrees on:
+ *   · `samples` — a 60 s ring buffer (30 × 2 s) of per-node telemetry, the ONE
+ *     place status ticks accumulate (node sparklines, hardware strip, mini-board);
+ *   · `liveRun` — the run's usage-calibrated aggregate while a Streams/Bench run
+ *     is live, so the header shows the same number the run does (never two
+ *     unexplained tok/s).
  */
 
 export const LAB_STATUS_POLL_MS = 2000;
+/** 30 samples × 2 s = the 60 s window every sparkline draws. */
+export const NODE_SAMPLES_KEEP = 30;
 
-export type StrandCounts = { running: number; waiting: number };
+export type LiveRun = {
+  tok_s: number;
+  peak: number;
+  running: number;
+  waiting: number;
+  source: "streams" | "bench";
+};
+
+export type NodeSample = {
+  /** epoch ms of the poll that produced it */
+  t: number;
+  tok_s: number | null;
+  power: number | null;
+  util: number | null;
+  temp: number | null;
+};
 
 type LabStatusStore = {
   status: LabStatus | null;
@@ -26,34 +50,79 @@ type LabStatusStore = {
   error: string | null;
   /** epoch ms of the last successful poll */
   lastGoodAt: number | null;
-  /**
-   * Hook point for the streams engine (Phase B): live strand counts shown in
-   * the header instrument strip. Zero until a run is feeding them.
-   */
-  strands: StrandCounts;
+  /** per-node ring buffer of the last NODE_SAMPLES_KEEP polls, oldest first */
+  samples: Record<string, NodeSample[]>;
+  /** the live run's aggregate, or null when no run is streaming */
+  liveRun: LiveRun | null;
   refresh: () => Promise<void>;
-  setStrands: (s: StrandCounts) => void;
+  /** Writes only when a value changed — a fresh object per render looped hydration once. */
+  setLiveRun: (run: LiveRun | null) => void;
 };
 
-export const useLabStatusStore = create<LabStatusStore>((set) => ({
+function num(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Append one sample per node (pure). Nodes come and go, so series are keyed by id. */
+export function pushNodeSamples(
+  prev: Record<string, NodeSample[]>,
+  nodes: ClusterNode[] | undefined,
+  t: number,
+  keep = NODE_SAMPLES_KEEP,
+): Record<string, NodeSample[]> {
+  if (!nodes?.length) return prev;
+  const next: Record<string, NodeSample[]> = { ...prev };
+  for (const n of nodes) {
+    const cur = prev[n.id] ?? [];
+    const last = cur[cur.length - 1];
+    if (last && last.t === t) continue;
+    const sample: NodeSample = {
+      t,
+      tok_s: num(n.gen_tok_per_s),
+      power: num(n.power_w),
+      util: num(n.gpu_util_pct),
+      temp: num(n.temperature_c),
+    };
+    next[n.id] = cur.length >= keep ? [...cur.slice(cur.length - keep + 1), sample] : [...cur, sample];
+  }
+  return next;
+}
+
+export function sameLiveRun(a: LiveRun | null, b: LiveRun | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.tok_s === b.tok_s &&
+    a.peak === b.peak &&
+    a.running === b.running &&
+    a.waiting === b.waiting &&
+    a.source === b.source
+  );
+}
+
+export const useLabStatusStore = create<LabStatusStore>((set, get) => ({
   status: null,
   loading: true,
   needToken: false,
   unreachable: false,
   error: null,
   lastGoodAt: null,
-  strands: { running: 0, waiting: 0 },
+  samples: {},
+  liveRun: null,
   refresh: async () => {
     try {
       const status = await api.labStatus();
-      set({
+      const now = Date.now();
+      const nodes = status.cluster?.nodes ?? status.serve?.cluster?.nodes;
+      set((s) => ({
         status,
         loading: false,
         needToken: false,
         unreachable: false,
         error: null,
-        lastGoodAt: Date.now(),
-      });
+        lastGoodAt: now,
+        samples: pushNodeSamples(s.samples, nodes, now),
+      }));
     } catch (e) {
       const unauthorized = isUnauthorizedError(e);
       set({
@@ -64,7 +133,10 @@ export const useLabStatusStore = create<LabStatusStore>((set) => ({
       });
     }
   },
-  setStrands: (strands) => set({ strands }),
+  setLiveRun: (liveRun) => {
+    if (sameLiveRun(get().liveRun, liveRun)) return;
+    set({ liveRun });
+  },
 }));
 
 /** Read-only view for pages. Re-renders on every poll, like a page-local poll did. */

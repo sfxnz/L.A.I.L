@@ -55,6 +55,9 @@ def init_db() -> None:
         # external runners wrote perf_*. Re-kind them `legacy_*` once so `decode` means the
         # one controller bench and old rows never ghost or delta against new ones. A row
         # with malformed summary JSON is left alone (json_extract would abort startup).
+        # Rows are only re-kinded, never changed otherwise; to roll back to a build that
+        # still lists them as decode/perf_*:
+        #   UPDATE runs SET kind = substr(kind, 8) WHERE kind LIKE 'legacy_%';
         c.execute(
             """
             UPDATE runs SET kind = 'legacy_' || kind

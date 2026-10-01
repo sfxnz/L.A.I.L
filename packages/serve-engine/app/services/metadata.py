@@ -591,18 +591,3 @@ def _flag_value(flags: list[str], name: str) -> str | None:
         if f.startswith(f"{name}="):
             return f.split("=", 1)[1]
     return None
-
-
-def cost_per_1m_tokens(
-    decode_tok_per_s: float | None,
-    dollars_per_hour: float,
-) -> dict[str, float | None]:
-    if not decode_tok_per_s or decode_tok_per_s <= 0:
-        return {"cost_per_1m_output_tokens": None, "tokens_per_hour": None}
-    tph = decode_tok_per_s * 3600
-    cost = (dollars_per_hour / tph) * 1_000_000 if tph else None
-    return {
-        "cost_per_1m_output_tokens": round(cost, 4) if cost is not None else None,
-        "tokens_per_hour": round(tph, 1),
-        "assumed_dollars_per_hour": dollars_per_hour,
-    }

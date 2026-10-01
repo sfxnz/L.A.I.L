@@ -1,7 +1,7 @@
 /** Status card maths: quant parsing, the KV capacity forecast, uptime, the DNA strand slices. */
 import { describe, expect, test } from "bun:test";
-import { FORECAST_SEQ_TOKENS, fmtKvPct, fmtTokensK, forecastLine, kvForecast, kvFraction, kvUsedTokens } from "./forecast";
-import { fmtUptime } from "./format";
+import { FORECAST_SEQ_TOKENS, fmtKvPct, fmtTokensK, forecastLine, kvForecast } from "./forecast";
+import { fmtAgo, fmtUptime } from "./format";
 import { parseQuant } from "./quant";
 
 describe("parseQuant", () => {
@@ -43,19 +43,6 @@ describe("KV capacity forecast", () => {
     expect(fmtTokensK(800)).toBe("800");
     expect(fmtTokensK(2_100_000)).toBe("2.1M");
   });
-  test("kv usage is a percent, always — 0.5 is 0.5 %, never 50 %", () => {
-    expect(kvFraction(0.5)).toBeCloseTo(0.005);
-    expect(kvFraction(0.11)).toBeCloseTo(0.0011);
-    expect(kvFraction(1)).toBeCloseTo(0.01);
-    expect(kvFraction(11)).toBeCloseTo(0.11);
-    expect(kvFraction(140)).toBe(1);
-    expect(kvFraction(-3)).toBe(0);
-    // the live pool: 1,694,725 tokens
-    expect(kvUsedTokens(1_694_725, 0.5)).toBe(8474);
-    expect(kvUsedTokens(524_288, 50)).toBe(262_144);
-    expect(kvUsedTokens(null, 0.5)).toBeNull();
-    expect(kvUsedTokens(524_288, null)).toBeNull();
-  });
   test("fmtKvPct: one decimal below 10 % so small real use is visible", () => {
     expect(fmtKvPct(0)).toBe("0%");
     expect(fmtKvPct(0.84)).toBe("0.8%");
@@ -78,5 +65,10 @@ describe("fmtUptime", () => {
     expect(fmtUptime(90_000)).toBe("1 d 1 h");
     expect(fmtUptime(null)).toBe("");
     expect(fmtUptime(-1)).toBe("");
+  });
+  test("fmtAgo never reads \"now ago\"", () => {
+    expect(fmtAgo(0.4)).toBe("just now");
+    expect(fmtAgo(3.2)).toBe("3 s ago");
+    expect(fmtAgo(null)).toBe("");
   });
 });

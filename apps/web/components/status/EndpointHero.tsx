@@ -4,8 +4,8 @@ import Link from "next/link";
 import { memo, useEffect, useState } from "react";
 import type { LabStatus } from "@/lib/api";
 import type { EndpointSample } from "@/lib/lab-status-store";
-import { fmtKvPct, fmtTokensK, forecastLine, kvForecast, kvUsedTokens } from "@/lib/status/forecast";
-import { engineLabel, fmtAge, fmtRate, fmtUptime } from "@/lib/status/format";
+import { fmtKvPct, fmtTokensK, forecastLine, kvForecast } from "@/lib/status/forecast";
+import { engineLabel, fmtAgo, fmtRate, fmtUptime } from "@/lib/status/format";
 import { parseQuant } from "@/lib/status/quant";
 import { Badge, CopyButton, Eyebrow, Nil, Panel, Sparkline, Stat, useCopy } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -87,7 +87,6 @@ export const EndpointHero = memo(function EndpointHero({
   const running = engine.requests_running ?? m.requests_running ?? null;
   const waiting = engine.requests_waiting ?? m.requests_waiting ?? null;
   const kvPct = engine.kv_usage_pct ?? null;
-  const kvTokens = kvUsedTokens(engine.kv_capacity_tokens, kvPct);
   const forecast = kvForecast(engine.kv_capacity_tokens);
 
   const decode = m.decode_tok_per_s ?? null;
@@ -159,7 +158,7 @@ export const EndpointHero = memo(function EndpointHero({
                 </Big>
                 <Eyebrow className="mt-1.5 block text-[9px]">
                   last burst{burst.tokens ? ` · ${burst.tokens} tok` : ""}
-                  {burstAge != null ? ` · ${fmtAge(burstAge)} ago` : ""}
+                  {burstAge != null ? ` · ${fmtAgo(burstAge)}` : ""}
                 </Eyebrow>
               </div>
             ) : (
@@ -208,7 +207,7 @@ export const EndpointHero = memo(function EndpointHero({
               ) : lastTtft ? (
                 <span className="text-lab-muted" title="No request started this second: the last one's TTFT — not live">
                   last {msOrS(lastTtft.s)}
-                  {lastTtftAge != null ? ` · ${fmtAge(lastTtftAge)} ago` : ""}
+                  {lastTtftAge != null ? ` · ${fmtAgo(lastTtftAge)}` : ""}
                 </span>
               ) : (
                 <Nil word={busy ? "None" : "Idle"} />
@@ -220,7 +219,7 @@ export const EndpointHero = memo(function EndpointHero({
               ) : lastPrefill ? (
                 <span className="text-lab-muted" title="Last finished request's prefill — not live">
                   last {fmtRate(lastPrefill.tok_per_s)}
-                  {lastPrefillAge != null ? ` · ${fmtAge(lastPrefillAge)} ago` : ""}
+                  {lastPrefillAge != null ? ` · ${fmtAgo(lastPrefillAge)}` : ""}
                 </span>
               ) : (
                 <Nil word={busy ? "None" : "Idle"} />
@@ -240,17 +239,12 @@ export const EndpointHero = memo(function EndpointHero({
                 <Nil word="None" />
               )}
             </Row>
-            <Row label="KV cache" title={forecast ? forecastLine(forecast) : "KV cache in use"}>
+            <Row
+              label="KV cache"
+              title={`Share of the KV block pool in use (blocks are reserved whole, so this is not a token count)${forecast ? ` · ${forecastLine(forecast)}` : ""}`}
+            >
               {kvPct != null ? (
-                <span className={cn(kvPct >= 90 && "text-lab-warn")}>
-                  {fmtKvPct(kvPct)}
-                  {kvTokens != null && engine.kv_capacity_tokens ? (
-                    <span className="text-lab-muted">
-                      {" "}
-                      · {fmtTokensK(kvTokens)} / {fmtTokensK(engine.kv_capacity_tokens)}
-                    </span>
-                  ) : null}
-                </span>
+                <span className={cn(kvPct >= 90 && "text-lab-warn")}>{fmtKvPct(kvPct)}</span>
               ) : (
                 <Nil />
               )}

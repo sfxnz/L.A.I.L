@@ -41,19 +41,12 @@ export function forecastLine(f: KvForecast): string {
   return `KV capacity ${fmtTokensK(f.capacityTokens)} tokens · fits ${f.fits} × ${fmtTokensK(f.seqTokens)}`;
 }
 
-/**
- * KV contract: the serve-engine sends `engine.kv_usage_pct` as a PERCENT, 0–100, always.
- * No unit guessing — 0.84 means 0.84 %, never 84 %.
+/*
+ * KV contract: the serve-engine sends `engine.kv_usage_pct` as a PERCENT, 0–100, always
+ * (0.84 means 0.84 %, never 84 %). It is vLLM's share of KV *blocks* in use: on hybrid
+ * (Mamba/attention) models every request reserves whole blocks whatever its length, so
+ * percent × kv_capacity_tokens is not the tokens cached — never show it as such.
  */
-export function kvFraction(pct: number): number {
-  return Math.max(0, Math.min(1, pct / 100));
-}
-
-/** KV tokens in use, from the pool's usage percent. */
-export function kvUsedTokens(capacityTokens: number | null | undefined, pct: number | null | undefined): number | null {
-  if (capacityTokens == null || pct == null || !Number.isFinite(capacityTokens) || !Number.isFinite(pct)) return null;
-  return Math.round(capacityTokens * kvFraction(pct));
-}
 
 /**
  * "0.8%" below 10 %, "42%" above; any real use below 0.05 % reads "<0.1%", never "0.0%"

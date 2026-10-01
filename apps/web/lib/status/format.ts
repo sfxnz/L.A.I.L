@@ -51,6 +51,12 @@ export function fmtAge(s: number | null | undefined): string {
   return fmtUptime(s);
 }
 
+/** How long ago, for "last …" labels: "just now" under a second, then "4 s ago". */
+export function fmtAgo(s: number | null | undefined): string {
+  const age = fmtAge(s);
+  return age === "now" ? "just now" : age ? `${age} ago` : "";
+}
+
 /** Display name of an engine / backend key. */
 export function engineLabel(key: string | null | undefined): string {
   const k = (key || "").toLowerCase();

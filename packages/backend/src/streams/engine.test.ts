@@ -480,10 +480,14 @@ describe("bench runs", () => {
     const res = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
     const { run_id } = (await res.json()) as { run_id: string };
     const events = await collect(run_id);
-    const firstDone = events.findIndex((e) => e.type === "strand" && e.state === "done");
     const aggs = byType(events, "agg");
     expect(aggs.length).toBeGreaterThan(2);
-    expect(events.findIndex((e) => e.type === "agg" && e.calibrated)).toBeGreaterThan(firstDone);
+    expect(aggs[0].calibrated).toBe(false);
+    // The trailing usage frame follows every output chunk but precedes [DONE] by one frame, so an
+    // agg tick may land between it and the strand's `done`. What must hold: the first calibrated
+    // agg already counts every output chunk, i.e. calibration came from the trailing frame.
+    const doneTokens = byType(events, "strand").find((s) => s.state === "done")!.tokens!;
+    expect(aggs.find((a) => a.calibrated)!.tokens).toBe(doneTokens);
     expect(aggs[aggs.length - 1]).toMatchObject({ calibrated: true, tokens_per_chunk: 3 });
   });
 

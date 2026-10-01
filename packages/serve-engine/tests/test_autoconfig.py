@@ -127,7 +127,7 @@ def test_checkpoint_safety_keeps_flashinfer_b12x_on_v027():
     assert serve_cfg["moe_backend"] == "flashinfer_b12x"
     assert any(e == "CUTE_DSL_ARCH=sm_121a" for e in serve_cfg["docker_env"])
     ac._apply_first_boot_defaults(
-        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+        serve_cfg, detected=detected, warnings=warnings, rationale=rationale
     )
     assert serve_cfg["moe_backend"] == "flashinfer_b12x"
 
@@ -697,7 +697,7 @@ def test_checkpoint_safety_strips_marlin_on_moe():
     assert serve_cfg["moe_backend"] == ""
     assert any("marlin" in w for w in warnings)
     ac._apply_first_boot_defaults(
-        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+        serve_cfg, detected=detected, warnings=warnings, rationale=rationale
     )
     assert serve_cfg["mtp"] is False
     assert "speculative-config" not in (serve_cfg.get("extra_flags") or "")
@@ -734,7 +734,7 @@ def test_marlin_kept_for_nemotron_family():
     ac._apply_checkpoint_safety(cfg, detected, warnings, rationale)
     assert cfg["moe_backend"] == "marlin"
     ac._apply_first_boot_defaults(
-        cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+        cfg, detected=detected, warnings=warnings, rationale=rationale
     )
     assert cfg["moe_backend"] == "marlin"
 
@@ -928,7 +928,6 @@ def test_early_image_resolve_never_replaces_anemll():
     rat: list[str] = []
     out = ac._resolve_image_for_gates(
         cfg,
-        mode="workflow_max",
         candidate_image="vllm/vllm-openai:v0.28.0",
         card_image="vllm/vllm-openai:v0.28.0",
         detected={"has_nvfp4": True, "family": "nemotron"},
@@ -945,7 +944,6 @@ def test_early_image_resolve_never_downgrades_lab_default():
     rat: list[str] = []
     out = ac._resolve_image_for_gates(
         cfg,
-        mode="workflow_max",
         candidate_image="vllm/vllm-openai:v0.25.0",
         card_image="vllm/vllm-openai:v0.25.0",
         detected={"has_nvfp4": True},
@@ -1086,7 +1084,7 @@ def test_topology_two_sparks_sets_tp2_and_fabric(monkeypatch):
     monkeypatch.setattr(ac, "_ib_hca_for_iface", lambda iface: "rocep1s0f1")
     cfg = ac._empty_config(DSV4)
     warnings, rationale = [], []
-    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_two_spark_topo(), weights_gib=155.4, warnings=warnings, rationale=rationale)
     assert cfg["tensor_parallel_size"] == 2
     assert "--nnodes 2" in cfg["extra_flags"]
     assert "--master-addr 10.100.8.1" in cfg["extra_flags"]
@@ -1102,7 +1100,7 @@ def test_topology_one_spark_strips_multinode_and_dp():
     cfg = ac._empty_config(DSV4)
     cfg["extra_flags"] = "--data-parallel-size 4 --tensor-parallel-size 2"
     warnings, rationale = [], []
-    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_one_spark_topo(), weights_gib=21.0, mode="lab_safe", warnings=warnings, rationale=rationale)
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=_one_spark_topo(), weights_gib=21.0, warnings=warnings, rationale=rationale)
     assert cfg.get("tensor_parallel_size") is None
     assert "--data-parallel-size" not in cfg["extra_flags"]
     assert "--nnodes" not in cfg["extra_flags"]
@@ -1126,7 +1124,7 @@ def _apply_multinode(monkeypatch, topo):
     monkeypatch.setattr(ac, "_ib_hca_for_iface", lambda iface: None)
     cfg = ac._empty_config(DSV4)
     warnings, rationale = [], []
-    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=topo, weights_gib=155.4, mode="workflow_max", warnings=warnings, rationale=rationale)
+    ac._apply_topology(cfg, overlay=ac._family_overlay(DSV4, {}), topology=topo, weights_gib=155.4, warnings=warnings, rationale=rationale)
     return cfg, warnings, rationale, cluster
 
 
@@ -1877,7 +1875,6 @@ def test_size_memory_clamps_huge_context_single_node():
         detected={"family": "qwen"},
         weights_gib=40.0,
         node_ram_gib=121.7,
-        mode="workflow_max",
         rationale=rationale,
         warnings=warnings,
     )
@@ -1911,7 +1908,6 @@ def test_size_memory_keeps_native_len_drops_seqs_first():
         detected={"family": "qwen"},
         weights_gib=18.0,
         node_ram_gib=121.7,
-        mode="auto",
         rationale=rationale,
         warnings=warnings,
     )
@@ -1941,7 +1937,6 @@ def test_size_memory_sizes_multinode_per_node():
         detected={"family": "deepseek_v4"},
         weights_gib=77.7,  # 155.4 / 2
         node_ram_gib=121.7,
-        mode="workflow_max",
         rationale=rationale,
         warnings=warnings,
     )
@@ -1999,18 +1994,6 @@ def test_vl_keeps_vision_by_default():
     assert "--language-model-only" not in (cfg.get("extra_flags") or "")
     assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
     assert any("vision" in r.lower() for r in rationale)
-
-
-def test_vl_legacy_mode_arg_still_keeps_vision():
-    cfg = {"extra_flags": "--language-model-only", "moe_backend": ""}
-    warnings: list[str] = []
-    rationale: list[str] = []
-    ac._apply_vl_spark_defaults(
-        cfg, {"is_vl": True}, warnings, rationale, mode="lab_safe"
-    )
-    assert "--language-model-only" not in (cfg.get("extra_flags") or "")
-    assert "--limit-mm-per-prompt" in (cfg.get("extra_flags") or "")
-    assert not any("Lab Safe serves language-model-only" in w for w in warnings)
 
 
 def test_resolve_dspark_draft_from_card():
@@ -2907,7 +2890,6 @@ def test_apply_topology_rtx_has_no_gb10_arch():
         overlay=None,
         topology=_one_node_topo(ram_gib=24.0, gpu_sku="NVIDIA GeForce RTX 4090"),
         weights_gib=8.0,
-        mode="lab_safe",
         warnings=warnings,
         rationale=rationale,
     )
@@ -2923,7 +2905,6 @@ def test_apply_topology_gb10_sets_arch():
         overlay=None,
         topology=_one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"),
         weights_gib=20.0,
-        mode="workflow_max",
         warnings=[],
         rationale=[],
     )
@@ -3282,7 +3263,7 @@ def test_first_boot_keeps_playbook_mtp_and_attention():
     ac._apply_checkpoint_safety(serve_cfg, detected, warnings, rationale)
     assert serve_cfg["moe_backend"] == "marlin"
     ac._apply_first_boot_defaults(
-        serve_cfg, mode="workflow_max", detected=detected, warnings=warnings, rationale=rationale
+        serve_cfg, detected=detected, warnings=warnings, rationale=rationale
     )
     assert serve_cfg["moe_backend"] == "marlin"
     assert serve_cfg["mtp"] is True
@@ -4259,7 +4240,6 @@ def test_playbook_image_gemma4_not_anemll():
     cfg = ac._empty_config("google/gemma-4-31B-it")
     ac._resolve_image_for_gates(
         cfg,
-        mode=None,
         candidate_image=None,
         card_image=None,
         detected={"family": "gemma4"},
@@ -4270,7 +4250,6 @@ def test_playbook_image_gemma4_not_anemll():
     dcfg = ac._empty_config("google/diffusiongemma-26B-A4B-it")
     ac._resolve_image_for_gates(
         dcfg,
-        mode=None,
         candidate_image="vllm/vllm-openai:v0.27.1",
         card_image="vllm/vllm-openai:v0.27.1",
         detected={"family": "diffusiongemma"},
@@ -4283,7 +4262,6 @@ def test_playbook_image_gemma4_not_anemll():
     anemll["image"] = ac.DSPARK_IMAGE
     ac._resolve_image_for_gates(
         anemll,
-        mode=None,
         candidate_image="vllm/vllm-openai:gemma4-cu130",
         card_image="vllm/vllm-openai:gemma4-cu130",
         detected={"family": "gemma4"},
@@ -4295,7 +4273,6 @@ def test_playbook_image_gemma4_not_anemll():
     anemll_dg["image"] = ac.DSPARK_IMAGE
     ac._resolve_image_for_gates(
         anemll_dg,
-        mode=None,
         candidate_image=None,
         card_image=None,
         detected={"family": "diffusiongemma"},

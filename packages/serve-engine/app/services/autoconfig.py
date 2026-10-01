@@ -1445,12 +1445,11 @@ def _apply_topology(
     overlay: Optional[dict[str, Any]],
     topology: dict[str, Any],
     weights_gib: Optional[float],
-    mode: str,
     warnings: list[str],
     rationale: list[str],
 ) -> None:
     """Compute TP / nnodes / fabric env from the placement plan (live cluster + weights)."""
-    plan = plan_placement(weights_gib, topology, mode=mode, overlay=overlay)
+    plan = plan_placement(weights_gib, topology, overlay=overlay)
     n = int(plan["nodes_needed"])
     head = plan.get("head") or {}
     workers = plan.get("workers") or []
@@ -2128,8 +2127,8 @@ def _is_anemll_image(image: str | None) -> bool:
     return "anemll" in s or "dspark-vllm" in s
 
 
-def _lab_default_image(mode: str | None = None) -> str:
-    """Single stock image. ``mode`` is ignored (legacy)."""
+def _lab_default_image() -> str:
+    """Single stock image."""
     return DEFAULT_IMAGE_MAX or DEFAULT_IMAGE_SAFE
 
 
@@ -2151,7 +2150,6 @@ def _playbook_required_image(model: str, detected: dict[str, Any] | None) -> str
 def _resolve_image_for_gates(
     cfg: dict[str, Any],
     *,
-    mode: str,
     candidate_image: str | None,
     card_image: str | None,
     detected: dict[str, Any] | None,
@@ -2160,12 +2158,12 @@ def _resolve_image_for_gates(
 ) -> str:
     """Resolve cfg['image'] before marlin/safety gates.
 
-    Floor is the lab default for ``mode``. Stock card/docker pins and capability
+    Floor is the lab default image. Stock card/docker pins and capability
     floors may only *raise*. Anemll/DSpark images are never replaced.
     Non-stock alternate pins (nvcr, eugr, …) are recorded, not auto-selected.
     """
     warnings = warnings if warnings is not None else []
-    lab = _lab_default_image(mode)
+    lab = _lab_default_image()
     cur = (cfg.get("image") or "").strip()
 
     if _is_anemll_image(cur):
@@ -2289,7 +2287,7 @@ def _capability_min_stock_image(
 
 def check_serve_loadability(
     *,
-    mode: str,
+    mode: str | None = None,
     weights_gib: Optional[float],
     node_ram_gib: float,
     nodes_used: int,
@@ -3844,10 +3842,8 @@ def _apply_vl_spark_defaults(
     detected: dict[str, Any],
     warnings: list[str],
     rationale: list[str],
-    *,
-    mode: str | None = None,
 ) -> None:
-    """Keep vision on by default with an MM cap. ``mode`` is ignored (legacy)."""
+    """Keep vision on by default with an MM cap."""
     if not detected.get("is_vl"):
         return
     ex = cfg.get("extra_flags") or ""
@@ -3864,7 +3860,6 @@ def _apply_vl_spark_defaults(
 def _apply_first_boot_defaults(
     cfg: dict[str, Any],
     *,
-    mode: str,
     detected: dict[str, Any],
     warnings: list[str],
     rationale: list[str],
@@ -3931,7 +3926,7 @@ def _apply_first_boot_defaults(
             + ")"
         )
 
-    # Long card contexts are clamped by _apply_mode_envelope on single-node Spark.
+    # Long card contexts are clamped by _apply_hardware_envelope on single-node Spark.
     # Multi-node overlays (TP>=2) keep their pin.
 
 
@@ -4777,7 +4772,6 @@ def _size_memory_for_spark(
     detected: dict[str, Any],
     weights_gib: Optional[float],
     node_ram_gib: float,
-    mode: str,
     rationale: list[str],
     warnings: list[str],
 ) -> None:
@@ -4788,7 +4782,6 @@ def _size_memory_for_spark(
     a recipe already pinned util. Runs for every model, including TP>=2
     (``weights_gib`` must be per-node).
     """
-    del mode
     per_node_w = float(weights_gib) if weights_gib and weights_gib > 0 else 0.0
     ml = cfg.get("max_model_len")
     if not isinstance(ml, int) or ml <= 0:
@@ -4871,15 +4864,14 @@ def _apply_hardware_envelope(
     card_set_max_len: bool,
     card_set_util: bool = False,
     *,
-    mode: str | None = None,
     native_max_len: int | None = None,
 ) -> None:
     """Fill max-len / image when the recipe is silent. Util is sized later.
 
     Target context is the checkpoint's native window when known — not a
-    one-size 262k default. ``mode`` is ignored (legacy).
+    one-size 262k default.
     """
-    del mode, card_set_util
+    del card_set_util
     tp = int(cfg.get("tensor_parallel_size") or 1)
     if not card_set_max_len:
         if isinstance(native_max_len, int) and native_max_len > 0:
@@ -4908,19 +4900,6 @@ def _apply_hardware_envelope(
         )
 
 
-def _apply_mode_envelope(
-    cfg: dict[str, Any],
-    mode: str | None,
-    rationale: list[str],
-    card_set_max_len: bool,
-    card_set_util: bool = False,
-) -> None:
-    """Legacy wrapper — ``mode`` is ignored."""
-    _apply_hardware_envelope(
-        cfg, rationale, card_set_max_len, card_set_util=card_set_util, mode=mode
-    )
-
-
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -4939,7 +4918,7 @@ def recommend(
     ``backend`` is ``vllm`` (default), ``llamacpp``, or ``sglang``. GGUF ids
     should use ``llamacpp``. None of these paths start a server.
     """
-    mode = None  # user-facing dual envelopes are gone
+    del mode  # accepted for old clients; user-facing dual envelopes are gone
     model = (model or "").strip()
     if not model:
         raise ValueError("model is required")
@@ -5151,14 +5130,13 @@ def recommend(
     card_image_pin = _parse_card_image_requirement(readme)
     _resolve_image_for_gates(
         cfg,
-        mode=mode,
         candidate_image=cand_image,
         card_image=card_image_pin,
         detected=detected,
         rationale=rationale,
         warnings=warnings,
     )
-    _warn_floating_card_image(readme, _lab_default_image(mode), warnings)
+    _warn_floating_card_image(readme, _lab_default_image(), warnings)
 
     # config.json is ground truth for quant layout — fix card flags that crash
     _apply_checkpoint_safety(cfg, detected, warnings, rationale)
@@ -5210,7 +5188,6 @@ def recommend(
         overlay=overlay,
         topology=topology,
         weights_gib=weights_gib,
-        mode=mode,
         warnings=warnings,
         rationale=rationale,
     )
@@ -5220,12 +5197,11 @@ def recommend(
     if not overlay:
         _apply_first_boot_defaults(
             cfg,
-            mode=mode,
             detected=detected,
             warnings=warnings,
             rationale=rationale,
         )
-    _apply_vl_spark_defaults(cfg, detected, warnings, rationale, mode=mode)
+    _apply_vl_spark_defaults(cfg, detected, warnings, rationale)
 
     # Always explain flashinfer avoidance when card recommends it but checkpoint forbids it.
     # Overlay already encodes the correct backend, so only run for card-driven configs.
@@ -5258,7 +5234,6 @@ def recommend(
     # fully filled cfg. Anemll overlay image is preserved (never replaced).
     _resolve_image_for_gates(
         cfg,
-        mode=mode,
         candidate_image=cand_image if not overlay else None,
         card_image=card_image_pin if not overlay else None,
         detected=detected,
@@ -5295,7 +5270,6 @@ def recommend(
         detected=detected,
         weights_gib=per_node if per_node is not None else weights_gib,
         node_ram_gib=node_ram,
-        mode=mode,
         rationale=rationale,
         warnings=warnings,
     )
@@ -5382,7 +5356,6 @@ def recommend(
     plan = cfg.get("topology_plan") or {}
     fits = bool(plan.get("fits", True))
     ok_load, load_msg = check_serve_loadability(
-        mode=mode,
         weights_gib=weights_gib,
         node_ram_gib=_resolved_node_ram_gib(plan.get("node_ram_gib")),
         nodes_used=int(plan.get("nodes_needed") or 1),
@@ -5798,7 +5771,6 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
 
     fits = bool(plan.get("fits", True))
     ok_load, load_msg = check_serve_loadability(
-        mode=None,
         weights_gib=weights_gib,
         node_ram_gib=ram,
         nodes_used=int(plan.get("nodes_needed") or tp or 1),

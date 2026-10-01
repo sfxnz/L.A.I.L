@@ -29,8 +29,10 @@ export function InstrumentBar({ state, live, className }: { state: StreamRunStat
   const ringLabel = state.error ? "Run failed" : sum ? (sum.status === "cancelled" ? "Run cancelled" : "Run synchronized") : live ? "Synchronizing" : "Idle";
   const peak = sum?.peak_tok_s ?? latest?.peak_tok_s;
   const tokens = sum?.tokens ?? latest?.tokens;
-  const p50 = sum?.ttft_p50_ms ?? latest?.ttft_p50_ms;
-  const p95 = sum?.ttft_p95_ms ?? latest?.ttft_p95_ms;
+  // Once the run is done its summary is the definition (a null p95 = too few samples),
+  // never a fallback to the live pooled value.
+  const p50 = sum ? sum.ttft_p50_ms : latest?.ttft_p50_ms;
+  const p95 = sum ? sum.ttft_p95_ms : latest?.ttft_p95_ms;
   const elapsed = sum?.duration_ms ?? latest?.t_ms;
   const lastLive = state.agg.length ? state.agg[state.agg.length - 1].tok_s : 0;
 

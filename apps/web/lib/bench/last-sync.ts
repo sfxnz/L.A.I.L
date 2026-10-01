@@ -41,6 +41,22 @@ function indexKey(r: RunRow) {
 }
 
 /**
+ * The newest index row created before `current` (and not `current` itself) that is like
+ * for like with it — the Bench ghost's baseline, found the way Status finds its delta.
+ */
+export function previousComparable(
+  rows: RunRow[],
+  current: { id: string | null; savedRunId: string | null; model: string; pack: string; maxTokens: number | null; fingerprint: string | null; createdAt: string | null },
+): RunRow | null {
+  return (
+    rows
+      .filter((r) => r.run_id !== current.id && r.run_id !== current.savedRunId && (!current.createdAt || r.created_at <= current.createdAt))
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+      .find((r) => comparable(indexKey(r), current)) ?? null
+  );
+}
+
+/**
  * The newest decode run for `servingModel` (any model when nothing is served) and the
  * newest earlier run comparable to it.
  */

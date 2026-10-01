@@ -20,7 +20,7 @@ import {
 } from "@/lib/bench/levels";
 import { fmtDate } from "@/lib/bench/format";
 import { decodeResultFromLive, prefillResultFromLive, type BenchResult } from "@/lib/bench/result";
-import { loadEntry, previousOf, useRunHistory, type HistoryEntry } from "@/lib/bench/use-run-history";
+import { loadEntry, usePreviousRun, useRunHistory, type HistoryEntry } from "@/lib/bench/use-run-history";
 import { Callout, PageSkeleton, Panel, SegmentedControl } from "@/components/ui";
 import { DecodeConfigPanel, PrefillConfigPanel } from "@/components/bench/ConfigPanels";
 import { DecodeInstrument, type InstrumentStatus } from "@/components/bench/DecodeInstrument";
@@ -282,11 +282,11 @@ function BenchRoom() {
   const result = runId ? liveResult : selectedResult;
   const shownTab: Tab = runId ? (runMeta?.tab ?? tab) : tab;
 
-  const ghost = useMemo(() => {
-    if (!result || result.kind !== "decode") return null;
-    const prev = previousOf(history.entries, result);
-    return prev?.result?.kind === "decode" ? { arms: prev.result.arms, label: fmtDate(prev.createdAt) } : null;
-  }, [result, history.entries]);
+  const previous = usePreviousRun(result);
+  const ghost = useMemo(
+    () => (previous?.result?.kind === "decode" ? { arms: previous.result.arms, label: fmtDate(previous.createdAt) } : null),
+    [previous],
+  );
 
   // History selection: load the envelope, keep the row highlighted.
   const select = useCallback(

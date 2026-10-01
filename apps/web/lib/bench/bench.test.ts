@@ -15,7 +15,8 @@ import {
 import { benchMarkdown, decodeMarkdown, prefillMarkdown, quantFromModelId } from "./export";
 import { fmtDuration, fmtMs, fmtSize, fmtTokS } from "./format";
 import { findKnee, interpretDecode, interpretPrefill, referenceGain, spread, suggestLevels } from "./interpret";
-import { previousOf, type HistoryEntry } from "./use-run-history";
+import { previousComparable } from "./last-sync";
+import type { RunRow } from "../api";
 import {
   CONCURRENCY_LEVELS,
   LEVEL_PRESETS,
@@ -458,28 +459,29 @@ describe("comparability", () => {
     expect(comparable({ ...key, fingerprint: null }, { ...key, fingerprint: null })).toBe(false);
   });
 
-  test("the ghost is the newest earlier comparable run", () => {
-    const res = (id: string, createdAt: string, over: Partial<DecodeResult> = {}): DecodeResult => ({
+  test("the ghost is the newest earlier comparable run, past any number of other models' runs", () => {
+    const row = (id: string, created_at: string, over: { model?: string; max_tokens?: number; fp?: string } = {}): RunRow => ({
+      run_id: id,
+      created_at,
       kind: "decode",
-      id,
-      savedRunId: id,
-      model: "m",
-      pack: "prose",
-      maxTokens: 512,
-      createdAt,
-      durationMs: null,
-      engine: null,
-      fingerprint: "fp",
-      hardware: null,
-      source: "history",
-      levels: [1],
-      arms: [],
-      ...over,
+      intent: null,
+      model_id: over.model ?? "m",
+      summary: { pack: "prose", max_tokens: over.max_tokens ?? 512, serve_fingerprint: over.fp ?? "fp" },
+      path: "",
     });
-    const entry = (r: DecodeResult): HistoryEntry => ({ id: r.id!, source: "engine", createdAt: r.createdAt!, model: r.model, headline: { c1: null, peak: null, peakAt: null, sustained: null }, result: r, envelope: null, failed: false });
-    const cur = res("c", "2026-09-30");
-    const entries = [cur, res("a", "2026-09-29", { maxTokens: 256 }), res("b", "2026-09-28", { fingerprint: "old" }), res("d", "2026-09-27")].map(entry);
-    expect(previousOf(entries, cur)?.id).toBe("d");
-    expect(previousOf(entries.slice(0, 3), cur)).toBeNull();
+    const cur = { id: "c", savedRunId: "c", model: "m", pack: "prose", maxTokens: 512, fingerprint: "fp", createdAt: "2026-09-30T12:00:00Z" };
+    // a dozen newer-than-baseline runs of another model would have pushed it out of a 12-row window
+    const others = Array.from({ length: 15 }, (_, k) => row(`o${k}`, `2026-09-29T${String(10 + (k % 10)).padStart(2, "0")}:0${k % 6}:00Z`, { model: "other" }));
+    const rows = [
+      row("c", "2026-09-30T12:00:00Z"),
+      row("later", "2026-09-30T13:00:00Z"),
+      row("a", "2026-09-29T23:00:00Z", { max_tokens: 256 }),
+      row("b", "2026-09-29T22:00:00Z", { fp: "old" }),
+      ...others,
+      row("d", "2026-09-27T00:00:00Z"),
+      row("e", "2026-09-26T00:00:00Z"),
+    ];
+    expect(previousComparable(rows, cur)?.run_id).toBe("d");
+    expect(previousComparable(rows.filter((r) => r.run_id !== "d" && r.run_id !== "e"), cur)).toBeNull();
   });
 });

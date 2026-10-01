@@ -97,6 +97,15 @@ describe("export shapes", () => {
     expect(md).not.toContain("### 1 ·");
   });
 
+  test("a done run's TTFT is the summary's: a null p95 (too few samples) never falls back to the live value", () => {
+    const fewer = build([
+      hello,
+      { type: "agg", t_ms: 2500, tok_s: 84.4, peak_tok_s: 90, tokens: 200, running: 1, waiting: 1, done: 0, tokens_exact: true, ttft_p50_ms: 412, ttft_p95_ms: 900 },
+      { type: "done", run_id: "r9", summary: { ...finished.done!.summary, ttft_p95_ms: null }, saved_run_id: null },
+    ]);
+    expect(markdownSummary(fewer)).toContain("| TTFT p50 / p95 | 412 ms / — |");
+  });
+
   test("live markdown quotes the live estimate and the strand counts", () => {
     const md = markdownSummary(live);
     expect(md).toContain("| Aggregate tok/s (live · 3 s window · usage tokens) | 84.4 |");

@@ -90,7 +90,7 @@ export function markdownSummary(state: StreamRunState, opts: ExportOptions = {})
   lines.push(`| Peak tok/s (live ${WINDOW}) | ${fmtRate(sum?.peak_tok_s ?? latest?.peak_tok_s)} |`);
   if (sum) lines.push(`| Goodput tok/s (wall-clock, incl. TTFT) | ${fmtRate(sum.aggregate_tok_s)} |`);
   lines.push(`| Tokens | ${fmtInt(sum?.tokens ?? latest?.tokens)} |`);
-  lines.push(`| TTFT p50 / p95 | ${fmtMs(sum?.ttft_p50_ms ?? latest?.ttft_p50_ms)} / ${fmtMs(sum?.ttft_p95_ms ?? latest?.ttft_p95_ms)} |`);
+  lines.push(`| TTFT p50 / p95 | ${fmtMs(sum ? sum.ttft_p50_ms : latest?.ttft_p50_ms)} / ${fmtMs(sum ? sum.ttft_p95_ms : latest?.ttft_p95_ms)} |`);
   lines.push(`| Per-strand median tok/s | ${fmtRate(sum?.per_stream_median_tok_s)} |`);
   lines.push(`| Duration | ${fmtDuration(sum?.duration_ms ?? latest?.t_ms)} |`);
   lines.push(`| Strands ok | ${sum ? `${sum.ok} / ${sum.requests}` : `${latest?.done ?? 0} done · ${latest?.running ?? 0} streaming · ${latest?.waiting ?? 0} waiting`} |`);

@@ -39,6 +39,11 @@ export function engineHas(engine: ServeEngine | undefined, field: string): boole
   return !engine || engine.fields.length === 0 || engine.fields.includes(field);
 }
 
+/** The subset of `fields` the engine translates: what Start sends (a hidden field never is). */
+export function engineFields(engine: ServeEngine | undefined, fields: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(fields).filter(([k]) => engineHas(engine, k)));
+}
+
 export function EngineSelect({
   engines,
   value,

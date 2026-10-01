@@ -22,7 +22,7 @@ import {
   useCopy,
 } from "@/components/ui";
 import { useShallow } from "zustand/react/shallow";
-import { EngineSelect, EngineSummary, engineHas, useServeEngines } from "@/components/serve/EngineSelect";
+import { EngineSelect, EngineSummary, engineFields, engineHas, useServeEngines } from "@/components/serve/EngineSelect";
 import { engineLabel } from "@/lib/engines";
 import { serveHealthy, tightestNode, useLabStatusStore, useStale } from "@/lib/lab-status-store";
 import { CONFIRM_WINDOW_MS, confirmStep } from "@/lib/confirm-click";
@@ -352,15 +352,23 @@ export default function ServerPage() {
     if (c.port != null) setPort(String(c.port));
   }
 
-  /** Switch engine: its default port replaces the old engine's default (never a port you typed). */
+  /**
+   * Switch engine: everything the old engine's recipe filled (image, flags, env, TP,
+   * parsers…) is cleared — it would be passed to the new engine's CLI. The model stays;
+   * its default port replaces the old engine's default (never a port you typed).
+   */
   function selectEngine(name: string) {
     const next = engines.find((e) => e.name === name);
-    if (next && (!port.trim() || port === String(eng?.default_port ?? 8000))) setPort(String(next.default_port));
+    const typedPort = port.trim() && port !== String(eng?.default_port ?? 8000);
+    clearForm({ keepModel: true });
+    setPort(typedPort ? port : String(next?.default_port ?? 8000));
+    setAppliedExample(null);
     setEngineName(name);
-    setRec(null);
   }
 
   function applyExample(ex: ServeExample, key?: string) {
+    // Presets are vLLM recipes.
+    if (engineName !== "vllm") selectEngine("vllm");
     if (ex.model != null) setModel(ex.model);
     if (ex.quantization != null) setQuantization(ex.quantization);
     if (ex.kv_cache_dtype != null) setKvCacheDtype(ex.kv_cache_dtype);
@@ -388,8 +396,8 @@ export default function ServerPage() {
     applyConfig({ ...cfg, model: model || cfg.model });
   }
 
-  function clearForm() {
-    setModel("");
+  function clearForm({ keepModel = false }: { keepModel?: boolean } = {}) {
+    if (!keepModel) setModel("");
     setUtil("");
     setMaxLen("");
     setPort(String(eng?.default_port ?? 8000));
@@ -411,7 +419,7 @@ export default function ServerPage() {
     setMtpMoeBackend("");
     setDockerEnv("");
     setExtra("");
-    setDownload(false);
+    if (!keepModel) setDownload(false);
     setRec(null);
     setRecError(null);
     setStartError(null);
@@ -451,6 +459,12 @@ export default function ServerPage() {
       engine: engineName,
       port: parseInt(port, 10) || eng?.default_port || 8000,
       docker_env: envLines,
+      extra_flags: extra,
+      stop_first: true,
+      download,
+    };
+    if (image.trim()) body.image = image.trim();
+    const fields: Record<string, unknown> = {
       quantization: quantization.trim(),
       kv_cache_dtype: kvCacheDtype.trim(),
       moe_backend: moeBackend.trim(),
@@ -464,15 +478,13 @@ export default function ServerPage() {
       load_format: loadFormat.trim(),
       enable_chunked_prefill: chunkedPrefill,
       enable_prefix_caching: prefixCaching,
-      extra_flags: extra,
-      stop_first: true,
-      download,
     };
-    if (util) body.util = parseFloat(util);
-    if (maxLen) body.max_model_len = parseInt(maxLen, 10);
-    if (image.trim()) body.image = image.trim();
-    if (maxNumSeqs) body.max_num_seqs = parseInt(maxNumSeqs, 10);
-    if (tpSize) body.tensor_parallel_size = parseInt(tpSize, 10);
+    if (util) fields.util = parseFloat(util);
+    if (maxLen) fields.max_model_len = parseInt(maxLen, 10);
+    if (maxNumSeqs) fields.max_num_seqs = parseInt(maxNumSeqs, 10);
+    if (tpSize) fields.tensor_parallel_size = parseInt(tpSize, 10);
+    // Only what the selected engine translates — a hidden field is never sent.
+    Object.assign(body, engineFields(eng, fields));
     setStartBusy(true);
     try {
       const { job_id } = await api.startServe(body);
@@ -518,7 +530,7 @@ export default function ServerPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Btn variant="ghost" size="sm" onClick={clearForm}>
+          <Btn variant="ghost" size="sm" onClick={() => clearForm()}>
             Clear form
           </Btn>
         </div>

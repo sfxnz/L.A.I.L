@@ -156,6 +156,10 @@ export type ServeMetrics = {
   /** computed prompt tok/s of requests that finished in the window */
   prefill_tok_per_s?: number | null;
   ttft_s?: number | null;
+  /** window percentiles from the engine's TTFT / inter-token latency histograms (s) */
+  ttft_p50_s?: number | null;
+  itl_p50_s?: number | null;
+  itl_p95_s?: number | null;
   spec_accept_rate?: number | null;
   spec_tokens_per_step?: number | null;
   spec_accept_rate_lifetime?: number | null;

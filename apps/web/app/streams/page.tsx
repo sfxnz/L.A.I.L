@@ -69,13 +69,15 @@ function StreamsRoom() {
   const urlRun = search.get("run");
 
   // Narrow selectors: this page re-renders for the run, not for every 1 s lab sample.
-  const { loading, needToken, unreachable, statusError, anyUp } = useLabStatusStore(
+  const { loading, needToken, unreachable, statusError, anyUp, servingUrl } = useLabStatusStore(
     useShallow((s) => ({
       loading: s.loading,
       needToken: s.needToken,
       unreachable: s.unreachable,
       statusError: s.error,
       anyUp: serveHealthy(s.status) || Object.values(s.status?.backends ?? {}).some((b) => b.ok),
+      // The endpoint actually serving (any engine, any port) — a string, so samples do not re-render.
+      servingUrl: serveHealthy(s.status) && s.status?.serve?.base_url ? canonUrl(String(s.status.serve.base_url)) : "",
     })),
   );
   const [packs, setPacks] = useState<StreamPack[]>([]);
@@ -109,6 +111,12 @@ function StreamsRoom() {
       : !anyUp
         ? "No model served"
         : undefined;
+
+  // Default to the endpoint actually serving until the operator picks one.
+  const endpointPicked = useRef(false);
+  useEffect(() => {
+    if (servingUrl && !endpointPicked.current) setControls((c) => (c.base_url === servingUrl ? c : { ...c, base_url: servingUrl }));
+  }, [servingUrl]);
 
   const packLabel = useCallback((id: string) => packs.find((p) => p.id === id)?.label ?? (id || "—"), [packs]);
 
@@ -311,6 +319,7 @@ function StreamsRoom() {
   const reuse = useCallback(
     (row: StreamRunRow) => {
       // The row carries endpoint, pack and n; tokens/arrival/thinking are not in the list row.
+      endpointPicked.current = true;
       setControls((c) => ({ ...c, base_url: row.base_url, pack: row.pack, n: Math.min(32, Math.max(1, row.n)) }));
       setNotice({ tone: "muted", title: "Controls pre-filled", body: `${packLabel(row.pack)} · ×${row.n} on ${row.base_url}` });
     },
@@ -468,7 +477,10 @@ function StreamsRoom() {
           <Panel padded className="streams-controls-panel">
             <ControlBar
               controls={controls}
-              onChange={(patch) => setControls((c) => ({ ...c, ...patch }))}
+              onChange={(patch) => {
+                if (patch.base_url !== undefined) endpointPicked.current = true;
+                setControls((c) => ({ ...c, ...patch }));
+              }}
               endpoints={endpoints.length ? endpoints : controls.base_url ? [{ url: controls.base_url, label: "backend" }] : []}
               packs={packs}
               running={live}

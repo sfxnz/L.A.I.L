@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { EndpointHero } from "../components/status/EndpointHero";
-import { EngineSelect, EngineSummary, engineHas } from "../components/serve/EngineSelect";
+import { EngineSelect, EngineSummary, engineFields, engineHas } from "../components/serve/EngineSelect";
 import type { LabStatus, ServeEngine } from "./api";
 import { engineLabel } from "./engines";
 
@@ -35,8 +35,10 @@ describe("engine identity", () => {
 
   test("spec-decode acceptance and TTFT sit next to the engine's other live readings", () => {
     const s = serve("vllm", "http://127.0.0.1:8000");
-    s.metrics = { spec_accept_rate: 0.71, spec_tokens_per_step: 3.13, ttft_s: 0.182 };
+    s.metrics = { spec_accept_rate: 0.71, spec_tokens_per_step: 3.13, ttft_s: 0.182, itl_p50_s: 0.0413, itl_p95_s: 0.0697 };
     const live = hero(s);
+    expect(live).toContain("ITL p50 · p95");
+    expect(live).toContain('41<span class="text-lab-muted"> · 70</span> ms');
     expect(live).toContain("71%");
     expect(live).toContain("3.13/step");
     expect(live).toContain("182 ms");
@@ -73,5 +75,14 @@ describe("engine select", () => {
     expect(engineHas(engines[1], "moe_backend")).toBe(false);
     expect(engineHas(engines[1], "max_model_len")).toBe(true);
     expect(engineHas(undefined, "moe_backend")).toBe(true); // engine list not loaded: show everything
+  });
+
+  test("Start sends only the fields the selected engine translates", () => {
+    // A vLLM recommendation left TP=2 and a MoE backend in the form; llama.cpp-style
+    // engines without those fields must never receive them.
+    const form = { tensor_parallel_size: 2, moe_backend: "marlin", max_model_len: 32768 };
+    expect(engineFields(engines[1], form)).toEqual({ max_model_len: 32768 });
+    expect(engineFields(engines[0], form)).toEqual({ moe_backend: "marlin" });
+    expect(engineFields(undefined, form)).toEqual(form);
   });
 });

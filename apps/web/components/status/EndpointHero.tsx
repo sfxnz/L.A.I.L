@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
                  never shown as live.
     throughput   all streams together per wall-clock second, with its last 60 s
                  on a real time axis (idle reads 0, a gap is a missed sample).
-    TTFT · prefill · requests · spec acceptance · KV — each with its own idle rule.
+    TTFT · ITL p50/p95 · prefill · requests · spec acceptance · KV — each with its own idle rule.
 */
 
 const WINDOW_MS = 60_000;
@@ -210,6 +210,19 @@ export const EndpointHero = memo(function EndpointHero({
                   last {msOrS(lastTtft.s)}
                   {lastTtftAge != null ? ` · ${fmtAgo(lastTtftAge)}` : ""}
                 </span>
+              ) : (
+                <Nil word={busy ? "None" : "Idle"} />
+              )}
+            </Row>
+            <Row
+              label="ITL p50 · p95"
+              title="Inter-token latency over the last second, from the engine's histogram (resolution: its bucket edges)"
+            >
+              {m.itl_p50_s != null ? (
+                <>
+                  {Math.round(m.itl_p50_s * 1000)}
+                  {m.itl_p95_s != null && <span className="text-lab-muted"> · {Math.round(m.itl_p95_s * 1000)}</span>} ms
+                </>
               ) : (
                 <Nil word={busy ? "None" : "Idle"} />
               )}

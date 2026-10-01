@@ -84,10 +84,9 @@ export function openAiBase(kind?: BackendKind): string {
 }
 
 /** Placeholders that mean "use whatever the backend is serving". */
-function isPlaceholderModel(model: string | undefined | null): boolean {
+export function isPlaceholderModel(model: string | undefined | null): boolean {
   const m = (model || "").trim().toLowerCase();
-  // mock-model is used only in unit tests — never treat as a real served id
-  return !m || m === "default" || m === "auto" || m === "none" || m === "mock-model";
+  return !m || m === "default" || m === "auto" || m === "none";
 }
 
 export async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
@@ -103,35 +102,16 @@ export async function listServedModelIds(kind?: BackendKind): Promise<string[]> 
 }
 
 /**
- * Model id for Workbench / agent / chat.
- *
- * Rule: if the backend is serving something, that is the model — full stop.
- * Configure "default model" is only a fallback when nothing is up (and a
- * mirror of the live id for the UI). Never 404 because Configure lagged Server.
+ * Model id for a request that named a placeholder: the live served id when the
+ * backend serves something, else the configured default (if it is a real id).
  * Pass `served` to reuse an already-fetched id list instead of probing again.
  */
 export async function resolveModelId(kind?: BackendKind, served?: string[]): Promise<string> {
   served ??= await listServedModelIds(kind);
-  if (served[0]) {
-    const id = served[0];
-    // Keep Configure / sidebar in sync with live serve (best-effort)
-    try {
-      const cur = getSettings().defaultModel?.trim();
-      if (cur !== id) putSettings({ defaultModel: id });
-    } catch {
-      /* ignore persist errors */
-    }
-    return id;
-  }
+  if (served[0]) return served[0];
 
-  const settings = getSettings();
-  const configured = settings.defaultModel?.trim() || "";
-  if (configured && !isPlaceholderModel(configured)) {
-    return configured;
-  }
+  const configured = getSettings().defaultModel?.trim() || "";
+  if (configured && !isPlaceholderModel(configured)) return configured;
 
-  const base = openAiBase(kind);
-  throw new Error(
-    `Nothing is served at ${base}/models. Start a model on Server, then chat in Workbench.`,
-  );
+  throw new Error(`Nothing is served at ${openAiBase(kind)}/models. Start a model on Serve first.`);
 }

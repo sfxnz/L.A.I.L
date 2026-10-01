@@ -7,7 +7,7 @@ import { proxyOpenAI } from "./controller/llm-proxy";
 import { streamsEngine } from "./streams/engine";
 import { createStreamsRoutes } from "./streams/routes";
 import { config } from "./config";
-import { allowQueryToken, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
+import { allowQueryToken, isCrossSiteWrite, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
   compareLabRuns,
   getLabRun,
@@ -40,6 +40,14 @@ export function createApp() {
       allowHeaders: ["Content-Type", "Authorization", "X-Lail-Token"],
     }),
   );
+
+  app.use("*", async (c, next) => {
+    if (!isCrossSiteWrite(c.req.raw, corsAllow)) return next();
+    return c.json(
+      { error: "cross_site_write", message: "Cross-site write refused (send Content-Type: application/json)" },
+      403,
+    );
+  });
 
   app.use("*", async (c, next) => {
     if (!config.token) return next();

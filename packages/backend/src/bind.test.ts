@@ -4,6 +4,7 @@ import {
   assertSafeBind,
   BindPolicyError,
   isLoopbackHost,
+  isCrossSiteWrite,
   isPublicUnauthedPath,
   resolveCorsOrigin,
   tokenMatches,
@@ -75,6 +76,28 @@ describe("allowQueryToken / public paths / CORS", () => {
     const allow = ["http://127.0.0.1:3000"];
     expect(resolveCorsOrigin("https://evil.example", allow)).toBeUndefined();
     expect(resolveCorsOrigin("http://127.0.0.1:3000", allow)).toBe("http://127.0.0.1:3000");
-    expect(resolveCorsOrigin("http://127.0.0.1:9999", allow)).toBe("http://127.0.0.1:9999");
+    // Other loopback ports (dev apps, artifact servers) are not the lab UI.
+    expect(resolveCorsOrigin("http://127.0.0.1:9999", allow)).toBeUndefined();
+    expect(resolveCorsOrigin("http://localhost:8766", allow)).toBeUndefined();
+  });
+
+  test("cross-site writes must be preflighted JSON", () => {
+    const allow = ["http://127.0.0.1:3000"];
+    const r = (method: string, h: Record<string, string>) =>
+      new Request("http://127.0.0.1:8787/api/serve/stop", { method, headers: h });
+    // curl / Hermes: no Origin
+    expect(isCrossSiteWrite(r("POST", {}), allow)).toBe(false);
+    // the lab UI itself
+    expect(isCrossSiteWrite(r("POST", { origin: "http://127.0.0.1:3000" }), allow)).toBe(false);
+    expect(isCrossSiteWrite(r("POST", { origin: "http://spark1:3000", "sec-fetch-site": "same-origin" }), allow)).toBe(false);
+    // UI proxied by Next under a LAN / Tailscale host: JSON, so it was preflighted or same-origin
+    expect(isCrossSiteWrite(r("POST", { origin: "http://100.64.0.7:3000", "content-type": "application/json" }), allow)).toBe(false);
+    // no-cors simple requests from anywhere else
+    expect(isCrossSiteWrite(r("POST", { origin: "https://evil.example" }), allow)).toBe(true);
+    expect(isCrossSiteWrite(r("POST", { origin: "https://evil.example", "content-type": "text/plain" }), allow)).toBe(true);
+    expect(isCrossSiteWrite(r("POST", { origin: "http://127.0.0.1:8766", "content-type": "application/x-www-form-urlencoded" }), allow)).toBe(true);
+    expect(isCrossSiteWrite(r("PUT", { origin: "null", "sec-fetch-site": "cross-site" }), allow)).toBe(true);
+    // reads are never blocked here
+    expect(isCrossSiteWrite(r("GET", { origin: "https://evil.example" }), allow)).toBe(false);
   });
 });

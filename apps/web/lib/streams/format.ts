@@ -1,9 +1,10 @@
 /** Telemetry formatting for the Streams instrument. Numbers render in `lab-num` (tabular). */
 
+import { fmtRate as fmtRateOrEmpty } from "../status/format";
+
+/** The console's one tok/s format; "—" where there is no value. */
 export function fmtRate(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  if (v >= 100) return String(Math.round(v));
-  return v.toFixed(1);
+  return fmtRateOrEmpty(v) || "—";
 }
 
 export function fmtInt(v: number | null | undefined): string {

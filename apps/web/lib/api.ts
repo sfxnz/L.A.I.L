@@ -162,6 +162,8 @@ export type ServeMetrics = {
   last_burst?: { decode_tok_per_s?: number | null; tokens?: number; ended_at?: number } | null;
   /** latest non-null prefill_tok_per_s and when (epoch ms) — "last", never live */
   last_prefill?: { tok_per_s: number; at: number } | null;
+  /** latest non-null ttft_s and when (epoch ms) — "last", never live */
+  last_ttft?: { s: number; at: number } | null;
   /** server epoch ms of the /metrics scrape */
   sampled_at?: number | null;
 };

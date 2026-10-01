@@ -9,7 +9,7 @@ import { ClusterPanel } from "@/components/ClusterPanel";
 import { LastSyncCard } from "@/components/bench/LastSyncCard";
 import { EndpointHero } from "@/components/status/EndpointHero";
 import { LiveAge } from "@/components/status/LiveAge";
-import { Btn, Callout, Corridor, EmptyState, Eyebrow, Panel, btnClass } from "@/components/ui";
+import { Btn, Callout, Corridor, EmptyState, Panel, Skeleton, btnClass } from "@/components/ui";
 
 /*
   Status — the console's front page, one live instrument:
@@ -88,7 +88,6 @@ export default function StatusPage() {
   const cluster = serve?.cluster ?? null;
   const healthy = serveHealthy(status);
   const now = serverNow({ status, receivedAt });
-  const nodeCount = cluster?.nodes?.length ?? 0;
 
   return (
     <div className="lab-fade-in space-y-4">
@@ -106,13 +105,6 @@ export default function StatusPage() {
           </Link>
         </div>
       </div>
-
-      {needToken && (
-        <Callout tone="warn" title="LAIL_TOKEN required">
-          The controller is up. Paste the token in the banner — it stays in sessionStorage and is sent as{" "}
-          <code className="text-lab-text">X-Lail-Token</code>.
-        </Callout>
-      )}
 
       {unreachable && (
         <Callout
@@ -145,61 +137,69 @@ export default function StatusPage() {
         </Callout>
       )}
 
-      <section className="space-y-2.5">
-        <Band index="01" label="Endpoint" meta={<LiveAge />} />
-        <div className="lab-rise">
-          {needToken ? null : healthy && serve ? (
-            <EndpointHero
-              serve={serve}
-              defaultBackend={status?.defaultBackend}
-              endpoint={samples.endpoint}
-              serverNow={now}
-              stale={stale}
-            />
-          ) : (
-            <Panel>
-              <Corridor
-                title={loading ? "Connecting…" : "No model serving"}
-                action={
-                  loading ? undefined : (
-                    <Link href="/server" className={btnClass("primary", "sm")}>
-                      Serve a model
-                    </Link>
-                  )
-                }
-              >
-                {loading
-                  ? "Waiting for the first live sample."
-                  : "Start one on Serve — the Sparks below stay live with nothing loaded."}
-              </Corridor>
-            </Panel>
-          )}
-        </div>
-      </section>
+      {needToken ? (
+        // The AppShell banner asks for the token; nothing below can load without it.
+        <Panel padded>
+          <EmptyState title="Live data needs the token">The model, the Sparks and the last bench appear once it is pasted.</EmptyState>
+        </Panel>
+      ) : (
+        <>
+          <section className="space-y-2.5">
+            <Band index="01" label="Endpoint" meta={<LiveAge />} />
+            <div className="lab-rise">
+              {healthy && serve ? (
+                <EndpointHero
+                  serve={serve}
+                  defaultBackend={status?.defaultBackend}
+                  endpoint={samples.endpoint}
+                  serverNow={now}
+                  stale={stale}
+                />
+              ) : loading ? (
+                // The hero's footprint, so the Sparks and Bench below do not jump when the first sample lands.
+                <Panel title="Served model" className="min-h-[600px] sm:min-h-[436px] lg:min-h-[397px]">
+                  <div className="space-y-4 p-4" aria-busy="true" aria-label="Waiting for the first live sample">
+                    <Skeleton className="h-4 w-72 max-w-full" />
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                      <Skeleton className="h-16" />
+                      <Skeleton className="h-16" />
+                      <Skeleton className="h-16" />
+                    </div>
+                    <Skeleton className="h-4 w-56 max-w-full" />
+                  </div>
+                </Panel>
+              ) : (
+                <Panel>
+                  <Corridor
+                    title="No model serving"
+                    action={
+                      <Link href="/server" className={btnClass("primary", "sm")}>
+                        Serve a model
+                      </Link>
+                    }
+                  >
+                    Start one on Serve — the Sparks below stay live with nothing loaded.
+                  </Corridor>
+                </Panel>
+              )}
+            </div>
+          </section>
 
-      <section className="space-y-2.5">
-        <Band
-          index="02"
-          label="Sparks"
-          meta={<Eyebrow className="lab-num">{nodeCount >= 2 ? `${nodeCount} nodes` : nodeCount === 1 ? "this host" : ""}</Eyebrow>}
-        />
-        <div className="lab-rise lab-rise-1">
-          {needToken ? (
-            <Panel title="Sparks" padded>
-              <EmptyState title="Token required">Paste LAIL_TOKEN in the banner to load the Sparks.</EmptyState>
-            </Panel>
-          ) : (
-            <ClusterPanel cluster={cluster} loading={loading} samples={samples.nodes} serverNow={now} stale={stale} />
-          )}
-        </div>
-      </section>
+          <section className="space-y-2.5">
+            <Band index="02" label="Sparks" />
+            <div className="lab-rise lab-rise-1">
+              <ClusterPanel cluster={cluster} loading={loading} samples={samples.nodes} serverNow={now} stale={stale} />
+            </div>
+          </section>
 
-      <section className="space-y-2.5">
-        <Band index="03" label="Bench" />
-        <div className="lab-rise lab-rise-2">
-          <LastSyncCard runs={decodeRuns} loading={runsLoading} servingModel={healthy ? (serve?.model_id ?? null) : null} />
-        </div>
-      </section>
+          <section className="space-y-2.5">
+            <Band index="03" label="Bench" />
+            <div className="lab-rise lab-rise-2">
+              <LastSyncCard runs={decodeRuns} loading={runsLoading} servingModel={healthy ? (serve?.model_id ?? null) : null} />
+            </div>
+          </section>
+        </>
+      )}
     </div>
   );
 }

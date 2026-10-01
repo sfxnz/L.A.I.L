@@ -65,7 +65,7 @@ export function Eyebrow({
  * genuinely empty; "Offline" = its source is down, nothing will arrive; "Idle" =
  * a rate with no traffic to measure.
  */
-export type NilWord = "Awaiting" | "None" | "Offline" | "Idle";
+type NilWord = "Awaiting" | "None" | "Offline" | "Idle";
 
 export function Nil({ word = "Awaiting" }: { word?: NilWord }) {
   return (

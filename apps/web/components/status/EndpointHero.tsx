@@ -96,6 +96,9 @@ export const EndpointHero = memo(function EndpointHero({
   const prefill = m.prefill_tok_per_s ?? null;
   const lastPrefill = prefill == null ? m.last_prefill : null;
   const lastPrefillAge = lastPrefill && serverNow != null ? (serverNow - lastPrefill.at) / 1000 : null;
+  // No request started this second (mid-decode, or idle): the last TTFT, dimmed, with its age.
+  const lastTtft = m.ttft_s == null ? m.last_ttft : null;
+  const lastTtftAge = lastTtft && serverNow != null ? (serverNow - lastTtft.at) / 1000 : null;
   const busy = (running ?? 0) > 0;
   const domain = serverNow != null ? ([serverNow - WINDOW_MS, serverNow] as const) : undefined;
   const throughputPts = endpoint.map((s) => ({ t: s.t, v: s.throughput }));
@@ -200,7 +203,16 @@ export const EndpointHero = memo(function EndpointHero({
               )}
             </Row>
             <Row label="TTFT" title="Mean time to first token of the requests that started in the last second">
-              {m.ttft_s != null ? msOrS(m.ttft_s) : <Nil word="Idle" />}
+              {m.ttft_s != null ? (
+                msOrS(m.ttft_s)
+              ) : lastTtft ? (
+                <span className="text-lab-muted" title="No request started this second: the last one's TTFT — not live">
+                  last {msOrS(lastTtft.s)}
+                  {lastTtftAge != null ? ` · ${fmtAge(lastTtftAge)} ago` : ""}
+                </span>
+              ) : (
+                <Nil word={busy ? "None" : "Idle"} />
+              )}
             </Row>
             <Row label="Prefill" title="Prompt tok/s of requests that finished in the last second (cache hits excluded)">
               {prefill != null ? (
@@ -211,7 +223,7 @@ export const EndpointHero = memo(function EndpointHero({
                   {lastPrefillAge != null ? ` · ${fmtAge(lastPrefillAge)} ago` : ""}
                 </span>
               ) : (
-                <Nil word="Idle" />
+                <Nil word={busy ? "None" : "Idle"} />
               )}
             </Row>
             <Row label="Spec accept" title="Speculative decoding: accepted draft tokens / proposed, and tokens per step">

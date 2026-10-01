@@ -21,7 +21,6 @@ import { startLive } from "@/lib/live-connection";
 import { WORKSPACE_NAV, isProseRoute } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
 import { Eyebrow, SyncRing, Tick, type SyncState } from "@/components/ui";
-import { AnimusField } from "@/components/animus/AnimusField";
 import { ThemeToggle } from "@/components/animus/ThemeToggle";
 import { CommandPalette } from "@/components/command/CommandPalette";
 import { LiveAge } from "@/components/status/LiveAge";
@@ -114,9 +113,10 @@ function HeaderReadout() {
   return (
     <div
       // Instrument strip — the side that yields: `min-w-0 flex-1` soaks up the
-      // remaining space and its cells hide progressively at md/lg/xl, so the nav
-      // always renders in full.
-      className="lab-num flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
+      // remaining space and its cells hide progressively at md/lg/xl/2xl, so the nav
+      // always renders in full. Left-aligned: cells that appear with the first
+      // sample extend it to the right instead of shoving the ring sideways.
+      className="lab-num flex min-w-0 flex-1 items-center justify-start gap-2 overflow-hidden sm:gap-2.5"
     >
       <span className="sr-only" aria-live="polite">
         {probeNote}
@@ -124,15 +124,17 @@ function HeaderReadout() {
 
       <span className="flex items-center gap-1.5" title={probeNote}>
         <SyncRing state={ring} label={stale && !unreachable ? "Live data not updating" : probeNote} />
-        <Eyebrow className="hidden tracking-[0.18em] lg:inline">{word}</Eyebrow>
+        {/* stale: LiveAge beside it says "not updating · N s" — not the same word twice */}
+        {!(stale && showNumbers) && <Eyebrow className="hidden tracking-[0.18em] lg:inline">{word}</Eyebrow>}
       </span>
       {showNumbers && <LiveAge quiet className="hidden sm:inline" />}
 
       <div className={cn("flex min-w-0 items-center gap-2 transition-opacity duration-300 sm:gap-2.5", stale && "opacity-50")}>
         {showNumbers && model && (
           <>
-            <Tick className="hidden xl:block" />
-            <span className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim xl:inline" title={model}>
+            {/* only where it fits whole: at 1440 the strip squeezed it to "Qwen…" */}
+            <Tick className="hidden 2xl:block" />
+            <span className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim 2xl:inline" title={model}>
               {model.split("/").pop()}
             </span>
           </>
@@ -153,9 +155,11 @@ function HeaderReadout() {
                     : "Endpoint idle — no burst measured yet"
               }
             >
-              <Eyebrow className="text-[8px]">{rateSource}</Eyebrow>
+              {/* fixed widths: a request starting or ending never resizes the strip */}
+              <Eyebrow className="inline-block w-[44px] text-right text-[8px]">{rateSource}</Eyebrow>
               <span className={rateSource !== "decode" ? "text-lab-muted" : undefined}>
-                {tokS != null ? fmtRate(tokS) : "—"} <span className="text-lab-muted">tok/s</span>
+                <span className="inline-block min-w-[5ch] text-right">{tokS != null ? fmtRate(tokS) : "—"}</span>{" "}
+                <span className="text-lab-muted">tok/s</span>
               </span>
             </span>
           </>
@@ -165,15 +169,17 @@ function HeaderReadout() {
           <>
             <Tick className="hidden lg:block" />
             <Eyebrow className="hidden shrink-0 lg:inline" title="Requests running / queued on the engine">
-              {running ?? 0} running / {waiting ?? 0} queued
+              <span className="inline-block min-w-[2ch] text-right">{running ?? 0}</span> running ·{" "}
+              <span className="inline-block min-w-[2ch] text-right">{waiting ?? 0}</span> queued
             </Eyebrow>
           </>
         )}
 
         {showNumbers && kvPct != null && (
           <>
-            <Tick className="hidden xl:block" />
-            <Eyebrow className="hidden shrink-0 xl:inline" title="KV cache in use">
+            {/* lowest priority: only on the widest screens (Status and Serve show it anyway) */}
+            <Tick className="hidden 2xl:block" />
+            <Eyebrow className="hidden shrink-0 2xl:inline" title="KV cache in use">
               KV {fmtKvPct(kvPct)}
             </Eyebrow>
           </>
@@ -190,7 +196,6 @@ function HeaderReadout() {
                   : "MemAvailable on this host (/proc/meminfo)"
               }
             >
-              {freeMulti ? `${tightest?.id} ` : ""}
               {freeGib.toFixed(1)} GiB free
             </Eyebrow>
           </>
@@ -214,8 +219,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="relative isolate flex h-full min-h-0 flex-col bg-lab-bg text-lab-text">
-      {/* Reconstruction field — z-0, behind every layer of chrome. */}
-      <AnimusField />
+      {/* Still atmosphere — two static CSS blooms, z-0, behind every layer of chrome. */}
+      <div className="animus-atmosphere" aria-hidden="true">
+        <span className="animus-haze animus-haze-1" />
+        <span className="animus-haze animus-haze-2" />
+      </div>
 
       <a href="#main" className="lab-skip-link">
         Skip to content

@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ClusterPanel } from "../components/ClusterPanel";
+import { ClusterPanel, flowDurS } from "../components/ClusterPanel";
 import { LastSyncCard } from "../components/bench/LastSyncCard";
 import { EndpointHero, hermesBases } from "../components/status/EndpointHero";
 import type { ClusterNode, RunRow } from "./api";
@@ -235,6 +235,10 @@ describe("Sparks panel (per-node hardware)", () => {
     });
     expect(html).toContain("TP worker · rank 1");
     expect(html).toContain("Tensor parallel");
+    // each fact once: the online count, no TP= or model message repeated from the hero
+    expect(html).toContain("2/2 online");
+    expect(html).not.toContain("TP=");
+    expect(html).not.toContain("serving</");
     expect(html).toContain("enp1s0f1np1");
     expect(html).toContain("enP2p1s0f1np1");
     expect(html).toContain("↑ 118 MB/s");
@@ -281,6 +285,14 @@ describe("Sparks panel (per-node hardware)", () => {
     const html = render({ cluster: { nodes: [], pending: true, summary: { healthy: false } } });
     expect(html).toContain("probing the Sparks");
     expect(html).not.toContain("0/0");
+  });
+
+  test("the fabric's flow speed moves in steps, so 1 s rate jitter never re-phases the animation", () => {
+    // 120 vs 132 MB/s on a 200 Gb/s rail: same step
+    expect(flowDurS(120e6, 200_000)).toBe(flowDurS(132e6, 200_000));
+    expect(flowDurS(1e6, 200_000)).toBe(2.4);
+    expect(flowDurS(5e9, 200_000)).toBe(0.45);
+    expect(flowDurS(120e6, null)).toBe(1.2);
   });
 
   test("three nodes: every card renders and every link gets a row", () => {
@@ -345,6 +357,12 @@ describe("Served model panel", () => {
     expect(html).toContain("last 1234 · 1 m 35 s ago");
     expect(html).toContain("84% lifetime");
     expect(html).toContain("text-lab-muted");
+  });
+
+  test("mid-decode TTFT: no request started this second, so the last one shows dimmed with its age — never 'Idle'", () => {
+    const html = render({ decode_tok_per_s: 46.7, throughput_tok_per_s: 46.7, ttft_s: null, last_ttft: { s: 0.174, at: NOW - 4_000 } });
+    expect(html).toContain("last 174 ms · 4 s ago");
+    expect(html).not.toContain(">Idle<");
   });
 
   test("hermesBases follows the port that answers and adds the page host when it is not loopback", () => {

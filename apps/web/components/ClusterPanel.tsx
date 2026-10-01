@@ -2,7 +2,7 @@
 
 import { memo, type CSSProperties } from "react";
 import type { ClusterNode, ClusterStatus } from "@/lib/api";
-import { STALE_AFTER_S, type NodeSample } from "@/lib/lab-status-store";
+import { staleAfterS, useLabStatusStore, type NodeSample } from "@/lib/lab-status-store";
 import { fmtAge, fmtBytesRate, fmtPct, fmtTemp, fmtWatts } from "@/lib/status/format";
 import {
   Badge,
@@ -13,7 +13,6 @@ import {
   Skeleton,
   SparkStat,
   SyncRing,
-  Tick,
   syncStateFromNode,
   type SparkPoint,
 } from "@/components/ui";
@@ -29,7 +28,7 @@ import { cn } from "@/lib/utils";
 
   Honesty rules: every sparkline sits on a real 60 s time axis ending at the
   server's "now" (gaps stay gaps); a node whose telemetry is older than
-  STALE_AFTER_S is dimmed with its age; a down node says Offline / SSH failed and
+  staleAfterS (longer while polling) is dimmed with its age; a down node says Offline / SSH failed and
   shows no numbers; nothing animates while the data is stale.
 */
 
@@ -139,8 +138,9 @@ const NodeCard = memo(function NodeCard({
 }) {
   const down = isDown(node);
   const serving = node.state === "serving" || node.state === "serving_worker";
+  const transport = useLabStatusStore((s) => s.transport);
   const age = down ? null : ageS(serverNow, node.sampled_at);
-  const old = stale || (age != null && age > STALE_AFTER_S);
+  const old = stale || (age != null && age > staleAfterS(transport));
   const domain = serverNow != null ? ([serverNow - WINDOW_MS, serverNow] as const) : undefined;
   const series = down ? [] : samples;
   const nil = down ? "Offline" : "Awaiting";
@@ -241,7 +241,13 @@ const NodeCard = memo(function NodeCard({
 
         <div className="lab-num mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 font-mono text-[10px] text-lab-muted">
           <span title="All CPU cores, from /proc/stat">
-            CPU {down || node.cpu_util_pct == null ? <Nil word={nil} /> : <span className="text-lab-text-dim">{fmtPct(node.cpu_util_pct)}</span>}
+            CPU{" "}
+            {down || node.cpu_util_pct == null ? (
+              <Nil word={nil} />
+            ) : (
+              // fixed width: "2%" → "20%" must not shift the temperatures after it
+              <span className="inline-block w-[4ch] text-lab-text-dim">{fmtPct(node.cpu_util_pct)}</span>
+            )}
           </span>
           {!down &&
             minorTemps.map((t) => (
@@ -310,7 +316,19 @@ function linkRate(link: Link, byId: Map<string, ClusterNode>): { tx: number; rx:
 }
 
 /**
- * One rail: a line that flows only while RDMA bytes cross it (speed scales with
+ * Seconds per dash cycle for a rail carrying `peakBps`: one of three fixed speeds by
+ * link utilisation (< 1 %, < 10 %, more). Stepped, not continuous: changing a running
+ * CSS animation's duration re-phases it, so a value that moved with every 1 s sample
+ * made the flow jump once a second. Unknown link speed: the middle step.
+ */
+export function flowDurS(peakBps: number, speedMbps: number | null | undefined): number {
+  if (!speedMbps) return 1.2;
+  const util = (peakBps * 8) / (speedMbps * 1e6);
+  return util < 0.01 ? 2.4 : util < 0.1 ? 1.2 : 0.45;
+}
+
+/**
+ * One rail: a line that flows only while RDMA bytes cross it (faster with more
  * link utilisation), a static dashed line when idle or unmeasured, red when down.
  */
 function RailLine({ link, rate, stale }: { link: Link; rate: { tx: number; rx: number } | null; stale?: boolean }) {
@@ -318,9 +336,7 @@ function RailLine({ link, rate, stale }: { link: Link; rate: { tx: number; rx: n
   const speed = link.from_speed_mbps || link.to_speed_mbps || null;
   const peak = rate ? Math.max(rate.tx, rate.rx) : 0;
   const flowing = up && !stale && peak >= FLOW_MIN_BPS;
-  // 0 % → 2.4 s per dash cycle, ≥ 10 % of the link → 0.45 s
-  const util = speed ? Math.min(1, (peak * 8) / (speed * 1e6) / 0.1) : 0;
-  const dur = `${(2.4 - 1.95 * util).toFixed(2)}s`;
+  const dur = `${flowDurS(peak, speed)}s`;
   return (
     <div className="min-w-0">
       <div className="flex items-baseline justify-between gap-2 font-mono text-[9.5px] text-lab-muted">
@@ -391,11 +407,15 @@ function FabricLinks({ links, byId, stale }: { links: Link[]; byId: Map<string, 
   );
 }
 
-/** How the served model is placed across the nodes — one line, no rates (those live above). */
-function PlacementStrip({ cluster }: { cluster: ClusterStatus }) {
+/**
+ * How the served model is placed across the nodes, and how many answer — one line.
+ * The model, TP size and per-node states are shown elsewhere (the endpoint hero and
+ * each card); the message is kept only where it explains a problem.
+ */
+function PlacementStrip({ cluster, online, total }: { cluster: ClusterStatus; online: number; total: number }) {
   const multi = cluster.summary?.multi;
   const mode = multi?.mode || "none";
-  const nodes = cluster.nodes || [];
+  const explain = mode === "multi_partial" || mode === "multi_mismatch";
   return (
     <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
@@ -403,32 +423,11 @@ function PlacementStrip({ cluster }: { cluster: ClusterStatus }) {
           <Badge tone={placementTone(mode)} dot>
             {placementLabel(mode)}
           </Badge>
-          {multi?.tensor_parallel_hint != null && mode !== "none" && (
-            <span className="shrink-0 font-mono text-[10px] tabular-nums text-lab-line-bright">TP={multi.tensor_parallel_hint}</span>
-          )}
-          {multi?.message && <span className="min-w-0 text-[11px] leading-snug text-lab-muted">{multi.message}</span>}
+          {explain && multi?.message && <span className="min-w-0 text-[11px] leading-snug text-lab-muted">{multi.message}</span>}
         </div>
-        <div className="flex items-center gap-2">
-          {nodes.map((n) => {
-            const filled = n.state === "serving" || n.state === "serving_worker";
-            return (
-              <div key={n.id} className="flex items-center gap-1.5" title={`${n.id}: ${stateLabel(n)}`}>
-                <div
-                  className={cn(
-                    "h-2 w-8 border",
-                    filled && "border-lab-ok bg-lab-ok",
-                    n.state === "loading" && "border-lab-warn bg-lab-warn/70",
-                    n.state === "stray" && "border-lab-warn bg-lab-hover",
-                    n.state === "idle" && "border-lab-border bg-lab-hover",
-                    isDown(n) &&
-                      "border-[color:color-mix(in_srgb,var(--color-lab-danger)_50%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_20%,transparent)]",
-                  )}
-                />
-                <Eyebrow className="tracking-[0.14em]">{n.id}</Eyebrow>
-              </div>
-            );
-          })}
-        </div>
+        <Eyebrow className={cn("lab-num", online === total ? "text-lab-ok" : "text-lab-danger")}>
+          {online}/{total} online
+        </Eyebrow>
       </div>
     </div>
   );
@@ -436,15 +435,16 @@ function PlacementStrip({ cluster }: { cluster: ClusterStatus }) {
 
 function ProbingPanel({ note }: { note: string }) {
   return (
-    <Panel title="Sparks" action={<Badge tone="muted">{note}</Badge>} className="overflow-hidden">
+    <Panel className="overflow-hidden">
       <div aria-busy="true" aria-label="Probing the cluster">
         <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
-          <Skeleton className="h-3.5 w-44" />
+          <Badge tone="muted">{note}</Badge>
         </div>
         <div className="grid grid-cols-1 gap-3 p-3.5 sm:p-4 lg:grid-cols-[1fr_auto_1fr]">
-          <Skeleton className="min-h-[220px]" />
-          <Skeleton className="hidden min-h-[220px] w-[176px] lg:block" />
-          <Skeleton className="min-h-[220px]" />
+          {/* about a node card's height, so the cards replace it without a jump */}
+          <Skeleton className="min-h-[300px] lg:min-h-[240px]" />
+          <Skeleton className="hidden min-h-[240px] w-[176px] lg:block" />
+          <Skeleton className="min-h-[300px] lg:min-h-[240px]" />
         </div>
       </div>
     </Panel>
@@ -473,7 +473,7 @@ export function ClusterPanel({
 
   if (!cluster) {
     return (
-      <Panel title="Sparks" padded>
+      <Panel padded>
         <EmptyState title="Cluster probe unavailable">
           Serve-engine didn’t return cluster topology. Check that the engine is up on :8765.
         </EmptyState>
@@ -483,7 +483,7 @@ export function ClusterPanel({
 
   if (cluster.error) {
     return (
-      <Panel title="Sparks" padded>
+      <Panel padded>
         <EmptyState title="Cluster probe failed">
           <span className="text-lab-danger">{cluster.error}</span>
         </EmptyState>
@@ -503,24 +503,9 @@ export function ClusterPanel({
   );
 
   return (
-    <Panel
-      className="overflow-hidden"
-      title="Sparks"
-      action={
-        <span className="flex shrink-0 items-center gap-2">
-          <Eyebrow className={cn("lab-num", online === total ? "text-lab-ok" : "text-lab-danger")}>
-            {online}/{total} online
-          </Eyebrow>
-          {summary?.nodes_serving ? (
-            <>
-              <Tick />
-              <Eyebrow className="lab-num">{summary.nodes_serving} serving</Eyebrow>
-            </>
-          ) : null}
-        </span>
-      }
-    >
-      <PlacementStrip cluster={cluster} />
+    // Untitled: the page's "Sparks" band already names it.
+    <Panel className="overflow-hidden">
+      <PlacementStrip cluster={cluster} online={online} total={total} />
 
       <div className="p-3.5 sm:p-4">
         {pair ? (

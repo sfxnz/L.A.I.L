@@ -17,9 +17,10 @@ import {
   listLabRuns,
   listLabRunsByFingerprint,
   publicPlayHeaders,
+  playKeyMatches,
   publishLabRun,
-  resolveLabFile,
   resolvePublicFile,
+  resolveRunArtifact,
 } from "./lab/store";
 import { readFileSync } from "fs";
 
@@ -221,29 +222,25 @@ export function createApp() {
   });
 
   app.get("/api/lab/runs/:id/play", (c) => {
-    const id = c.req.param("id");
-    const run = getLabRun(id);
+    const run = getLabRun(c.req.param("id"));
     if (!run) return c.json({ error: "not_found" }, 404);
-    const entry = run.entry || "index.html";
-    return c.redirect(`/api/lab/runs/${id}/files/artifacts/${entry}`, 302);
+    return c.redirect(run.play_url, 302);
   });
 
-  app.get("/api/lab/runs/:id/files/*", (c) => {
-    const id = c.req.param("id");
-    const rel = c.req.path.replace(`/api/lab/runs/${id}/files/`, "");
+  // Private play: the path's key is the capability (no token: iframes cannot send
+  // one). Same CSP as public shares — model-written HTML is untrusted.
+  app.get("/api/lab/play/:id/:key/*", (c) => {
+    const { id, key } = c.req.param();
+    if (!playKeyMatches(id, key)) return c.json({ error: "not_found" }, 404);
+    const rel = c.req.path.slice(`/api/lab/play/${id}/${key}/`.length);
     try {
-      const { abs, contentType } = resolveLabFile(id, rel);
-      const data = readFileSync(abs);
-      return new Response(data, {
-        headers: {
-          "Content-Type": contentType,
-          "Cache-Control": "no-cache",
-          "X-Frame-Options": "SAMEORIGIN",
-        },
+      const { abs, contentType } = resolveRunArtifact(id, rel);
+      return new Response(readFileSync(abs), {
+        headers: { ...publicPlayHeaders(contentType), "Cache-Control": "private, no-cache" },
       });
     } catch (e) {
       const err = e as Error & { code?: string };
-      const status = err.code === "not_found" ? 404 : 400;
+      const status = err.code === "forbidden_type" ? 403 : err.code === "bad_path" ? 400 : 404;
       return c.json({ error: err.code || "error", message: err.message }, status);
     }
   });

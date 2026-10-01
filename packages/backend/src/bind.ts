@@ -61,6 +61,7 @@ export function isPublicUnauthedPath(pathname: string, method: string): boolean 
   if (method !== "GET" && method !== "HEAD") return false;
   return (
     pathname.startsWith("/api/lab/p/") ||
+    pathname.startsWith("/api/lab/play/") ||
     pathname.startsWith("/api/lab/public/") ||
     pathname.startsWith("/p/")
   );

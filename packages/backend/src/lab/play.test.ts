@@ -1,0 +1,78 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { createApp } from "../app";
+import { config } from "../config";
+import { importLabRun, playKey } from "./store";
+
+const prevToken = config.token;
+const src = mkdtempSync(join(tmpdir(), "lail-play-src-"));
+let run: ReturnType<typeof importLabRun>;
+let other: ReturnType<typeof importLabRun>;
+
+beforeAll(() => {
+  config.token = "op-secret";
+  mkdirSync(join(src, "game"), { recursive: true });
+  writeFileSync(join(src, "game", "index.html"), '<script src="js/main.js"></script>');
+  mkdirSync(join(src, "game", "js"));
+  writeFileSync(join(src, "game", "js", "main.js"), "console.log(1)");
+  writeFileSync(join(src, "game", "run.sh"), "rm -rf /");
+  run = importLabRun({ title: "game", from: join(src, "game") });
+  other = importLabRun({ title: "other", from: join(src, "game", "index.html") });
+});
+
+afterAll(() => {
+  config.token = prevToken;
+  rmSync(src, { recursive: true, force: true });
+});
+
+describe("private lab play (capability URL)", () => {
+  test("play_url and artifacts_url carry the run's key, never the token", () => {
+    expect(run.artifacts_url).toBe(`/api/lab/play/${run.id}/${playKey(run.id)}/`);
+    expect(run.play_url).toBe(`${run.artifacts_url}index.html`);
+    expect(run.play_url).not.toContain("op-secret");
+  });
+
+  test("an iframe (no token) loads the entry and its relative assets, under the untrusted-content CSP", async () => {
+    const app = createApp();
+    const page = await app.request(run.play_url);
+    expect(page.status).toBe(200);
+    const csp = page.headers.get("content-security-policy") || "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("sandbox allow-scripts");
+    expect(csp).not.toContain("allow-same-origin");
+    expect(page.headers.get("cache-control")).toBe("private, no-cache");
+    const asset = await app.request(`${run.artifacts_url}js/main.js`);
+    expect(asset.status).toBe(200);
+    expect(await asset.text()).toBe("console.log(1)");
+  });
+
+  test("wrong, foreign or missing keys and non-artifact files are refused", async () => {
+    const app = createApp();
+    expect((await app.request(`/api/lab/play/${run.id}/${"0".repeat(32)}/index.html`)).status).toBe(404);
+    expect((await app.request(`/api/lab/play/${run.id}/${playKey(other.id)}/index.html`)).status).toBe(404);
+    expect((await app.request(`${run.artifacts_url}run.sh`)).status).toBe(403);
+    expect((await app.request(`${run.artifacts_url}..%2Fmeta.json`)).status).not.toBe(200);
+    // The old token-only /files route is gone; with a token set it is simply unauthorized.
+    expect((await app.request(`/api/lab/runs/${run.id}/files/artifacts/index.html`)).status).toBe(401);
+  });
+
+  test("rotating LAIL_TOKEN revokes old play links", async () => {
+    const url = run.play_url;
+    config.token = "rotated";
+    try {
+      expect((await createApp().request(url)).status).toBe(404);
+    } finally {
+      config.token = "op-secret";
+    }
+  });
+
+  test("the authed /play alias redirects to the capability URL", async () => {
+    const res = await createApp().request(`/api/lab/runs/${run.id}/play`, {
+      headers: { "x-lail-token": "op-secret" },
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(run.play_url);
+  });
+});

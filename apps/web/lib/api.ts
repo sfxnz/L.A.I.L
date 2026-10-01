@@ -306,8 +306,9 @@ export type LabArtifactRun = {
   tags: string[];
   brief?: string;
   eval_run_id?: string | null;
+  /** Capability URL for the run's artifacts (no token needed; iframes cannot send one). */
+  artifacts_url: string;
   play_url: string;
-  preview_url?: string | null;
   gallery_url?: string;
   public_url?: string | null;
   task_fingerprint?: string;

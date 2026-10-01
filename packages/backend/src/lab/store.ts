@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import {
   copyFileSync,
   existsSync,
@@ -31,7 +31,8 @@ export type LabRunMeta = {
 
 export type LabRunSummary = LabRunMeta & {
   dir: string;
-  preview_url: string | null;
+  /** Capability base for the run's artifacts (see playKey); play_url = artifacts_url + entry. */
+  artifacts_url: string;
   play_url: string;
   public_url: string | null;
   gallery_url: string;
@@ -132,9 +133,29 @@ function writeMeta(meta: LabRunMeta): void {
   writeFileSync(join(labRoot(), meta.id, "meta.json"), JSON.stringify(meta, null, 2), "utf8");
 }
 
+/**
+ * Per-run capability for the private play path. Iframes and plain links cannot
+ * send the LAIL token, and a ?token= in the URL would hand the operator secret
+ * to the artifact's own (model-written) scripts. The key is an HMAC of the run
+ * id under LAIL_TOKEN: it unlocks only this run's artifacts, and rotating the
+ * token revokes every link.
+ */
+export function playKey(id: string): string {
+  return createHmac("sha256", config.token || "lail-no-token")
+    .update(`lab-play:${id}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+export function playKeyMatches(id: string, key: string): boolean {
+  const want = Buffer.from(playKey(id));
+  const got = Buffer.from(key);
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
 function toSummary(meta: LabRunMeta): LabRunSummary {
   const dir = join(labRoot(), meta.id);
-  const previewPath = join(dir, "preview.png");
+  const artifacts_url = `/api/lab/play/${meta.id}/${playKey(meta.id)}/`;
   const slug = meta.share?.slug || null;
   let public_url: string | null = null;
   if (meta.share?.public && slug) {
@@ -155,8 +176,8 @@ function toSummary(meta: LabRunMeta): LabRunSummary {
   return {
     ...meta,
     dir,
-    preview_url: existsSync(previewPath) ? `/api/lab/runs/${meta.id}/files/preview.png` : null,
-    play_url: `/api/lab/runs/${meta.id}/play`,
+    artifacts_url,
+    play_url: artifacts_url + encodeURI(meta.entry || "index.html"),
     gallery_url: `/lab/${meta.id}`,
     public_url,
   };
@@ -311,6 +332,41 @@ export function getPublicBySlug(slug: string): {
 export function resolvePublicFile(slug: string, relPath: string): { abs: string; contentType: string } {
   const pub = getPublicBySlug(slug);
   if (!pub) throw Object.assign(new Error("not found"), { code: "not_found" });
+  return resolveArtifactFile(pub.dir, relPath);
+}
+
+/** A private run's artifact, for the capability play path (same rules as public shares). */
+export function resolveRunArtifact(id: string, relPath: string): { abs: string; contentType: string } {
+  if (!readMeta(id)) throw Object.assign(new Error("not found"), { code: "not_found" });
+  return resolveArtifactFile(join(labRoot(), id, "artifacts"), relPath);
+}
+
+const PLAYABLE_EXTS = new Set([
+  ".html",
+  ".htm",
+  ".js",
+  ".mjs",
+  ".css",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".svg",
+  ".webp",
+  ".wasm",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".mp3",
+  ".ogg",
+  ".wav",
+  ".json", // game data only; share.json blocked below
+  ".txt",
+  ".md",
+  ".map",
+]);
+
+function resolveArtifactFile(dir: string, relPath: string): { abs: string; contentType: string } {
   let clean = (relPath || "index.html").replace(/^\/+/, "").replace(/\\/g, "/");
   if (!clean || clean.endsWith("/")) clean = `${clean}index.html`;
   if (clean.includes("..") || clean.includes("\0")) {
@@ -321,35 +377,12 @@ export function resolvePublicFile(slug: string, relPath: string): { abs: string;
   if (base === "share.json" || base === "meta.json" || base.startsWith(".")) {
     throw Object.assign(new Error("not found"), { code: "not_found" });
   }
-  // Allowlist extensions for public play (no server configs)
+  // Allowlist extensions for play (no server configs)
   const ext = extname(clean).toLowerCase() || ".html";
-  const allowed = new Set([
-    ".html",
-    ".htm",
-    ".js",
-    ".mjs",
-    ".css",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".webp",
-    ".wasm",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".mp3",
-    ".ogg",
-    ".wav",
-    ".json", // game data only; share.json blocked above
-    ".txt",
-    ".map",
-  ]);
-  if (!allowed.has(ext)) {
+  if (!PLAYABLE_EXTS.has(ext)) {
     throw Object.assign(new Error("type not allowed"), { code: "forbidden_type" });
   }
-  const abs = safeResolveUnder(pub.dir, clean);
+  const abs = safeResolveUnder(dir, clean);
   if (!existsSync(abs) || !statSync(abs).isFile()) {
     throw Object.assign(new Error("file not found"), { code: "not_found" });
   }
@@ -377,6 +410,9 @@ export function publicPlayHeaders(contentType: string): Record<string, string> {
       "frame-ancestors 'self'",
       "base-uri 'none'",
       "object-src 'none'",
+      // Opaque origin even when opened top-level ("Open fullscreen"): the
+      // artifact never shares the dashboard's origin, storage or cookies.
+      "sandbox allow-scripts",
     ].join("; "),
     // Do not let other sites embed as a tracking pixel / data siphon easily
     "X-Frame-Options": "SAMEORIGIN",
@@ -440,19 +476,6 @@ function copyTree(src: string, dst: string) {
     if (st.isDirectory()) copyTree(s, d);
     else if (st.isFile() && st.size < 20_000_000) copyFileSync(s, d);
   }
-}
-
-export function resolveLabFile(id: string, relPath: string): { abs: string; contentType: string } {
-  const meta = readMeta(id);
-  if (!meta) throw Object.assign(new Error("not found"), { code: "not_found" });
-  const runDir = join(labRoot(), id);
-  const clean = relPath.replace(/^\/+/, "").replace(/\\/g, "/");
-  if (clean.includes("..")) throw Object.assign(new Error("bad path"), { code: "bad_path" });
-  const abs = safeResolveUnder(runDir, clean);
-  if (!existsSync(abs) || !statSync(abs).isFile()) {
-    throw Object.assign(new Error("file not found"), { code: "not_found" });
-  }
-  return { abs, contentType: mimeFor(abs) };
 }
 
 export function listLabFiles(id: string): string[] {

@@ -1,5 +1,5 @@
-import { openAiBase, getSettings, listServedModelIds, resolveModelId } from "./settings";
-import { recordUsage } from "./usage";
+import { config } from "../config";
+import { isPlaceholderModel, listServedModelIds, openAiBase, resolveModelId } from "./settings";
 
 const SERVED_TTL_MS = 5000;
 const servedCache = new Map<string, { at: number; ids: string[] }>();
@@ -13,48 +13,63 @@ async function servedIds(base: string): Promise<string[]> {
   return ids;
 }
 
+/**
+ * Request headers that belong to this hop or to L.A.I.L itself. The operator's
+ * LAIL_TOKEN (Authorization / X-Lail-Token) and browser cookies must never reach
+ * the model backend. Without a LAIL_TOKEN the controller does not consume
+ * Authorization, so a client's own backend key (vLLM --api-key) passes through.
+ */
+function upstreamHeaders(req: Request): Headers {
+  const headers = new Headers(req.headers);
+  for (const h of ["host", "connection", "content-length", "cookie", "x-lail-token"]) headers.delete(h);
+  if (config.token) headers.delete("authorization");
+  headers.set("content-type", "application/json");
+  return headers;
+}
+
 export async function proxyOpenAI(req: Request, path: string): Promise<Response> {
-  const settings = getSettings();
   const targetBase = openAiBase();
   const url = `${targetBase}${path.startsWith("/") ? path : `/${path}`}${new URL(req.url).search}`;
 
-  const headers = new Headers(req.headers);
-  headers.delete("host");
-  headers.set("content-type", "application/json");
-
-  const init: RequestInit = {
-    method: req.method,
-    headers,
-  };
+  // The client's disconnect aborts the upstream request, so vLLM stops generating.
+  const init: RequestInit = { method: req.method, headers: upstreamHeaders(req), signal: req.signal };
 
   let bodyText: string | undefined;
   if (req.method !== "GET" && req.method !== "HEAD") {
     bodyText = await req.text();
-    // Always bind chat/completions to the live served model (Server is source of truth).
-    // A model that is really being served passes through untouched; placeholders and
-    // stale ids are rewritten to the live id.
-    if (path.includes("chat/completions") || path.includes("completions")) {
+    // Only placeholder ids ("", auto, default) are bound to the live served model;
+    // a real id, even a wrong one, goes through untouched so typos fail loudly.
+    if (path.includes("completions")) {
       try {
         const body = JSON.parse(bodyText) as { model?: string; [k: string]: unknown };
-        const requested = (body.model || "").trim();
-        const served = await servedIds(targetBase);
-        if (!served.includes(requested)) {
-          body.model = await resolveModelId(undefined, served);
+        if (isPlaceholderModel(body.model)) {
+          body.model = await resolveModelId(undefined, await servedIds(targetBase));
           bodyText = JSON.stringify(body);
         }
       } catch {
-        /* leave body as-is */
+        /* not JSON, or nothing served: leave the body for the backend to reject */
       }
     }
     init.body = bodyText;
   }
 
-  const upstream = await fetch(url, init);
+  let upstream: Response;
+  try {
+    upstream = await fetch(url, init);
+  } catch (e) {
+    return Response.json(
+      {
+        error: "backend_unreachable",
+        message: e instanceof Error ? e.message : String(e),
+        backend: targetBase,
+      },
+      { status: 502 },
+    );
+  }
   const ct = upstream.headers.get("content-type") || "";
 
   // Stream pass-through
   if (ct.includes("text/event-stream") || bodyText?.includes('"stream":true')) {
-    // Tee usage approximately on stream end is hard; meter after clone for non-stream only.
     return new Response(upstream.body, {
       status: upstream.status,
       headers: {
@@ -64,25 +79,7 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
     });
   }
 
-  const text = await upstream.text();
-  try {
-    const j = JSON.parse(text) as {
-      model?: string;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-    if (j.usage) {
-      recordUsage({
-        model: j.model || settings.defaultModel,
-        prompt: j.usage.prompt_tokens || 0,
-        completion: j.usage.completion_tokens || 0,
-        source: "proxy",
-      });
-    }
-  } catch {
-    /* not json */
-  }
-
-  return new Response(text, {
+  return new Response(await upstream.text(), {
     status: upstream.status,
     headers: { "Content-Type": ct || "application/json" },
   });

@@ -52,7 +52,6 @@ export function tokenMatches(
 
 /** Query-string tokens are only for transports that cannot set headers. */
 export function allowQueryToken(pathname: string): boolean {
-  if (pathname === "/ws") return true;
   return /^\/api\/jobs\/[^/]+\/logs$/.test(pathname) || /^\/api\/streams\/runs\/[^/]+\/events$/.test(pathname);
 }
 
@@ -61,23 +60,77 @@ export function isPublicUnauthedPath(pathname: string, method: string): boolean 
   if (method !== "GET" && method !== "HEAD") return false;
   return (
     pathname.startsWith("/api/lab/p/") ||
+    pathname.startsWith("/api/lab/play/") ||
     pathname.startsWith("/api/lab/public/") ||
     pathname.startsWith("/p/")
   );
 }
 
-/** Never reflect an unknown Origin. Loopback hostnames are allowed on any port. */
+/**
+ * Never reflect an unknown Origin. Only the configured web origins are trusted;
+ * other loopback ports (dev apps, artifact servers, bridges) are not.
+ */
 export function resolveCorsOrigin(
   origin: string | undefined,
   allow: string[],
 ): string | undefined {
   if (!origin) return allow[0];
-  if (allow.includes(origin)) return origin;
-  try {
-    const u = new URL(origin);
-    if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return origin;
-  } catch {
-    /* */
+  return allow.includes(origin) ? origin : undefined;
+}
+
+/**
+ * Cross-site write guard, independent of LAIL_TOKEN. A browser request from a
+ * foreign origin can still *reach* a handler as a CORS "simple request"
+ * (text/plain or form body, or no body) even though it cannot read the reply.
+ * Such a write is refused unless it is JSON — application/json forces a
+ * preflight, which only the configured web origins pass. curl, Hermes and other
+ * non-browser clients send no Origin and are unaffected.
+ */
+export function isCrossSiteWrite(req: Request, allow: string[]): boolean {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return false;
+  const origin = req.headers.get("origin");
+  if (!origin) return false;
+  if (req.headers.get("sec-fetch-site") === "same-origin") return false;
+  if (resolveCorsOrigin(origin, allow) === origin) return false;
+  const ct = (req.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  return ct !== "application/json";
+}
+
+/** Hostname of a Host / X-Forwarded-Host value: port stripped, IPv6 brackets kept off. */
+function hostnameOf(host: string): string {
+  const h = host.trim().toLowerCase();
+  if (h.startsWith("[")) return h.slice(1, h.indexOf("]") > 0 ? h.indexOf("]") : undefined);
+  return h.replace(/:\d+$/, "");
+}
+
+/**
+ * DNS-rebinding guard for the token-less (loopback) setup. A rebinding page talks to
+ * the lab under its own domain name, so the browser treats it as same-origin; only the
+ * Host it sends gives it away. Allowed: IP literals, localhost / *.localhost, single-label
+ * names (no public DNS name rebinds to them — docker service names, `spark1`) and the
+ * hosts of the configured web origins. With LAIL_TOKEN set the token is the gate.
+ * Every Host-like header is checked (Next's rewrite forwards the browser's Host as
+ * X-Forwarded-Host).
+ */
+export function isUntrustedHost(req: Request, allow: string[]): boolean {
+  const trusted = new Set(
+    allow.flatMap((o) => {
+      try {
+        return [new URL(o).hostname.replace(/^\[|\]$/g, "").toLowerCase()];
+      } catch {
+        return [];
+      }
+    }),
+  );
+  for (const value of [req.headers.get("host"), req.headers.get("x-forwarded-host")]) {
+    if (!value) continue;
+    for (const part of value.split(",")) {
+      const name = hostnameOf(part);
+      if (!name) continue;
+      if (trusted.has(name) || name === "localhost" || name.endsWith(".localhost")) continue;
+      if (!name.includes(".") || /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || name.includes(":")) continue;
+      return true;
+    }
   }
-  return undefined;
+  return false;
 }

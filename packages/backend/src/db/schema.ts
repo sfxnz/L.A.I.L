@@ -14,85 +14,51 @@ export function getDb(): Database {
   return db;
 }
 
-function migrate(database: Database) {
+/**
+ * Older databases also hold the retired agent/workbench tables (workspaces,
+ * sessions, messages, agent_runs, patches) and usage_events (controller-side
+ * metering that saw only proxied, non-streamed calls). They are left on disk
+ * untouched. usage_events is read once, when usage_minutes is first created, so
+ * /usage keeps the days it already showed (test-suite rows excluded).
+ */
+export function migrate(database: Database) {
+  const hasTable = (name: string) =>
+    !!database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  const firstUsageMinutes = !hasTable("usage_minutes");
   database.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS workspaces (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      root_path TEXT NOT NULL UNIQUE,
-      pinned INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      workspace_id TEXT,
-      pinned INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      meta TEXT,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS usage_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
+    -- Engine-metered token usage (controller/usage.ts): per-minute deltas of the
+    -- backend's Prometheus counters, and the last reading each delta is taken from.
+    CREATE TABLE IF NOT EXISTS usage_minutes (
+      minute TEXT NOT NULL,
       model TEXT NOT NULL,
       prompt_tokens INTEGER NOT NULL DEFAULT 0,
       completion_tokens INTEGER NOT NULL DEFAULT 0,
-      session_id TEXT,
-      source TEXT NOT NULL DEFAULT 'proxy'
+      requests INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (minute, model)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
-    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-
-    CREATE TABLE IF NOT EXISTS agent_runs (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      workspace_id TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      status TEXT NOT NULL,
-      message TEXT NOT NULL,
-      error TEXT,
-      prompt_tokens INTEGER NOT NULL DEFAULT 0,
-      completion_tokens INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS usage_counters (
+      backend TEXT NOT NULL,
+      model TEXT NOT NULL,
+      prompt REAL NOT NULL,
+      completion REAL NOT NULL,
+      requests REAL NOT NULL,
+      start_time REAL,
+      PRIMARY KEY (backend, model)
     );
-
-    CREATE TABLE IF NOT EXISTS patches (
-      id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      path TEXT NOT NULL,
-      old_string TEXT NOT NULL,
-      new_string TEXT NOT NULL,
-      op TEXT NOT NULL,
-      status TEXT NOT NULL,
-      reason TEXT,
-      created_at TEXT NOT NULL,
-      resolved_at TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_patches_session_status ON patches(session_id, status);
-    CREATE INDEX IF NOT EXISTS idx_patches_run ON patches(run_id);
-    CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON agent_runs(session_id);
   `);
+  if (firstUsageMinutes && hasTable("usage_events")) {
+    database.exec(`
+      INSERT INTO usage_minutes (minute, model, prompt_tokens, completion_tokens, requests)
+      SELECT substr(ts, 1, 16), model, SUM(prompt_tokens), SUM(completion_tokens), COUNT(*)
+      FROM usage_events
+      WHERE model != 'ci-test-model'
+      GROUP BY substr(ts, 1, 16), model
+    `);
+  }
 }

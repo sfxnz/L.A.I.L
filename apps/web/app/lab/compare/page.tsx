@@ -137,7 +137,7 @@ function CompareInner() {
                 title={r.title}
                 src={r.play_url}
                 className="h-[min(55vh,480px)] w-full bg-black"
-                sandbox="allow-scripts allow-same-origin"
+                sandbox="allow-scripts"
               />
             </div>
           ))}

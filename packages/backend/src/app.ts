@@ -2,38 +2,14 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveProxy } from "./routes/serve-proxy";
 import { getSettings, putSettings, openAiBase } from "./controller/settings";
-import {
-  ensureDefaultWorkspace,
-  listWorkspaces,
-  createWorkspace,
-  getWorkspace,
-  updateWorkspace,
-  buildTree,
-} from "./controller/workspaces";
-import {
-  listSessions,
-  createSession,
-  getSession,
-  updateSession,
-  listMessages,
-} from "./controller/sessions";
-import { runAgent, cancelAgentRun } from "./controller/agent";
-import {
-  listPatches,
-  acceptPatch,
-  rejectPatch,
-  acceptAllPatches,
-} from "./controller/patches";
-import { approvalHub } from "./agent/approvals";
 import { getUsageSummary } from "./controller/usage";
-import { searchHuggingFace, hfSearchQuery, listLocalModels, pullModel, getPullJob } from "./controller/models";
 import { proxyOpenAI } from "./controller/llm-proxy";
 import { streamsEngine } from "./streams/engine";
 import { createStreamsRoutes } from "./streams/routes";
 import { config } from "./config";
-import { allowQueryToken, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
+import { allowQueryToken, isCrossSiteWrite, isPublicUnauthedPath, isUntrustedHost, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
-  ensureDemoLabRuns,
+  artifactBody,
   compareLabRuns,
   getLabRun,
   getPublicBySlug,
@@ -42,21 +18,14 @@ import {
   listLabRuns,
   listLabRunsByFingerprint,
   publicPlayHeaders,
+  playKeyMatches,
   publishLabRun,
-  resolveLabFile,
   resolvePublicFile,
+  resolveRunArtifact,
 } from "./lab/store";
-import { readFileSync } from "fs";
 
 export function createApp() {
   const app = new Hono();
-  // Seed gallery once if empty (demo HTML)
-  try {
-    ensureDemoLabRuns();
-  } catch {
-    /* */
-  }
-
   const corsAllow = [
     "http://127.0.0.1:3000",
     "http://localhost:3000",
@@ -72,6 +41,21 @@ export function createApp() {
       allowHeaders: ["Content-Type", "Authorization", "X-Lail-Token"],
     }),
   );
+
+  // Without a token, a DNS-rebinding page would be same-origin with the lab: refuse
+  // requests addressed to a host name the lab does not answer to.
+  app.use("*", async (c, next) => {
+    if (config.token || !isUntrustedHost(c.req.raw, corsAllow)) return next();
+    return c.json({ error: "untrusted_host", message: "Host not allowed (set LAIL_CORS_ORIGINS or LAIL_TOKEN)" }, 403);
+  });
+
+  app.use("*", async (c, next) => {
+    if (!isCrossSiteWrite(c.req.raw, corsAllow)) return next();
+    return c.json(
+      { error: "cross_site_write", message: "Cross-site write refused (send Content-Type: application/json)" },
+      403,
+    );
+  });
 
   app.use("*", async (c, next) => {
     if (!config.token) return next();
@@ -91,191 +75,13 @@ export function createApp() {
     c.json({ status: "ok", service: "lail-controller", version: "0.1.0" }),
   );
 
-  // Bootstrap default workspace
-  app.get("/api/bootstrap", (c) => {
-    const ws = ensureDefaultWorkspace();
-    return c.json({ workspace: ws, settings: getSettings() });
-  });
-
   app.get("/api/configure", (c) => c.json(getSettings()));
   app.put("/api/configure", async (c) => {
     const body = await c.req.json();
     return c.json(putSettings(body));
   });
 
-  app.get("/api/workspaces", (c) => {
-    ensureDefaultWorkspace();
-    return c.json(listWorkspaces());
-  });
-  app.post("/api/workspaces", async (c) => {
-    const body = await c.req.json();
-    return c.json(createWorkspace(body.name || "project", body.rootPath));
-  });
-  app.get("/api/workspaces/:id", (c) => {
-    const ws = getWorkspace(c.req.param("id"));
-    if (!ws) return c.json({ error: "not_found" }, 404);
-    return c.json(ws);
-  });
-  app.patch("/api/workspaces/:id", async (c) => {
-    try {
-      const body = await c.req.json();
-      const ws = updateWorkspace(c.req.param("id"), body);
-      if (!ws) return c.json({ error: "not_found" }, 404);
-      return c.json(ws);
-    } catch (e) {
-      const err = e as Error & { code?: string; recovery?: string };
-      return c.json({ error: err.code || "error", message: err.message, recovery: err.recovery }, 400);
-    }
-  });
-  app.get("/api/workspaces/:id/tree", (c) => {
-    return c.json(buildTree(c.req.param("id")));
-  });
-  app.get("/api/workspaces/:id/file", async (c) => {
-    const rel = c.req.query("path") || "";
-    try {
-      const { resolveInWorkspace } = await import("./controller/workspaces");
-      const { readFileSync, statSync } = await import("fs");
-      const abs = resolveInWorkspace(c.req.param("id"), rel);
-      const st = statSync(abs);
-      if (!st.isFile()) return c.json({ error: "not_a_file" }, 400);
-      if (st.size > 2_000_000) return c.json({ error: "too_large", size: st.size }, 413);
-      const content = readFileSync(abs, "utf8");
-      return c.json({ path: rel, content, size: st.size });
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      return c.json({ error: err.code || "error", message: err.message }, 400);
-    }
-  });
-  app.put("/api/workspaces/:id/file", async (c) => {
-    const body = await c.req.json();
-    const rel = String(body.path || "");
-    try {
-      const { resolveInWorkspace } = await import("./controller/workspaces");
-      const { writeFileSync, mkdirSync } = await import("fs");
-      const { dirname } = await import("path");
-      const abs = resolveInWorkspace(c.req.param("id"), rel);
-      mkdirSync(dirname(abs), { recursive: true });
-      writeFileSync(abs, String(body.content ?? ""), "utf8");
-      return c.json({ ok: true, path: rel });
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      return c.json({ error: err.code || "error", message: err.message }, 400);
-    }
-  });
-
-  app.get("/api/sessions", (c) => c.json(listSessions()));
-  app.post("/api/sessions", async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const ws = ensureDefaultWorkspace();
-    const session = createSession(body.title || "New session", body.workspaceId || ws.id);
-    return c.json(session);
-  });
-  app.get("/api/sessions/:id", (c) => {
-    const s = getSession(c.req.param("id"));
-    if (!s) return c.json({ error: "not_found" }, 404);
-    return c.json({ session: s, messages: listMessages(s.id) });
-  });
-  app.patch("/api/sessions/:id", async (c) => {
-    const body = await c.req.json();
-    const s = updateSession(c.req.param("id"), body);
-    if (!s) return c.json({ error: "not_found" }, 404);
-    return c.json(s);
-  });
-
-  app.post("/api/agent/run", async (c) => {
-    try {
-      const body = await c.req.json();
-      const result = await runAgent({
-        sessionId: body.sessionId,
-        message: body.message,
-        workspaceId: body.workspaceId,
-        mode: body.mode, // plan|ask|agent, optional
-        editorSnapshot: body.editorSnapshot,
-      });
-      return c.json(result);
-    } catch (e) {
-      const err = e as Error & { code?: string; recovery?: string };
-      return c.json({ error: err.code || "error", message: err.message, recovery: err.recovery }, 400);
-    }
-  });
-
-  app.post("/api/agent/runs/:runId/cancel", (c) => {
-    const ok = cancelAgentRun(c.req.param("runId"));
-    return c.json({ ok });
-  });
-
-  app.post("/api/agent/runs/:runId/shell-approvals/:approvalId", async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const decision = body.decision === "allow" ? "allow" : "deny";
-    const ok = approvalHub.decide(c.req.param("approvalId"), decision);
-    return c.json({ ok });
-  });
-
-  app.get("/api/patches", (c) => {
-    return c.json(
-      listPatches({
-        sessionId: c.req.query("sessionId") || undefined,
-        runId: c.req.query("runId") || undefined,
-        status: c.req.query("status") || undefined,
-      }),
-    );
-  });
-
-  app.post("/api/patches/:id/accept", (c) => {
-    try {
-      return c.json(acceptPatch(c.req.param("id")));
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      const status = err.code === "NOT_FOUND" ? 404 : 400;
-      return c.json({ error: err.code || "error", message: err.message }, status);
-    }
-  });
-
-  app.post("/api/patches/:id/reject", (c) => {
-    try {
-      return c.json(rejectPatch(c.req.param("id")));
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      const status = err.code === "NOT_FOUND" ? 404 : 400;
-      return c.json({ error: err.code || "error", message: err.message }, status);
-    }
-  });
-
-  app.post("/api/patches/accept-all", async (c) => {
-    try {
-      const body = await c.req.json().catch(() => ({}));
-      return c.json(acceptAllPatches(body));
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      return c.json({ error: err.code || "error", message: err.message }, 400);
-    }
-  });
-
   app.get("/api/usage", (c) => c.json(getUsageSummary()));
-
-  app.get("/api/models", async (c) => {
-    const local = await listLocalModels();
-    return c.json({ local });
-  });
-  app.get("/api/models/search", async (c) => {
-    const q = hfSearchQuery(c.req.query("q"));
-    try {
-      const results = await searchHuggingFace(q);
-      return c.json({ results });
-    } catch (e) {
-      return c.json({ results: [], error: e instanceof Error ? e.message : String(e) }, 502);
-    }
-  });
-  app.post("/api/models/pull", async (c) => {
-    const body = await c.req.json();
-    const result = await pullModel(body.model, body.backend || "hf");
-    return c.json(result);
-  });
-  app.get("/api/models/pull/:jobId", (c) => {
-    const job = getPullJob(c.req.param("jobId"));
-    if (!job) return c.json({ error: "not_found" }, 404);
-    return c.json(job);
-  });
 
   // Merged lab status: controller + serve-engine + backends (all probed in parallel)
   app.get("/api/lab-status", async (c) => {
@@ -422,30 +228,24 @@ export function createApp() {
     }
   });
 
-  app.get("/api/lab/runs/:id/play", (c) => {
-    const id = c.req.param("id");
-    const run = getLabRun(id);
-    if (!run) return c.json({ error: "not_found" }, 404);
-    const entry = run.entry || "index.html";
-    return c.redirect(`/api/lab/runs/${id}/files/artifacts/${entry}`, 302);
-  });
-
-  app.get("/api/lab/runs/:id/files/*", (c) => {
-    const id = c.req.param("id");
-    const rel = c.req.path.replace(`/api/lab/runs/${id}/files/`, "");
+  // Private play: the path's key is the capability (no token: iframes cannot send
+  // one). Same CSP as public shares — model-written HTML is untrusted. Files that
+  // are not web assets (the run's sources) download instead of rendering.
+  app.get("/api/lab/play/:id/:key/*", (c) => {
+    const { id, key } = c.req.param();
+    if (!playKeyMatches(id, key)) return c.json({ error: "not_found" }, 404);
+    const rel = c.req.path.slice(`/api/lab/play/${id}/${key}/`.length);
     try {
-      const { abs, contentType } = resolveLabFile(id, rel);
-      const data = readFileSync(abs);
-      return new Response(data, {
-        headers: {
-          "Content-Type": contentType,
-          "Cache-Control": "no-cache",
-          "X-Frame-Options": "SAMEORIGIN",
-        },
-      });
+      const { abs, contentType, playable } = resolveRunArtifact(id, rel);
+      const headers: Record<string, string> = {
+        ...publicPlayHeaders(contentType),
+        "Cache-Control": "private, no-cache",
+      };
+      if (!playable) headers["Content-Disposition"] = "attachment";
+      return new Response(artifactBody(abs, contentType), { headers });
     } catch (e) {
       const err = e as Error & { code?: string };
-      const status = err.code === "not_found" ? 404 : 400;
+      const status = err.code === "forbidden_type" ? 403 : err.code === "bad_path" ? 400 : 404;
       return c.json({ error: err.code || "error", message: err.message }, status);
     }
   });
@@ -473,7 +273,7 @@ export function createApp() {
     if (!rel || rel === "index.html") return servePublicIndex(slug);
     try {
       const { abs, contentType } = resolvePublicFile(slug, rel);
-      return new Response(readFileSync(abs), {
+      return new Response(artifactBody(abs, contentType), {
         headers: publicPlayHeaders(contentType),
       });
     } catch (e) {
@@ -510,7 +310,7 @@ export function createApp() {
 function servePublicIndex(slug: string): Response {
   try {
     const { abs, contentType } = resolvePublicFile(slug, "index.html");
-    return new Response(readFileSync(abs), {
+    return new Response(artifactBody(abs, contentType), {
       headers: publicPlayHeaders(contentType),
     });
   } catch {

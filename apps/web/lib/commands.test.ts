@@ -43,7 +43,8 @@ describe("command registry", () => {
   test("nav commands carry their g-chord in display form", () => {
     const bench = COMMANDS.find((c) => c.id === "nav:/bench")!;
     expect(bench.shortcut).toEqual(["g", "b"]);
-    expect(COMMANDS.find((c) => c.id === "nav:/models")?.shortcut).toBeUndefined();
+    expect(COMMANDS.find((c) => c.id === "nav:/usage")?.shortcut).toBeUndefined();
+    expect(COMMANDS.find((c) => c.id === "nav:/lab")?.hint).toBe("/lab");
     expect(COMMANDS.find((c) => c.id === "help:shortcuts")?.shortcut).toEqual(["?"]);
   });
 

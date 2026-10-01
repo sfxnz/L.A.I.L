@@ -7,7 +7,7 @@ Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to 
 | Layer | Stack |
 |-------|--------|
 | UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
-| Controller | Bun + Hono · lab-status, models, configure, proxy to serve-engine |
+| Controller | Bun + Hono · lab-status, configure, usage, lab gallery, proxy to serve-engine |
 | Serve-engine | Python FastAPI · vLLM auto-configure, smoke, benches, run history |
 | Models | **vLLM** and **llama.cpp** (no Ollama) |
 
@@ -19,12 +19,11 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 |------|------|------|
 | **Status** | `/status` | Health, headroom, containers, recent runs |
 | **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
-| **Models** | `/models` | Hugging Face search + local `/v1/models` |
 | **Evals** | `/evals` | Smoke + perf jobs + run history |
 | **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
 | **Configure** | `/configure` | Default backend / model |
 
-`/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench` is a retirement notice — Hermes is the agent. `/integrations` is not shipped.
+`/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench`, `/integrations` and `/models` are retired and redirect to live pages — Hermes is the agent; Serve’s “Download weights first” fetches into the HF cache.
 
 ## Architecture
 
@@ -36,7 +35,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
                              │ REST :8787
 ┌────────────────────────────▼─────────────────────────────────┐
 │  LabController (Bun + Hono)                                  │
-│  lab-status · models · configure · serve/* · bench/* proxy   │
+│  lab-status · configure · usage · serve/* · bench/* proxy    │
 └──────────────┬─────────────────────────────┬─────────────────┘
                │                             │
                ▼                             ▼
@@ -49,7 +48,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). Composer agent remains in the backend for now but is **out of the primary UI**.
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
 
 ### Model resolution
 
@@ -96,7 +95,6 @@ Open http://127.0.0.1:3000 — **`/` redirects to Status**.
 | Web (Status) | http://127.0.0.1:3000 |
 | Controller | http://127.0.0.1:8787 |
 | Serve-engine | http://127.0.0.1:8765 |
-| WebSocket | derived from the page host (controller `/ws`) |
 
 ### Linux + NVIDIA / DGX Spark
 
@@ -156,8 +154,8 @@ Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first
 
 ## Models & Usage
 
-- **`/models`**: HF search, local list from vLLM/llama.cpp `/v1/models`, HF download jobs (not Ollama pull).
-- **`/usage`**: lifetime tokens, heatmap, mix, top models (metered from proxy + agent).
+- **`/models`** is retired (redirects to Server): weights download through Serve’s “Download weights first” option into the HF cache the engine reads.
+- **`/usage`**: lifetime tokens, heatmap, mix, top models — metered every 15 s from the engine’s own `/metrics` counters, so it covers every client, including Hermes direct to `:8000` (vLLM always; SGLang with `--enable-metrics`; llama-server with `--metrics`).
 
 ## Environment
 
@@ -170,7 +168,7 @@ See [`.env.example`](./.env.example).
 | `LAIL_LLAMACPP_URL` | Default `http://127.0.0.1:8080` |
 | `LAIL_DEFAULT_MODEL` | Served model id, or `auto` |
 | `LAIL_API_PORT` / `LAIL_WEB_PORT` / `LAIL_SERVE_ENGINE_PORT` | Ports |
-| `LAIL_DATA_DIR` / `LAIL_WORKSPACES_DIR` | Data + project roots |
+| `LAIL_DATA_DIR` | Data root (sqlite, lab runs) |
 | `HF_TOKEN` | Optional gated HF access |
 | `LAIL_CLUSTER_JSON` | Optional pin. Unset = this host + live RoCE peers. See `.env.example` |
 | `LAIL_HOST` | Bind address. Default `127.0.0.1`. Off-loopback requires `LAIL_TOKEN` |
@@ -180,18 +178,18 @@ See [`.env.example`](./.env.example).
 
 ## Retired: Workbench
 
-`/workbench` is not the landing page. It shows a retirement notice pointing at Hermes. Plan / Ask / Agent live in Hermes against the served `:8000` endpoint, not in this console.
+`/workbench` redirects to Status; its controller backend (workspaces, sessions, agent runs, patches) is gone. Plan / Ask / Agent live in Hermes against the served `:8000` endpoint, not in this console.
 
 ## Monorepo layout
 
 ```text
 lail/
   apps/web/                 Next.js UI (Status, Serve, Evals, Connect, …)
-    lib/ide-chrome.ts       Top-nav + stream chrome contract (tested)
-  packages/backend/         Bun LabController + agent + proxy
+    lib/ide-chrome.ts       Top-nav contract (tested)
+  packages/backend/         Bun LabController + proxies + streams
   packages/serve-engine/    Python vLLM serve/bench API (install from pyproject.toml)
   packages/shared/          Shared TS types
-  workspaces/demo/          Default workspace root
+  workspaces/demo/          Example artifacts (lab gallery import sample)
   data/                     sqlite, runs/, models/ (gitignored runtime state)
   scripts/dev.ts            One-command: serve-engine + API + web
   docker-compose.yml
@@ -220,8 +218,8 @@ python3 -m pytest packages/serve-engine/tests -q
 ```
 
 - `bun run typecheck` — web + backend TypeScript
-- `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), shell source, mentions
-- `packages/backend` tests — agent runtime, patches, context packer
+- `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), API/token handling, live status store, stream runs
+- `packages/backend` tests — usage metering, serve-engine and `/v1` proxies, lab play capability, streams
 - `packages/serve-engine` pytest — auto-config, cluster, captured corpus
 - Python runtime pins: `packages/serve-engine/requirements.txt` (`uv pip compile packages/serve-engine/pyproject.toml -o packages/serve-engine/requirements.txt`)
 

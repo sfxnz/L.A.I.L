@@ -19,7 +19,7 @@ export default function ConfigurePage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   useEffect(() => {
     api.configure
@@ -28,7 +28,7 @@ export default function ConfigurePage() {
         setSettings(s);
         setLoadError(null);
       })
-      .catch((e) => setLoadError(String((e as Error).message || e)));
+      .catch(setLoadError);
   }, []);
 
   if (loadError) {
@@ -37,7 +37,7 @@ export default function ConfigurePage() {
         <div className="page-header">
           <div>
             <h1 className="page-title">Configure</h1>
-            <p className="page-sub">vLLM / llama.cpp · default model · HF token · context budget</p>
+            <p className="page-sub">vLLM / llama.cpp · default model · backend URLs</p>
           </div>
         </div>
         <Callout
@@ -56,7 +56,7 @@ export default function ConfigurePage() {
                 api.configure
                   .get()
                   .then(setSettings)
-                  .catch((e) => setLoadError(String((e as Error).message || e)));
+                  .catch(setLoadError);
               }}
             >
               Retry
@@ -65,7 +65,9 @@ export default function ConfigurePage() {
         >
           {isUnauthorizedError(loadError)
             ? "The controller is up. Paste the token in the banner, then retry."
-            : loadError}
+            : loadError instanceof Error
+              ? loadError.message
+              : String(loadError)}
         </Callout>
       </div>
     );
@@ -96,7 +98,7 @@ export default function ConfigurePage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Configure</h1>
-          <p className="page-sub">vLLM / llama.cpp · default model · HF token · context budget</p>
+          <p className="page-sub">vLLM / llama.cpp · default model · backend URLs</p>
         </div>
       </div>
 
@@ -107,7 +109,7 @@ export default function ConfigurePage() {
       )}
       {msg && (
         <Callout tone="ok" title="Configuration saved">
-          Defaults will apply on the next serve / agent run.
+          Defaults apply on the next serve.
         </Callout>
       )}
 
@@ -138,40 +140,11 @@ export default function ConfigurePage() {
             placeholder="auto — or the first live /v1/models id"
           />
         </Field>
-        <Field
-          label="Hugging Face token (optional)"
-          htmlFor="cfg-hf"
-          hint="Stored for private cards and gated weights. Never pasted into chat logs."
-        >
-          <Input
-            id="cfg-hf"
-            type="password"
-            autoComplete="off"
-            value={settings.hfToken || ""}
-            onChange={(e) => setSettings({ ...settings, hfToken: e.target.value })}
-            placeholder="hf_…"
-          />
-        </Field>
-        <Field
-          label="Context budget (chars)"
-          htmlFor="cfg-budget"
-          hint="Max characters packed from open tabs, @mentions, and search hits per agent run (default 32000, min 2000)."
-        >
-          <Input
-            id="cfg-budget"
-            type="number"
-            min={2000}
-            step={1000}
-            value={settings.contextBudgetChars ?? 32_000}
-            onChange={(e) => {
-              const n = Number(e.target.value);
-              setSettings({
-                ...settings,
-                contextBudgetChars: Number.isFinite(n) ? n : 32_000,
-              });
-            }}
-          />
-        </Field>
+        <p className="text-[12px] leading-relaxed text-lab-muted">
+          Hugging Face token: serve-engine reads <code>HF_TOKEN</code> or{" "}
+          <code>~/.cache/huggingface/token</code> (<code>hf auth login</code>) on the Spark host.
+          It is never stored or shown here.
+        </p>
       </Panel>
 
       <Panel className="space-y-4 p-4">

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import {
   copyFileSync,
   existsSync,
@@ -31,7 +31,8 @@ export type LabRunMeta = {
 
 export type LabRunSummary = LabRunMeta & {
   dir: string;
-  preview_url: string | null;
+  /** Capability base for the run's artifacts (see playKey); play_url = artifacts_url + entry. */
+  artifacts_url: string;
   play_url: string;
   public_url: string | null;
   gallery_url: string;
@@ -132,9 +133,29 @@ function writeMeta(meta: LabRunMeta): void {
   writeFileSync(join(labRoot(), meta.id, "meta.json"), JSON.stringify(meta, null, 2), "utf8");
 }
 
+/**
+ * Per-run capability for the private play path. Iframes and plain links cannot
+ * send the LAIL token, and a ?token= in the URL would hand the operator secret
+ * to the artifact's own (model-written) scripts. The key is an HMAC of the run
+ * id under LAIL_TOKEN: it unlocks only this run's artifacts, and rotating the
+ * token revokes every link.
+ */
+export function playKey(id: string): string {
+  return createHmac("sha256", config.token || "lail-no-token")
+    .update(`lab-play:${id}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+export function playKeyMatches(id: string, key: string): boolean {
+  const want = Buffer.from(playKey(id));
+  const got = Buffer.from(key);
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
 function toSummary(meta: LabRunMeta): LabRunSummary {
   const dir = join(labRoot(), meta.id);
-  const previewPath = join(dir, "preview.png");
+  const artifacts_url = `/api/lab/play/${meta.id}/${playKey(meta.id)}/`;
   const slug = meta.share?.slug || null;
   let public_url: string | null = null;
   if (meta.share?.public && slug) {
@@ -155,8 +176,8 @@ function toSummary(meta: LabRunMeta): LabRunSummary {
   return {
     ...meta,
     dir,
-    preview_url: existsSync(previewPath) ? `/api/lab/runs/${meta.id}/files/preview.png` : null,
-    play_url: `/api/lab/runs/${meta.id}/play`,
+    artifacts_url,
+    play_url: artifacts_url + encodeURI(meta.entry || "index.html"),
     gallery_url: `/lab/${meta.id}`,
     public_url,
   };
@@ -308,9 +329,50 @@ export function getPublicBySlug(slug: string): {
   return { slug, meta, dir };
 }
 
-export function resolvePublicFile(slug: string, relPath: string): { abs: string; contentType: string } {
+type ArtifactFile = { abs: string; contentType: string; playable: boolean };
+
+export function resolvePublicFile(slug: string, relPath: string): ArtifactFile {
   const pub = getPublicBySlug(slug);
   if (!pub) throw Object.assign(new Error("not found"), { code: "not_found" });
+  return resolveArtifactFile(pub.dir, relPath, false);
+}
+
+/**
+ * A private run's artifact, for the capability play path. Same rules as public
+ * shares, except that other file types (sources Hermes wrote, e.g. .py) are
+ * returned with playable=false so the route serves them as downloads.
+ */
+export function resolveRunArtifact(id: string, relPath: string): ArtifactFile {
+  if (!readMeta(id)) throw Object.assign(new Error("not found"), { code: "not_found" });
+  return resolveArtifactFile(join(labRoot(), id, "artifacts"), relPath, true);
+}
+
+const PLAYABLE_EXTS = new Set([
+  ".html",
+  ".htm",
+  ".js",
+  ".mjs",
+  ".css",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".svg",
+  ".webp",
+  ".wasm",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".mp3",
+  ".ogg",
+  ".wav",
+  ".json", // game data only; share.json blocked below
+  ".txt",
+  ".md",
+  ".map",
+]);
+
+function resolveArtifactFile(dir: string, relPath: string, anyType: boolean): ArtifactFile {
   let clean = (relPath || "index.html").replace(/^\/+/, "").replace(/\\/g, "/");
   if (!clean || clean.endsWith("/")) clean = `${clean}index.html`;
   if (clean.includes("..") || clean.includes("\0")) {
@@ -321,39 +383,44 @@ export function resolvePublicFile(slug: string, relPath: string): { abs: string;
   if (base === "share.json" || base === "meta.json" || base.startsWith(".")) {
     throw Object.assign(new Error("not found"), { code: "not_found" });
   }
-  // Allowlist extensions for public play (no server configs)
+  // Allowlist extensions for play (no server configs)
   const ext = extname(clean).toLowerCase() || ".html";
-  const allowed = new Set([
-    ".html",
-    ".htm",
-    ".js",
-    ".mjs",
-    ".css",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".webp",
-    ".wasm",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".mp3",
-    ".ogg",
-    ".wav",
-    ".json", // game data only; share.json blocked above
-    ".txt",
-    ".map",
-  ]);
-  if (!allowed.has(ext)) {
+  const playable = PLAYABLE_EXTS.has(ext);
+  if (!playable && !anyType) {
     throw Object.assign(new Error("type not allowed"), { code: "forbidden_type" });
   }
-  const abs = safeResolveUnder(pub.dir, clean);
+  const abs = safeResolveUnder(dir, clean);
   if (!existsSync(abs) || !statSync(abs).isFile()) {
     throw Object.assign(new Error("file not found"), { code: "not_found" });
   }
-  return { abs, contentType: mimeFor(abs) };
+  return { abs, contentType: playable ? mimeFor(abs) : "application/octet-stream", playable };
+}
+
+/**
+ * The sandbox gives artifacts an opaque origin, where touching localStorage /
+ * sessionStorage throws a SecurityError — and model-written games often keep a high
+ * score there. This runs before any of the artifact's scripts and, only where access
+ * throws, puts an in-memory Storage in its place (lost on reload, never shared).
+ * IndexedDB and cookies stay unavailable.
+ */
+const STORAGE_SHIM =
+  "<script>(function(){function S(){var m=new Map();return{get length(){return m.size}," +
+  "key:function(i){var k=Array.from(m.keys())[i];return k===undefined?null:k}," +
+  "getItem:function(k){k=String(k);return m.has(k)?m.get(k):null}," +
+  "setItem:function(k,v){m.set(String(k),String(v))},removeItem:function(k){m.delete(String(k))}," +
+  "clear:function(){m.clear()}}}" +
+  '["localStorage","sessionStorage"].forEach(function(n){try{window[n]}catch(e){' +
+  "try{Object.defineProperty(window,n,{value:S(),configurable:true})}catch(_){}}})})();</script>";
+
+/** An artifact's bytes as served: HTML gets the storage shim ahead of its own scripts. */
+export function artifactBody(abs: string, contentType: string): BodyInit {
+  const bytes = readFileSync(abs);
+  if (!contentType.startsWith("text/html")) return bytes;
+  const html = bytes.toString("utf8");
+  // After the doctype (anything before it would switch the page to quirks mode).
+  const doctype = html.match(/^\uFEFF?\s*<!doctype[^>]*>/i);
+  const at = doctype ? doctype[0].length : 0;
+  return html.slice(0, at) + STORAGE_SHIM + html.slice(at);
 }
 
 /** Safe response headers for untrusted model-generated HTML/JS. */
@@ -364,6 +431,11 @@ export function publicPlayHeaders(contentType: string): Record<string, string> {
     "X-Robots-Tag": "noindex, nofollow",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    // The sandbox below gives the artifact an opaque origin (Origin: null), so its
+    // own module scripts, fetch()ed JSON/WASM and @font-face loads are CORS
+    // requests. Allow them; no credentials are involved and the URL (capability
+    // key or public slug) is the only access check.
+    "Access-Control-Allow-Origin": "*",
     // Lock down what the game page can do. Model HTML is untrusted.
     "Content-Security-Policy": [
       "default-src 'none'",
@@ -377,6 +449,9 @@ export function publicPlayHeaders(contentType: string): Record<string, string> {
       "frame-ancestors 'self'",
       "base-uri 'none'",
       "object-src 'none'",
+      // Opaque origin even when opened top-level ("Open fullscreen"): the
+      // artifact never shares the dashboard's origin, storage or cookies.
+      "sandbox allow-scripts",
     ].join("; "),
     // Do not let other sites embed as a tracking pixel / data siphon easily
     "X-Frame-Options": "SAMEORIGIN",
@@ -442,19 +517,6 @@ function copyTree(src: string, dst: string) {
   }
 }
 
-export function resolveLabFile(id: string, relPath: string): { abs: string; contentType: string } {
-  const meta = readMeta(id);
-  if (!meta) throw Object.assign(new Error("not found"), { code: "not_found" });
-  const runDir = join(labRoot(), id);
-  const clean = relPath.replace(/^\/+/, "").replace(/\\/g, "/");
-  if (clean.includes("..")) throw Object.assign(new Error("bad path"), { code: "bad_path" });
-  const abs = safeResolveUnder(runDir, clean);
-  if (!existsSync(abs) || !statSync(abs).isFile()) {
-    throw Object.assign(new Error("file not found"), { code: "not_found" });
-  }
-  return { abs, contentType: mimeFor(abs) };
-}
-
 export function listLabFiles(id: string): string[] {
   const meta = readMeta(id);
   if (!meta) return [];
@@ -479,6 +541,8 @@ function mimeFor(path: string): string {
     ".html": "text/html; charset=utf-8",
     ".htm": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".map": "application/json",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json",
     ".png": "image/png",
@@ -490,27 +554,12 @@ function mimeFor(path: string): string {
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".wasm": "application/wasm",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
   };
   return map[e] || "application/octet-stream";
-}
-
-/** Seed gallery from demo HTML if empty */
-export function ensureDemoLabRuns(): void {
-  if (listLabRuns(1).length > 0) return;
-  const demo = join(config.workspacesDir, "demo", "geometry-dash-like.html");
-  if (!existsSync(demo)) return;
-  try {
-    importLabRun({
-      title: "Geometry Dash–like runner",
-      task_type: "html-game",
-      model_id: "demo/seed",
-      from: demo,
-      tags: ["html", "game", "self-contained", "seed"],
-      brief:
-        "Self-contained HTML game (seed). Replace with Hermes-built runs via lail_lab_publish.",
-      hermes: { source: "seed" },
-    });
-  } catch {
-    /* ignore seed failures */
-  }
 }

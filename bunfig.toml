@@ -3,3 +3,6 @@ peer = true
 
 [run]
 bun = true
+
+[test]
+preload = ["./packages/backend/src/test-setup.ts"]

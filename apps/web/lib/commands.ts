@@ -38,9 +38,9 @@ export type Command = {
 };
 
 const NAV_EXTRA = [
-  { href: "/models", label: "Models" },
   { href: "/connect", label: "Connect" },
   { href: "/usage", label: "Usage" },
+  { href: "/lab", label: "Lab gallery" },
 ];
 
 /** Bench query params are the page's own (`lib/bench/levels.ts` decodeConfigToQuery). */

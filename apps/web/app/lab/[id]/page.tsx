@@ -30,7 +30,6 @@ export default function LabRunDetailPage() {
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const shareUrl = `${origin}/lab/${id}`;
-  const playUrl = run?.play_url || `/api/lab/runs/${id}/play`;
   const publicUrl = run?.public_url ? `${origin}${run.public_url}` : null;
 
   async function copy(label: string, text: string) {
@@ -90,7 +89,7 @@ export default function LabRunDetailPage() {
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone="ok">{run.task_type}</Badge>
           {run.share?.public && <Badge tone="ok">public</Badge>}
-          <a className={btnClass("primary")} href={playUrl} target="_blank" rel="noreferrer">
+          <a className={btnClass("primary")} href={run.play_url} target="_blank" rel="noreferrer">
             Open fullscreen
           </a>
           {(run.siblings?.length || 0) > 0 && (
@@ -118,9 +117,9 @@ export default function LabRunDetailPage() {
           <div className="overflow-hidden rounded-[2px] border border-lab-border bg-black">
             <iframe
               title={run.title}
-              src={playUrl}
+              src={run.play_url}
               className="h-[min(70vh,640px)] w-full"
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts"
             />
           </div>
         </div>
@@ -221,7 +220,7 @@ bun run lab:site-deploy`}
                 <li key={f}>
                   <a
                     className="hover:text-lab-accent"
-                    href={`/api/lab/runs/${run.id}/files/artifacts/${f}`}
+                    href={`${run.artifacts_url}${encodeURI(f)}`}
                     target="_blank"
                     rel="noreferrer"
                   >

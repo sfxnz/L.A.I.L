@@ -13,18 +13,37 @@ function lailTokenHeader(): Record<string, string> {
   return t ? { "X-Lail-Token": t } : {};
 }
 
+/** A non-2xx reply. `message` stays the body text (what pages already show). */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    body: string,
+    /** Parsed body when it was JSON, e.g. the controller's {error, message}. */
+    readonly json: { error?: string; message?: string } | null,
+  ) {
+    super(body);
+    this.name = "ApiError";
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
+    ...init,
     headers: {
       "Content-Type": "application/json",
       ...lailTokenHeader(),
       ...(init?.headers || {}),
     },
-    ...init,
   });
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || r.statusText);
+    const body = await r.text();
+    let json: ApiError["json"] = null;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(r.status, body || r.statusText, json);
   }
   return r.json();
 }
@@ -306,8 +325,9 @@ export type LabArtifactRun = {
   tags: string[];
   brief?: string;
   eval_run_id?: string | null;
+  /** Capability URL for the run's artifacts (no token needed; iframes cannot send one). */
+  artifacts_url: string;
   play_url: string;
-  preview_url?: string | null;
   gallery_url?: string;
   public_url?: string | null;
   task_fingerprint?: string;
@@ -358,94 +378,13 @@ export type ServeRecommend = {
 };
 
 export const api = {
-  health: () => req<{ status: string }>("/api/health"),
   labStatus: () => req<LabStatus>("/api/lab-status"),
-  status: () => req<Record<string, unknown>>("/api/status"),
-  cluster: () => req<ClusterStatus>("/api/cluster"),
-  bootstrap: () => req<{ workspace: Workspace; settings: Settings }>("/api/bootstrap"),
   configure: {
     get: () => req<Settings>("/api/configure"),
     put: (body: Partial<Settings>) =>
       req<Settings>("/api/configure", { method: "PUT", body: JSON.stringify(body) }),
   },
-  workspaces: {
-    list: () => req<Workspace[]>("/api/workspaces"),
-    create: (name: string, rootPath?: string) =>
-      req<Workspace>("/api/workspaces", {
-        method: "POST",
-        body: JSON.stringify({ name, rootPath }),
-      }),
-    tree: (id: string) => req<TreeNode[]>(`/api/workspaces/${id}/tree`),
-    patch: (id: string, body: Partial<Workspace>) =>
-      req<Workspace>(`/api/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-    readFile: (id: string, path: string) =>
-      req<{ path: string; content: string; size: number }>(
-        `/api/workspaces/${id}/file?path=${encodeURIComponent(path)}`,
-      ),
-    writeFile: (id: string, path: string, content: string) =>
-      req<{ ok: boolean }>(`/api/workspaces/${id}/file`, {
-        method: "PUT",
-        body: JSON.stringify({ path, content }),
-      }),
-  },
-  sessions: {
-    list: () => req<Session[]>("/api/sessions"),
-    create: (title?: string, workspaceId?: string) =>
-      req<Session>("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({ title, workspaceId }),
-      }),
-    get: (id: string) =>
-      req<{ session: Session; messages: Message[] }>(`/api/sessions/${id}`),
-    patch: (id: string, body: Partial<Session>) =>
-      req<Session>(`/api/sessions/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  },
-  agentRun: (
-    sessionId: string,
-    message: string,
-    workspaceId?: string,
-    mode: AgentMode = "agent",
-    editorSnapshot?: EditorSnapshot,
-  ) =>
-    req<{ runId: string }>("/api/agent/run", {
-      method: "POST",
-      body: JSON.stringify({ sessionId, message, workspaceId, mode, editorSnapshot }),
-    }),
-  cancelAgentRun: (runId: string) =>
-    req<{ ok: boolean }>(`/api/agent/runs/${runId}/cancel`, { method: "POST" }),
-  shellApproval: (runId: string, approvalId: string, decision: "allow" | "deny") =>
-    req<{ ok: boolean }>(`/api/agent/runs/${runId}/shell-approvals/${approvalId}`, {
-      method: "POST",
-      body: JSON.stringify({ decision }),
-    }),
-  patches: {
-    list: (q: { sessionId?: string; runId?: string; status?: string } = {}) => {
-      const sp = new URLSearchParams();
-      if (q.sessionId) sp.set("sessionId", q.sessionId);
-      if (q.runId) sp.set("runId", q.runId);
-      if (q.status) sp.set("status", q.status);
-      return req<Patch[]>(`/api/patches?${sp}`);
-    },
-    accept: (id: string) =>
-      req<Patch>(`/api/patches/${id}/accept`, { method: "POST" }),
-    reject: (id: string) =>
-      req<Patch>(`/api/patches/${id}/reject`, { method: "POST" }),
-    acceptAll: (body: { sessionId?: string; runId?: string }) =>
-      req<Patch[]>("/api/patches/accept-all", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
-  },
   usage: () => req<UsageSummary>("/api/usage"),
-  models: {
-    local: () => req<{ local: ModelCard[] }>("/api/models"),
-    search: (q: string) => req<{ results: ModelCard[]; error?: string }>(`/api/models/search?q=${encodeURIComponent(q)}`),
-    pull: (model: string, backend: "hf" | "vllm" | "llamacpp" = "hf") =>
-      req<{ jobId: string }>("/api/models/pull", {
-        method: "POST",
-        body: JSON.stringify({ model, backend }),
-      }),
-  },
   startServe: (body: Record<string, unknown>) =>
     req<{ job_id: string }>("/api/serve/start", { method: "POST", body: JSON.stringify(body) }),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
@@ -540,21 +479,6 @@ export const api = {
         same_brief: boolean;
         brief: string | null;
       }>(`/api/lab/compare?ids=${encodeURIComponent(ids.join(","))}`),
-    import: (body: {
-      title: string;
-      from: string;
-      task_type?: string;
-      model_id?: string;
-      entry?: string;
-      tags?: string[];
-      brief?: string;
-      eval_run_id?: string;
-      share_public?: boolean;
-    }) =>
-      req<LabArtifactRun>("/api/lab/runs/import", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
     share: (id: string, makePublic = true) =>
       req<LabArtifactRun>(`/api/lab/runs/${encodeURIComponent(id)}/share`, {
         method: "POST",
@@ -634,7 +558,7 @@ export function watchJob(
       })
       .catch((e: unknown) => {
         if (closed) return;
-        if (String((e as Error)?.message ?? e).includes("job not found")) {
+        if (e instanceof ApiError && e.status === 404) {
           status({ status: "failed", progress: last.progress, message: "job not found — the serve-engine no longer knows it" });
           finish(null);
           return;
@@ -692,69 +616,10 @@ export function watchJob(
   return () => finish();
 }
 
-export type Workspace = {
-  id: string;
-  name: string;
-  rootPath: string;
-  pinned: boolean;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type Session = {
-  id: string;
-  title: string;
-  workspaceId: string | null;
-  pinned: boolean;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type Message = {
-  id: string;
-  sessionId: string;
-  role: string;
-  content: string;
-  createdAt: string;
-  meta?: Record<string, unknown>;
-};
-
-export type TreeNode = {
-  name: string;
-  path: string;
-  type: "file" | "dir";
-  children?: TreeNode[];
-};
-
 export type Settings = {
   defaultBackend: string;
   defaultModel: string;
   backends: Record<string, { url: string; enabled: boolean; label: string }>;
-  hfToken?: string;
-  contextBudgetChars?: number;
-  contextMaxFileChars?: number;
-  contextMaxSearchHits?: number;
-};
-
-/** Mirrors @lail/shared ContextMention */
-export type ContextMention =
-  | { type: "file"; path: string }
-  | { type: "folder"; path: string }
-  | { type: "search"; query: string };
-
-export type EditorSelection = {
-  path: string;
-  startLine: number;
-  endLine: number;
-  text: string;
-};
-
-/** Mirrors @lail/shared EditorSnapshot — client → server context pack */
-export type EditorSnapshot = {
-  openFiles: Array<{ path: string; content?: string }>;
-  activePath?: string | null;
-  selection?: EditorSelection | null;
-  mentions: ContextMention[];
 };
 
 export type UsageSummary = {
@@ -765,36 +630,4 @@ export type UsageSummary = {
   daily: Array<{ date: string; prompt: number; completion: number }>;
   mix: { prompt: number; completion: number };
   topModels: Array<{ model: string; tokens: number; calls: number }>;
-};
-
-export type ModelCard = {
-  id: string;
-  name: string;
-  author?: string;
-  downloads?: number;
-  likes?: number;
-  tags?: string[];
-  license?: string;
-  sizeHint?: string;
-  quantizations?: string[];
-  hardwareFit?: string;
-  local?: boolean;
-  backends?: string[];
-  pipeline_tag?: string;
-};
-
-export type AgentMode = "plan" | "ask" | "agent";
-
-export type Patch = {
-  id: string;
-  runId: string;
-  sessionId: string;
-  path: string;
-  oldString: string;
-  newString: string;
-  op: "replace" | "create" | "delete";
-  status: "pending" | "accepted" | "rejected" | "failed";
-  reason?: string;
-  createdAt: string;
-  resolvedAt?: string;
 };

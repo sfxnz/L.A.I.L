@@ -3,7 +3,7 @@
  * reconnect are not duplicated, and the stream is not re-polled forever.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { api, watchJob } from "./api";
+import { api, ApiError, watchJob } from "./api";
 
 type Listener = (e: { data: string }) => void;
 
@@ -93,7 +93,7 @@ describe("watchJob", () => {
     await tick();
     expect((result as { status: string }).status).toBe("completed");
 
-    api.job = (() => Promise.reject(new Error('{"detail":"job not found"}'))) as typeof api.job;
+    api.job = (() => Promise.reject(new ApiError(404, '{"detail":"job not found"}', null))) as typeof api.job;
     const statuses: string[] = [];
     watchJob("gone", () => {}, (s) => statuses.push(s.status), () => {});
     for (let k = 0; k < 3; k++) FakeEventSource.all[1].onerror?.();

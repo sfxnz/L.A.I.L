@@ -14,7 +14,6 @@ const servePort = process.env.LAIL_SERVE_ENGINE_PORT || "8765";
 const dataDir = resolve(process.env.LAIL_DATA_DIR || join(root, "data"));
 
 mkdirSync(dataDir, { recursive: true });
-mkdirSync(join(root, "workspaces/demo"), { recursive: true });
 
 process.env.LAIL_ROOT = root;
 process.env.LOCAL_AI_LAB_ROOT = root;
@@ -125,10 +124,8 @@ run(
   join(root, "apps/web"),
   {
     PORT: webPort,
-    // Server-side rewrite target (Next → controller on this host). Do NOT bake
-    // NEXT_PUBLIC_LAIL_WS to 127.0.0.1 — the browser would connect to the
-    // client's loopback (broken for Mac→Spark Tailscale). Client derives WS
-    // from window.location.hostname in apps/web/lib/ws.ts.
+    // Server-side rewrite target (Next → controller on this host). The browser
+    // only ever talks to Next (same origin), so nothing here is baked for it.
     LAIL_API_URL: `http://127.0.0.1:${apiPort}`,
     NEXT_PUBLIC_LAIL_API: `http://127.0.0.1:${apiPort}`,
     LAIL_TOKEN: process.env.LAIL_TOKEN || "",

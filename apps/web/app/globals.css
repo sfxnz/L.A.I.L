@@ -598,15 +598,12 @@ html.animus-theming .lab-card {
 }
 .bento-span-3,
 .bento-span-4,
-.bento-span-6,
-.bento-span-8,
 .bento-span-12 {
   grid-column: span 12;
 }
 @media (min-width: 640px) {
   .bento-span-3,
-  .bento-span-4,
-  .bento-span-6 {
+  .bento-span-4 {
     grid-column: span 6;
   }
 }
@@ -616,12 +613,6 @@ html.animus-theming .lab-card {
   }
   .bento-span-4 {
     grid-column: span 4;
-  }
-  .bento-span-6 {
-    grid-column: span 6;
-  }
-  .bento-span-8 {
-    grid-column: span 8;
   }
 }
 

@@ -11,12 +11,10 @@ import {
   LAB_STATUS_POLL_MS,
   SAMPLES_KEEP_MS,
   STALE_AFTER_S,
-  ageOf,
   ingestStatus,
   isOlder,
   isStale,
   mergeTick,
-  ownsEndpoint,
   pushSamples,
   sameLiveRun,
   serverNow,
@@ -164,7 +162,6 @@ describe("freshness against the server clock", () => {
     // the server's "now" counts the snapshot's age when served (stale_s) and the time since
     expect(serverNow(clock, receivedAt + 1500)).toBe(1_001_700);
     expect(snapshotAge(clock, receivedAt + 1500)).toBeCloseTo(1.7, 5);
-    expect(ageOf(clock, 999_000, receivedAt)).toBeCloseTo(1.2, 5);
     expect(isStale(clock, 3, receivedAt + 1000)).toBe(false);
     expect(isStale(clock, 3, receivedAt + 4000)).toBe(true);
     expect(isStale({ ...clock, unreachable: true }, 3, receivedAt)).toBe(true);
@@ -185,12 +182,6 @@ describe("freshness against the server clock", () => {
 });
 
 describe("nodes", () => {
-  test("only the LOCAL serving node owns the endpoint the serve-engine probes", () => {
-    expect(ownsEndpoint(node("spark1", 1))).toBe(true);
-    expect(ownsEndpoint(node("spark2", 1, { local: false }))).toBe(false);
-    expect(ownsEndpoint(node("spark1", 1, { state: "serving_worker" }))).toBe(false);
-  });
-
   test("tightestNode: the live node with the least MemAvailable; down nodes skipped", () => {
     const nodes = [
       node("spark1", 1, { available_gib: 14.2 }),

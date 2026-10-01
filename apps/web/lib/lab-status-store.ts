@@ -120,15 +120,6 @@ function num(v: unknown): number | null {
 
 export const EMPTY_SAMPLES: Samples = { endpoint: [], nodes: {} };
 
-/**
- * The node whose endpoint serve.metrics describes: the serve-engine probes the endpoint
- * of the host it runs on, so only the LOCAL serving node owns those rates. A TP worker
- * serves the same tokens, and a remote node serving on its own is not what was probed.
- */
-export function ownsEndpoint(n: ClusterNode): boolean {
-  return n.state === "serving" && !!n.local;
-}
-
 /** A node that has a current reading (the local host, or a remote that answers). */
 function nodeLive(n: ClusterNode): boolean {
   return !!(n.local || n.online);
@@ -356,13 +347,6 @@ export function serverNow(s: Clock, now = Date.now()): number | null {
 export function snapshotAge(s: Clock, now = Date.now()): number | null {
   if (s.receivedAt == null || !s.status?.serve) return null;
   return Math.max(0, num(s.status.serve.stale_s) ?? 0) + Math.max(0, now - s.receivedAt) / 1000;
-}
-
-/** Seconds since a server-clock timestamp from the current snapshot (e.g. node.sampled_at). */
-export function ageOf(s: Clock, serverMs: number | null | undefined, now = Date.now()): number | null {
-  const sn = serverNow(s, now);
-  if (sn == null || serverMs == null) return null;
-  return Math.max(0, (sn - serverMs) / 1000);
 }
 
 /**

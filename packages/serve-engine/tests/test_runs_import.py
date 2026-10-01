@@ -140,3 +140,20 @@ def test_init_db_rekinds_retired_perf_rows_once(isolated_data):
     db.init_db()  # idempotent
     kinds = {r["run_id"]: r["kind"] for r in db.list_runs(10)}
     assert kinds == {"perfpy": "legacy_decode", "ctrl": "decode", "wf": "legacy_perf_workflow"}
+
+
+def test_init_db_rekind_survives_malformed_summary_json(isolated_data):
+    from app import db
+
+    _row("ok", "2026-09-21T00:00:00", "decode", {"aggregate_peak_tok_per_s": 96.0})
+    with db._conn() as c:
+        for rid, raw in (("empty", ""), ("broken", "{not json")):
+            c.execute(
+                "INSERT INTO runs (run_id, created_at, kind, intent, model_id, summary_json, path) VALUES (?,?,?,?,?,?,?)",
+                (rid, "2026-09-22T00:00:00", "decode", None, None, raw, ""),
+            )
+        c.commit()
+    db.init_db()  # must not raise "malformed JSON" and abort serve-engine startup
+    with db._conn() as c:
+        kinds = {r[0]: r[1] for r in c.execute("SELECT run_id, kind FROM runs")}
+    assert kinds == {"ok": "decode", "empty": "decode", "broken": "decode"}

@@ -79,9 +79,10 @@ class JobLog:
 def request_cancel(job_id: str) -> dict[str, Any] | None:
     """Flag a job for cancellation; returns the job row or None if unknown.
 
-    The runner flips the row to `cancelled` at its next check (between bench waves,
-    per SSE chunk). A queued/running row with no runner in this process (orphaned by
-    a restart) is marked `cancelled` directly.
+    The runner flips the row to `cancelled` at its next check: before each golden case;
+    for tool-eval, a watcher terminates the subprocess group within ~0.5 s. Serve jobs do
+    not honour cancel yet. A queued/running row with no runner in this process (orphaned
+    by a restart) is marked `cancelled` directly.
     """
     ev = _cancel_events.get(job_id)
     if ev is not None:

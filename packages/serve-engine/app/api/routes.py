@@ -206,10 +206,11 @@ def get_job(job_id: str) -> dict[str, Any]:
 def cancel_job(job_id: str) -> dict[str, Any]:
     """Request cancellation. Job states: queued → running → completed | failed | cancelled.
 
-    Sets the job's cancel flag; the runner writes `cancelled` at its next check
-    (between golden cases, per tool-eval-bench output line — the subprocess is
-    terminated), so `status` here is usually still `running`. A job with no runner in this process (orphaned by a restart) is
-    marked `cancelled` immediately. Already-terminal jobs are returned unchanged.
+    Sets the job's cancel flag; the runner writes `cancelled` at its next check (before
+    each golden case; tool-eval's subprocess group is terminated by a watcher within
+    ~0.5 s; serve jobs do not honour cancel yet), so `status` here is usually still
+    `running`. A job with no runner in this process (orphaned by a restart) is marked
+    `cancelled` immediately. Already-terminal jobs are returned unchanged.
     """
     job = jobs.request_cancel(job_id)
     if not job:

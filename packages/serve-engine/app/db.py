@@ -53,11 +53,14 @@ def init_db() -> None:
         # The retired serve-engine decode bench (perf.py: 256 tokens, no warmup, other
         # percentile/TPOT definitions) wrote kind='decode' with `summary.workload`, and its
         # external runners wrote perf_*. Re-kind them `legacy_*` once so `decode` means the
-        # one controller bench and old rows never ghost or delta against new ones.
+        # one controller bench and old rows never ghost or delta against new ones. A row
+        # with malformed summary JSON is left alone (json_extract would abort startup).
         c.execute(
             """
             UPDATE runs SET kind = 'legacy_' || kind
-            WHERE (kind = 'decode' AND json_extract(summary_json, '$.workload') IS NOT NULL)
+            WHERE (kind = 'decode'
+                   AND CASE WHEN json_valid(summary_json)
+                            THEN json_extract(summary_json, '$.workload') END IS NOT NULL)
                OR kind IN ('perf_workflow', 'perf_prefill_decode', 'perf_concurrency')
             """
         )

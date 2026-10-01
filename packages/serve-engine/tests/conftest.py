@@ -8,9 +8,13 @@ from app.services import agentic
 from app.services import jobs
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def isolated_data(monkeypatch, tmp_path):
-    """Fresh sqlite + runs/logs under tmp_path — never the repo's data/."""
+    """Fresh sqlite + runs/logs under tmp_path — never the repo's data/.
+
+    Autouse: the app lifespan (init_db's re-kind, fail_orphaned_jobs) writes the DB, and a
+    test run in the live checkout must never flip the running serve-engine's jobs to failed.
+    """
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "lab.sqlite")
     runs = tmp_path / "runs"
     runs.mkdir()

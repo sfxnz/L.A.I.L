@@ -396,6 +396,33 @@ function resolveArtifactFile(dir: string, relPath: string, anyType: boolean): Ar
   return { abs, contentType: playable ? mimeFor(abs) : "application/octet-stream", playable };
 }
 
+/**
+ * The sandbox gives artifacts an opaque origin, where touching localStorage /
+ * sessionStorage throws a SecurityError — and model-written games often keep a high
+ * score there. This runs before any of the artifact's scripts and, only where access
+ * throws, puts an in-memory Storage in its place (lost on reload, never shared).
+ * IndexedDB and cookies stay unavailable.
+ */
+const STORAGE_SHIM =
+  "<script>(function(){function S(){var m=new Map();return{get length(){return m.size}," +
+  "key:function(i){var k=Array.from(m.keys())[i];return k===undefined?null:k}," +
+  "getItem:function(k){k=String(k);return m.has(k)?m.get(k):null}," +
+  "setItem:function(k,v){m.set(String(k),String(v))},removeItem:function(k){m.delete(String(k))}," +
+  "clear:function(){m.clear()}}}" +
+  '["localStorage","sessionStorage"].forEach(function(n){try{window[n]}catch(e){' +
+  "try{Object.defineProperty(window,n,{value:S(),configurable:true})}catch(_){}}})})();</script>";
+
+/** An artifact's bytes as served: HTML gets the storage shim ahead of its own scripts. */
+export function artifactBody(abs: string, contentType: string): BodyInit {
+  const bytes = readFileSync(abs);
+  if (!contentType.startsWith("text/html")) return bytes;
+  const html = bytes.toString("utf8");
+  // After the doctype (anything before it would switch the page to quirks mode).
+  const doctype = html.match(/^\uFEFF?\s*<!doctype[^>]*>/i);
+  const at = doctype ? doctype[0].length : 0;
+  return html.slice(0, at) + STORAGE_SHIM + html.slice(at);
+}
+
 /** Safe response headers for untrusted model-generated HTML/JS. */
 export function publicPlayHeaders(contentType: string): Record<string, string> {
   return {

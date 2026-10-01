@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createApp } from "../app";
 import { config } from "../config";
-import { importLabRun, playKey, publishLabRun } from "./store";
+import { artifactBody, importLabRun, playKey, publishLabRun } from "./store";
 
 const prevToken = config.token;
 const src = mkdtempSync(join(tmpdir(), "lail-play-src-"));
@@ -48,6 +48,22 @@ describe("private lab play (capability URL)", () => {
     const asset = await app.request(`${run.artifacts_url}js/main.js`);
     expect(asset.status).toBe(200);
     expect(await asset.text()).toBe("console.log(1)");
+  });
+
+  test("HTML gets an in-memory storage shim before its own scripts; other files are untouched", async () => {
+    const app = createApp();
+    const html = await (await app.request(run.play_url)).text();
+    expect(html.indexOf("localStorage")).toBeGreaterThanOrEqual(0);
+    expect(html.indexOf("defineProperty")).toBeLessThan(html.indexOf('<script src="js/main.js">'));
+    expect(await (await app.request(`${run.artifacts_url}js/main.js`)).text()).toBe("console.log(1)");
+  });
+
+  test("the shim goes after a doctype, never before it (no quirks mode)", () => {
+    const f = join(src, "doc.html");
+    writeFileSync(f, "<!DOCTYPE html>\n<html><body><script>localStorage.getItem('best')</script></body></html>");
+    const out = String(artifactBody(f, "text/html; charset=utf-8"));
+    expect(out.startsWith("<!DOCTYPE html><script>")).toBe(true);
+    expect(String(artifactBody(f, "text/plain"))).not.toContain("defineProperty");
   });
 
   test("wrong, foreign or missing keys and non-artifact files are refused", async () => {

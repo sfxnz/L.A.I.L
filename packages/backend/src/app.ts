@@ -9,6 +9,7 @@ import { createStreamsRoutes } from "./streams/routes";
 import { config } from "./config";
 import { allowQueryToken, isCrossSiteWrite, isPublicUnauthedPath, isUntrustedHost, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
+  artifactBody,
   compareLabRuns,
   getLabRun,
   getPublicBySlug,
@@ -22,7 +23,6 @@ import {
   resolvePublicFile,
   resolveRunArtifact,
 } from "./lab/store";
-import { readFileSync } from "fs";
 
 export function createApp() {
   const app = new Hono();
@@ -242,7 +242,7 @@ export function createApp() {
         "Cache-Control": "private, no-cache",
       };
       if (!playable) headers["Content-Disposition"] = "attachment";
-      return new Response(readFileSync(abs), { headers });
+      return new Response(artifactBody(abs, contentType), { headers });
     } catch (e) {
       const err = e as Error & { code?: string };
       const status = err.code === "forbidden_type" ? 403 : err.code === "bad_path" ? 400 : 404;
@@ -273,7 +273,7 @@ export function createApp() {
     if (!rel || rel === "index.html") return servePublicIndex(slug);
     try {
       const { abs, contentType } = resolvePublicFile(slug, rel);
-      return new Response(readFileSync(abs), {
+      return new Response(artifactBody(abs, contentType), {
         headers: publicPlayHeaders(contentType),
       });
     } catch (e) {
@@ -310,7 +310,7 @@ export function createApp() {
 function servePublicIndex(slug: string): Response {
   try {
     const { abs, contentType } = resolvePublicFile(slug, "index.html");
-    return new Response(readFileSync(abs), {
+    return new Response(artifactBody(abs, contentType), {
       headers: publicPlayHeaders(contentType),
     });
   } catch {

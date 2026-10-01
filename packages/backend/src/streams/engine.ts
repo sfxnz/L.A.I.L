@@ -829,7 +829,8 @@ export class StreamsEngine {
       // One body for every engine (checked upstream): SGLang accepts continuous_usage_stats,
       // min_tokens, ignore_eos and chat_template_kwargs (openai/protocol.py @ b51d4a04);
       // llama.cpp and TensorFold honour ignore_eos + chat_template_kwargs and ignore the
-      // rest, reporting usage once at the end — the calibrated fallback counts those streams.
+      // rest, reporting usage once at the end: until it arrives those strands count 1 token
+      // per chunk (not exact), so their live tok/s is a chunk rate; the final usage corrects the total.
       stream_options: { include_usage: true, continuous_usage_stats: true },
     };
     if (run.fill_to_max) {

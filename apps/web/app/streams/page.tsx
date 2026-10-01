@@ -83,7 +83,7 @@ function StreamsRoom() {
   const [controls, setControls] = useState<StreamControls>(DEFAULT_CONTROLS);
   const [runControls, setRunControls] = useState<RunControls>({});
   const [runId, setRunId] = useState<string | null>(urlRun);
-  const { state, stop } = useStreamRun(runId);
+  const { state } = useStreamRun(runId);
   const [runs, setRuns] = useState<StreamRunRow[]>([]);
   const [starting, setStarting] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -248,9 +248,9 @@ function StreamsRoom() {
   }, [attach, canRun, controls, live, starting]);
 
   const doStop = useCallback(() => {
-    if (!live) return;
-    void stop().catch(() => {});
-  }, [live, stop]);
+    if (!live || !runId) return;
+    void api.stopStreamRun(runId).catch(() => {});
+  }, [live, runId]);
 
   const exportOpts = useMemo(() => ({ ...runControls, packLabel }), [runControls, packLabel]);
 
@@ -376,7 +376,7 @@ function StreamsRoom() {
   // ── Derived view bits ────────────────────────────────────────────────────
   const maxTokens = state.hello?.max_tokens ?? controls.max_tokens;
   const fillToMax = runControls.fill_to_max ?? false;
-  const tpc = state.latest?.tokens_per_chunk ?? 1;
+  const tokensExact = state.latest?.tokens_exact ?? true;
   const liveRates = state.latest?.strand_tok_s;
   const ringState = needToken ? "token" : unreachable ? "offline" : loading ? null : live ? "loading" : anyUp ? "serving" : "idle";
   const ringWord = needToken
@@ -517,7 +517,7 @@ function StreamsRoom() {
                       packLabel={packLabel(s.pack)}
                       maxTokens={maxTokens}
                       fillToMax={fillToMax}
-                      tokensPerChunk={tpc}
+                      tokensExact={tokensExact}
                       liveRate={liveRates?.[s.i] ?? 0}
                       desync={desyncs[k]}
                       focused={focused === s.i}
@@ -584,7 +584,7 @@ function StreamsRoom() {
       <TranscriptSheet
         strand={sheetStrand}
         packLabel={sheetStrand ? packLabel(sheetStrand.pack) : ""}
-        tokensPerChunk={tpc}
+        tokensExact={tokensExact}
         open={sheet !== null}
         onOpenChange={(open) => {
           if (!open) setSheet(null);

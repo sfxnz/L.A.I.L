@@ -187,6 +187,8 @@ export type LabStatus = {
     healthy?: boolean;
     base_url?: string;
     model_id?: string | null;
+    /** Age of the serve-engine sampler snapshot (s). */
+    stale_s?: number | null;
     models?: Array<{ id: string }>;
     /** vLLM /version, as sampled today. */
     version?: { version?: string | null } | null;

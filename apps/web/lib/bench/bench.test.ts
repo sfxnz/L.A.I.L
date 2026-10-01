@@ -14,7 +14,8 @@ import {
 } from "./eta";
 import { benchMarkdown, decodeMarkdown, prefillMarkdown, quantFromModelId } from "./export";
 import { fmtDuration, fmtMs, fmtSize, fmtTokS } from "./format";
-import { findKnee, interpretDecode, interpretPrefill, referenceGain, suggestLevels } from "./interpret";
+import { findKnee, interpretDecode, interpretPrefill, referenceGain, spread, suggestLevels } from "./interpret";
+import { previousOf, type HistoryEntry } from "./use-run-history";
 import {
   CONCURRENCY_LEVELS,
   LEVEL_PRESETS,
@@ -26,6 +27,7 @@ import {
   toggleLevel,
 } from "./levels";
 import {
+  comparable,
   decodeArmsFromLevels,
   headlineFromResult,
   peakArm,
@@ -39,9 +41,15 @@ import {
 
 // The sparkDash reference run: Prose · 512 tok · 1,2,4,6,8.
 const ARM = (c: number, aggregate: number, perStream: number, ttft: number, ok = c): DecodeArm => ({
+  samples: 1,
+  foreignMax: 0,
+  server: null,
   concurrency: c,
   aggregate,
+  steady: aggregate,
+  aggregateRange: null,
   perStream,
+  perStreamRange: null,
   ttftP50: ttft,
   ttftP95: ttft * 1.3,
   ttftP99: ttft * 1.6,
@@ -141,8 +149,31 @@ describe("decode interpretation", () => {
   test("single level and empty input degrade honestly", () => {
     const one = interpretDecode([SPARK[0]], { floor: 20, sloMs: 500 });
     expect(one.efficiency).toBeNull();
-    expect(one.sentence).toBe("Single stream at ×1: 54.4 tok/s, TTFT p50 160 ms — add levels to see scaling; best interactive point ×1 — 54.4 tok/s per stream, TTFT p50 160 ms.");
+    expect(one.sentence).toBe("Single stream: 54.4 tok/s, TTFT p50 160 ms — add levels to see scaling; best interactive point ×1 — 54.4 tok/s per stream, TTFT p50 160 ms.");
+    // ×1's sentence quotes the per-stream decode rate, not the wall-clock aggregate
+    expect(interpretDecode([{ ...SPARK[0], aggregate: 50.1 }], { floor: 20, sloMs: 500 }).sentence).toStartWith("Single stream: 54.4 tok/s");
     expect(interpretDecode([], { floor: 20, sloMs: 500 }).sentence).toContain("nothing to interpret");
+  });
+
+  test("a gain drop inside the measured spread is noise, not a knee or saturation", () => {
+    // ×8→×16 adds 1.6/stream (< 25 % of 32.1), but the waves of ×8 and ×16 scattered ±30
+    const noisy = [...SPARK.slice(0, 4), { ...SPARK[4], aggregateRange: [177, 237] as [number, number] }, { ...ARM(16, 220, 13.75, 900), aggregateRange: [190, 250] as [number, number] }];
+    expect(spread(noisy[4])).toBe(30);
+    expect(findKnee(noisy, 5).knee).toBeNull();
+    expect(interpretDecode(noisy, { floor: 5, sloMs: 5000 }).saturated).toBe(false);
+    // the same drop measured tightly is a knee
+    const tight = [...SPARK.slice(0, 4), { ...SPARK[4], aggregateRange: [205, 209] as [number, number] }, { ...ARM(16, 220, 13.75, 900), aggregateRange: [218, 222] as [number, number] }];
+    expect(findKnee(tight, 5)).toMatchObject({ knee: 16, reason: "marginal" });
+  });
+
+  test("contended levels are named and kept out of the knee and saturation calls", () => {
+    // ×16 lost throughput only because foreign requests shared the GPU
+    const arms = [...SPARK, { ...ARM(16, 150, 9.4, 900), foreignMax: 6 }];
+    const it = interpretDecode(arms, { floor: 5, sloMs: 5000 });
+    expect(it.contended).toEqual([16]);
+    expect(it.knee).toBeNull();
+    expect(it.saturated).toBe(false);
+    expect(it.sentence).toContain("×16 contended (foreign requests on the server)");
   });
 
   test("failed levels (ok = 0) are ignored by the maths but kept in the arms", () => {
@@ -155,9 +186,13 @@ describe("decode interpretation", () => {
 
 describe("prefill interpretation", () => {
   const P = (size: number, tokS: number, ttftMs: number): PrefillArm => ({
+    samples: 1,
+    foreignMax: 0,
+    server: null,
     size,
     promptTokens: size + 38,
     prefillTokS: tokS,
+    prefillRange: null,
     ttftMs,
     ok: 1,
     requests: 1,
@@ -225,6 +260,13 @@ describe("ETA maths", () => {
     expect(etaDecodeMs({ levels: [1, 2], maxTokens: 512, measured, current: null })).toBe(0);
   });
 
+  test("repeats: a level of concurrency c costs ⌈samples ÷ c⌉ waves, the current level its later waves", () => {
+    const one = etaDecodeMs({ levels: [1, 2, 4], maxTokens: 512, measured: [measured[0]], current: { concurrency: 2, tokens: [512, 512], rateTokS: 45.1, waitingFirstToken: 0, wavesLeft: 1 }, samples: 3 })!;
+    // current wave done; one more ×2 wave (512/45.1 s + 0.8×160×2 ms), then ×4: 1 wave at predict(4) = 54.4 (one measured level)
+    const expected = ((512 / 45.1) * 1000 + 256 + ((512 / 54.4) * 1000 + 0.8 * 160 * 4)) * ETA_PAD;
+    expect(one).toBeCloseTo(expected, -1);
+  });
+
   test("revision falls freely and rises only past 25 %", () => {
     expect(reviseEta(60_000, 50_000)).toBe(50_000);
     expect(reviseEta(60_000, 70_000)).toBe(60_000);
@@ -249,6 +291,11 @@ describe("ETA maths", () => {
     expect(eta).toBeCloseTo(expected, -2);
     expect(etaPrefillMs({ sizes: [8192, 16384, 262144], measured: m, skipped: new Set([262144]), current: null })).toBe(0);
     expect(etaPrefillMs({ sizes: [8192], measured: [], skipped: new Set(), current: { size: 8192, elapsedMs: 100 } })).toBeNull();
+    // two requests per size: the current size's next request and both of every later size
+    const two = etaPrefillMs({ sizes: [8192, 16384, 32768], measured: m.slice(0, 1).concat(m[1]), skipped: new Set(), current: null, samples: 2 });
+    expect(two).toBeCloseTo(5540 * r * 2 * ETA_PAD, -2);
+    const mid = etaPrefillMs({ sizes: [8192, 16384, 32768], measured: m, skipped: new Set(), current: { size: 32768, elapsedMs: 1000, requestsLeft: 1 }, samples: 2 });
+    expect(mid).toBeCloseTo((5540 * r - 1000 + 5540 * r) * ETA_PAD, -2);
   });
 });
 
@@ -263,6 +310,8 @@ describe("Markdown export", () => {
     createdAt: "2026-09-05T20:00:00Z",
     durationMs: 77_000,
     engine: "vllm 0.28.1",
+    fingerprint: "8488b677",
+    hardware: null,
     source: "history",
     levels: [1, 2, 4, 6, 8],
     arms: SPARK,
@@ -290,8 +339,8 @@ describe("Markdown export", () => {
       kind: "prefill",
       sizes: [8192, 262144],
       arms: [
-        { size: 8192, promptTokens: 8230, prefillTokS: 2874.9, ttftMs: 2860, ok: 1, requests: 1, errors: [], skipped: null },
-        { size: 262144, promptTokens: null, prefillTokS: null, ttftMs: null, ok: 0, requests: 0, errors: [], skipped: "size 262144 ≥ max_model_len 262144" },
+        { samples: 1, foreignMax: 0, server: null, size: 8192, promptTokens: 8230, prefillTokS: 2874.9, prefillRange: null, ttftMs: 2860, ok: 1, requests: 1, errors: [], skipped: null },
+        { samples: null, foreignMax: null, server: null, size: 262144, promptTokens: null, prefillTokS: null, prefillRange: null, ttftMs: null, ok: 0, requests: 0, errors: [], skipped: "size 262144 ≥ max_model_len 262144" },
       ],
     };
     const lines = prefillMarkdown(prefill).trim().split("\n");
@@ -359,18 +408,78 @@ describe("result shaping", () => {
     expect(headlineFromResult(r)).toEqual({ c1: 54.4, peak: 86.5, peakAt: 2, sustained: null });
   });
 
-  test("retired perf.py envelope (workload string, concurrencies) still reads", () => {
+  test("repeats, spread, contention, the server's view, fingerprint and hardware ride along from the envelope", () => {
     const envelope = {
       kind: "decode",
       model: { id: "nvidia/Qwen3.8-Flash-Next-NVFP4" },
-      workload: { kind: "prose", concurrencies: [1, 8], max_tokens: 256 },
-      metrics: { arms: [{ concurrency: 1, ok: 1, requests: 1, ttft_s: { p50: 0.68 }, aggregate_tok_per_s: 31.65, decode_tok_per_s_median: 34.59, errors: [] }] },
+      engine: { name: "vllm", version: "0.30.0", flags_fingerprint: "8488b677" },
+      workload: { pack: "prose", levels: [1], samples: 3, max_tokens: 512, serve_fingerprint: "8488b677" },
+      metrics: {
+        arms: [
+          {
+            concurrency: 1,
+            ok: 3,
+            requests: 3,
+            samples: 3,
+            ttft_s: { p50: 0.16, p95: null, p99: null },
+            aggregate_tok_per_s: 52.1,
+            aggregate_steady_tok_per_s: 54.4,
+            aggregate_range: [50.2, 53.0],
+            decode_tok_per_s_median: 54.4,
+            per_stream_range: [53.1, 55.0],
+            foreign_max: 0,
+            server: { spec_acceptance: 0.86, spec_tokens_per_step: 3.58, ttft_mean_ms: 150, prefill_tok_s: null, preemptions: 0 },
+            tpot_s: 0.0184,
+            errors: [],
+          },
+        ],
+        hardware: { series: [], nodes: [{ id: "spark1", samples: 9, temp_max_c: 61, temp_mean_c: 57.2, power_mean_w: 88.1, available_min_gib: 14 }], energy_j: 2210, energy_j_per_token: 1.44 },
+      },
     };
-    const r = resultFromEnvelope(index, envelope);
+    const r = resultFromEnvelope({ ...index, summary: { pack: "prose" } }, envelope);
     if (r?.kind !== "decode") throw new Error("kind");
-    expect(r.pack).toBe("prose");
-    expect(r.levels).toEqual([1, 8]);
-    expect(r.arms[0]).toMatchObject({ ttftP50: 680, aggregate: 31.65, perStream: 34.59, tpotMs: null });
+    expect(r.fingerprint).toBe("8488b677");
+    expect(r.hardware).toEqual({ nodes: envelope.metrics.hardware.nodes, energy_j: 2210, energy_j_per_token: 1.44 });
+    expect(r.arms[0]).toMatchObject({ samples: 3, steady: 54.4, aggregateRange: [50.2, 53.0], perStreamRange: [53.1, 55.0], foreignMax: 0, ttftP95: null });
+    expect(r.arms[0].server?.spec_acceptance).toBe(0.86);
     expect(resultFromEnvelope(index, null)).toBeNull();
+  });
+});
+
+describe("comparability", () => {
+  const key = { model: "m", pack: "prose", maxTokens: 512, fingerprint: "fp" };
+  test("like for like: model, pack, tokens/stream and serve fingerprint must all match", () => {
+    expect(comparable(key, { ...key })).toBe(true);
+    expect(comparable(key, { ...key, model: "other" })).toBe(false);
+    expect(comparable(key, { ...key, pack: "code" })).toBe(false);
+    expect(comparable(key, { ...key, maxTokens: 256 })).toBe(false);
+    expect(comparable(key, { ...key, fingerprint: "fp2" })).toBe(false);
+    // unknown fingerprint (runs before it was recorded) compares with nothing
+    expect(comparable({ ...key, fingerprint: null }, { ...key, fingerprint: null })).toBe(false);
+  });
+
+  test("the ghost is the newest earlier comparable run", () => {
+    const res = (id: string, createdAt: string, over: Partial<DecodeResult> = {}): DecodeResult => ({
+      kind: "decode",
+      id,
+      savedRunId: id,
+      model: "m",
+      pack: "prose",
+      maxTokens: 512,
+      createdAt,
+      durationMs: null,
+      engine: null,
+      fingerprint: "fp",
+      hardware: null,
+      source: "history",
+      levels: [1],
+      arms: [],
+      ...over,
+    });
+    const entry = (r: DecodeResult): HistoryEntry => ({ id: r.id!, source: "engine", createdAt: r.createdAt!, model: r.model, headline: { c1: null, peak: null, peakAt: null, sustained: null }, result: r, envelope: null, failed: false });
+    const cur = res("c", "2026-09-30");
+    const entries = [cur, res("a", "2026-09-29", { maxTokens: 256 }), res("b", "2026-09-28", { fingerprint: "old" }), res("d", "2026-09-27")].map(entry);
+    expect(previousOf(entries, cur)?.id).toBe("d");
+    expect(previousOf(entries.slice(0, 3), cur)).toBeNull();
   });
 });

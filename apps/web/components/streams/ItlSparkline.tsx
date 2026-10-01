@@ -4,7 +4,8 @@ import { STALL_MS, stallIndices } from "@/lib/streams/stalls";
 import { cn } from "@/lib/utils";
 
 /**
- * Inter-token latency, last ≤100 gaps, with stall markers (≥ 2 s) as warn
+ * Decode-step gaps (time between output chunks; a chunk carries 1–4 tokens
+ * under speculative decoding), last ≤100, with stall markers (≥ 2 s) as warn
  * ticks. Y is clamped to 4× the median so one stall does not flatten the rest
  * of the trace; the stall itself is the marker.
  */
@@ -38,7 +39,7 @@ export function ItlSparkline({
       preserveAspectRatio="none"
       className={cn("block overflow-visible text-lab-line-2", className)}
       role="img"
-      aria-label={label ?? (n ? `Inter-token latency, ${n} gaps, ${stalls.length} stalls` : "No inter-token latency yet")}
+      aria-label={label ?? (n ? `Decode step gaps, ${n} steps, ${stalls.length} stalls` : "No decode steps yet")}
     >
       <line x1="0" x2={width} y1={height - 1} y2={height - 1} stroke="var(--animus-hairline)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
       {n > 1 && <path d={line} fill="none" stroke="currentColor" strokeWidth="1" vectorEffect="non-scaling-stroke" opacity="0.9" />}

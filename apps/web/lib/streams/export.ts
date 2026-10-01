@@ -3,6 +3,7 @@
  * a per-strand table, optionally with transcripts) and a JSON snapshot of the
  * client state. Pure — the page supplies the state and the run's controls.
  */
+import { LIVE_RATE_WINDOW_MS } from "@lail/shared";
 import type { StreamRunState, StrandView } from "../use-stream-run";
 import { fmtDuration, fmtInt, fmtMs, fmtRate } from "./format";
 import { itlStats } from "./stalls";
@@ -23,21 +24,28 @@ export type ExportOptions = RunControls & {
 
 const cell = (v: string) => v.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 
-/** The method chip's words, so the export says which number it is quoting. */
+const WINDOW = `${LIVE_RATE_WINDOW_MS / 1000} s window`;
+
+/**
+ * The method chip's words, so the export says which number it is quoting. Live and
+ * final are the same metric: the live value is tokens in the sliding window; the final
+ * one is the decode-span aggregate, which is that live rate averaged over the run.
+ * (Wall-clock "goodput" — including TTFT — is a separate number with its own label.)
+ */
 export function aggregateMethod(state: StreamRunState): { value: number | null; method: string } {
-  const tpc = state.latest?.tokens_per_chunk ?? 1;
-  const liveMethod = tpc > 1 ? `live · usage-calibrated ×${tpc.toFixed(1)} tok/chunk` : "live · chunk estimate";
+  const source = state.latest && !state.latest.tokens_exact ? "chunk count" : "usage tokens";
+  const liveMethod = `live · ${WINDOW} · ${source}`;
   if (state.done) {
-    const final = state.done.summary.aggregate_tok_s;
-    if (final !== null) return { value: final, method: "final · usage" };
-    // A cancelled run has no usage frames to settle on: quote the last live sample and say so.
-    return { value: state.latest?.tok_s ?? null, method: `last sample · ${liveMethod.replace(/^live · /, "")}` };
+    const final = state.done.summary.aggregate_steady_tok_s;
+    if (final != null) return { value: final, method: "final · decode span" };
+    // Nothing finished to settle on: quote the last live sample and say so.
+    return { value: state.latest?.tok_s ?? null, method: `last sample · ${WINDOW} · ${source}` };
   }
   return { value: state.latest?.tok_s ?? null, method: liveMethod };
 }
 
 function strandRow(s: StrandView, packLabel: (id: string) => string): string {
-  const itl = itlStats(s.itl_ms);
+  const itl = itlStats(s.step_ms, s.step_tokens);
   const reasoningShare = s.chunks ? s.reasoning_chunks / s.chunks : 0;
   return [
     String(s.i + 1),
@@ -79,7 +87,8 @@ export function markdownSummary(state: StreamRunState, opts: ExportOptions = {})
   lines.push("| Metric | Value |");
   lines.push("|---|---|");
   lines.push(`| Aggregate tok/s (${method}) | ${fmtRate(aggregate)} |`);
-  lines.push(`| Peak tok/s (live 1 s window) | ${fmtRate(sum?.peak_tok_s ?? latest?.peak_tok_s)} |`);
+  lines.push(`| Peak tok/s (live ${WINDOW}) | ${fmtRate(sum?.peak_tok_s ?? latest?.peak_tok_s)} |`);
+  if (sum) lines.push(`| Goodput tok/s (wall-clock, incl. TTFT) | ${fmtRate(sum.aggregate_tok_s)} |`);
   lines.push(`| Tokens | ${fmtInt(sum?.tokens ?? latest?.tokens)} |`);
   lines.push(`| TTFT p50 / p95 | ${fmtMs(sum?.ttft_p50_ms ?? latest?.ttft_p50_ms)} / ${fmtMs(sum?.ttft_p95_ms ?? latest?.ttft_p95_ms)} |`);
   lines.push(`| Per-strand median tok/s | ${fmtRate(sum?.per_stream_median_tok_s)} |`);
@@ -89,7 +98,7 @@ export function markdownSummary(state: StreamRunState, opts: ExportOptions = {})
   lines.push("");
   lines.push("## Strands");
   lines.push("");
-  lines.push("| # | Pack | Prompt | State | TTFT | Tokens | tok/s | Peak | ITL p50 / p95 ms | Thinking | Finish |");
+  lines.push("| # | Pack | Prompt | State | TTFT | Tokens | tok/s | Peak | ITL/token p50 / p95 ms | Thinking | Finish |");
   lines.push("|---|---|---|---|---|---|---|---|---|---|---|");
   for (const s of state.strands) lines.push(`| ${strandRow(s, packLabel)} |`);
   if (opts.transcripts) {
@@ -137,7 +146,8 @@ export function jsonSnapshot(state: StreamRunState, controls: RunControls = {}):
       error: s.error ?? null,
       chunks: s.chunks,
       reasoning_chunks: s.reasoning_chunks,
-      itl_ms: s.itl_ms ?? [],
+      step_ms: s.step_ms ?? [],
+      step_tokens: s.step_tokens ?? [],
       text: s.text,
       reasoning: s.reasoning,
     })),

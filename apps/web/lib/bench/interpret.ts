@@ -5,9 +5,15 @@
  *   efficiency      aggregate_N ÷ (N × aggregate_1) at the top level
  *   best interactive largest N whose per-stream median ≥ floor AND TTFT p50 ≤ SLO
  *   knee            first level whose marginal aggregate gain per added stream is
- *                   < 25 % of the ×1→×2 gain (the first two levels), or whose
- *                   per-stream median falls below the floor — whichever comes first
- *   saturated       the last level's marginal gain is < 25 % of the reference
+ *                   < 25 % of the ×1→×2 gain (the first two levels) by more than
+ *                   the measured spread, or whose per-stream median falls below the
+ *                   floor — whichever comes first
+ *   saturated       the last level's marginal gain is < 25 % of the reference, beyond
+ *                   the measured spread
+ *   spread          half the min–max of a level's per-wave aggregates (0 for one wave)
+ *   contended       a level that ran while the server held foreign requests is not
+ *                   used for the knee or saturation (its numbers are not a clean
+ *                   measurement)
  * Prefill:
  *   hold            1 − sustained ÷ peak prefill tok/s
  *   doubling ratios TTFT_i ÷ TTFT_{i−1}, normalised to one context doubling
@@ -19,6 +25,8 @@ export const KNEE_FRACTION = 0.25;
 
 export type DecodeInterpretation = {
   topLevel: number | null;
+  /** levels measured while foreign requests ran on the server */
+  contended: number[];
   efficiency: number | null;
   perStreamRatio: number | null;
   bestInteractive: DecodeArm | null;
@@ -40,11 +48,28 @@ function measured(arms: DecodeArm[]): DecodeArm[] {
     .sort((a, b) => a.concurrency - b.concurrency);
 }
 
+function isContended(a: DecodeArm): boolean {
+  return (a.foreignMax ?? 0) > 0;
+}
+
+/** Half the min–max of the level's per-wave aggregates; 0 when it ran one wave. */
+export function spread(a: DecodeArm): number {
+  return a.aggregateRange ? (a.aggregateRange[1] - a.aggregateRange[0]) / 2 : 0;
+}
+
 /** (agg_i − agg_{i−1}) ÷ (c_i − c_{i−1}) */
 function marginalGain(prev: DecodeArm, cur: DecodeArm): number | null {
   if (prev.aggregate === null || cur.aggregate === null) return null;
   const dc = cur.concurrency - prev.concurrency;
   return dc > 0 ? (cur.aggregate - prev.aggregate) / dc : null;
+}
+
+/** The marginal gain is below the threshold even at the top of the measured spread. */
+function clearlyBelow(prev: DecodeArm, cur: DecodeArm, threshold: number): boolean {
+  const gain = marginalGain(prev, cur);
+  if (gain === null) return false;
+  const dc = cur.concurrency - prev.concurrency;
+  return gain + (spread(prev) + spread(cur)) / dc < threshold;
 }
 
 /**
@@ -68,14 +93,13 @@ export function findKnee(
   arms: DecodeArm[],
   floor: number,
 ): { knee: number | null; reason: "marginal" | "floor" | null; reference: number | null } {
-  const ms = measured(arms);
+  const ms = measured(arms).filter((a) => !isContended(a));
   const reference = referenceGain(ms);
   for (let i = 0; i < ms.length; i++) {
     const a = ms[i];
     if (a.perStream !== null && a.perStream < floor) return { knee: a.concurrency, reason: "floor", reference };
-    if (i >= 2 && reference !== null && reference > 0) {
-      const gain = marginalGain(ms[i - 1], a);
-      if (gain !== null && gain < KNEE_FRACTION * reference) return { knee: a.concurrency, reason: "marginal", reference };
+    if (i >= 2 && reference !== null && reference > 0 && clearlyBelow(ms[i - 1], a, KNEE_FRACTION * reference)) {
+      return { knee: a.concurrency, reason: "marginal", reference };
     }
   }
   return { knee: null, reason: null, reference };
@@ -112,6 +136,7 @@ export function interpretDecode(arms: DecodeArm[], opts: InterpretOpts): DecodeI
   const ms = measured(arms);
   const empty: DecodeInterpretation = {
     topLevel: null,
+    contended: [],
     efficiency: null,
     perStreamRatio: null,
     bestInteractive: null,
@@ -130,20 +155,24 @@ export function interpretDecode(arms: DecodeArm[], opts: InterpretOpts): DecodeI
   const { knee, reason, reference } = findKnee(ms, opts.floor);
   const perStreamRatio =
     first.perStream && top.perStream && top.perStream > 0 ? first.perStream / top.perStream : null;
+  const contended = ms.filter(isContended).map((a) => a.concurrency);
+  const clean = ms.filter((a) => !isContended(a));
 
   let saturated = false;
-  if (ms.length >= 3 && reference !== null && reference > 0) {
-    const last = marginalGain(ms[ms.length - 2], top);
-    saturated = last !== null && last < KNEE_FRACTION * reference;
-  } else if (ms.length >= 2 && reference !== null) {
-    saturated = reference <= 0;
+  if (clean.length >= 3 && reference !== null && reference > 0) {
+    saturated = clearlyBelow(clean[clean.length - 2], clean[clean.length - 1], KNEE_FRACTION * reference);
+  } else if (clean.length >= 2 && reference !== null) {
+    saturated = reference + (spread(clean[0]) + spread(clean[1])) / (clean[1].concurrency - clean[0].concurrency) <= 0;
   }
   const suggest = saturated ? [] : suggestLevels(top.concurrency);
 
   const parts: string[] = [];
   if (ms.length === 1) {
+    // ×1 is one stream: quote its decode rate (= 1 / TPOT), the number the hero's ×1 shows.
     parts.push(
-      `Single stream at ×${top.concurrency}: ${fmtTokS(top.aggregate)} tok/s` +
+      (top.concurrency === 1
+        ? `Single stream: ${fmtTokS(top.perStream)} tok/s`
+        : `Single level ×${top.concurrency}: ${fmtTokS(top.aggregate)} tok/s aggregate`) +
         (top.ttftP50 !== null ? `, TTFT p50 ${fmtMs(top.ttftP50)}` : "") +
         " — add levels to see scaling",
     );
@@ -165,6 +194,7 @@ export function interpretDecode(arms: DecodeArm[], opts: InterpretOpts): DecodeI
   if (knee !== null) {
     parts.push(reason === "floor" ? `knee at ×${knee} (per-stream below the ${opts.floor} tok/s floor)` : `knee at ×${knee}`);
   }
+  if (contended.length) parts.push(`${contended.map((c) => `×${c}`).join("/")} contended (foreign requests on the server) — not used for knee or saturation`);
   if (ms.length >= 2) {
     if (saturated) parts.push(`saturated by ×${top.concurrency}`);
     else if (suggest.length) parts.push(`saturation not reached — run ${suggest.map((n) => `×${n}`).join("/")}`);
@@ -173,6 +203,7 @@ export function interpretDecode(arms: DecodeArm[], opts: InterpretOpts): DecodeI
 
   return {
     topLevel: top.concurrency,
+    contended,
     efficiency: eff?.efficiency ?? null,
     perStreamRatio,
     bestInteractive: best,

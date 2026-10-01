@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type RunRow } from "../api";
 import type { StreamRunRow } from "../stream-run-types";
-import { headlineFromIndex, headlineFromResult, resultFromEnvelope, resultFromSnapshot, type BenchResult } from "./result";
+import { comparable, headlineFromIndex, headlineFromResult, resultFromEnvelope, resultFromSnapshot, type BenchResult } from "./result";
 
 /**
  * The history strand: bench runs from the serve-engine index (`/api/runs`),
@@ -130,15 +130,17 @@ export function useRunHistory(kind: "decode" | "prefill", limit = 12) {
   return { entries, loading, refresh };
 }
 
-/** Most recent earlier run of the same pack (and model) — the ghost behind a result. */
-export function previousOf(entries: HistoryEntry[], current: { id: string | null; savedRunId: string | null; pack: string; model: string; createdAt: string | null } | null): HistoryEntry | null {
+/** Most recent earlier run that is like for like (`comparable`) — the ghost behind a result. */
+export function previousOf(
+  entries: HistoryEntry[],
+  current: Pick<BenchResult, "id" | "savedRunId" | "pack" | "model" | "createdAt" | "maxTokens" | "fingerprint"> | null,
+): HistoryEntry | null {
   if (!current) return null;
   for (const e of entries) {
     if (!e.result) continue;
     if (e.id === current.id || e.id === current.savedRunId) continue;
     if (current.createdAt && e.createdAt > current.createdAt) continue;
-    if (e.result.pack !== current.pack) continue;
-    if (current.model && e.result.model && e.result.model !== current.model) continue;
+    if (!comparable(e.result, current)) continue;
     return e;
   }
   return null;

@@ -77,7 +77,7 @@ function BenchRoom() {
   // Live run
   const [runId, setRunId] = useState<string | null>(null);
   const [runMeta, setRunMeta] = useState<{ tab: Tab; pack: string; levels: number[]; sizes: number[]; maxTokens: number } | null>(null);
-  const { state, stop: detach } = useStreamRun(runId);
+  const { state } = useStreamRun(runId);
   const [starting, setStarting] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
 
@@ -103,15 +103,6 @@ function BenchRoom() {
           ? "running"
           : "starting";
   const running = status === "running" || status === "starting";
-
-  // Wall clock, 4 Hz while a run is live.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!running) return;
-    setNow(Date.now());
-    const t = setInterval(() => setNow(Date.now()), 250);
-    return () => clearInterval(t);
-  }, [running]);
 
   const hardware = useHardwareSamples(running, runId);
 
@@ -244,12 +235,12 @@ function BenchRoom() {
     api.stopStreamRun(runId).catch(() => {});
   }, [runId, running]);
 
-  // When a live run ends, the engine has imported it: refresh the strand.
+  // When a live run ends, the engine has imported it: refresh the strand. (The
+  // EventSource closed itself on `done`; nothing to stop.)
   const doneSeen = useRef<string | null>(null);
   useEffect(() => {
     if (!runId || !state.done || doneSeen.current === runId) return;
     doneSeen.current = runId;
-    detach();
     const t = setTimeout(() => void history.refresh(), 400);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -271,6 +262,7 @@ function BenchRoom() {
         rows: state.levels,
         summary,
         savedRunId,
+        fingerprint: state.hello.serve_fingerprint ?? null,
       });
     }
     return prefillResultFromLive({
@@ -282,6 +274,7 @@ function BenchRoom() {
       rows: state.levels,
       summary,
       savedRunId,
+      fingerprint: state.hello.serve_fingerprint ?? null,
     });
   }, [runId, runMeta, state.hello, state.levels, state.done]);
 
@@ -291,7 +284,7 @@ function BenchRoom() {
 
   const ghost = useMemo(() => {
     if (!result || result.kind !== "decode") return null;
-    const prev = previousOf(history.entries, { id: result.id, savedRunId: result.savedRunId, pack: result.pack, model: result.model, createdAt: result.createdAt });
+    const prev = previousOf(history.entries, result);
     return prev?.result?.kind === "decode" ? { arms: prev.result.arms, label: fmtDate(prev.createdAt) } : null;
   }, [result, history.entries]);
 
@@ -350,8 +343,13 @@ function BenchRoom() {
   }, [result, decodeCfg, prefillCfg, start, run]);
 
   // ── Keys ──────────────────────────────────────────────────────────────────
+  // One listener for the page's life; it reads the latest render through a ref.
+  const keyState = { canRun, run, stopRun, result, tab, running, stepHistory };
+  const keys = useRef(keyState);
+  keys.current = keyState;
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      const { canRun, run, stopRun, result, tab, running, stepHistory } = keys.current;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key === "Enter") {
         e.preventDefault();
@@ -390,7 +388,7 @@ function BenchRoom() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
 
   const errorMessage = state.error ?? state.done?.summary.error ?? null;
 
@@ -467,7 +465,6 @@ function BenchRoom() {
               result={result?.kind === "decode" ? result : null}
               ghost={ghost}
               fromHistory={fromHistory}
-              now={now}
               hardware={hardware}
               errorMessage={errorMessage}
               onRunLevels={runLevels}
@@ -484,7 +481,6 @@ function BenchRoom() {
               live={runId ? state : null}
               result={result?.kind === "prefill" ? result : null}
               fromHistory={fromHistory}
-              now={now}
               hardware={hardware}
               errorMessage={errorMessage}
               onRunAgain={runAgain}

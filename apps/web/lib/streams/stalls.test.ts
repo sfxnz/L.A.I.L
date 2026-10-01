@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { DESYNC_MS, STALL_MS, itlStats, percentile, stallIndices, strandDesync } from "./stalls";
+import { DESYNC_MS, STALL_MS, itlStats, stallIndices, strandDesync } from "./stalls";
 
 describe("stall markers and desync", () => {
   test("stallIndices flags gaps at or above STALL_MS", () => {
@@ -8,15 +8,13 @@ describe("stall markers and desync", () => {
     expect(stallIndices([])).toEqual([]);
   });
 
-  test("percentile is nearest-rank like the engine", () => {
-    const s = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    expect(percentile(s, 50)).toBe(5);
-    expect(percentile(s, 95)).toBe(10);
-    expect(percentile([], 50)).toBeNull();
-  });
-
-  test("itlStats gives p50/p95/max and the stall count", () => {
+  test("itlStats: per-token p50/p95 from decode steps, the longest gap, and stalls on the raw gap", () => {
+    // without token counts every step is one token
     expect(itlStats([20, 18, 22, 3000, 19])).toEqual({ p50: 20, p95: 3000, max: 3000, stalls: 1 });
+    // MTP: 46 ms steps of 4 tokens are 11.5 ms per token; a 2.4 s gap that carried 4 tokens
+    // is still a stall (no output for 2.4 s), though it is 600 ms per token
+    const st = itlStats([46, 46, 46, 46, 2400], [4, 4, 4, 4, 4]);
+    expect(st).toEqual({ p50: 11.5, p95: 600, max: 2400, stalls: 1 });
     expect(itlStats(undefined)).toEqual({ p50: null, p95: null, max: null, stalls: 0 });
   });
 

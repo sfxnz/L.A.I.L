@@ -56,10 +56,22 @@ export function HistoryStrip({
                 <Eyebrow className="shrink-0 text-lab-text-dim">{packLabel(r.pack)}</Eyebrow>
                 <span className="lab-num shrink-0 font-mono text-[11px] text-lab-text-dim">×{r.n}</span>
                 <Badge tone={r.mode === "load" ? "muted" : "accent"}>{r.mode}</Badge>
-                <span className="lab-num shrink-0 font-mono text-[11px] text-lab-text-dim" title="aggregate · peak tok/s">
-                  {r.summary ? (
+                <span
+                  className="lab-num shrink-0 font-mono text-[11px] text-lab-text-dim"
+                  title={r.mode === "load" ? "aggregate (decode span) · live peak tok/s" : "headline: peak level aggregate · ×1 per stream"}
+                >
+                  {r.summary && r.mode === "bench-prefill" ? (
                     <>
-                      {fmtRate(r.summary.aggregate_tok_s)} <span className="text-lab-muted">agg</span> · {fmtRate(r.summary.peak_tok_s)} <span className="text-lab-muted">pk</span>
+                      {fmtRate(r.summary.headline?.prefill_tok_per_s_sustained)} <span className="text-lab-muted">prefill</span>
+                    </>
+                  ) : r.summary && r.mode === "bench-decode" ? (
+                    <>
+                      {fmtRate(r.summary.aggregate_tok_s)} <span className="text-lab-muted">pk @×{r.summary.headline?.aggregate_peak_concurrency ?? "—"}</span> ·{" "}
+                      {fmtRate(r.summary.per_stream_median_tok_s)} <span className="text-lab-muted">×1</span>
+                    </>
+                  ) : r.summary ? (
+                    <>
+                      {fmtRate(r.summary.aggregate_steady_tok_s)} <span className="text-lab-muted">agg</span> · {fmtRate(r.summary.peak_tok_s)} <span className="text-lab-muted">pk</span>
                       {r.summary.tokens ? <> · {fmtInt(r.summary.tokens)} <span className="text-lab-muted">tok</span></> : null}
                     </>
                   ) : (

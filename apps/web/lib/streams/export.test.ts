@@ -25,14 +25,15 @@ const hello: StreamRunAction = {
 const live = build([
   hello,
   { type: "strand", i: 0, state: "decode", ttft_ms: 412 },
-  { type: "delta", i: 0, text: "Decode throughput", reasoning: false, chunks: 4 },
-  { type: "delta", i: 0, text: "hmm", reasoning: true, chunks: 1 },
-  { type: "agg", t_ms: 2500, tok_s: 84.4, peak_tok_s: 90, tokens: 200, running: 1, waiting: 1, done: 0, tokens_per_chunk: 2.7, calibrated: true, ttft_p50_ms: 412, ttft_p95_ms: 412 },
+  { type: "delta", i: 0, text: "Decode throughput", reasoning: false, chunks: 4, tokens: 13 },
+  { type: "delta", i: 0, text: "hmm", reasoning: true, chunks: 1, tokens: 4 },
+  { type: "agg", t_ms: 2500, tok_s: 84.4, peak_tok_s: 90, tokens: 200, running: 1, waiting: 1, done: 0, tokens_exact: true, ttft_p50_ms: 412, ttft_p95_ms: 412 },
 ]);
 
 const finished = build([
   hello,
-  { type: "strand", i: 0, state: "done", ttft_ms: 412, tokens: 96, tok_s: 54.2, peak_tok_s: 61, finish_reason: "length", itl_ms: [18, 20, 2400, 19] },
+  // four decode steps: three MTP steps of 4 tokens, then a 2.4 s stall carrying 1
+  { type: "strand", i: 0, state: "done", ttft_ms: 412, tokens: 96, tok_s: 54.2, peak_tok_s: 61, finish_reason: "length", step_ms: [48, 52, 2400, 44], step_tokens: [4, 4, 1, 4] },
   { type: "strand", i: 1, state: "error", error: "HTTP 500: boom | bang" },
   {
     type: "done",
@@ -44,7 +45,8 @@ const finished = build([
       duration_ms: 77_000,
       tokens: 96,
       peak_tok_s: 61,
-      aggregate_tok_s: 52.1,
+      aggregate_tok_s: 48.3,
+      aggregate_steady_tok_s: 52.1,
       per_stream_median_tok_s: 54.2,
       ttft_p50_ms: 412,
       ttft_p95_ms: 412,
@@ -57,19 +59,20 @@ const finished = build([
 ]);
 
 describe("export shapes", () => {
-  test("aggregateMethod names the number it quotes", () => {
-    expect(aggregateMethod(live)).toEqual({ value: 84.4, method: "live · usage-calibrated ×2.7 tok/chunk" });
-    expect(aggregateMethod(build([hello, { type: "agg", t_ms: 1, tok_s: 3, peak_tok_s: 3, tokens: 3, running: 1, waiting: 0, done: 0, tokens_per_chunk: 1, calibrated: false }])).method).toBe(
-      "live · chunk estimate",
+  test("aggregateMethod names the number it quotes; live and final are the same metric", () => {
+    expect(aggregateMethod(live)).toEqual({ value: 84.4, method: "live · 3 s window · usage tokens" });
+    expect(aggregateMethod(build([hello, { type: "agg", t_ms: 1, tok_s: 3, peak_tok_s: 3, tokens: 3, running: 1, waiting: 0, done: 0, tokens_exact: false }])).method).toBe(
+      "live · 3 s window · chunk count",
     );
-    expect(aggregateMethod(finished)).toEqual({ value: 52.1, method: "final · usage" });
-    // Cancelled: the engine reports aggregate_tok_s null — keep the last live number, name it.
+    // final = the decode span (the live window's run average), never the wall-clock goodput (48.3)
+    expect(aggregateMethod(finished)).toEqual({ value: 52.1, method: "final · decode span" });
+    // Nothing settled: keep the last live number, name it.
     const cancelled = build([
       hello,
-      { type: "agg", t_ms: 900, tok_s: 40, peak_tok_s: 41, tokens: 30, running: 1, waiting: 0, done: 0, tokens_per_chunk: 2.5, calibrated: true },
-      { type: "done", run_id: "r9", summary: { ...finished.done!.summary, status: "cancelled", aggregate_tok_s: null }, saved_run_id: null },
+      { type: "agg", t_ms: 900, tok_s: 40, peak_tok_s: 41, tokens: 30, running: 1, waiting: 0, done: 0, tokens_exact: true },
+      { type: "done", run_id: "r9", summary: { ...finished.done!.summary, status: "cancelled", aggregate_steady_tok_s: null }, saved_run_id: null },
     ]);
-    expect(aggregateMethod(cancelled)).toEqual({ value: 40, method: "last sample · usage-calibrated ×2.5 tok/chunk" });
+    expect(aggregateMethod(cancelled)).toEqual({ value: 40, method: "last sample · 3 s window · usage tokens" });
   });
 
   test("markdown summary: title, facts line, metric table and one strand row per strand", () => {
@@ -79,15 +82,16 @@ describe("export shapes", () => {
     expect(lines[2]).toContain("run `r9`");
     expect(lines[2]).toContain("pack Prose");
     expect(lines[2]).toContain("natural EOS");
-    expect(md).toContain("| Aggregate tok/s (final · usage) | 52.1 |");
-    expect(md).toContain("| Peak tok/s (live 1 s window) | 61.0 |");
+    expect(md).toContain("| Aggregate tok/s (final · decode span) | 52.1 |");
+    expect(md).toContain("| Peak tok/s (live 3 s window) | 61.0 |");
+    expect(md).toContain("| Goodput tok/s (wall-clock, incl. TTFT) | 48.3 |");
     expect(md).toContain("| TTFT p50 / p95 | 412 ms / 412 ms |");
     expect(md).toContain("| Duration | 1 m 17 s |");
     expect(md).toContain("| Strands ok | 1 / 2 |");
     const rows = lines.filter((l) => /^\| \d+ \| /.test(l));
     expect(rows).toHaveLength(2);
-    // ITL p50 of [18, 19, 20, 2400] is 19 by nearest rank; p95 is the stall itself
-    expect(rows[0]).toContain("| Prose | prose_essay | done | 412 ms | 96 | 54.2 | 61.0 | 19 / 2400 | — | length |");
+    // per token: 12 samples of 11–13 ms and one of 2400 → p50 12 ms, p95 2400 (the stall)
+    expect(rows[0]).toContain("| Prose | prose_essay | done | 412 ms | 96 | 54.2 | 61.0 | 12 / 2400 | — | length |");
     // pipes in error text are escaped so the table stays a table
     expect(rows[1]).toContain("HTTP 500: boom \\| bang");
     expect(md).not.toContain("### 1 ·");
@@ -95,7 +99,7 @@ describe("export shapes", () => {
 
   test("live markdown quotes the live estimate and the strand counts", () => {
     const md = markdownSummary(live);
-    expect(md).toContain("| Aggregate tok/s (live · usage-calibrated ×2.7 tok/chunk) | 84.4 |");
+    expect(md).toContain("| Aggregate tok/s (live · 3 s window · usage tokens) | 84.4 |");
     expect(md).toContain("| Strands ok | 0 done · 1 streaming · 1 waiting |");
     expect(md).toContain("| 1 | prose | prose_essay | decode | 412 ms |");
     expect(md).toContain("| 20 % |"); // 1 reasoning chunk of 5
@@ -116,7 +120,7 @@ describe("export shapes", () => {
     const j = jsonSnapshot(finished, { pack: "prose" }) as { strands: Array<Record<string, unknown>>; controls: unknown; agg: unknown[] };
     expect(j.controls).toEqual({ pack: "prose" });
     expect(j.strands).toHaveLength(2);
-    expect(j.strands[0]).toMatchObject({ i: 0, state: "done", tokens: 96, itl_ms: [18, 20, 2400, 19], text: "" });
+    expect(j.strands[0]).toMatchObject({ i: 0, state: "done", tokens: 96, step_ms: [48, 52, 2400, 44], step_tokens: [4, 4, 1, 4], text: "" });
     expect(j.strands[1]).toMatchObject({ error: "HTTP 500: boom | bang", finish_reason: null });
     expect(Array.isArray(j.agg)).toBe(true);
     expect(exportStem(finished)).toBe("streams-Qwen3.8-Flash-Next-NVFP4-r9");

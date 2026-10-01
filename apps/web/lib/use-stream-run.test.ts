@@ -4,8 +4,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   AGG_WINDOW_MS,
+  QUEUE_FLUSH_AT,
   TEXT_RING_CHARS,
   appendRing,
+  flushPlan,
   initialStreamRunState,
   streamRunReducer,
   type StreamRunAction,
@@ -45,27 +47,31 @@ describe("stream run reducer", () => {
     expect(s.strands[1]).toMatchObject({ i: 1, title: "Code", pack: "code", state: "waiting", text: "" });
   });
 
-  test("delta appends text; reasoning goes to its own buffer; chunks accumulate per delta", () => {
+  test("delta appends text; reasoning goes to its own buffer; chunks and tokens accumulate per delta", () => {
     // `delta.chunks` is the number of upstream chunks folded into THIS delta
     // (the engine resets its pending count after every flush), so it sums.
     const s = run([
       hello,
-      { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1 },
-      { type: "delta", i: 0, text: "world", reasoning: false, chunks: 2 },
-      { type: "delta", i: 0, text: "thinking…", reasoning: true, chunks: 3 },
+      { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1, tokens: 1 },
+      { type: "delta", i: 0, text: "world", reasoning: false, chunks: 2, tokens: 2 },
+      { type: "delta", i: 0, text: "thinking…", reasoning: true, chunks: 3, tokens: 3 },
     ]);
     expect(s.strands[0].text).toBe("Hello world");
     expect(s.strands[0].reasoning).toBe("thinking…");
     expect(s.strands[0].chunks).toBe(6);
     expect(s.strands[0].reasoning_chunks).toBe(3);
+    expect(s.strands[0].reasoning_tokens).toBe(3);
+    // MTP: a chunk carries several tokens; the reasoning share in tokens is exact
+    const mtp = run([hello, { type: "delta", i: 0, text: "why", reasoning: true, chunks: 2, tokens: 7 }]);
+    expect(mtp.strands[0].reasoning_tokens).toBe(7);
   });
 
   test("hello starts every strand blank — the server replays retained text after it", () => {
     const s = run([
       hello,
-      { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1 },
+      { type: "delta", i: 0, text: "Hello ", reasoning: false, chunks: 1, tokens: 1 },
       hello, // EventSource reconnect: hello again, then a full replay
-      { type: "delta", i: 0, text: "Hello world", reasoning: false, chunks: 2 },
+      { type: "delta", i: 0, text: "Hello world", reasoning: false, chunks: 2, tokens: 2 },
     ]);
     expect(s.strands[0].text).toBe("Hello world");
     expect(s.strands[0].chunks).toBe(2);
@@ -76,17 +82,17 @@ describe("stream run reducer", () => {
       { ...hello, at: 1000 },
       { type: "strand", i: 0, state: "prefill", at: 1010 },
       { type: "strand", i: 0, state: "decode", ttft_ms: 400, at: 1410 },
-      { type: "delta", i: 0, text: "a", reasoning: false, chunks: 1, at: 1420 },
-      { type: "delta", i: 0, text: "b", reasoning: false, chunks: 1, at: 1500 },
-      { type: "delta", i: 0, text: "c", reasoning: false, chunks: 1, at: 4000 }, // 2.5 s gap → stall
-      { type: "agg", t_ms: 3200, tok_s: 12, peak_tok_s: 12, tokens: 3, running: 1, waiting: 1, done: 0, tokens_per_chunk: 1, calibrated: true, at: 4100 },
+      { type: "delta", i: 0, text: "a", reasoning: false, chunks: 1, tokens: 1, at: 1420 },
+      { type: "delta", i: 0, text: "b", reasoning: false, chunks: 1, tokens: 1, at: 1500 },
+      { type: "delta", i: 0, text: "c", reasoning: false, chunks: 1, tokens: 1, at: 4000 }, // 2.5 s gap → stall
+      { type: "agg", t_ms: 3200, tok_s: 12, peak_tok_s: 12, tokens: 3, running: 1, waiting: 1, done: 0, tokens_exact: true, at: 4100 },
       { type: "strand", i: 0, state: "done", tokens: 3, at: 4200 },
       { type: "strand", i: 0, state: "done", tokens: 3, at: 9999 }, // re-emit never moves the first stamp
     ]);
     expect(s.hello_at).toBe(1000);
     expect(s.strands[0]).toMatchObject({ at_prefill: 1010, at_decode: 1410, at_end: 4200, at_last_delta: 4000 });
     expect(s.strands[0].stalls).toEqual([{ from: 1500, to: 4000 }]);
-    expect(s.strands[0].samples.map((p) => p.chunks)).toEqual([1, 2, 3]);
+    expect(s.strands[0].samples.map((p) => p.tokens)).toEqual([1, 2, 3]);
     expect(s.clock).toEqual({ t_ms: 3200, at: 4100 });
     // unstamped actions leave the timeline alone
     const plain = run([hello, { type: "strand", i: 1, state: "decode" }]);
@@ -97,12 +103,12 @@ describe("stream run reducer", () => {
   test("agg carries the client-observed per-strand split of the engine aggregate", () => {
     const actions: StreamRunAction[] = [{ ...hello, at: 0 }];
     for (const i of [0, 1]) actions.push({ type: "strand", i, state: "decode", at: 0 });
-    // strand 0 emits 3× as many chunks as strand 1 over the same second
+    // strand 0 emits 3× as many tokens as strand 1 over the same second
     for (let k = 1; k <= 10; k++) {
-      actions.push({ type: "delta", i: 0, text: "x", reasoning: false, chunks: 3, at: k * 100 });
-      actions.push({ type: "delta", i: 1, text: "y", reasoning: false, chunks: 1, at: k * 100 });
+      actions.push({ type: "delta", i: 0, text: "x", reasoning: false, chunks: 3, tokens: 3, at: k * 100 });
+      actions.push({ type: "delta", i: 1, text: "y", reasoning: false, chunks: 1, tokens: 1, at: k * 100 });
     }
-    actions.push({ type: "agg", t_ms: 1000, tok_s: 80, peak_tok_s: 80, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 2, calibrated: true, at: 1000 });
+    actions.push({ type: "agg", t_ms: 1000, tok_s: 80, peak_tok_s: 80, tokens: 40, running: 2, waiting: 0, done: 0, tokens_exact: true, at: 1000 });
     const s = run(actions);
     expect(s.latest?.strand_tok_s).toEqual([60, 20]);
     expect(s.agg[0].strand_tok_s?.reduce((a, b) => a + b, 0)).toBe(80);
@@ -122,13 +128,13 @@ describe("stream run reducer", () => {
     const big = "x".repeat(TEXT_RING_CHARS);
     expect(appendRing(big, "tail")).toHaveLength(TEXT_RING_CHARS);
     expect(appendRing(big, "tail").endsWith("tail")).toBe(true);
-    const s = run([hello, { type: "delta", i: 1, text: big + "END", reasoning: false, chunks: 9 }]);
+    const s = run([hello, { type: "delta", i: 1, text: big + "END", reasoning: false, chunks: 9, tokens: 9 }]);
     expect(s.strands[1].text).toHaveLength(TEXT_RING_CHARS);
     expect(s.strands[1].text.endsWith("END")).toBe(true);
   });
 
   test("delta for an unseen strand creates a placeholder instead of dropping text", () => {
-    const s = run([{ type: "delta", i: 3, text: "early", reasoning: false, chunks: 1 }]);
+    const s = run([{ type: "delta", i: 3, text: "early", reasoning: false, chunks: 1, tokens: 1 }]);
     expect(s.strands).toHaveLength(4);
     expect(s.strands[3].text).toBe("early");
     expect(s.strands[0].state).toBe("waiting");
@@ -138,7 +144,7 @@ describe("stream run reducer", () => {
     const s = run([
       hello,
       { type: "strand", i: 0, state: "decode", ttft_ms: 412, tok_s: 54.2 },
-      { type: "strand", i: 0, state: "done", tokens: 512, tok_s: 53.9, peak_tok_s: 61, finish_reason: "length", itl_ms: [18, 19] },
+      { type: "strand", i: 0, state: "done", tokens: 512, tok_s: 53.9, peak_tok_s: 61, finish_reason: "length", step_ms: [18, 19], step_tokens: [4, 4] },
     ]);
     expect(s.strands[0]).toMatchObject({
       state: "done",
@@ -147,9 +153,26 @@ describe("stream run reducer", () => {
       tok_s: 53.9,
       peak_tok_s: 61,
       finish_reason: "length",
-      itl_ms: [18, 19],
+      step_ms: [18, 19],
+      step_tokens: [4, 4],
     });
     expect(s.strands[1].state).toBe("waiting");
+  });
+
+  test("live strand events append only their new steps; a terminal event replaces them", () => {
+    const steps = (n: number, from: number) => Array.from({ length: n }, (_, k) => from + k);
+    const s = run([
+      hello,
+      { type: "strand", i: 0, state: "decode", step_ms: [40, 41], step_tokens: [4, 4], steps_append: true },
+      { type: "strand", i: 0, state: "decode", tok_s: 30 }, // a tick with no new steps keeps them
+      { type: "strand", i: 0, state: "decode", step_ms: [42], step_tokens: [3], steps_append: true },
+    ]);
+    expect(s.strands[0]).toMatchObject({ step_ms: [40, 41, 42], step_tokens: [4, 4, 3], tok_s: 30 });
+    // capped to the last 100, like the engine
+    const long = run([hello, { type: "strand", i: 0, state: "decode", step_ms: steps(80, 0), step_tokens: steps(80, 0), steps_append: true }, { type: "strand", i: 0, state: "decode", step_ms: steps(40, 80), step_tokens: steps(40, 80), steps_append: true }]);
+    expect(long.strands[0].step_ms).toEqual(steps(100, 20));
+    const done = streamRunReducer(s, { type: "strand", i: 0, state: "done", step_ms: [9], step_tokens: [1] });
+    expect(done.strands[0]).toMatchObject({ step_ms: [9], step_tokens: [1] });
   });
 
   test("agg keeps a 60s sliding window, oldest first, and the latest sample", () => {
@@ -163,8 +186,7 @@ describe("stream run reducer", () => {
       running: 2,
       waiting: 0,
       done: 0,
-      tokens_per_chunk: 1,
-      calibrated: true,
+      tokens_exact: true,
     }));
     const s = run([hello, ...points]);
     expect(s.agg.map((p) => p.t_ms)).toEqual([30_000, 61_000, 89_000]);
@@ -223,6 +245,7 @@ describe("stream run reducer", () => {
     tokens: 4096,
     peak_tok_s: 207,
     aggregate_tok_s: 190.4,
+    aggregate_steady_tok_s: 201.2,
     per_stream_median_tok_s: 24.1,
     ttft_p50_ms: 471,
     ttft_p95_ms: 902,
@@ -248,24 +271,32 @@ describe("stream run reducer", () => {
       hello: helloBody,
       status: "running",
       strands: [
-        { i: 0, state: "done", tokens: 300, tok_s: 50, chunks: 300, text: "full text", reasoning_text: "why" },
-        { i: 1, state: "decode", tok_s: 44, chunks: 120, text: "", reasoning_text: "" },
+        { i: 0, state: "done", tokens: 300, tok_s: 50, chunks: 300, text: "full text", reasoning_text: "why", reasoning_tokens: 12 },
+        { i: 1, state: "decode", tok_s: 44, chunks: 120, text: "", reasoning_text: "", reasoning_tokens: 0 },
       ],
       agg: [
-        { t_ms: 1000, tok_s: 40, peak_tok_s: 40, tokens: 40, running: 2, waiting: 0, done: 0, tokens_per_chunk: 1, calibrated: true },
-        { t_ms: 70_000, tok_s: 90, peak_tok_s: 95, tokens: 900, running: 1, waiting: 0, done: 1, tokens_per_chunk: 1, calibrated: true },
+        { t_ms: 1000, tok_s: 40, peak_tok_s: 40, tokens: 40, running: 2, waiting: 0, done: 0, tokens_exact: true },
+        { t_ms: 70_000, tok_s: 90, peak_tok_s: 95, tokens: 900, running: 1, waiting: 0, done: 1, tokens_exact: true },
       ],
       levels: [],
       done: null,
       error: null,
     };
-    const stale = run([hello, { type: "delta", i: 0, text: "partial", reasoning: false, chunks: 1 }]);
+    const stale = run([hello, { type: "delta", i: 0, text: "partial", reasoning: false, chunks: 1, tokens: 1 }]);
     const s = streamRunReducer(stale, { type: "snapshot", snapshot });
     expect(s.strands[0].text).toBe("full text");
     expect(s.strands[0].reasoning).toBe("why");
     expect(s.strands[0].state).toBe("done");
+    expect(s.strands[0].reasoning_tokens).toBe(12);
     expect(s.strands[1]).toMatchObject({ state: "decode", tok_s: 44, title: "Code" });
     expect(s.agg.map((p) => p.t_ms)).toEqual([70_000]);
     expect(s.latest?.tok_s).toBe(90);
+  });
+
+  test("flush plan: animation frame when visible, a timer when hidden (rAF is paused), at once on a backlog", () => {
+    expect(flushPlan(1, false)).toBe("frame");
+    expect(flushPlan(1, true)).toBe("timer");
+    expect(flushPlan(QUEUE_FLUSH_AT, false)).toBe("now");
+    expect(flushPlan(QUEUE_FLUSH_AT, true)).toBe("now");
   });
 });

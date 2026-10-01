@@ -1,37 +1,39 @@
 /**
- * Per-strand live tok/s, computed client-side from `delta.chunks` growth.
+ * Per-strand live tok/s, computed client-side from `delta.tokens` growth.
  *
- * The engine's `agg.tok_s` is the ONE aggregate number (chunks in its 1 s
- * window × `tokens_per_chunk`). The stacked sparkline needs that number split
- * per strand, so each strand keeps `(at, cumulative chunks)` samples — one per
- * coalesced delta — and its rate over a sliding window is chunk growth ×
- * tokens_per_chunk. `stackShares` then scales the split so the stack's top edge
- * IS the engine aggregate: bands are the client-observed share of the one
- * reconciled number, never a second unexplained total.
+ * The engine's `agg.tok_s` is the ONE aggregate number (exact usage tokens in its
+ * sliding window). The stacked sparkline needs that number split per strand, so
+ * each strand keeps `(at, cumulative tokens)` samples — one per coalesced delta —
+ * and its rate over a sliding window is token growth ÷ the time it grew over.
+ * `stackShares` then scales the split so the stack's top edge IS the engine
+ * aggregate: bands are the client-observed share of the one reconciled number,
+ * never a second unexplained total.
  */
 
-export type RateSample = { at: number; chunks: number };
+export type RateSample = { at: number; tokens: number };
 
-/** Sliding window for per-strand rates (the engine uses 1 s for the aggregate; 1.5 s smooths 80 ms coalescing). */
+/** Sliding window for per-strand rates (1.5 s smooths 80 ms coalescing). */
 export const RATE_WINDOW_MS = 1500;
 /** Samples older than this fall off the ring. */
 export const RATE_KEEP_MS = 3000;
 
-export function pushSample(samples: readonly RateSample[], at: number, chunks: number, keepMs = RATE_KEEP_MS): RateSample[] {
+export function pushSample(samples: readonly RateSample[], at: number, tokens: number, keepMs = RATE_KEEP_MS): RateSample[] {
   const floor = at - keepMs;
   const kept = samples.length && samples[0].at < floor ? samples.filter((s) => s.at >= floor) : samples.slice();
-  kept.push({ at, chunks });
+  kept.push({ at, tokens });
   return kept;
 }
 
 /**
- * Tokens per second over `(at − windowMs, at]`: chunk growth since the last
- * sample at or before the window start, × tokens_per_chunk. With no sample that
- * old, the earliest sample is the baseline over its own (shorter) span, so a
- * strand's first second reads a rate instead of zero. A strand that stopped
- * emitting decays to 0 as `at` advances past its last sample.
+ * Tokens per second over `(at − windowMs, at]`: token growth since the baseline —
+ * the last sample at or before the window start — divided by the time since that
+ * baseline (a coalesced sample carries tokens since the previous one, so the growth
+ * spans back to the baseline, not to the window start). With no sample that old,
+ * the earliest sample is the baseline over its own (shorter) span, so a strand's
+ * first second reads a rate instead of zero. A strand that stopped emitting decays
+ * to 0 as `at` advances past its last sample.
  */
-export function windowRate(samples: readonly RateSample[], at: number, tokensPerChunk: number, windowMs = RATE_WINDOW_MS): number {
+export function windowRate(samples: readonly RateSample[], at: number, windowMs = RATE_WINDOW_MS): number {
   if (samples.length < 2) return 0;
   const latest = samples[samples.length - 1];
   const start = at - windowMs;
@@ -42,10 +44,10 @@ export function windowRate(samples: readonly RateSample[], at: number, tokensPer
       break;
     }
   }
-  const spanMs = base ? windowMs : Math.max(250, at - samples[0].at);
   const baseline = base ?? samples[0];
-  const grown = Math.max(0, latest.chunks - baseline.chunks);
-  const rate = (grown * tokensPerChunk) / (spanMs / 1000);
+  const spanMs = Math.max(250, at - baseline.at);
+  const grown = Math.max(0, latest.tokens - baseline.tokens);
+  const rate = grown / (spanMs / 1000);
   return Math.round(rate * 10) / 10;
 }
 

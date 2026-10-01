@@ -3,7 +3,7 @@ import type { StreamPack, StreamPromptRef } from "@lail/shared";
 type PackPrompt = { title: string; text: string; pack: string };
 type Pack = Omit<StreamPack, "prompts"> & { prompts: PackPrompt[] };
 
-// The four decode-bench families, verbatim from serve-engine perf.py (_WORKLOAD_FAMILY).
+// The four decode-bench families (the prompts the retired serve-engine decode bench used).
 const FAMILIES: Pack[] = [
   {
     id: "prose",

@@ -11,20 +11,20 @@ import { ItlSparkline } from "./ItlSparkline";
 export function TranscriptSheet({
   strand,
   packLabel,
-  tokensPerChunk,
+  tokensExact,
   open,
   onOpenChange,
   onCopy,
 }: {
   strand: StrandView | null;
   packLabel: string;
-  tokensPerChunk: number;
+  tokensExact: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCopy: (i: number) => void;
 }) {
   const s = strand;
-  const itl = itlStats(s?.itl_ms);
+  const itl = itlStats(s?.step_ms, s?.step_tokens);
   const share = s && s.chunks ? s.reasoning_chunks / s.chunks : 0;
   return (
     <Dialog.Root open={open && !!s} onOpenChange={onOpenChange}>
@@ -55,13 +55,15 @@ export function TranscriptSheet({
               </div>
 
               <div className="lab-num flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-b border-lab-border-subtle px-4 py-2 font-mono text-[11px] text-lab-text-dim">
-                <span>{fmtInt(s.tokens ?? Math.round(s.chunks * tokensPerChunk))} tok</span>
+                <span>{fmtInt(s.tokens ?? 0)} tok</span>
                 <Tick />
                 <span>{fmtRate(s.tok_s)} tok/s{s.peak_tok_s ? ` · pk ${fmtRate(s.peak_tok_s)}` : ""}</span>
                 <Tick />
                 <span>ttft {fmtMs(s.ttft_ms)}</span>
                 <Tick />
-                <span>itl p50/p95 {itl.p50 === null ? "—" : `${Math.round(itl.p50)} / ${Math.round(itl.p95 ?? itl.p50)} ms`}</span>
+                <span title={tokensExact ? "Per token: each decode step's gap ÷ the tokens it carried" : "Per chunk: no per-chunk token counts from this server"}>
+                  {tokensExact ? "itl" : "inter-chunk"} p50/p95 {itl.p50 === null ? "—" : `${Math.round(itl.p50)} / ${Math.round(itl.p95 ?? itl.p50)} ms`}
+                </span>
                 {itl.stalls > 0 && (
                   <>
                     <Tick />
@@ -80,7 +82,7 @@ export function TranscriptSheet({
                     <span className="text-lab-danger">{s.error}</span>
                   </>
                 )}
-                <ItlSparkline itl={s.itl_ms} width={160} height={22} className="ml-auto w-40" />
+                <ItlSparkline itl={s.step_ms} width={160} height={22} className="ml-auto w-40" />
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 font-mono text-[12px] leading-relaxed">
@@ -89,7 +91,7 @@ export function TranscriptSheet({
                 {s.reasoning && (
                   <details className="mb-4">
                     <summary className="strand-chip cursor-pointer">
-                      thinking {fmtPct(share)} · {fmtInt(Math.round(s.reasoning_chunks * tokensPerChunk))} tok
+                      thinking {fmtPct(share)} · {fmtInt(s.reasoning_tokens)} tok
                     </summary>
                     <pre className="mt-2 border-l-2 border-l-lab-border pl-3 whitespace-pre-wrap break-words text-lab-muted">{s.reasoning}</pre>
                   </details>

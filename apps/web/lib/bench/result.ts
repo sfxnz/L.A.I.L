@@ -1,18 +1,33 @@
 /**
  * One result shape for the bench, whatever fed it: the live `level` events of a
- * running sync, a serve-engine envelope from history (`GET /api/runs/{id}`,
- * both the controller's `metrics.arms` and the older perf.py arms), or a
- * controller snapshot when the import into the run index failed.
+ * running sync, a controller envelope from history (`GET /api/runs/{id}`,
+ * `metrics.arms`), or a controller snapshot when the import into the run index
+ * failed. (Rows of the retired serve-engine decode bench are `legacy_decode`
+ * in the index and never reach these views.)
  * Times are ms here; the envelope keeps seconds.
  */
-import type { BenchArm, BenchHeadline, StreamRunSnapshot, StreamRunSummary } from "@lail/shared";
+import type { BenchArm, BenchHardware, BenchHeadline, BenchRange, ServerLevelMetrics, StreamRunSnapshot, StreamRunSummary } from "@lail/shared";
 import type { RunRow } from "../api";
 import type { LevelRow } from "../use-stream-run";
 
-export type DecodeArm = {
+/** Level context every arm carries: repeats, spread, foreign load, the server's own view. */
+type ArmContext = {
+  /** Waves (decode) or requests (prefill) behind the medians; null on runs that predate repeats. */
+  samples: number | null;
+  /** Most foreign requests seen on the server during the level; > 0 = contended. */
+  foreignMax: number | null;
+  server: ServerLevelMetrics | null;
+};
+
+export type DecodeArm = ArmContext & {
   concurrency: number;
+  /** Wall-clock aggregate (median over waves). */
   aggregate: number | null;
+  /** Decode-span aggregate (the live gauge's definition). */
+  steady: number | null;
+  aggregateRange: BenchRange | null;
   perStream: number | null;
+  perStreamRange: BenchRange | null;
   ttftP50: number | null;
   ttftP95: number | null;
   ttftP99: number | null;
@@ -22,10 +37,11 @@ export type DecodeArm = {
   errors: string[];
 };
 
-export type PrefillArm = {
+export type PrefillArm = ArmContext & {
   size: number;
   promptTokens: number | null;
   prefillTokS: number | null;
+  prefillRange: BenchRange | null;
   ttftMs: number | null;
   ok: number;
   requests: number;
@@ -43,6 +59,10 @@ export type ResultMeta = {
   createdAt: string | null;
   durationMs: number | null;
   engine: string | null;
+  /** Serve flags fingerprint the run measured; null when unknown (never comparable). */
+  fingerprint: string | null;
+  /** Node temperature / power / energy over the run. */
+  hardware: Omit<BenchHardware, "series"> | null;
   source: "live" | "history" | "controller";
 };
 
@@ -56,6 +76,39 @@ const sToMs = (v: unknown): number | null => {
   return n === null ? null : Math.round(n * 10000) / 10;
 };
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
+const rng = (v: unknown): BenchRange | null =>
+  Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "number") ? [v[0], v[1]] : null;
+const ctxOf = (l: { samples?: unknown; foreign_max?: unknown; server?: unknown }): ArmContext => ({
+  samples: num(l.samples),
+  foreignMax: num(l.foreign_max),
+  server: l.server && typeof l.server === "object" ? (l.server as ServerLevelMetrics) : null,
+});
+const hardwareOf = (v: unknown): ResultMeta["hardware"] => {
+  if (!v || typeof v !== "object" || !Array.isArray((v as BenchHardware).nodes)) return null;
+  const h = v as BenchHardware;
+  return { nodes: h.nodes, energy_j: h.energy_j ?? null, energy_j_per_token: h.energy_j_per_token ?? null };
+};
+
+/**
+ * Two decode runs compare ("vs previous", the ghost) only like for like: same model,
+ * pack, tokens per stream and serve flags fingerprint. An unknown fingerprint matches
+ * nothing — a run whose serve config is unknown is not evidence of a change.
+ */
+export function comparable(
+  a: { model: string; pack: string; maxTokens: number | null; fingerprint: string | null },
+  b: { model: string; pack: string; maxTokens: number | null; fingerprint: string | null },
+): boolean {
+  return (
+    !!a.model &&
+    a.model === b.model &&
+    !!a.pack &&
+    a.pack === b.pack &&
+    a.maxTokens !== null &&
+    a.maxTokens === b.maxTokens &&
+    a.fingerprint !== null &&
+    a.fingerprint === b.fingerprint
+  );
+}
 
 export function peakArm(arms: DecodeArm[]): DecodeArm | null {
   let best: DecodeArm | null = null;
@@ -84,9 +137,13 @@ export function decodeArmsFromLevels(levels: LevelRow[]): DecodeArm[] {
   return levels
     .filter((l) => typeof l.concurrency === "number")
     .map((l) => ({
+      ...ctxOf(l),
       concurrency: l.concurrency as number,
       aggregate: num(l.aggregate_tok_s),
+      steady: num(l.aggregate_steady_tok_s),
+      aggregateRange: rng(l.aggregate_range),
       perStream: num(l.per_stream_median_tok_s),
+      perStreamRange: rng(l.per_stream_range),
       ttftP50: num(l.ttft_p50_ms),
       ttftP95: num(l.ttft_p95_ms),
       ttftP99: num(l.ttft_p99_ms),
@@ -101,9 +158,11 @@ export function prefillArmsFromLevels(levels: LevelRow[]): PrefillArm[] {
   return levels
     .filter((l) => typeof l.size === "number")
     .map((l) => ({
+      ...ctxOf(l),
       size: l.size as number,
       promptTokens: num(l.prompt_tokens),
       prefillTokS: num(l.prefill_tok_s),
+      prefillRange: rng(l.per_stream_range),
       ttftMs: num(l.ttft_p50_ms),
       ok: l.ok,
       requests: l.requests,
@@ -122,6 +181,7 @@ export function decodeResultFromLive(opts: {
   rows: LevelRow[];
   summary: StreamRunSummary | null;
   savedRunId: string | null;
+  fingerprint: string | null;
 }): DecodeResult {
   return {
     kind: "decode",
@@ -133,6 +193,8 @@ export function decodeResultFromLive(opts: {
     createdAt: opts.startedAt,
     durationMs: opts.summary?.duration_ms ?? null,
     engine: null,
+    fingerprint: opts.fingerprint,
+    hardware: opts.summary?.hardware ?? null,
     source: "live",
     levels: opts.levels,
     arms: decodeArmsFromLevels(opts.rows),
@@ -148,6 +210,7 @@ export function prefillResultFromLive(opts: {
   rows: LevelRow[];
   summary: StreamRunSummary | null;
   savedRunId: string | null;
+  fingerprint: string | null;
 }): PrefillResult {
   return {
     kind: "prefill",
@@ -159,6 +222,8 @@ export function prefillResultFromLive(opts: {
     createdAt: opts.startedAt,
     durationMs: opts.summary?.duration_ms ?? null,
     engine: null,
+    fingerprint: opts.fingerprint,
+    hardware: opts.summary?.hardware ?? null,
     source: "live",
     sizes: opts.sizes,
     arms: prefillArmsFromLevels(opts.rows),
@@ -187,6 +252,14 @@ function envModel(envelope: Env, index?: RunRow): string {
   return index?.model_id ?? "";
 }
 
+/** The controller records the fingerprint in the workload; the serve-engine copies it to `engine`. */
+function envFingerprint(envelope: Env): string | null {
+  const w = envWorkload(envelope).serve_fingerprint;
+  if (typeof w === "string" && w) return w;
+  const e = envelope.engine as Env | undefined;
+  return e && typeof e.flags_fingerprint === "string" && e.flags_fingerprint ? e.flags_fingerprint : null;
+}
+
 function envEngine(envelope: Env): string | null {
   const e = envelope.engine;
   if (!e || typeof e !== "object") return null;
@@ -196,14 +269,11 @@ function envEngine(envelope: Env): string | null {
   return typeof version === "string" && version ? `${name} ${version}` : name;
 }
 
-/** The perf.py bench wrote `workload` as the family id; the controller writes `workload.pack`. */
 function envPack(envelope: Env, index?: RunRow): string {
   const w = envWorkload(envelope);
   if (typeof w.pack === "string") return w.pack;
-  if (typeof w.kind === "string") return w.kind;
   const s = index?.summary;
-  if (s && typeof s.workload === "string") return s.workload;
-  return "";
+  return s && typeof s.pack === "string" ? s.pack : "";
 }
 
 function decodeArmFromEnvelope(a: Record<string, unknown>): DecodeArm | null {
@@ -211,13 +281,17 @@ function decodeArmFromEnvelope(a: Record<string, unknown>): DecodeArm | null {
   if (c === null) return null;
   const ttft = (a.ttft_s ?? {}) as Env;
   return {
+    ...ctxOf(a),
     concurrency: c,
     aggregate: num(a.aggregate_tok_per_s),
+    steady: num(a.aggregate_steady_tok_per_s),
+    aggregateRange: rng(a.aggregate_range),
     perStream: num(a.decode_tok_per_s_median),
+    perStreamRange: rng(a.per_stream_range),
     ttftP50: sToMs(ttft.p50),
     ttftP95: sToMs(ttft.p95),
     ttftP99: sToMs(ttft.p99),
-    tpotMs: sToMs(a.tpot_s ?? a.tpot_s_median),
+    tpotMs: sToMs(a.tpot_s),
     ok: num(a.ok) ?? 0,
     requests: num(a.requests) ?? 0,
     errors: strs(a.errors),
@@ -229,9 +303,11 @@ function prefillArmFromEnvelope(a: Record<string, unknown>): PrefillArm | null {
   if (size === null) return null;
   const ttft = (a.ttft_s ?? {}) as Env;
   return {
+    ...ctxOf(a),
     size,
     promptTokens: num(a.prompt_tokens),
     prefillTokS: num(a.prefill_tok_per_s),
+    prefillRange: rng(a.per_stream_range),
     ttftMs: sToMs(ttft.p50),
     ok: num(a.ok) ?? 0,
     requests: num(a.requests) ?? 0,
@@ -253,6 +329,8 @@ export function resultFromEnvelope(index: RunRow, envelope: Env | null): BenchRe
     createdAt: (typeof envelope.created_at === "string" ? envelope.created_at : null) ?? index.created_at ?? null,
     durationMs: null,
     engine: envEngine(envelope),
+    fingerprint: envFingerprint(envelope),
+    hardware: hardwareOf((envelope.metrics as Env | undefined)?.hardware),
     source: "history" as const,
   };
   const arms = envArms(envelope);
@@ -263,11 +341,7 @@ export function resultFromEnvelope(index: RunRow, envelope: Env | null): BenchRe
   }
   const da = arms.map(decodeArmFromEnvelope).filter((a): a is DecodeArm => a !== null);
   if (!da.length && kind !== "decode") return null;
-  const levels = Array.isArray(w.levels)
-    ? (w.levels as number[])
-    : Array.isArray(w.concurrencies)
-      ? (w.concurrencies as number[])
-      : da.map((a) => a.concurrency);
+  const levels = Array.isArray(w.levels) ? (w.levels as number[]) : da.map((a) => a.concurrency);
   return { ...meta, kind: "decode", levels, arms: da };
 }
 
@@ -283,6 +357,8 @@ export function resultFromSnapshot(runId: string, snap: StreamRunSnapshot): Benc
     createdAt: h.started_at,
     durationMs: snap.done?.summary.duration_ms ?? null,
     engine: null,
+    fingerprint: h.serve_fingerprint ?? null,
+    hardware: snap.done?.summary.hardware ?? null,
     source: "controller" as const,
   };
   const rows = snap.levels.map((l) => ({ ...l }));
@@ -297,11 +373,7 @@ export function resultFromSnapshot(runId: string, snap: StreamRunSnapshot): Benc
 
 // ── Index rows (no envelope yet) ────────────────────────────────────
 
-export type HeadlineSummary = Partial<BenchHeadline> & {
-  workload?: string;
-  concurrencies?: number[];
-  [k: string]: unknown;
-};
+export type HeadlineSummary = Partial<BenchHeadline> & { [k: string]: unknown };
 
 /** Peak aggregate @ ×N straight from the index row, before its envelope is loaded. */
 export function headlineFromIndex(row: RunRow): {
@@ -337,14 +409,6 @@ export function headlineFromResult(r: BenchResult): {
     peakAt: p?.concurrency ?? null,
     sustained: null,
   };
-}
-
-/** Compatibility with the retired decode-bench index rows (perf.py wrote `summary.workload`). */
-export function decodeRunLabel(summary: Record<string, unknown> | undefined): string | null {
-  const w = summary?.workload;
-  if (typeof w !== "string") return null;
-  const label: Record<string, string> = { structured: "Structured", prose: "Prose", code: "Code", json: "JSON" };
-  return label[w] ?? null;
 }
 
 export type { BenchArm };

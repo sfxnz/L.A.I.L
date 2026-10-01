@@ -1,7 +1,8 @@
 /**
  * ETA from measured rates. Decode: remaining ≈ Σ over remaining levels of
- * (max_tokens ÷ predicted per-stream tok/s + predicted TTFT), plus what is left
- * of the current wave; padded 12 %, rounded to 5 s. Prefill: TTFT roughly
+ * waves × (max_tokens ÷ predicted per-stream tok/s + predicted TTFT), a level of
+ * concurrency c running ⌈samples ÷ c⌉ waves, plus what is left of the current
+ * wave and its level's later waves; padded 12 %, rounded to 5 s. Prefill: TTFT roughly
  * doubles per context doubling, so the next size ≈ ratio × the last measured
  * TTFT. `reviseEta` makes the shown number fall freely and rise only when the
  * new estimate is clearly larger.
@@ -45,6 +46,8 @@ export type CurrentWave = {
   rateTokS: number | null;
   /** strands that have not produced a first token yet */
   waitingFirstToken: number;
+  /** waves of this level still to run after the current one */
+  wavesLeft?: number;
 };
 
 export function etaDecodeMs(opts: {
@@ -52,8 +55,11 @@ export function etaDecodeMs(opts: {
   maxTokens: number;
   measured: MeasuredLevel[];
   current: CurrentWave | null;
+  /** minimum strands per level (the run's `samples`) */
+  samples?: number;
 }): number | null {
   const { levels, maxTokens, measured, current } = opts;
+  const waves = (c: number) => Math.max(1, Math.ceil((opts.samples ?? 1) / c));
   // Before the first level settles, the live rate of the current wave is the only basis.
   const basis: MeasuredLevel[] =
     measured.length || !current?.rateTokS
@@ -67,12 +73,13 @@ export function etaDecodeMs(opts: {
     const slowest = current.tokens.length ? Math.min(...current.tokens) : 0;
     ms += (Math.max(0, maxTokens - slowest) / rate) * 1000;
     if (current.waitingFirstToken > 0) ms += predictTtftMs(basis, current.concurrency);
+    ms += (current.wavesLeft ?? 0) * ((maxTokens / rate) * 1000 + predictTtftMs(basis, current.concurrency));
   }
   const remaining = levels.slice(measured.length + (current ? 1 : 0));
   for (const c of remaining) {
     const rate = predictPerStream(basis, c);
     if (rate === null || rate <= 0) return null;
-    ms += (maxTokens / rate) * 1000 + predictTtftMs(basis, c);
+    ms += waves(c) * ((maxTokens / rate) * 1000 + predictTtftMs(basis, c));
   }
   if (!current && !remaining.length) return 0;
   return Math.round(ms * ETA_PAD);
@@ -103,16 +110,23 @@ export function etaPrefillMs(opts: {
   sizes: number[];
   measured: MeasuredSize[];
   skipped: ReadonlySet<number>;
-  current: { size: number; elapsedMs: number } | null;
+  /** the request in flight, and how many more of its size follow it */
+  current: { size: number; elapsedMs: number; requestsLeft?: number } | null;
+  /** requests per size (the run's `samples`) */
+  samples?: number;
 }): number | null {
   const { sizes, measured, skipped, current } = opts;
+  const perSize = Math.max(1, opts.samples ?? 1);
   let ms = 0;
   let known = false;
   const pending = sizes.filter((s) => !skipped.has(s) && !measured.some((m) => m.size === s));
   for (const size of pending) {
     const predicted = predictTtftForSize(measured, size);
     if (predicted === null) return null;
-    const left = current && current.size === size ? Math.max(0, predicted - current.elapsedMs) : predicted;
+    const left =
+      current && current.size === size
+        ? Math.max(0, predicted - current.elapsedMs) + predicted * (current.requestsLeft ?? 0)
+        : predicted * perSize;
     ms += left;
     known = true;
   }

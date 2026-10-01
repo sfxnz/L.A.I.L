@@ -1,15 +1,17 @@
+import { percentile, perTokenLatencies } from "@lail/shared";
+
 /**
  * Stall + desync rules for a strand. Evidence, not decoration: a stall is a
- * measured inter-token gap; desync is an error state or a live gap past
+ * measured gap between decode steps; desync is an error state or a live gap past
  * DESYNC_MS. Both thresholds come from the design brief (§5.4).
  */
 
-/** Inter-token gap that draws a stall marker. */
+/** Step gap (no output for this long) that draws a stall marker. */
 export const STALL_MS = 2000;
 /** Live gap (no delta) after which a decoding strand is frozen as desync. */
 export const DESYNC_MS = 5000;
 
-/** Indices into `itl_ms` whose gap is a stall. */
+/** Indices into a strand's `step_ms` whose gap is a stall. */
 export function stallIndices(itlMs: readonly number[] | undefined, thresholdMs = STALL_MS): number[] {
   if (!itlMs) return [];
   const out: number[] = [];
@@ -17,24 +19,21 @@ export function stallIndices(itlMs: readonly number[] | undefined, thresholdMs =
   return out;
 }
 
-/** Nearest-rank percentile over an ascending array (mirrors the engine's metrics.ts). */
-export function percentile(sorted: readonly number[], p: number): number | null {
-  const n = sorted.length;
-  if (!n) return null;
-  const rank = Math.ceil((p / 100) * n);
-  return sorted[Math.min(n - 1, Math.max(0, rank - 1))];
-}
-
 export type ItlStats = { p50: number | null; p95: number | null; max: number | null; stalls: number };
 
-export function itlStats(itlMs: readonly number[] | undefined): ItlStats {
-  if (!itlMs || !itlMs.length) return { p50: null, p95: null, max: null, stalls: 0 };
-  const sorted = [...itlMs].sort((a, b) => a - b);
+/**
+ * Per-token ITL p50/p95 from decode steps (gap ÷ tokens in the step, weighted by
+ * tokens — `perTokenLatencies`), the longest step gap, and stalls (step gaps ≥
+ * STALL_MS: no output for that long, however many tokens followed).
+ */
+export function itlStats(stepMs: readonly number[] | undefined, stepTokens?: readonly number[]): ItlStats {
+  if (!stepMs || !stepMs.length) return { p50: null, p95: null, max: null, stalls: 0 };
+  const lat = perTokenLatencies(stepMs, stepTokens ?? stepMs.map(() => 1));
   return {
-    p50: percentile(sorted, 50),
-    p95: percentile(sorted, 95),
-    max: sorted[sorted.length - 1],
-    stalls: stallIndices(itlMs).length,
+    p50: percentile(lat, 50),
+    p95: percentile(lat, 95),
+    max: Math.max(...stepMs),
+    stalls: stallIndices(stepMs).length,
   };
 }
 

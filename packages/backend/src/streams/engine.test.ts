@@ -2,10 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import type { StreamRunEvent, StreamRunSnapshot } from "@lail/shared";
 import { config } from "../config";
-import { StreamsEngine, arrivalDelays } from "./engine";
+import { RATE_WINDOW_MS, StreamsEngine, Subscriber, arrivalDelays, strandWindowRate } from "./engine";
 import { createStreamsRoutes } from "./routes";
 import { assignPrompts, getPack, listPacks, strandSystemPrompt } from "./packs";
-import { aggregateSteadyTokPerS, aggregateTokPerS, summarizeWave, type StrandResult } from "./metrics";
+import { parseMetrics, serverDelta } from "./probes";
 import { SseParser } from "./sse-parser";
 
 // ── Mock OpenAI server: reasoning + content deltas, finish_reason, trailing usage frame ──
@@ -17,8 +17,34 @@ type MockState = {
   imported: unknown[];
   /** Honour `stream_options.continuous_usage_stats` (vLLM): `usage` on every chunk. */
   continuousUsage: boolean;
+  /** Streaming completions in flight (the mock's `vllm:num_requests_running`). */
+  active: number;
+  /** Requests running on the "server" that are not the engine's. */
+  foreign: number;
+  /** Cumulative spec-decode counters: every finished stream adds 10 drafts / 30 draft tokens / 24 accepted. */
+  specDrafts: number;
+  /** Streaming completions answer HTTP 500 (the warmup, non-streaming, still succeeds). */
+  failStream: boolean;
+  leaseMode: "ok" | "busy" | "down";
+  leases: string[];
+  statusCalls: number;
 };
-const state: MockState = { requests: [], aborted: 0, importMode: "ok", imported: [], continuousUsage: false };
+const state: MockState = {
+  requests: [],
+  aborted: 0,
+  importMode: "ok",
+  imported: [],
+  continuousUsage: false,
+  active: 0,
+  foreign: 0,
+  specDrafts: 0,
+  failStream: false,
+  leaseMode: "ok",
+  leases: [],
+  statusCalls: 0,
+};
+const isWarmup = (r: Record<string, unknown>) => String((r.messages as Array<{ content: string }>)[0].content).startsWith("Warmup");
+const measured = () => state.requests.filter((r) => !isWarmup(r));
 
 function frame(delta: Record<string, unknown>, finish: string | null = null, usage?: Record<string, number>): string {
   const chunk = { id: "cmpl-1", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: finish }], ...(usage ? { usage } : {}) };
@@ -55,6 +81,8 @@ function completions(body: Record<string, unknown>, signal: AbortSignal): Respon
 
   const enc = new TextEncoder();
   signal.addEventListener("abort", () => state.aborted++, { once: true });
+  const streaming = body.stream === true && !isWarmup(body);
+  if (streaming) state.active++;
   return new Response(
     new ReadableStream({
       async start(controller) {
@@ -66,6 +94,10 @@ function completions(body: Record<string, unknown>, signal: AbortSignal): Respon
           } catch {
             break;
           }
+        }
+        if (streaming) {
+          state.active--;
+          state.specDrafts++;
         }
         try {
           controller.close();
@@ -93,7 +125,52 @@ const server = Bun.serve({
     if (url.pathname === "/v1/chat/completions") {
       const body = (await req.json()) as Record<string, unknown>;
       state.requests.push(body);
+      if (state.failStream && body.stream === true && !isWarmup(body)) return new Response("boom", { status: 500 });
       return completions(body, req.signal);
+    }
+    if (url.pathname === "/metrics") {
+      const m = `engine="0",model_name="mock/served"`;
+      const d = state.specDrafts;
+      return new Response(
+        [
+          "# HELP vllm:num_requests_running running",
+          `vllm:num_requests_running{${m}} ${state.active + state.foreign}.0`,
+          `vllm:num_requests_waiting{${m}} 0.0`,
+          `vllm:spec_decode_num_drafts_total{${m}} ${d * 10}.0`,
+          `vllm:spec_decode_num_draft_tokens_total{${m}} ${d * 30}.0`,
+          `vllm:spec_decode_num_accepted_tokens_total{${m}} ${d * 24}.0`,
+          `vllm:spec_decode_num_accepted_tokens_per_pos_total{${m},position="0"} ${d * 9}.0`,
+          `vllm:time_to_first_token_seconds_sum{${m}} ${d * 0.05}`,
+          `vllm:time_to_first_token_seconds_count{${m}} ${d}.0`,
+          "",
+        ].join("\n"),
+      );
+    }
+    if (url.pathname === "/api/status") {
+      state.statusCalls++;
+      return Response.json({
+        sampled_at: `2026-10-01T00:00:${String(state.statusCalls).padStart(2, "0")}Z`,
+        engine: { flags_fingerprint: "fp-mock" },
+        cluster: {
+          nodes: [
+            { id: "spark1", temperature_c: 50 + state.statusCalls, power_w: 100, available_gib: 20 },
+            { id: "spark2", temperature_c: 45, power_w: 60, available_gib: 30 },
+          ],
+        },
+      });
+    }
+    if (url.pathname.startsWith("/api/bench/lease")) {
+      if (state.leaseMode === "down") return new Response("down", { status: 502 });
+      if (req.method === "DELETE") {
+        state.leases.push(`release:${url.pathname.split("/").pop()}`);
+        return Response.json({ released: true });
+      }
+      const body = (await req.json()) as { lease_id: string };
+      if (state.leaseMode === "busy") {
+        return Response.json({ detail: { error: "bench_busy", job_id: "j1", kind: "agentic_tool_eval" } }, { status: 409 });
+      }
+      state.leases.push(`take:${body.lease_id}`);
+      return Response.json({ lease_id: body.lease_id });
     }
     if (url.pathname === "/api/runs/import") {
       if (state.importMode === "404") return Response.json({ detail: "Not Found" }, { status: 404 });
@@ -105,7 +182,7 @@ const server = Bun.serve({
 });
 const BASE = `http://127.0.0.1:${server.port}`;
 
-const engine = new StreamsEngine({ idleAbortMs: 300 });
+const engine = new StreamsEngine({ idleAbortMs: 300, idleWaitMs: 200 });
 const app = new Hono();
 app.route("/api/streams", createStreamsRoutes(engine));
 
@@ -152,7 +229,7 @@ afterAll(() => {
 });
 
 describe("packs", () => {
-  test("six packs; the four perf.py families are verbatim; mixed rotates", async () => {
+  test("six packs; the four decode families; mixed rotates", async () => {
     const res = await app.request("/api/streams/packs");
     const packs = (await res.json()) as ReturnType<typeof listPacks>;
     expect(packs.map((p) => p.id)).toEqual(["prose", "structured", "code", "json", "chat-short", "mixed"]);
@@ -171,31 +248,6 @@ describe("packs", () => {
     expect(mixed[8].pack).toBe("prose");
     expect(strandSystemPrompt("run1", 0)).not.toBe(strandSystemPrompt("run1", 1));
     expect(strandSystemPrompt("run1", 0)).not.toBe(strandSystemPrompt("run2", 0));
-  });
-
-  test("wave aggregates: wall-clock spans the straggler's tail, steady sums per-strand decode rates", () => {
-    const strand = (i: number, t_start: number, t_first: number, t_last: number, tokens: number): StrandResult => ({
-      i,
-      ok: true,
-      t_start,
-      t_first,
-      t_last,
-      t_end: t_last,
-      completion_tokens: tokens,
-      prompt_tokens: null,
-      estimated: false,
-      finish_reason: "length",
-      error: null,
-      token_times_ms: [],
-    });
-    // Two strands at 10 tok/s each; strand 1 starts late and drags the wall-clock window to 3 s.
-    const results = [strand(0, 0, 500, 1500, 10), strand(1, 0, 2000, 3000, 10)];
-    expect(aggregateTokPerS(results)).toBeCloseTo(20 / 3);
-    expect(aggregateSteadyTokPerS(results)).toBeCloseTo(20);
-    const ws = summarizeWave(results);
-    expect(ws.aggregate_tok_s).toBe(6.67);
-    expect(ws.aggregate_steady_tok_s).toBe(20);
-    expect(aggregateSteadyTokPerS([{ ...results[0], ok: false }])).toBeNull();
   });
 
   test("arrival schedules", () => {
@@ -287,16 +339,22 @@ describe("load run", () => {
       expect(last.finish_reason).toBe("length");
       expect(last.ttft_ms).toBeGreaterThan(0);
       expect(last.tok_s).toBeGreaterThan(0);
-      expect(last.itl_ms).toHaveLength(7);
-      // live decode emits carry the gaps so far (the card draws ITL while decoding)
-      expect(strands.some((s) => s.state === "decode" && Array.isArray(s.itl_ms))).toBe(true);
+      // 8 one-token chunks → 7 decode steps, terminal emit carries all of them
+      expect(last.step_ms).toHaveLength(7);
+      expect(last.step_tokens).toEqual([1, 1, 1, 1, 1, 1, 1]);
+      expect(last.steps_append).toBeUndefined();
+      // live decode emits carry only the steps since the previous emit, never one twice
+      const live = strands.filter((s) => s.state === "decode" && s.steps_append);
+      expect(live.reduce((a, s) => a + s.step_ms!.length, 0)).toBeLessThanOrEqual(7);
+      expect(deltas.reduce((a, d) => a + d.tokens, 0)).toBe(8);
     }
 
     const aggs = byType(events, "agg");
     expect(aggs.length).toBeGreaterThan(0);
     const lastAgg = aggs[aggs.length - 1];
-    expect(lastAgg).toMatchObject({ running: 0, waiting: 0, done: 2, tokens: 16, tokens_per_chunk: 1, calibrated: true });
-    expect(lastAgg.peak_tok_s).toBeGreaterThan(0);
+    // No continuous usage in this mock: live counts are chunk counts and the agg says so.
+    expect(lastAgg).toMatchObject({ running: 0, waiting: 0, done: 2, tokens: 16, tokens_exact: false });
+    expect(lastAgg.peak_tok_s).toBe(0); // the run never decoded for a full rate window
     expect(byType(events, "level")).toHaveLength(0);
 
     const done = byType(events, "done")[0];
@@ -304,6 +362,7 @@ describe("load run", () => {
     expect(done.saved_run_id).toBeNull();
     expect(done.summary).toMatchObject({ status: "done", mode: "load", ok: 2, requests: 2, tokens: 16, errors: [] });
     expect(done.summary.aggregate_tok_s).toBeGreaterThan(0);
+    expect(done.summary.aggregate_steady_tok_s).toBeGreaterThan(0);
     expect(done.summary.headline).toBeUndefined();
 
     // Snapshot after completion + recent list
@@ -390,6 +449,14 @@ describe("load run", () => {
     expect(new Set(toks).size).toBe(toks.length); // tok0 … tok119, each exactly once
   });
 
+  test("a load run nobody ever subscribes to is aborted too", async () => {
+    const run_id = await engine.createRun({ mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
+    await Bun.sleep(150);
+    expect(engine.snapshot(run_id)!.status).toBe("running");
+    await Bun.sleep(400);
+    expect(engine.snapshot(run_id)!.status).toBe("cancelled");
+  });
+
   test("load run is aborted when its last subscriber leaves and nobody reattaches", async () => {
     const run_id = await engine.createRun({ mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
     const sub = engine.subscribe(run_id)!;
@@ -410,15 +477,22 @@ describe("bench runs", () => {
     state.requests = [];
     state.imported = [];
     state.importMode = "ok";
-    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [2, 1], max_tokens: 4 });
+    state.leases = [];
+    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [2, 1], max_tokens: 4, samples: 1 });
     expect(res.status).toBe(201);
     const { run_id } = (await res.json()) as { run_id: string };
     const events = await collect(run_id);
 
     const hello = byType(events, "hello")[0];
-    expect(hello).toMatchObject({ mode: "bench-decode", levels: [1, 2], n: 3 });
+    expect(hello).toMatchObject({ mode: "bench-decode", levels: [1, 2], n: 3, samples: 1, serve_fingerprint: "fp-mock" });
     expect(hello.prompts.map((p) => p.level)).toEqual([0, 1, 1]);
-    expect(state.requests.every((r) => r.min_tokens === 4 && r.ignore_eos === true)).toBe(true);
+    // one discarded warmup first (non-streaming, own nonce), then the measured strands
+    expect(isWarmup(state.requests[0])).toBe(true);
+    expect(state.requests[0]).toMatchObject({ stream: false, max_tokens: 16 });
+    expect(measured()).toHaveLength(3);
+    expect(measured().every((r) => r.min_tokens === 4 && r.ignore_eos === true)).toBe(true);
+    // the serve-engine bench lease is held for the run and released at the end
+    expect(state.leases).toEqual([`take:${run_id}`, `release:${run_id}`]);
 
     const levels = byType(events, "level");
     expect(levels).toHaveLength(2);
@@ -428,6 +502,9 @@ describe("bench runs", () => {
     expect(levels[1].aggregate_steady_tok_s).toBeGreaterThanOrEqual(levels[1].aggregate_tok_s!);
     expect(levels[1].per_stream_median_tok_s).toBeGreaterThan(0);
     expect(levels[1].ttft_p50_ms).toBeGreaterThan(0);
+    // nothing else ran on the server; vLLM's own view of the level rode along
+    expect(levels[1].foreign_max).toBe(0);
+    expect(levels[1].server).toMatchObject({ spec_acceptance: 0.8, spec_tokens_per_step: 3.4, ttft_mean_ms: 50 });
     // wave 2 starts only after wave 1 finished
     const strand0Done = events.findIndex((e) => e.type === "strand" && e.i === 0 && e.state === "done");
     const strand1Start = events.findIndex((e) => e.type === "strand" && e.i === 1);
@@ -435,86 +512,141 @@ describe("bench runs", () => {
 
     const done = byType(events, "done")[0];
     expect(done.saved_run_id).toBe("imported-123");
-    expect(done.summary.headline).toMatchObject({ aggregate_peak_concurrency: 2 });
-    expect(done.summary.headline!.decode_tok_per_s_median_c1).toBeGreaterThan(0);
+    const head = done.summary.headline!;
+    expect(head).toMatchObject({ aggregate_peak_concurrency: 2 });
+    expect(head.decode_tok_per_s_median_c1).toBeGreaterThan(0);
+    // run-level numbers are the headline's, never one aggregate across sequential levels
+    expect(done.summary.aggregate_tok_s).toBe(head.aggregate_peak_tok_per_s);
+    expect(done.summary.per_stream_median_tok_s).toBe(head.decode_tok_per_s_median_c1);
+    expect(done.summary.aggregate_steady_tok_s).toBe(levels[1].aggregate_steady_tok_s);
 
     expect(state.imported).toHaveLength(1);
     const env = state.imported[0] as Record<string, any>;
     expect(env.kind).toBe("decode");
     expect(env.source).toBe("controller-streams");
     expect(env.model).toBe("mock/served");
-    expect(env.workload).toEqual({ pack: "prose", levels: [1, 2], max_tokens: 4, thinking: "off", temperature: 0.2, fill_to_max: true, base_url: BASE });
+    expect(env.workload).toEqual({ pack: "prose", levels: [1, 2], samples: 1, max_tokens: 4, thinking: "off", temperature: 0.2, fill_to_max: true, base_url: BASE, serve_fingerprint: "fp-mock" });
     expect(env.metrics.arms.map((a: { concurrency: number }) => a.concurrency)).toEqual([1, 2]);
     expect(env.metrics.arms[1].aggregate_steady_tok_per_s).toBe(levels[1].aggregate_steady_tok_s);
     expect(env.metrics.full_arms[1].per_request).toHaveLength(2);
     expect(env.metrics.full_arms[1].per_request[0].token_times_ms).toHaveLength(6);
+    expect(env.metrics.full_arms[1].per_request[0].token_counts).toEqual([1, 2, 3, 4, 5, 6]);
     expect(env.metrics.full_arms[1].per_request[0].completion_tokens).toBe(6);
-    expect(env.summary).toEqual(env.metrics.headline);
+    expect(env.summary).toEqual({ ...env.metrics.headline, pack: "prose", max_tokens: 4, serve_fingerprint: "fp-mock", energy_j_per_token: env.metrics.hardware.energy_j_per_token });
+    // node temperature / power over the run (status snapshots), and energy per token
+    const hw = env.metrics.hardware;
+    expect(hw.nodes.map((n: { id: string }) => n.id).sort()).toEqual(["spark1", "spark2"]);
+    expect(hw.series.length).toBeGreaterThanOrEqual(4);
+    expect(hw.nodes.find((n: { id: string }) => n.id === "spark2")).toMatchObject({ power_mean_w: 60, available_min_gib: 30, temp_max_c: 45 });
+    expect(hw.energy_j).toBeGreaterThanOrEqual(0);
   });
 
-  test("live token estimate is calibrated from usage (multi-token chunks) and remembered per base_url+model", async () => {
+  test("bench-decode repeats: ⌈samples ÷ c⌉ waves per level, medians with min–max", async () => {
     state.importMode = "404";
-    // max_tokens 5 → the mock reports 3 tokens per chunk; wave 1 (c=1) calibrates wave 2 (c=2).
-    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 5 });
+    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 4 });
     const { run_id } = (await res.json()) as { run_id: string };
     const events = await collect(run_id);
-    const aggs = byType(events, "agg");
-    expect(aggs[aggs.length - 1].tokens_per_chunk).toBe(3);
-    // The first decode event of a strand carries exactly one chunk: ×1 before calibration (strand 0), ×3 after (strand 2).
-    const firstDecode = (i: number) => byType(events, "strand").find((s) => s.i === i && s.state === "decode")!;
-    expect(firstDecode(0).tokens).toBe(1);
-    expect(firstDecode(2).tokens).toBe(3);
-    // Terminal counts always come from usage.
-    expect(byType(events, "strand").filter((s) => s.i === 2).pop()!.tokens).toBe(21);
-    expect(byType(events, "done")[0].summary.tokens).toBe(63);
-
-    // A new run against the same base_url+model starts calibrated.
-    const again = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 5 });
-    const second = await collect(((await again.json()) as { run_id: string }).run_id);
-    expect(byType(second, "strand").find((s) => s.state === "decode")!.tokens).toBe(3);
+    const hello = byType(events, "hello")[0];
+    expect(hello).toMatchObject({ n: 7, samples: 3 });
+    expect(hello.prompts.map((p) => [p.level, p.wave])).toEqual([[0, 0], [0, 1], [0, 2], [1, 0], [1, 0], [1, 1], [1, 1]]);
+    const [l1, l2] = byType(events, "level");
+    expect(l1).toMatchObject({ concurrency: 1, samples: 3, ok: 3, requests: 3 });
+    expect(l2).toMatchObject({ concurrency: 2, samples: 2, ok: 4, requests: 4 });
+    expect(l1.aggregate_range![0]).toBeLessThanOrEqual(l1.aggregate_tok_s!);
+    expect(l1.aggregate_range![1]).toBeGreaterThanOrEqual(l1.aggregate_tok_s!);
+    expect(l1.ttft_p95_ms).toBeNull(); // 3 samples: no tail percentile
+    // waves run one after another: the second ×1 strand starts after the first finished
+    const firstDone = events.findIndex((e) => e.type === "strand" && e.i === 0 && e.state === "done");
+    expect(events.findIndex((e) => e.type === "strand" && e.i === 1)).toBeGreaterThan(firstDone);
     state.importMode = "ok";
   });
 
-  test("without continuous usage, `calibrated` stays false until a strand's trailing usage frame", async () => {
-    // Seeded from memory (previous test) is not "calibrated": the run has not measured anything yet.
-    const res = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
-    const { run_id } = (await res.json()) as { run_id: string };
-    const events = await collect(run_id);
-    const aggs = byType(events, "agg");
-    expect(aggs.length).toBeGreaterThan(2);
-    expect(aggs[0].calibrated).toBe(false);
-    // The trailing usage frame follows every output chunk but precedes [DONE] by one frame, so an
-    // agg tick may land between it and the strand's `done`. What must hold: the first calibrated
-    // agg already counts every output chunk, i.e. calibration came from the trailing frame.
-    const doneTokens = byType(events, "strand").find((s) => s.state === "done")!.tokens!;
-    expect(aggs.find((a) => a.calibrated)!.tokens).toBe(doneTokens);
-    expect(aggs[aggs.length - 1]).toMatchObject({ calibrated: true, tokens_per_chunk: 3 });
+  test("foreign requests on the server: waits, then measures and tags the level as contended", async () => {
+    state.importMode = "404";
+    state.foreign = 1;
+    try {
+      const t0 = performance.now();
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1], max_tokens: 120, samples: 1 });
+      const events = await collect(((await res.json()) as { run_id: string }).run_id);
+      expect(performance.now() - t0).toBeGreaterThan(200); // waited idleWaitMs for the server to drain
+      expect(byType(events, "level")[0].foreign_max).toBe(1);
+    } finally {
+      state.foreign = 0;
+      state.importMode = "ok";
+    }
   });
 
-  test("continuous usage stats calibrate from the first output chunk, before any strand finishes", async () => {
+  test("a bench is refused while the serve-engine holds the bench lease; runs without it when unreachable", async () => {
+    state.leaseMode = "busy";
+    try {
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1], max_tokens: 2, samples: 1 });
+      expect(res.status).toBe(409);
+      expect((await res.json()) as object).toMatchObject({ error: "bench_busy", job_id: "j1" });
+      // load runs are not benches
+      const load = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 1 });
+      expect(load.status).toBe(201);
+      await collect(((await load.json()) as { run_id: string }).run_id);
+      state.leaseMode = "down";
+      state.importMode = "404";
+      const ok = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1], max_tokens: 2, samples: 1 });
+      expect(ok.status).toBe(201);
+      const done = byType(await collect(((await ok.json()) as { run_id: string }).run_id), "done")[0];
+      expect(done.summary.status).toBe("done");
+    } finally {
+      state.leaseMode = "ok";
+      state.importMode = "ok";
+    }
+  });
+
+  test("a bench where every strand failed is an error, never an imported result", async () => {
+    state.imported = [];
+    state.failStream = true;
+    try {
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 4, samples: 1 });
+      const events = await collect(((await res.json()) as { run_id: string }).run_id);
+      const done = byType(events, "done")[0];
+      expect(done.summary.status).toBe("error");
+      expect(done.summary.error).toContain("no level completed");
+      expect(done.saved_run_id).toBeNull();
+      expect(state.imported).toHaveLength(0);
+    } finally {
+      state.failStream = false;
+    }
+  });
+
+  test("continuous usage: live tokens are exact per chunk (MTP chunks carry 3), steps carry their token counts", async () => {
     state.continuousUsage = true;
     state.importMode = "404";
     try {
-      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [2], max_tokens: 120 });
+      // max_tokens 5 → the mock reports 3 tokens per chunk
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 5, samples: 1 });
       const { run_id } = (await res.json()) as { run_id: string };
       const events = await collect(run_id);
-      const firstDecode = byType(events, "strand").find((s) => s.state === "decode")!;
-      expect(firstDecode.tokens).toBe(3);
-      const firstDone = events.findIndex((e) => e.type === "strand" && e.state === "done");
-      const firstCalibratedAgg = events.findIndex((e) => e.type === "agg" && e.calibrated);
-      expect(firstCalibratedAgg).toBeGreaterThan(-1);
-      expect(firstCalibratedAgg).toBeLessThan(firstDone);
-      expect(byType(events, "level")[0]).toMatchObject({ concurrency: 2, ok: 2 });
-      expect(byType(events, "done")[0].summary.tokens).toBe(732);
+      // The first decode event of every strand already carries the exact count — nothing to calibrate.
+      for (const i of [0, 1, 2]) expect(byType(events, "strand").find((s) => s.i === i && s.state === "decode")!.tokens).toBe(3);
+      const last = byType(events, "strand").filter((s) => s.i === 2).pop()!;
+      expect(last.tokens).toBe(21);
+      expect(new Set(last.step_tokens)).toEqual(new Set([3]));
+      expect(byType(events, "delta").filter((d) => d.i === 2).reduce((a, d) => a + d.tokens, 0)).toBe(21);
+      expect(byType(events, "agg").every((a) => a.tokens_exact)).toBe(true);
+      expect(byType(events, "done")[0].summary.tokens).toBe(63);
     } finally {
       state.continuousUsage = false;
       state.importMode = "ok";
     }
   });
 
+  test("without per-chunk usage, live counts are chunk counts (tokens_exact false); terminal counts come from usage", async () => {
+    const res = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 5 });
+    const events = await collect(((await res.json()) as { run_id: string }).run_id);
+    expect(byType(events, "strand").find((s) => s.state === "decode")!.tokens).toBe(1);
+    expect(byType(events, "strand").pop()!.tokens).toBe(21);
+    expect(byType(events, "agg").pop()!.tokens_exact).toBe(false);
+  });
+
   test("a cancelled bench keeps the level rows it completed and a partial summary", async () => {
     state.importMode = "404";
-    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 120 });
+    const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1, 2], max_tokens: 120, samples: 1 });
     const { run_id } = (await res.json()) as { run_id: string };
     const events: StreamRunEvent[] = [];
     const seen = collect(run_id, (ev) => {
@@ -531,7 +663,7 @@ describe("bench runs", () => {
     expect(done.summary.status).toBe("cancelled");
     expect(done.saved_run_id).toBeNull();
     expect(done.summary.ok).toBe(3); // strand 0 finished; strands 1–2 streamed output before the stop
-    expect(done.summary.aggregate_tok_s).toBeGreaterThan(0);
+    expect(done.summary.aggregate_tok_s).toBe(byType(all, "level")[0].aggregate_tok_s); // the completed level's
     const snap = (await (await app.request(`/api/streams/runs/${run_id}`)).json()) as StreamRunSnapshot;
     expect(snap.status).toBe("cancelled");
     expect(snap.levels).toHaveLength(1);
@@ -547,18 +679,22 @@ describe("bench runs", () => {
     const { run_id } = (await res.json()) as { run_id: string };
     const events = await collect(run_id);
 
-    expect(byType(events, "hello")[0]).toMatchObject({ mode: "bench-prefill", sizes: [64, 8192], max_tokens: 1, n: 2 });
-    expect(state.requests).toHaveLength(1);
-    expect(state.requests[0]).toMatchObject({ max_tokens: 1, min_tokens: 1, ignore_eos: true });
+    // two requests per size by default
+    expect(byType(events, "hello")[0]).toMatchObject({ mode: "bench-prefill", sizes: [64, 8192], max_tokens: 1, n: 4, samples: 2 });
+    expect(measured()).toHaveLength(2);
+    expect(measured().every((r) => r.max_tokens === 1 && r.min_tokens === 1 && r.ignore_eos === true)).toBe(true);
+    // each repeat has its own nonce'd prompt, so prefix caching cannot serve the second
+    const prompts = measured().map((r) => (r.messages as Array<{ content: string }>)[0].content);
+    expect(prompts[0]).not.toBe(prompts[1]);
 
     const levels = byType(events, "level");
     expect(levels).toHaveLength(2);
-    expect(levels[0]).toMatchObject({ index: 0, size: 64, ok: 1, requests: 1 });
+    expect(levels[0]).toMatchObject({ index: 0, size: 64, ok: 2, requests: 2, samples: 2 });
     expect(Math.abs(levels[0].prompt_tokens! - 64) / 64).toBeLessThanOrEqual(0.02);
     expect(levels[0].prefill_tok_s).toBeGreaterThan(0);
+    expect(levels[0].per_stream_range).not.toBeNull();
     expect(levels[1]).toMatchObject({ index: 1, size: 8192, ok: 0, requests: 0, skipped: "size 8192 ≥ max_model_len 4096" });
-    const skipped = byType(events, "strand").filter((s) => s.i === 1).pop()!;
-    expect(skipped.state).toBe("cancelled");
+    for (const i of [2, 3]) expect(byType(events, "strand").filter((s) => s.i === i).pop()!.state).toBe("cancelled");
 
     const done = byType(events, "done")[0];
     expect(done.summary.status).toBe("done");
@@ -566,5 +702,72 @@ describe("bench runs", () => {
     expect(done.summary.headline!.prefill_tok_per_s_sustained).toBeGreaterThan(0);
     expect(done.summary.headline!.decode_tok_per_s_median_c1).toBeNull();
     state.importMode = "ok";
+  });
+});
+
+describe("live rates and fan-out", () => {
+  test("per-strand window rate counts tokens in the last window and decays to 0 when the strand stalls", () => {
+    // tokens arrive 4 at a time every 50 ms from t=100 to t=3050 (relative to t_start=0)
+    const times: number[] = [];
+    const counts: number[] = [];
+    for (let k = 0, t = 100; t <= 3050; k++, t += 50) {
+      times.push(t);
+      counts.push((k + 1) * 4);
+    }
+    const s = { t_start: 0, t_first: 100, token_times: times, token_counts: counts };
+    expect(RATE_WINDOW_MS).toBe(3000);
+    // before the window has filled: all 60 chunks over the 2.95 s since the first token
+    expect(strandWindowRate(s, 3050)).toBeCloseTo(240 / 2.95, 6);
+    // full window (100, 3100]: the 59 chunks after t=100 → 236 tokens / 3 s
+    expect(strandWindowRate(s, 3100)).toBeCloseTo(236 / 3, 6);
+    // 1.55 s into a stall: (1600, 4600] holds 29 chunks; past a full window it reads 0
+    expect(strandWindowRate(s, 4600)).toBeCloseTo(116 / 3, 6);
+    expect(strandWindowRate(s, 6100)).toBe(0);
+    // first second of a strand divides by 1 s, not by 50 ms
+    expect(strandWindowRate({ t_start: 0, t_first: 100, token_times: [100, 150], token_counts: [1, 5] }, 150)).toBe(5);
+  });
+
+  test("a lagging subscriber's deltas merge per stream instead of being dropped", async () => {
+    const sub = new Subscriber();
+    for (let k = 0; k < 500; k++) {
+      sub.push({ type: "delta", i: 0, text: `t${k} `, reasoning: false, chunks: 1, tokens: 4 });
+      sub.push({ type: "delta", i: 0, text: "r", reasoning: true, chunks: 1, tokens: 1 });
+      sub.push({ type: "delta", i: 1, text: "x", reasoning: false, chunks: 1, tokens: 2 });
+    }
+    const got: StreamRunEvent[] = [];
+    for (let k = 0; k < 3; k++) got.push((await sub.next())!);
+    const d = got as Array<Extract<StreamRunEvent, { type: "delta" }>>;
+    expect(d.map((e) => [e.i, e.reasoning])).toEqual([[0, false], [0, true], [1, false]]);
+    expect(d[0].text).toBe(Array.from({ length: 500 }, (_, k) => `t${k} `).join(""));
+    expect(d[0]).toMatchObject({ chunks: 500, tokens: 2000 });
+    expect(d[2]).toMatchObject({ chunks: 500, tokens: 1000 });
+    // consumed: the next delta starts a new event
+    sub.push({ type: "delta", i: 0, text: "next", reasoning: false, chunks: 1, tokens: 1 });
+    expect(((await sub.next()) as { text: string }).text).toBe("next");
+  });
+
+  test("vLLM /metrics parsing and per-level deltas", () => {
+    const m = (d: number, run: number) =>
+      parseMetrics(
+        [
+          `vllm:num_requests_running{engine="0",model_name="m"} ${run}.0`,
+          `vllm:num_requests_running{engine="1",model_name="m"} 1.0`,
+          `vllm:spec_decode_num_drafts_total{engine="0",model_name="m"} ${1352 + d}.0`,
+          `vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="m"} ${4056 + 3 * d}.0`,
+          `vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="m"} ${3492 + 2 * d}.0`,
+          `vllm:request_prefill_kv_computed_tokens_sum{engine="0",model_name="m"} ${1397 + 8192 * (d / 100)}`,
+          `vllm:request_prefill_time_seconds_sum{engine="0",model_name="m"} ${5.36 + d / 100}`,
+          `vllm:num_preemptions_total{engine="0",model_name="m"} 0.0`,
+        ].join("\n"),
+      );
+    expect(m(0, 2)["vllm:num_requests_running"]).toBe(3); // summed over label sets
+    expect(serverDelta(m(0, 0), m(100, 0))).toEqual({
+      spec_acceptance: 0.667,
+      spec_tokens_per_step: 3,
+      ttft_mean_ms: null,
+      prefill_tok_s: 8192,
+      preemptions: 0,
+    });
+    expect(serverDelta(null, m(1, 0))).toBeNull();
   });
 });

@@ -31,13 +31,22 @@ export const SAMPLES_KEEP_MS = 65_000;
 /** The sampler publishes every second: older than 3 cadences is stale, not live. */
 export const STALE_AFTER_S = 3;
 
+/**
+ * The age past which live data reads as stale. The polling fallback only looks every
+ * LAB_STATUS_POLL_MS, so a healthy poll cycle ages each answer by that much more
+ * before the next one lands — it must not flicker "not updating" on every cycle.
+ */
+export function staleAfterS(transport: "stream" | "poll" | null | undefined): number {
+  return STALE_AFTER_S + (transport === "poll" ? LAB_STATUS_POLL_MS / 1000 : 0);
+}
+
 export type LiveRun = {
   running: number;
   waiting: number;
   source: "streams" | "bench";
 };
 
-export type RailRate = { tx_bps: number; rx_bps: number };
+type RailRate = { tx_bps: number; rx_bps: number };
 
 export type NodeSample = {
   /** server epoch ms of the node's telemetry */
@@ -121,7 +130,7 @@ export function ownsEndpoint(n: ClusterNode): boolean {
 }
 
 /** A node that has a current reading (the local host, or a remote that answers). */
-export function nodeLive(n: ClusterNode): boolean {
+function nodeLive(n: ClusterNode): boolean {
   return !!(n.local || n.online);
 }
 
@@ -270,7 +279,7 @@ export const useLabStatusStore = create<LabStatusStore>((set, get) => ({
 }));
 
 /** A status whose serve block is serve-engine's failure (or warm-up), not a snapshot. */
-export function engineFailure(status: LabStatus): string | null {
+function engineFailure(status: LabStatus): string | null {
   const serve = status.serve;
   if (serve && num(serve.sampled_at_ms) != null) return null;
   return serve?.error || (serve ? null : "serve-engine did not answer");
@@ -280,11 +289,16 @@ export function engineFailure(status: LabStatus): string | null {
  * Show one snapshot (from either transport). An older one than shown is dropped.
  * A serve-engine failure keeps the last real snapshot on screen, aging (and so
  * dimmed as stale) with the failure noted, rather than blanking the instruments.
+ *
+ * A stream tick makes the transport "stream". A polled answer never demotes it: a
+ * one-off poll (a stream failure being diagnosed, a poll that was in flight when the
+ * stream came back) is not the polling fallback — live-connection switches to that.
  */
-export function ingestStatus(status: LabStatus, transport: "stream" | "poll"): void {
+export function ingestStatus(status: LabStatus, via: "stream" | "poll"): void {
   const s = useLabStatusStore.getState();
   if (isOlder(s.status, status)) return;
   const engineError = engineFailure(status);
+  const transport = via === "stream" ? "stream" : s.transport;
   const base = { loading: false, needToken: false, unreachable: false, error: null, transport, engineError };
   if (engineError && num(s.status?.serve?.sampled_at_ms) != null) {
     useLabStatusStore.setState(base);
@@ -325,13 +339,17 @@ export function serveHealthy(status: LabStatus | null): boolean {
 
 // ── Freshness ────────────────────────────────────────────────────────────────
 
-type Clock = Pick<LabStatusStore, "status" | "receivedAt">;
+type Clock = Pick<LabStatusStore, "status" | "receivedAt"> & { transport?: LabStatusStore["transport"] };
 
-/** The serve-engine host's clock now, estimated from the last snapshot. */
+/**
+ * The serve-engine host's clock now, estimated from the last snapshot: its publish
+ * time, plus how old it already was when served (`stale_s`, non-zero for a polled
+ * answer), plus how long ago it arrived.
+ */
 export function serverNow(s: Clock, now = Date.now()): number | null {
   const pub = num(s.status?.serve?.sampled_at_ms);
   if (pub == null || s.receivedAt == null) return null;
-  return pub + Math.max(0, now - s.receivedAt);
+  return pub + Math.max(0, num(s.status?.serve?.stale_s) ?? 0) * 1000 + Math.max(0, now - s.receivedAt);
 }
 
 /** Seconds since the newest snapshot was sampled (its own age plus time since it arrived). */
@@ -347,14 +365,21 @@ export function ageOf(s: Clock, serverMs: number | null | undefined, now = Date.
   return Math.max(0, (sn - serverMs) / 1000);
 }
 
-/** True once the newest snapshot is older than `thresholdS` (no stream, no snapshot yet: false). */
-export function isStale(s: Clock & { unreachable?: boolean }, thresholdS = STALE_AFTER_S, now = Date.now()): boolean {
+/**
+ * True once the newest snapshot is older than `thresholdS` (by default the transport's
+ * staleAfterS). No snapshot yet: false.
+ */
+export function isStale(
+  s: Clock & { unreachable?: boolean },
+  thresholdS = staleAfterS(s.transport),
+  now = Date.now(),
+): boolean {
   const age = snapshotAge(s, now);
   return !!s.unreachable || (age != null && age > thresholdS);
 }
 
 /** Whether the live data stopped updating. Checked every second; re-renders only when it flips. */
-export function useStale(thresholdS = STALE_AFTER_S): boolean {
+export function useStale(thresholdS?: number): boolean {
   const [stale, setStale] = useState(false);
   useEffect(() => {
     const check = () => setStale(isStale(useLabStatusStore.getState(), thresholdS));

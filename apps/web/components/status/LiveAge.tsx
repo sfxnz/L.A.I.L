@@ -1,6 +1,6 @@
 "use client";
 
-import { STALE_AFTER_S, snapshotAge, useLabStatusStore, useNow } from "@/lib/lab-status-store";
+import { snapshotAge, staleAfterS, useLabStatusStore, useNow } from "@/lib/lab-status-store";
 import { fmtAge } from "@/lib/status/format";
 import { Eyebrow } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 /**
  * How current the live data is, in words: "live" while samples arrive every second,
  * "polling" on the fallback transport, "not updating · 14 s" once the newest sample
- * is older than STALE_AFTER_S. Ticks on its own clock, so it moves even when
+ * is older than staleAfterS (longer while polling). Ticks on its own clock, so it moves even when
  * nothing else on the page re-renders.
  */
 export function LiveAge({ className, quiet }: { className?: string; /** say nothing while live */ quiet?: boolean }) {
@@ -17,7 +17,7 @@ export function LiveAge({ className, quiet }: { className?: string; /** say noth
   const s = useLabStatusStore.getState();
   const age = snapshotAge(s, Math.max(now, Date.now()));
   if (age == null) return null;
-  const stale = s.unreachable || age > STALE_AFTER_S;
+  const stale = s.unreachable || age > staleAfterS(s.transport);
   if (quiet && !stale && s.transport !== "poll") return null;
   return (
     <Eyebrow

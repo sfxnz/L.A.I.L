@@ -8,7 +8,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ClusterNode, LabStatus } from "./api";
 import {
   EMPTY_SAMPLES,
+  LAB_STATUS_POLL_MS,
   SAMPLES_KEEP_MS,
+  STALE_AFTER_S,
   ageOf,
   ingestStatus,
   isOlder,
@@ -19,6 +21,7 @@ import {
   sameLiveRun,
   serverNow,
   snapshotAge,
+  staleAfterS,
   tightestNode,
   useLabStatusStore,
   type LiveMeta,
@@ -158,13 +161,26 @@ describe("freshness against the server clock", () => {
     const status = { serve: { sampled_at_ms: 1_000_000, stale_s: 0.2 } } as LabStatus;
     const receivedAt = 5_000_000;
     const clock = { status, receivedAt };
-    expect(serverNow(clock, receivedAt + 1500)).toBe(1_001_500);
+    // the server's "now" counts the snapshot's age when served (stale_s) and the time since
+    expect(serverNow(clock, receivedAt + 1500)).toBe(1_001_700);
     expect(snapshotAge(clock, receivedAt + 1500)).toBeCloseTo(1.7, 5);
-    expect(ageOf(clock, 999_000, receivedAt)).toBe(1);
+    expect(ageOf(clock, 999_000, receivedAt)).toBeCloseTo(1.2, 5);
     expect(isStale(clock, 3, receivedAt + 1000)).toBe(false);
     expect(isStale(clock, 3, receivedAt + 4000)).toBe(true);
     expect(isStale({ ...clock, unreachable: true }, 3, receivedAt)).toBe(true);
     expect(snapshotAge({ status: null, receivedAt: null })).toBeNull();
+  });
+
+  test("a healthy polling cycle is not stale: the poll interval is part of the threshold", () => {
+    const status = { serve: { sampled_at_ms: 1_000_000, stale_s: 0.9 } } as LabStatus;
+    const receivedAt = 5_000_000;
+    // answer 0.9 s old, next poll lands 2 s + request time later: age ~3.2 s
+    const at = receivedAt + 2300;
+    expect(isStale({ status, receivedAt, transport: "stream" }, undefined, at)).toBe(true);
+    expect(isStale({ status, receivedAt, transport: "poll" }, undefined, at)).toBe(false);
+    expect(staleAfterS("poll")).toBe(STALE_AFTER_S + LAB_STATUS_POLL_MS / 1000);
+    // polling that stopped answering still goes stale
+    expect(isStale({ status, receivedAt, transport: "poll" }, undefined, receivedAt + 4500)).toBe(true);
   });
 });
 

@@ -27,13 +27,14 @@ import {
  *   sees (401 → token banner, no answer → unreachable, an answer → keep going).
  * - When the controller answers but the stream keeps failing (a proxy that
  *   buffers event streams), the store is fed by polling every 2 s instead, and
- *   the stream is retried every RETRY_STREAM_MS.
+ *   the stream is retried every RETRY_STREAM_MS. Polling has its own timer and
+ *   keeps going through a retry; only a delivered tick stops it.
  * - A tab hidden for HIDDEN_CLOSE_MS closes everything; returning reconnects
  *   (the stream's history event refills the sparklines).
  */
 
 export const STALL_MS = 8000;
-export const HIDDEN_CLOSE_MS = 60_000;
+const HIDDEN_CLOSE_MS = 60_000;
 export const RETRY_STREAM_MS = 30_000;
 const MAX_BACKOFF_MS = 10_000;
 /** Stream failures in a row (with the controller answering polls) before polling takes over. */
@@ -77,7 +78,7 @@ export async function readSse(
 }
 
 /** Applies one stream event to the store. */
-export function handleLiveEvent(event: string, data: string): void {
+function handleLiveEvent(event: string, data: string): void {
   if (event === "meta") {
     useLabStatusStore.setState({ meta: JSON.parse(data) as LiveMeta });
   } else if (event === "history") {
@@ -108,7 +109,10 @@ export function startLive(
   const doc = typeof document !== "undefined" ? document : null;
   let stopped = false;
   let ac: AbortController | null = null;
+  /** the next stream (re)connect */
   let timer: ReturnType<typeof setTimeout> | null = null;
+  /** the polling fallback's loop — its own timer, so a stream retry never pauses it */
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let hiddenTimer: ReturnType<typeof setTimeout> | null = null;
   let failures = 0;
   let backoff = 1000;
@@ -118,15 +122,23 @@ export function startLive(
     if (timer) clearTimeout(timer);
     timer = null;
   };
+  const clearPoll = () => {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+  };
   const later = (fn: () => void, ms: number) => {
     clearTimer();
     timer = setTimeout(fn, ms);
   };
+  const polling = () => useLabStatusStore.getState().transport === "poll";
 
   const poll = async () => {
-    if (stopped || sleeping) return;
+    pollTimer = null;
+    if (stopped || sleeping || !polling()) return;
     await useLabStatusStore.getState().refresh();
-    if (!stopped && !sleeping && useLabStatusStore.getState().transport === "poll") later(poll, LAB_STATUS_POLL_MS);
+    if (stopped || sleeping || !polling() || pollTimer) return;
+    if (useLabStatusStore.getState().needToken) return; // the banner reloads the page
+    pollTimer = setTimeout(poll, LAB_STATUS_POLL_MS);
   };
 
   const connect = async () => {
@@ -156,6 +168,7 @@ export function startLive(
             delivered = true;
             failures = 0;
             backoff = 1000;
+            clearPoll(); // the stream is back: this tick takes over from polling
           }
           handleLiveEvent(event, data);
         },
@@ -169,7 +182,13 @@ export function startLive(
     }
     if (stopped || sleeping) return;
     if (isUnauthorizedError(error)) {
+      clearPoll();
       ingestFailure(error); // the banner reloads the page once a token is pasted
+      return;
+    }
+    if (!delivered && polling()) {
+      // A retry from poll mode that failed: the poll loop never stopped; try again later.
+      later(() => void connect(), RETRY_STREAM_MS);
       return;
     }
     if (!delivered) failures += 1;
@@ -178,14 +197,10 @@ export function startLive(
     if (stopped || sleeping || useLabStatusStore.getState().needToken) return;
     if (answered && failures >= POLL_AFTER_FAILURES) {
       useLabStatusStore.setState({ transport: "poll" });
-      later(poll, LAB_STATUS_POLL_MS);
+      clearPoll();
+      pollTimer = setTimeout(poll, LAB_STATUS_POLL_MS);
       // keep trying the stream now and then; the first tick takes over from polling
-      setTimeout(() => {
-        if (!stopped && !sleeping && useLabStatusStore.getState().transport === "poll") {
-          failures = 0;
-          void connect();
-        }
-      }, RETRY_STREAM_MS);
+      later(() => void connect(), RETRY_STREAM_MS);
       return;
     }
     const wait = delivered ? 1000 : backoff;
@@ -201,6 +216,7 @@ export function startLive(
         hiddenTimer = null;
         sleeping = true;
         clearTimer();
+        clearPoll();
         ac?.abort();
       }, HIDDEN_CLOSE_MS);
     } else {
@@ -210,6 +226,7 @@ export function startLive(
         sleeping = false;
         failures = 0;
         backoff = 1000;
+        if (polling()) void poll(); // the fallback resumes at once; the stream is retried too
         void connect();
       }
     }
@@ -220,6 +237,7 @@ export function startLive(
   return () => {
     stopped = true;
     clearTimer();
+    clearPoll();
     if (hiddenTimer) clearTimeout(hiddenTimer);
     ac?.abort();
     doc?.removeEventListener("visibilitychange", onVisibility);

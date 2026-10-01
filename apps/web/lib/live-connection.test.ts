@@ -4,8 +4,8 @@
  * and "unreachable" only when nothing answers.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { EMPTY_SAMPLES, useLabStatusStore } from "./lab-status-store";
-import { readSse, startLive } from "./live-connection";
+import { EMPTY_SAMPLES, LAB_STATUS_POLL_MS, useLabStatusStore } from "./lab-status-store";
+import { RETRY_STREAM_MS, STALL_MS, readSse, startLive } from "./live-connection";
 
 const origFetch = globalThis.fetch;
 afterEach(() => {
@@ -121,6 +121,52 @@ describe("startLive", () => {
     }
     expect(useLabStatusStore.getState().unreachable).toBe(false);
     expect(useLabStatusStore.getState().status?.serve?.sampled_at_ms).toBeGreaterThan(1000);
+  });
+
+  test("behind a proxy that buffers the stream, polling never pauses while the stream is retried", async () => {
+    const polls: number[] = [];
+    const streams: number[] = [];
+    globalThis.fetch = (async (url: string) => {
+      if (String(url).startsWith("/api/lab-status")) {
+        polls.push(Date.now());
+        return Response.json(JSON.parse(tick(1000 + polls.length)));
+      }
+      throw new Error("unexpected " + url);
+    }) as unknown as typeof fetch;
+    // every timer runs 100× faster: stall 80 ms, poll 20 ms, stream retry 300 ms
+    const SCALE = 100;
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number) => realSetTimeout(fn, (ms ?? 0) / SCALE)) as typeof setTimeout;
+    let stop = () => {};
+    try {
+      // headers arrive, then not one byte: the stall timer is what ends each attempt
+      stop = startLive(async (_url, init) => {
+        streams.push(Date.now());
+        const signal = init?.signal;
+        return new Response(
+          new ReadableStream({
+            start(ctrl) {
+              signal?.addEventListener("abort", () => ctrl.error(new DOMException("aborted", "AbortError")));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
+      // two failed attempts → poll mode → retries every RETRY_STREAM_MS; watch two retries
+      await until(() => streams.length >= 4, 5000);
+      await new Promise((r) => realSetTimeout(r, (STALL_MS + LAB_STATUS_POLL_MS) / SCALE));
+    } finally {
+      stop();
+      globalThis.setTimeout = realSetTimeout;
+    }
+    expect(useLabStatusStore.getState().transport).toBe("poll");
+    // a failed retry goes back to waiting RETRY_STREAM_MS, not through the reconnect backoff
+    expect(streams[3] - streams[2]).toBeGreaterThanOrEqual(RETRY_STREAM_MS / SCALE - 5);
+    // from the first retry on, polls kept landing every LAB_STATUS_POLL_MS (no stall-long holes)
+    const during = polls.filter((t) => t >= streams[2]);
+    expect(during.length).toBeGreaterThan(10);
+    const gaps = during.slice(1).map((t, i) => t - during[i]);
+    expect(Math.max(...gaps)).toBeLessThan(STALL_MS / SCALE);
   });
 
   test("the web proxy's bare 500 (controller down) reads as no answer, not as a server bug", async () => {

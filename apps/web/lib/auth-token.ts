@@ -35,8 +35,13 @@ export function tokenQuery(url: string): string {
   return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
 }
 
-/** 401 / LAIL_TOKEN required is not "controller down". */
+/**
+ * The controller's own token gate (HTTP 401 + {error:"unauthorized"}), from an
+ * ApiError thrown by lib/api.ts. Decided by status, not message text: a 401 the
+ * controller relays from elsewhere (e.g. the HF Hub) or a body that merely
+ * mentions "401" is a real failure, not "paste your token".
+ */
 export function isUnauthorizedError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err ?? "");
-  return /401|unauthorized|LAIL_TOKEN/i.test(msg);
+  const e = err as { status?: unknown; json?: { error?: unknown } | null } | null;
+  return e?.status === 401 && e.json?.error === "unauthorized";
 }

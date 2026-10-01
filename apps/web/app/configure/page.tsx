@@ -19,7 +19,7 @@ export default function ConfigurePage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
 
   useEffect(() => {
     api.configure
@@ -28,7 +28,7 @@ export default function ConfigurePage() {
         setSettings(s);
         setLoadError(null);
       })
-      .catch((e) => setLoadError(String((e as Error).message || e)));
+      .catch(setLoadError);
   }, []);
 
   if (loadError) {
@@ -56,7 +56,7 @@ export default function ConfigurePage() {
                 api.configure
                   .get()
                   .then(setSettings)
-                  .catch((e) => setLoadError(String((e as Error).message || e)));
+                  .catch(setLoadError);
               }}
             >
               Retry
@@ -65,7 +65,9 @@ export default function ConfigurePage() {
         >
           {isUnauthorizedError(loadError)
             ? "The controller is up. Paste the token in the banner, then retry."
-            : loadError}
+            : loadError instanceof Error
+              ? loadError.message
+              : String(loadError)}
         </Callout>
       </div>
     );

@@ -13,18 +13,37 @@ function lailTokenHeader(): Record<string, string> {
   return t ? { "X-Lail-Token": t } : {};
 }
 
+/** A non-2xx reply. `message` stays the body text (what pages already show). */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    body: string,
+    /** Parsed body when it was JSON, e.g. the controller's {error, message}. */
+    readonly json: { error?: string; message?: string } | null,
+  ) {
+    super(body);
+    this.name = "ApiError";
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
+    ...init,
     headers: {
       "Content-Type": "application/json",
       ...lailTokenHeader(),
       ...(init?.headers || {}),
     },
-    ...init,
   });
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || r.statusText);
+    const body = await r.text();
+    let json: ApiError["json"] = null;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(r.status, body || r.statusText, json);
   }
   return r.json();
 }

@@ -558,7 +558,7 @@ export function watchJob(
       })
       .catch((e: unknown) => {
         if (closed) return;
-        if (String((e as Error)?.message ?? e).includes("job not found")) {
+        if (e instanceof ApiError && e.status === 404) {
           status({ status: "failed", progress: last.progress, message: "job not found — the serve-engine no longer knows it" });
           finish(null);
           return;

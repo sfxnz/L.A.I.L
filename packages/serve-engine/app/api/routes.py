@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .. import db
 from ..config import DEFAULT_BASE_URL, RUNS_DIR, SERVE_EXAMPLES
-from ..services import agentic, autoconfig, cluster, jobs, metadata, perf, serve, status_sampler
+from ..services import agentic, autoconfig, cluster, jobs, metadata, serve, status_sampler
 
 router = APIRouter()
 
@@ -29,6 +29,10 @@ async def status() -> dict[str, Any]:
     Never runs collectors on the request path; waits (≤2 s) only for the first sample.
     """
     return await status_sampler.SAMPLER.status()
+
+
+# Handlers that shell out, ssh, or read sqlite / envelopes are plain `def`: FastAPI
+# runs them in its threadpool, so they never stall /status or the job SSE loop.
 
 
 @router.get("/cluster")
@@ -199,12 +203,12 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 
 @router.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str) -> dict[str, Any]:
+def cancel_job(job_id: str) -> dict[str, Any]:
     """Request cancellation. Job states: queued → running → completed | failed | cancelled.
 
     Sets the job's cancel flag; the runner writes `cancelled` at its next check
-    (between bench waves, per SSE chunk), so `status` here is usually still
-    `running`. A job with no runner in this process (orphaned by a restart) is
+    (between golden cases, per tool-eval-bench output line — the subprocess is
+    terminated), so `status` here is usually still `running`. A job with no runner in this process (orphaned by a restart) is
     marked `cancelled` immediately. Already-terminal jobs are returned unchanged.
     """
     job = jobs.request_cancel(job_id)
@@ -215,19 +219,26 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
 
 @router.get("/jobs/{job_id}/logs")
 async def job_logs_sse(job_id: str) -> EventSourceResponse:
-    j = db.get_job(job_id)
+    j = await asyncio.to_thread(db.get_job, job_id)
     if not j:
         raise HTTPException(404, "job not found")
     log_path = j.get("log_path")
 
+    def poll(offset: int) -> tuple[dict[str, Any], str, int]:
+        # Liveness before the row: a runner that finishes in between has already written its terminal state.
+        live = jobs.is_live(job_id)
+        job = db.get_job(job_id) or j
+        if job.get("status") not in jobs.TERMINAL_STATES and not live:
+            job = {**job, "status": "failed", "message": "no runner in this process (orphaned)"}
+        chunk, offset = jobs.read_log_tail(log_path, offset) if log_path else ("", offset)
+        return job, chunk, offset
+
     async def gen() -> AsyncIterator[dict[str, str]]:
         offset = 0
         while True:
-            job = db.get_job(job_id) or j
-            if log_path:
-                chunk, offset = jobs.read_log_tail(log_path, offset)
-                if chunk:
-                    yield {"event": "log", "data": chunk}
+            job, chunk, offset = await asyncio.to_thread(poll, offset)
+            if chunk:
+                yield {"event": "log", "data": chunk}
             yield {
                 "event": "status",
                 "data": json.dumps(
@@ -407,70 +418,6 @@ async def smoke(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
         }
 
 
-# ─── Perf ─────────────────────────────────────────────────────────────────────
-
-
-class PerfRequest(BaseModel):
-    base_url: str = DEFAULT_BASE_URL
-    model: Optional[str] = None
-    intent: str = "attach"
-    runner: Literal["decode", "workflow", "prefill", "concurrency"] = "decode"
-    workload: Literal["structured", "prose", "code", "json"] = "prose"
-    concurrencies: list[int] = Field(default_factory=lambda: [1])
-    concurrency: int = 4
-    dollars_per_hour: float = 0.5
-
-
-@router.post("/bench/perf")
-async def bench_perf(body: PerfRequest) -> dict[str, str]:
-    if body.runner in ("decode", "workflow"):
-
-        def work(log, progress, **kw):
-            return perf.run_workflow_bench(
-                base_url=body.base_url,
-                model=body.model,
-                concurrencies=body.concurrencies,
-                workload=body.workload,
-                intent=body.intent,
-                dollars_per_hour=body.dollars_per_hour,
-                log=log,
-                progress=progress,
-                probe=status_sampler.SAMPLER.probe(),
-                cancel=kw.get("cancel"),
-            )
-
-    elif body.runner == "prefill":
-
-        def work(log, progress, **kw):
-            return perf.run_external_prefill(
-                base_url=body.base_url,
-                model=body.model,
-                intent=body.intent,
-                log=log,
-                progress=progress,
-                probe=status_sampler.SAMPLER.probe(),
-            )
-
-    else:
-
-        def work(log, progress, **kw):
-            return perf.run_external_concurrency(
-                base_url=body.base_url,
-                model=body.model,
-                concurrency=body.concurrency,
-                intent=body.intent,
-                log=log,
-                progress=progress,
-                probe=status_sampler.SAMPLER.probe(),
-            )
-
-    job_kind = (
-        f"decode_{body.workload}" if body.runner in ("decode", "workflow") else f"perf_{body.runner}"
-    )
-    job_id = await jobs.start_job(job_kind, work)
-    return {"job_id": job_id}
-
-
 # ─── Agentic ──────────────────────────────────────────────────────────────────
 
 
@@ -488,7 +435,7 @@ class AgenticRequest(BaseModel):
 async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
     if body.suite == "golden":
 
-        def work(log, progress, **kw):
+        def work(log, progress, cancel, **kw):
             return agentic.run_golden_tools(
                 base_url=body.base_url,
                 model=body.model,
@@ -496,11 +443,12 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
                 log=log,
                 progress=progress,
                 probe=status_sampler.SAMPLER.probe(),
+                cancel=cancel,
             )
 
     else:
 
-        def work(log, progress, **kw):
+        def work(log, progress, cancel, **kw):
             return agentic.run_tool_eval_bench(
                 base_url=body.base_url,
                 model=body.model,
@@ -511,15 +459,42 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
                 log=log,
                 progress=progress,
                 probe=status_sampler.SAMPLER.probe(),
+                cancel=cancel,
             )
 
-    job_id = await jobs.start_job(f"agentic_{body.suite}", work)
+    try:
+        job_id = await jobs.start_job(f"agentic_{body.suite}", work)
+    except jobs.BenchBusy as e:
+        raise HTTPException(409, {"error": "bench_busy", **e.holder}) from e
     return {"job_id": job_id}
 
 
+class LeaseRequest(BaseModel):
+    lease_id: str = Field(min_length=1, max_length=128)
+    owner: str = "controller"
+    ttl_s: float = Field(default=90.0, gt=0, le=600)
+
+
+@router.post("/bench/lease")
+def bench_lease(body: LeaseRequest) -> dict[str, Any]:
+    """Take or renew the bench lease for a bench measured outside this process (the
+    controller's streams engine). 409 while a bench job runs here or another lease is
+    held; bench jobs refuse to start while it is held. Renew before `ttl_s` runs out."""
+    holder = jobs.acquire_lease(body.lease_id, body.owner, body.ttl_s)
+    if holder is not None:
+        raise HTTPException(409, {"error": "bench_busy", **holder})
+    return {"lease_id": body.lease_id, "ttl_s": body.ttl_s}
+
+
+@router.delete("/bench/lease/{lease_id}")
+def bench_lease_release(lease_id: str) -> dict[str, str]:
+    jobs.release_lease(lease_id)
+    return {"released": lease_id}
+
+
 @router.get("/bench/tool-eval-status")
-async def tool_eval_status() -> dict[str, Any]:
-    return await asyncio.to_thread(agentic.tool_eval_available)
+def tool_eval_status() -> dict[str, Any]:
+    return agentic.tool_eval_available()
 
 
 # ─── Runs / compare ───────────────────────────────────────────────────────────
@@ -530,11 +505,13 @@ async def tool_eval_status() -> dict[str, Any]:
 
 
 @router.get("/runs")
-def list_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[str, Any]]:
-    rows = db.list_runs(limit if not kind else max(limit, 100))
-    if kind:
-        rows = [r for r in rows if r.get("kind") == kind][:limit]
-    return rows
+def list_runs(limit: int = Query(50, ge=1, le=500), kind: Optional[str] = None) -> list[dict[str, Any]]:
+    return db.list_runs(limit, kind=kind)
+
+
+@router.get("/runs/count")
+def count_runs(kind: Optional[str] = None) -> dict[str, int]:
+    return {"count": db.count_runs(kind)}
 
 
 class RunImport(BaseModel):
@@ -562,7 +539,12 @@ async def import_run(body: RunImport) -> dict[str, str]:
             workload=body.workload,
             metrics=body.metrics,
             probe=probe,
+            # The serve config the run measured (taken by the controller at run start).
+            engine_extra={"flags_fingerprint": body.workload.get("serve_fingerprint")},
         )
+        # Cumulative endpoint counters at import time describe nothing about this run;
+        # per-level /metrics deltas travel in the arms instead.
+        envelope["engine"].pop("metrics_snapshot", None)
         envelope["source"] = body.source
         run_id = envelope["run_id"]
         path = RUNS_DIR / f"{run_id}.json"
@@ -583,65 +565,65 @@ async def import_run(body: RunImport) -> dict[str, str]:
     return {"run_id": run_id}
 
 
-@router.get("/runs/tool-eval/board")
-def tool_eval_board(limit: int = 40) -> dict[str, Any]:
-    """Normalized tool-eval scorecards for leaderboard + compare UI."""
-    rows = [r for r in db.list_runs(80) if r.get("kind") == "agentic_tool_eval"][:limit]
-    board: list[dict[str, Any]] = []
-    for row in rows:
-        env = db.load_envelope(row["path"]) or {}
-        ag = env.get("agentic") if isinstance(env.get("agentic"), dict) else {}
-        scores = ag.get("scores") if isinstance(ag.get("scores"), dict) else {}
-        model = env.get("model") if isinstance(env.get("model"), dict) else {}
-        engine = env.get("engine") if isinstance(env.get("engine"), dict) else {}
-        workload = env.get("workload") if isinstance(env.get("workload"), dict) else {}
-        model_id = row.get("model_id") or model.get("id") or "unknown"
-        final = ag.get("final_score")
-        if final is None:
-            final = (row.get("summary") or {}).get("final_score")
-        cats = scores.get("category_scores") or []
-        board.append(
+def _board_row(row: dict[str, Any]) -> dict[str, Any]:
+    """One normalized tool-eval scorecard from its index row and envelope."""
+    env = db.load_envelope(row["path"]) or {}
+    ag = env.get("agentic") if isinstance(env.get("agentic"), dict) else {}
+    scores = ag.get("scores") if isinstance(ag.get("scores"), dict) else {}
+    model = env.get("model") if isinstance(env.get("model"), dict) else {}
+    engine = env.get("engine") if isinstance(env.get("engine"), dict) else {}
+    workload = env.get("workload") if isinstance(env.get("workload"), dict) else {}
+    model_id = row.get("model_id") or model.get("id") or "unknown"
+    final = ag.get("final_score")
+    if final is None:
+        final = (row.get("summary") or {}).get("final_score")
+    cats = scores.get("category_scores") or []
+    return {
+        "run_id": row["run_id"],
+        "created_at": row.get("created_at"),
+        "model_id": model_id,
+        "model_short": str(model_id).split("/")[-1],
+        "final_score": final,
+        "rating": ag.get("rating") or (row.get("summary") or {}).get("rating"),
+        "preset": workload.get("preset") or (row.get("summary") or {}).get("preset"),
+        "total_scenarios": ag.get("total_scenarios")
+        or scores.get("total_scenarios")
+        or (row.get("summary") or {}).get("total_scenarios"),
+        "total_points": scores.get("total_points"),
+        "max_points": scores.get("max_points"),
+        "deployability": ag.get("deployability"),
+        "responsiveness": ag.get("responsiveness"),
+        "safety_passed": (ag.get("safety_gate") or {}).get("passed")
+        if isinstance(ag.get("safety_gate"), dict)
+        else True,
+        "safety_warnings": ag.get("safety_warnings") or [],
+        "categories": [
             {
-                "run_id": row["run_id"],
-                "created_at": row.get("created_at"),
-                "model_id": model_id,
-                "model_short": str(model_id).split("/")[-1],
-                "final_score": final,
-                "rating": ag.get("rating") or (row.get("summary") or {}).get("rating"),
-                "preset": workload.get("preset") or (row.get("summary") or {}).get("preset"),
-                "total_scenarios": ag.get("total_scenarios")
-                or scores.get("total_scenarios")
-                or (row.get("summary") or {}).get("total_scenarios"),
-                "total_points": scores.get("total_points"),
-                "max_points": scores.get("max_points"),
-                "deployability": ag.get("deployability"),
-                "responsiveness": ag.get("responsiveness"),
-                "safety_passed": (ag.get("safety_gate") or {}).get("passed")
-                if isinstance(ag.get("safety_gate"), dict)
-                else True,
-                "safety_warnings": ag.get("safety_warnings") or [],
-                "categories": [
-                    {
-                        "id": c.get("category"),
-                        "label": c.get("label"),
-                        "percent": c.get("percent"),
-                        "earned": c.get("earned"),
-                        "max": c.get("max"),
-                        "pass": c.get("pass_count"),
-                        "partial": c.get("partial_count"),
-                        "fail": c.get("fail_count"),
-                    }
-                    for c in cats
-                    if isinstance(c, dict)
-                ],
-                "engine_image": engine.get("image"),
-                "engine_version": engine.get("version"),
-                "quant": (env.get("weights") or {}).get("dtype")
-                if isinstance(env.get("weights"), dict)
-                else None,
-                "href": f"/evals/tool/{row['run_id']}",
+                "id": c.get("category"),
+                "label": c.get("label"),
+                "percent": c.get("percent"),
+                "earned": c.get("earned"),
+                "max": c.get("max"),
+                "pass": c.get("pass_count"),
+                "partial": c.get("partial_count"),
+                "fail": c.get("fail_count"),
             }
-        )
+            for c in cats
+            if isinstance(c, dict)
+        ],
+        "engine_image": engine.get("image"),
+        "engine_version": engine.get("version"),
+        "quant": (env.get("weights") or {}).get("dtype")
+        if isinstance(env.get("weights"), dict)
+        else None,
+        "href": f"/evals/tool/{row['run_id']}",
+    }
+
+
+@router.get("/runs/tool-eval/board")
+def tool_eval_board(limit: int = Query(40, ge=1, le=500)) -> dict[str, Any]:
+    """Normalized tool-eval scorecards for leaderboard + compare UI (the newest `limit`)."""
+    board = [_board_row(row) for row in db.list_runs(limit, kind="agentic_tool_eval")]
     # Sort by score desc then recency
     board.sort(
         key=lambda x: (
@@ -659,21 +641,12 @@ def tool_eval_compare(ids: str) -> dict[str, Any]:
     run_ids = [x.strip() for x in ids.split(",") if x.strip()]
     if len(run_ids) < 2 or len(run_ids) > 4:
         raise HTTPException(400, "pass 2–4 run ids via ?ids=a,b")
-    board = tool_eval_board(limit=80)["runs"]
-    by_id = {r["run_id"]: r for r in board}
     selected = []
     for rid in run_ids:
-        if rid not in by_id:
-            # try load fresh
-            row = db.get_run(rid)
-            if not row:
-                raise HTTPException(404, f"run not found: {rid}")
-            # rebuild one entry via board filter
-            full = tool_eval_board(limit=80)
-            by_id = {r["run_id"]: r for r in full["runs"]}
-        if rid not in by_id:
+        row = db.get_run(rid)
+        if not row or row.get("kind") != "agentic_tool_eval":
             raise HTTPException(404, f"run not found: {rid}")
-        selected.append(by_id[rid])
+        selected.append(_board_row(row))
 
     # winner by final_score
     ranked = sorted(

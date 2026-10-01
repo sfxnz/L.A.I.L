@@ -48,7 +48,33 @@ def init_db() -> None:
             )
             """
         )
+        c.execute("CREATE INDEX IF NOT EXISTS runs_kind_created ON runs(kind, created_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS runs_created ON runs(created_at DESC)")
+        # The retired serve-engine decode bench (perf.py: 256 tokens, no warmup, other
+        # percentile/TPOT definitions) wrote kind='decode' with `summary.workload`, and its
+        # external runners wrote perf_*. Re-kind them `legacy_*` once so `decode` means the
+        # one controller bench and old rows never ghost or delta against new ones.
+        c.execute(
+            """
+            UPDATE runs SET kind = 'legacy_' || kind
+            WHERE (kind = 'decode' AND json_extract(summary_json, '$.workload') IS NOT NULL)
+               OR kind IN ('perf_workflow', 'perf_prefill_decode', 'perf_concurrency')
+            """
+        )
         c.commit()
+
+
+def fail_orphaned_jobs() -> int:
+    """At startup no runner exists yet: every queued/running row is an orphan of the last process."""
+    with _conn() as c:
+        n = c.execute(
+            """
+            UPDATE jobs SET status = 'failed', message = 'interrupted by serve-engine restart'
+            WHERE status IN ('queued', 'running')
+            """
+        ).rowcount
+        c.commit()
+    return n
 
 
 def insert_run(
@@ -80,17 +106,30 @@ def insert_run(
         c.commit()
 
 
-def list_runs(limit: int = 50) -> list[dict[str, Any]]:
+def list_runs(limit: int = 50, kind: str | None = None) -> list[dict[str, Any]]:
+    """Newest first. `kind` filters in SQL, before the LIMIT."""
     with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if kind:
+            rows = c.execute(
+                "SELECT * FROM runs WHERE kind = ? ORDER BY created_at DESC LIMIT ?", (kind, limit)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         d["summary"] = json.loads(d.pop("summary_json") or "{}")
         out.append(d)
     return out
+
+
+def count_runs(kind: str | None = None) -> int:
+    with _conn() as c:
+        if kind:
+            return c.execute("SELECT COUNT(*) FROM runs WHERE kind = ?", (kind,)).fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
 
 def get_run(run_id: str) -> dict[str, Any] | None:

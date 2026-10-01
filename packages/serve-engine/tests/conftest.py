@@ -4,7 +4,8 @@ import pytest
 
 from app import db
 from app.api import routes
-from app.services import jobs, perf
+from app.services import agentic
+from app.services import jobs
 
 
 @pytest.fixture
@@ -14,7 +15,7 @@ def isolated_data(monkeypatch, tmp_path):
     runs = tmp_path / "runs"
     runs.mkdir()
     monkeypatch.setattr(routes, "RUNS_DIR", runs)
-    monkeypatch.setattr(perf, "RUNS_DIR", runs)
+    monkeypatch.setattr(agentic, "RUNS_DIR", runs)
     monkeypatch.setattr(jobs, "DATA_DIR", tmp_path)
     db.init_db()
     return tmp_path

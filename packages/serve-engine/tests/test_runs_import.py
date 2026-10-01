@@ -22,7 +22,7 @@ PROBE = {
 BODY = {
     "kind": "decode",
     "model": "org/m",
-    "workload": {"pack": "prose", "levels": [1, 2], "max_tokens": 512},
+    "workload": {"pack": "prose", "levels": [1, 2], "max_tokens": 512, "serve_fingerprint": "8488b677"},
     "metrics": {
         "arms": [{"concurrency": 1, "aggregate_tok_per_s": 33.1}],
         "headline": {"decode_tok_per_s_median_c1": 33.1, "aggregate_peak_tok_per_s": 96.0},
@@ -55,7 +55,9 @@ def test_import_persists_envelope_and_indexes_the_run(client, isolated_data):
     assert env["model"]["id"] == "org/m" and env["model"]["max_model_len"] == 262144
     assert env["hardware"]["gpu_sku"] == "NVIDIA GB10"
     assert env["engine"]["version"] == "0.28.1"
-    assert env["engine"]["metrics_snapshot"] == {"gen_tok_per_s": 40.0}
+    # The serve config the run measured; no post-run cumulative counters.
+    assert env["engine"]["flags_fingerprint"] == "8488b677"
+    assert "metrics_snapshot" not in env["engine"]
     assert env["endpoint"]["base_url"] == "http://127.0.0.1:8000"
     assert env["workload"] == BODY["workload"] and env["metrics"] == BODY["metrics"]
 
@@ -91,3 +93,50 @@ def test_import_requires_the_same_token_as_sibling_routes(client, monkeypatch):
     assert denied.status_code == 401 and "LAIL_TOKEN required" in denied.text
     assert client.post("/api/runs/import", json=BODY, headers={"X-Lail-Token": "s3cret"}).status_code == 200
     assert client.post("/api/jobs/x/cancel").status_code == 401
+
+
+# ─── run index: filters before LIMIT ──────────────────────────────────────────
+
+
+def _row(run_id: str, created: str, kind: str, summary: dict | None = None, path: str = "/nope.json") -> None:
+    from app import db
+
+    db.insert_run(run_id=run_id, created_at=created, kind=kind, intent="attach", model_id="org/m", summary=summary or {}, path=path)
+
+
+def test_kind_filter_runs_before_the_limit(client):
+    _row("old-prefill", "2026-09-01T00:00:00", "prefill")
+    _row("old-tool", "2026-09-02T00:00:00", "agentic_tool_eval", {"final_score": 86})
+    for i in range(150):  # a newer decode flood, as on the live box
+        _row(f"d{i:03d}", f"2026-09-20T00:{i // 60:02d}:{i % 60:02d}", "decode")
+    assert [r["run_id"] for r in client.get("/api/runs", params={"kind": "prefill", "limit": 12}).json()] == ["old-prefill"]
+    assert [r["run_id"] for r in client.get("/api/runs", params={"kind": "agentic_tool_eval"}).json()] == ["old-tool"]
+    assert len(client.get("/api/runs", params={"kind": "decode", "limit": 12}).json()) == 12
+    assert len(client.get("/api/runs").json()) == 50
+    assert client.get("/api/runs/count").json() == {"count": 152}
+    assert client.get("/api/runs/count", params={"kind": "agentic_tool_eval"}).json() == {"count": 1}
+    board = client.get("/api/runs/tool-eval/board").json()
+    assert board["count"] == 1 and board["runs"][0]["run_id"] == "old-tool" and board["runs"][0]["final_score"] == 86
+
+
+def test_tool_eval_compare_loads_runs_by_id(client):
+    for i, score in enumerate((86, 65)):
+        _row(f"t{i}", f"2026-09-0{i + 1}T00:00:00", "agentic_tool_eval", {"final_score": score})
+    for i in range(100):
+        _row(f"d{i:03d}", f"2026-09-20T00:00:{i:02d}", "decode")
+    r = client.get("/api/runs/tool-eval/compare", params={"ids": "t0,t1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["winner_run_id"] == "t0"
+    assert client.get("/api/runs/tool-eval/compare", params={"ids": "t0,d001"}).status_code == 404
+
+
+def test_init_db_rekinds_retired_perf_rows_once(isolated_data):
+    from app import db
+
+    _row("perfpy", "2026-09-20T00:00:00", "decode", {"workload": "prose", "decode_tok_per_s_median_c1": 29.1})
+    _row("ctrl", "2026-09-21T00:00:00", "decode", {"aggregate_peak_tok_per_s": 96.0})
+    _row("wf", "2026-08-01T00:00:00", "perf_workflow")
+    db.init_db()
+    db.init_db()  # idempotent
+    kinds = {r["run_id"]: r["kind"] for r in db.list_runs(10)}
+    assert kinds == {"perfpy": "legacy_decode", "ctrl": "decode", "wf": "legacy_perf_workflow"}

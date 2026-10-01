@@ -8,7 +8,7 @@ from collections import Counter
 import httpx
 import pytest
 
-from app.services import agentic, cluster, metadata, perf, status_sampler
+from app.services import agentic, cluster, metadata, status_sampler
 from app.services.status_sampler import StatusSampler
 
 STATUS_KEYS = {
@@ -375,52 +375,6 @@ def test_lifespan_starts_the_sampler_and_replaces_on_event(monkeypatch):
     assert body["healthy"] is True
     assert calls["hw"] >= 1 and calls["cluster"] >= 1
     assert status_sampler.SAMPLER._tasks == []
-
-
-# ─── bench threads use the cached probe ───────────────────────────────────────
-
-
-def _fake_stream(base, model, user_content, max_tokens, label, cancel=None):
-    return perf.ReqResult(True, 1.0, 0.2, 60, 100, label, last_s=0.9)
-
-
-def test_workflow_bench_uses_the_cached_probe_and_never_probes_itself(isolated_data, monkeypatch):
-    _no_collectors(monkeypatch)
-    monkeypatch.setattr(metadata, "collect_hardware", lambda: {"gpu_sku": "NVIDIA GB10"})
-    monkeypatch.setattr(metadata, "list_vllm_containers", lambda: [])
-    monkeypatch.setattr(perf, "stream_one", _fake_stream)
-
-    env = perf.run_workflow_bench(
-        base_url="http://127.0.0.1:8000",
-        model="org/m",
-        concurrencies=[1],
-        workload="prose",
-        probe=_probe("http://127.0.0.1:8000"),
-    )
-    assert env["engine"]["version"] == "0.28.1"
-    assert env["engine"]["metrics_snapshot"]["decode_tok_per_s"] == 42.0
-    assert env["endpoint"]["models"] == [{"id": "org/m", "max_model_len": 8192}]
-    assert env["model"]["max_model_len"] == 8192
-
-
-def test_workflow_bench_ignores_a_cached_probe_for_another_endpoint(isolated_data, monkeypatch):
-    _no_collectors(monkeypatch)
-    monkeypatch.setattr(metadata, "collect_hardware", lambda: {"gpu_sku": "NVIDIA GB10"})
-    monkeypatch.setattr(metadata, "list_vllm_containers", lambda: [])
-    monkeypatch.setattr(perf, "stream_one", _fake_stream)
-
-    env = perf.run_workflow_bench(
-        base_url="http://127.0.0.1:8888",
-        model="org/other",
-        concurrencies=[1],
-        workload="prose",
-        probe=_probe("http://127.0.0.1:8000"),
-    )
-    assert env["engine"]["version"] is None
-    assert env["endpoint"]["models"] == []
-    assert env["model"]["id"] == "org/other"
-
-
 
 
 # ─── memory pressure (headroom) ───────────────────────────────────────────────

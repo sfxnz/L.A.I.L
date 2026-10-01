@@ -4,13 +4,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import threading
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 from ..config import DEFAULT_BASE_URL, RUNS_DIR
 from .. import db
+from .jobs import JobCancelled
 from .metadata import build_envelope, make_run_id
 
 
@@ -173,7 +176,9 @@ def run_golden_tools(
     log: Any = None,
     progress: Callable | None = None,
     probe: dict[str, Any] | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
+    """12 serial tool-choice cases. `cancel` is checked before each case."""
     base = base_url.rstrip("/")
     with urllib.request.urlopen(f"{base}/v1/models", timeout=30) as r:
         models = json.loads(r.read().decode())
@@ -189,6 +194,8 @@ def run_golden_tools(
     passes = 0
     fingerprint = None
     for i, (prompt, allowed) in enumerate(GOLDEN_CASES):
+        if cancel is not None and cancel.is_set():
+            raise JobCancelled(f"cancelled before case {i + 1}/{len(GOLDEN_CASES)}")
         if progress:
             progress(i / len(GOLDEN_CASES), prompt[:40])
         try:
@@ -296,7 +303,9 @@ def run_tool_eval_bench(
     log: Any = None,
     progress: Callable | None = None,
     probe: dict[str, Any] | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
+    """Run the tool-eval-bench CLI. Setting `cancel` terminates the subprocess."""
     info = tool_eval_available()
     if not info.get("available"):
         raise RuntimeError(
@@ -353,8 +362,23 @@ def run_tool_eval_bench(
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
+        # Own process group: cancel must reach children that hold stdout open too.
+        start_new_session=True,
     )
     assert proc.stdout
+
+    def watch_cancel() -> None:
+        # stdout can stay quiet for a whole scenario; don't wait for a line to notice.
+        while proc.poll() is None:
+            if cancel.wait(0.5):
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                return
+
+    if cancel is not None:
+        threading.Thread(target=watch_cancel, name="tool-eval-cancel", daemon=True).start()
     n_lines = 0
     done_hint = 0
     for line in proc.stdout:
@@ -384,6 +408,8 @@ def run_tool_eval_bench(
                 progress(min(0.9, 0.1 + n_lines * 0.01), line[:80])
 
     code = proc.wait()
+    if cancel is not None and cancel.is_set():
+        raise JobCancelled("cancelled — tool-eval-bench terminated")
     if code != 0 and not json_out.exists():
         raise RuntimeError(f"tool-eval-bench exited {code}")
 

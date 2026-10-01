@@ -68,7 +68,8 @@ function safeResolveUnder(root: string, rel: string): string {
   return abs;
 }
 
-export function listLabRuns(limit = 50): LabRunSummary[] {
+/** Newest first; `match` filters before `limit`, so a filtered list is never cut short by older non-matches. */
+export function listLabRuns(limit = 50, match?: (meta: LabRunMeta) => boolean): LabRunSummary[] {
   const root = labRoot();
   const dirs = readdirSync(root, { withFileTypes: true })
     .filter((d) => d.isDirectory())
@@ -80,7 +81,7 @@ export function listLabRuns(limit = 50): LabRunSummary[] {
   for (const id of dirs) {
     if (out.length >= limit) break;
     const meta = readMeta(id);
-    if (!meta) continue;
+    if (!meta || (match && !match(meta))) continue;
     out.push(toSummary(meta));
   }
   return out;
@@ -93,9 +94,7 @@ export function getLabRun(id: string): LabRunSummary | null {
 
 export function listLabRunsByFingerprint(fp: string, limit = 20): LabRunSummary[] {
   if (!fp) return [];
-  return listLabRuns(200)
-    .filter((r) => r.task_fingerprint === fp)
-    .slice(0, limit);
+  return listLabRuns(limit, (m) => m.task_fingerprint === fp);
 }
 
 export function compareLabRuns(ids: string[]): {

@@ -385,3 +385,17 @@ def test_job_sse_ends_for_a_row_with_no_runner(isolated_data, monkeypatch):
     with client.stream("GET", "/api/jobs/ghost/logs") as r:
         body = "".join(r.iter_text())
     assert '"status": "failed"' in body and "orphaned" in body
+
+
+def test_job_list_leaves_the_result_envelope_to_get_job(isolated_data, monkeypatch):
+    held = HeldExecutor()
+    monkeypatch.setitem(jobs._executors, "bench", held)
+
+    def work(log, progress, cancel, **kw):
+        return {"big": "x" * 1000}
+
+    job_id = asyncio.run(jobs.start_job("test", work))
+    held.fns[0]()
+    listed = next(j for j in db.list_jobs() if j["job_id"] == job_id)
+    assert "result" not in listed and "result_json" not in listed
+    assert db.get_job(job_id)["result"] == {"big": "x" * 1000}

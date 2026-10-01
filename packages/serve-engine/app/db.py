@@ -200,6 +200,8 @@ def get_job(job_id: str) -> dict[str, Any] | None:
 
 
 def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
+    """Job rows without their result envelope (tool-eval results run to hundreds of KB);
+    `get_job` carries it."""
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
@@ -207,8 +209,7 @@ def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         d = dict(r)
-        raw = d.pop("result_json")
-        d["result"] = json.loads(raw) if raw else None
+        d.pop("result_json", None)
         out.append(d)
     return out
 

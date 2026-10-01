@@ -229,16 +229,6 @@ export type LabStatus = {
     headroom?: string;
     error?: string;
     unreachable?: boolean;
-    presets?: string[];
-    serve_examples?: Record<string, ServeExample>;
-    tool_eval?: {
-      available: boolean;
-      path?: string | null;
-      via?: string;
-      version?: string | null;
-      install?: string;
-      repo?: string;
-    };
     cluster?: ClusterStatus;
     /** server epoch ms when this snapshot was published */
     sampled_at_ms?: number | null;
@@ -387,6 +377,8 @@ export const api = {
   usage: () => req<UsageSummary>("/api/usage"),
   startServe: (body: Record<string, unknown>) =>
     req<{ job_id: string }>("/api/serve/start", { method: "POST", body: JSON.stringify(body) }),
+  serveExamples: () =>
+    req<{ examples: Record<string, ServeExample>; presets: string[] }>("/api/serve/examples"),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
   agentRestore: () => req<{ job_id: string }>("/api/serve/agent-restore", { method: "POST" }),
   recommendServe: (model: string, fetchRemote = true) =>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, type LabStatus, type ServeExample, type ServeRecommend } from "@/lib/api";
+import { api, type ServeExample, type ServeRecommend } from "@/lib/api";
 import {
   Badge,
   Btn,
@@ -202,8 +202,18 @@ export default function ServerPage() {
   const jobStatus = jobWatch.job.status ?? "";
   const jobRunning = jobWatch.running;
 
-  const examples = (status?.serve?.serve_examples || {}) as Record<string, ServeExample>;
-  const modelHints = status?.serve?.presets || [];
+  // Static presets: fetched once, not carried on the 1 s live snapshot.
+  const [examples, setExamples] = useState<Record<string, ServeExample>>({});
+  const [modelHints, setModelHints] = useState<string[]>([]);
+  useEffect(() => {
+    api
+      .serveExamples()
+      .then((r) => {
+        setExamples(r.examples || {});
+        setModelHints(r.presets || []);
+      })
+      .catch(() => {});
+  }, []);
   /**
    * Spine numbering. The presets block is conditional, so hardcoded numerals
    * render 01 → 02 → 04 when no presets exist — a skipped step reads as a
@@ -1282,7 +1292,6 @@ export default function ServerPage() {
         <AgenticTab
           track={track}
           healthy={healthy}
-          toolEval={status?.serve?.tool_eval}
         />
       )}
 
@@ -1404,11 +1413,9 @@ export default function ServerPage() {
 function AgenticTab({
   track,
   healthy,
-  toolEval,
 }: {
   track: (id: string) => void;
   healthy: boolean;
-  toolEval?: NonNullable<LabStatus["serve"]>["tool_eval"];
 }) {
   const [err, setErr] = useState<string | null>(null);
   const [preset, setPreset] = useState<"short" | "full" | "hardmode" | "coding">("short");
@@ -1418,13 +1425,13 @@ function AgenticTab({
     version?: string | null;
     install?: string;
     repo?: string;
-  } | null>(toolEval ?? null);
+  } | null>(null);
 
   useEffect(() => {
     api.toolEvalStatus().then(setTeb).catch(() => {});
   }, []);
 
-  const available = !!(teb?.available ?? toolEval?.available);
+  const available = !!teb?.available;
 
   return (
     <div className="space-y-4">

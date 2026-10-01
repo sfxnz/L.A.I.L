@@ -22,6 +22,8 @@ import {
   useCopy,
 } from "@/components/ui";
 import { useShallow } from "zustand/react/shallow";
+import { EngineSelect, EngineSummary, engineHas, useServeEngines } from "@/components/serve/EngineSelect";
+import { engineLabel } from "@/lib/engines";
 import { serveHealthy, tightestNode, useLabStatusStore, useStale } from "@/lib/lab-status-store";
 import { CONFIRM_WINDOW_MS, confirmStep } from "@/lib/confirm-click";
 import { LiveAge } from "@/components/status/LiveAge";
@@ -31,6 +33,13 @@ import { cn } from "@/lib/utils";
 
 // Serve is for serving: throughput / latency live on /bench, smoke, tool-calling
 // suites and the run log on /evals.
+
+/** What each engine calls the context window flag (vLLM: max-model-len). */
+const CONTEXT_FLAG: Record<string, string> = {
+  sglang: "context-length",
+  llamacpp: "ctx-size (-c)",
+  tensorfold: "context",
+};
 
 /* ---------------------------------------------------------------------------
    Local HUD atoms. Everything chromatic here resolves through lab-* tokens so
@@ -156,6 +165,11 @@ function Telem({
 export default function ServerPage() {
   // No live subscription here: the form must not re-render on every sample. The live
   // endpoint panel subscribes on its own and is the one place that says what serves.
+  const engines = useServeEngines();
+  const [engineName, setEngineName] = useState("vllm");
+  const eng = engines.find((e) => e.name === engineName);
+  const engLabel = eng?.label ?? engineName;
+  const has = (field: string) => engineHas(eng, field);
   const [model, setModel] = useState("");
   const [util, setUtil] = useState("");
   const [maxLen, setMaxLen] = useState("");
@@ -335,6 +349,15 @@ export default function ServerPage() {
     if (c.image) setImage(String(c.image));
     if (c.util != null) setUtil(String(c.util));
     if (c.max_model_len != null) setMaxLen(String(c.max_model_len));
+    if (c.port != null) setPort(String(c.port));
+  }
+
+  /** Switch engine: its default port replaces the old engine's default (never a port you typed). */
+  function selectEngine(name: string) {
+    const next = engines.find((e) => e.name === name);
+    if (next && (!port.trim() || port === String(eng?.default_port ?? 8000))) setPort(String(next.default_port));
+    setEngineName(name);
+    setRec(null);
   }
 
   function applyExample(ex: ServeExample, key?: string) {
@@ -369,7 +392,7 @@ export default function ServerPage() {
     setModel("");
     setUtil("");
     setMaxLen("");
-    setPort("8000");
+    setPort(String(eng?.default_port ?? 8000));
     setImage("");
     setQuantization("");
     setKvCacheDtype("");
@@ -402,7 +425,7 @@ export default function ServerPage() {
     setRecBusy(true);
     setRecError(null);
     try {
-      const r = await api.recommendServe(model.trim(), true);
+      const r = await api.recommendServe(model.trim(), true, engineName);
       setRec(r);
       applyConfig(r.config, r.model);
     } catch (e) {
@@ -425,7 +448,8 @@ export default function ServerPage() {
       .filter((l) => l && !l.startsWith("#") && l.includes("="));
     const body: Record<string, unknown> = {
       model: model.trim(),
-      port: parseInt(port, 10) || 8000,
+      engine: engineName,
+      port: parseInt(port, 10) || eng?.default_port || 8000,
       docker_env: envLines,
       quantization: quantization.trim(),
       kv_cache_dtype: kvCacheDtype.trim(),
@@ -489,8 +513,8 @@ export default function ServerPage() {
         <div>
           <h1 className="page-title">Serve</h1>
           <p className="page-sub">
-            Start a vLLM container on this host. Auto-configure reads the live model card and sizes
-            memory; advanced flags stay folded until you need them.
+            Start a serve container — vLLM, SGLang, llama.cpp or TensorFold. Auto-configure reads the
+            live model card and sizes memory; advanced flags stay folded until you need them.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -515,15 +539,26 @@ export default function ServerPage() {
                   }
                 />
                 <div className="animus-rule" aria-hidden />
-                <p className="text-[11px] leading-relaxed text-lab-muted">
-                  Fetches the live model card + config from huggingface.co, then researches
-                  Unsloth docs, NVIDIA playbooks, and GitHub vLLM recipes even when the card
-                  has no links. Scores every{" "}
-                  <code className="font-mono text-[10.5px] text-lab-text-dim">vllm serve</code>{" "}
-                  recipe, applies checkpoint safety (e.g. strips flashinfer_b12x on mixed FP8
-                  MoE), and sizes the hardware envelope automatically.
-                </p>
+                {engineName === "vllm" ? (
+                  <p className="text-[11px] leading-relaxed text-lab-muted">
+                    Fetches the live model card + config from huggingface.co, then researches
+                    Unsloth docs, NVIDIA playbooks, and GitHub vLLM recipes even when the card
+                    has no links. Scores every{" "}
+                    <code className="font-mono text-[10.5px] text-lab-text-dim">vllm serve</code>{" "}
+                    recipe, applies checkpoint safety (e.g. strips flashinfer_b12x on mixed FP8
+                    MoE), and sizes the hardware envelope automatically.
+                  </p>
+                ) : (
+                  <p className="text-[11px] leading-relaxed text-lab-muted">
+                    Fetches the model card + config from huggingface.co, sizes weights, tensor
+                    parallel and memory with the placement engine, and shows the exact{" "}
+                    {engLabel} command line for every rank before anything launches.
+                  </p>
+                )}
                 <div className="flex flex-wrap items-end gap-3">
+                  <div className="w-full sm:w-40">
+                    <EngineSelect engines={engines} value={engineName} onChange={selectEngine} disabled={jobRunning} />
+                  </div>
                   <div className="min-w-[16rem] flex-1">
                     <Field label="Model (HF id)" htmlFor="serve-model">
                       <input
@@ -555,6 +590,7 @@ export default function ServerPage() {
                     {recBusy ? "Fetching card…" : "Auto-configure from HF"}
                   </Btn>
                 </div>
+                <EngineSummary engine={eng} />
                 {recError && (
                   <Callout
                     tone="danger"
@@ -627,6 +663,22 @@ export default function ServerPage() {
                   )}
                   {rec.notes && (
                     <p className="text-[11px] leading-relaxed text-lab-muted">{rec.notes}</p>
+                  )}
+                  {(rec.processes || []).length > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="animus-eyebrow text-[9px] tracking-[0.2em]">
+                        {rec.processes!.length > 1 ? `Command per rank (${rec.processes!.length})` : "Command"}
+                      </div>
+                      {rec.processes!.map((p) => (
+                        <pre
+                          key={String(p.rank)}
+                          className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-[2px] border border-lab-border-subtle bg-lab-panel/60 p-2 font-mono text-[10.5px] leading-relaxed text-lab-text-dim"
+                        >
+                          {p.rank != null ? `# rank ${p.rank}${p.node ? ` on ${p.node}` : ""}\n` : ""}
+                          {p.argv}
+                        </pre>
+                      ))}
+                    </div>
                   )}
                   {(rec.warnings || []).length > 0 && (
                     <ul className="space-y-1 border-l-2 border-l-lab-warn pl-3 text-[11px] leading-relaxed text-lab-warn">
@@ -820,33 +872,46 @@ export default function ServerPage() {
               />
               <div className="animus-rule" aria-hidden />
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                <Field label="gpu-memory-utilization" htmlFor="serve-util">
-                  <Input
-                    id="serve-util"
-                    value={util}
-                    onChange={(e) => setUtil(e.target.value)}
-                    placeholder="0.85"
-                  />
-                </Field>
-                <Field label="max-model-len" htmlFor="serve-maxlen">
-                  <Input
-                    id="serve-maxlen"
-                    value={maxLen}
-                    onChange={(e) => setMaxLen(e.target.value)}
-                    placeholder="262144"
-                  />
-                </Field>
+                {has("util") && (
+                  <Field
+                    label={engineName === "sglang" ? "mem-fraction-static" : "gpu-memory-utilization"}
+                    htmlFor="serve-util"
+                  >
+                    <Input
+                      id="serve-util"
+                      value={util}
+                      onChange={(e) => setUtil(e.target.value)}
+                      placeholder={engineName === "vllm" ? "0.85" : "engine default"}
+                    />
+                  </Field>
+                )}
+                {has("max_model_len") && (
+                  <Field label={CONTEXT_FLAG[engineName] ?? "max-model-len"} htmlFor="serve-maxlen">
+                    <Input
+                      id="serve-maxlen"
+                      value={maxLen}
+                      onChange={(e) => setMaxLen(e.target.value)}
+                      placeholder={engineName === "vllm" ? "262144" : "engine default"}
+                    />
+                  </Field>
+                )}
                 <Field label="Port" htmlFor="serve-port">
                   <Input id="serve-port" value={port} onChange={(e) => setPort(e.target.value)} />
                 </Field>
-                <Field label="tensor-parallel-size" htmlFor="serve-tp">
-                  <Input
-                    id="serve-tp"
-                    value={tpSize}
-                    onChange={(e) => setTpSize(e.target.value)}
-                    placeholder="1"
-                  />
-                </Field>
+                {has("tensor_parallel_size") && (
+                  <Field
+                    label="tensor-parallel-size"
+                    htmlFor="serve-tp"
+                    hint={eng?.max_tp ? `≤ ${eng.max_tp} · one rank per Spark` : undefined}
+                  >
+                    <Input
+                      id="serve-tp"
+                      value={tpSize}
+                      onChange={(e) => setTpSize(e.target.value)}
+                      placeholder="1"
+                    />
+                  </Field>
+                )}
               </div>
 
               <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] bg-lab-editor/50 px-2 py-1">
@@ -878,14 +943,15 @@ export default function ServerPage() {
                   </span>
                 </summary>
                 <div className="grid gap-3 border-t border-lab-border-subtle p-3.5 sm:grid-cols-2 lg:grid-cols-3">
-                  <Field label="vLLM image" htmlFor="adv-image">
+                  <Field label={`${engLabel} image`} htmlFor="adv-image" hint={eng?.image_env ? `default from ${eng.image_env}` : undefined}>
                     <Input
                       id="adv-image"
                       value={image}
                       onChange={(e) => setImage(e.target.value)}
-                      placeholder="vllm/vllm-openai:v0.27.1"
+                      placeholder={eng?.default_image || "vllm/vllm-openai:v0.27.1"}
                     />
                   </Field>
+                  {has("quantization") && (
                   <Field label="--quantization" htmlFor="adv-quant">
                     <Input
                       id="adv-quant"
@@ -900,7 +966,9 @@ export default function ServerPage() {
                       <option value="compressed-tensors" />
                     </datalist>
                   </Field>
-                  <Field label="--kv-cache-dtype" htmlFor="adv-kv">
+                  )}
+                  {has("kv_cache_dtype") && (
+                  <Field label={engineName === "tensorfold" ? "--kv-dtype" : "--kv-cache-dtype"} htmlFor="adv-kv">
                     <Input
                       id="adv-kv"
                       value={kvCacheDtype}
@@ -913,6 +981,8 @@ export default function ServerPage() {
                       <option value="auto" />
                     </datalist>
                   </Field>
+                  )}
+                  {has("moe_backend") && (
                   <Field label="--moe-backend" htmlFor="adv-moe">
                     <Input
                       id="adv-moe"
@@ -926,84 +996,107 @@ export default function ServerPage() {
                       <option value="triton" />
                     </datalist>
                   </Field>
-                  <Field label="--max-num-seqs" htmlFor="adv-seqs">
-                    <Input
-                      id="adv-seqs"
-                      value={maxNumSeqs}
-                      onChange={(e) => setMaxNumSeqs(e.target.value)}
-                      placeholder="4"
-                    />
-                  </Field>
-                  <Field label="--load-format" htmlFor="adv-loadfmt">
-                    <Input
-                      id="adv-loadfmt"
-                      value={loadFormat}
-                      onChange={(e) => setLoadFormat(e.target.value)}
-                    />
-                  </Field>
-                  <Field label="--tool-call-parser" htmlFor="adv-toolparser">
-                    <Input
-                      id="adv-toolparser"
-                      value={toolCallParser}
-                      onChange={(e) => setToolCallParser(e.target.value)}
-                      placeholder="qwen3_coder"
-                    />
-                  </Field>
-                  <Field label="--reasoning-parser" htmlFor="adv-reasonparser">
-                    <Input
-                      id="adv-reasonparser"
-                      value={reasoningParser}
-                      onChange={(e) => setReasoningParser(e.target.value)}
-                      placeholder="qwen3"
-                    />
-                  </Field>
-                  <Field label="MTP speculative tokens" htmlFor="adv-mtptokens">
-                    <Input
-                      id="adv-mtptokens"
-                      value={mtpTokens}
-                      onChange={(e) => setMtpTokens(e.target.value)}
-                      disabled={!mtp}
-                    />
-                  </Field>
+                  )}
+                  {has("max_num_seqs") && (
+                    <Field label={engineName === "sglang" ? "--max-running-requests" : "--max-num-seqs"} htmlFor="adv-seqs">
+                      <Input
+                        id="adv-seqs"
+                        value={maxNumSeqs}
+                        onChange={(e) => setMaxNumSeqs(e.target.value)}
+                        placeholder="4"
+                      />
+                    </Field>
+                  )}
+                  {has("load_format") && (
+                    <Field label="--load-format" htmlFor="adv-loadfmt">
+                      <Input
+                        id="adv-loadfmt"
+                        value={loadFormat}
+                        onChange={(e) => setLoadFormat(e.target.value)}
+                      />
+                    </Field>
+                  )}
+                  {has("tool_call_parser") && (
+                    <Field label="--tool-call-parser" htmlFor="adv-toolparser">
+                      <Input
+                        id="adv-toolparser"
+                        value={toolCallParser}
+                        onChange={(e) => setToolCallParser(e.target.value)}
+                        placeholder="qwen3_coder"
+                      />
+                    </Field>
+                  )}
+                  {has("reasoning_parser") && (
+                    <Field label="--reasoning-parser" htmlFor="adv-reasonparser">
+                      <Input
+                        id="adv-reasonparser"
+                        value={reasoningParser}
+                        onChange={(e) => setReasoningParser(e.target.value)}
+                        placeholder="qwen3"
+                      />
+                    </Field>
+                  )}
+                  {has("mtp") && (
+                    <Field label="MTP speculative tokens" htmlFor="adv-mtptokens">
+                      <Input
+                        id="adv-mtptokens"
+                        value={mtpTokens}
+                        onChange={(e) => setMtpTokens(e.target.value)}
+                        disabled={!mtp}
+                      />
+                    </Field>
+                  )}
+                  {(has("trust_remote_code") || has("mtp")) && (
                   <div className="space-y-1.5 sm:col-span-2 lg:col-span-3">
                     <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Toggles</div>
                     <div className="animus-rule" aria-hidden />
                     <div className="grid gap-x-4 sm:grid-cols-2 lg:grid-cols-3">
-                      <CheckboxRow
-                        id="adv-trc"
-                        checked={trustRemoteCode}
-                        onChange={setTrustRemoteCode}
-                      >
-                        <span className="font-mono text-[11px]">--trust-remote-code</span>
-                      </CheckboxRow>
-                      <CheckboxRow
-                        id="adv-autotool"
-                        checked={enableAutoTool}
-                        onChange={setEnableAutoTool}
-                      >
-                        <span className="font-mono text-[11px]">--enable-auto-tool-choice</span>
-                      </CheckboxRow>
-                      <CheckboxRow
-                        id="adv-chunked"
-                        checked={chunkedPrefill}
-                        onChange={setChunkedPrefill}
-                      >
-                        <span className="font-mono text-[11px]">--enable-chunked-prefill</span>
-                      </CheckboxRow>
-                      <CheckboxRow
-                        id="adv-prefix"
-                        checked={prefixCaching}
-                        onChange={setPrefixCaching}
-                      >
-                        <span className="font-mono text-[11px]">--enable-prefix-caching</span>
-                      </CheckboxRow>
-                      <CheckboxRow id="adv-mtp" checked={mtp} onChange={setMtp}>
-                        <span className="font-mono text-[11px]">
-                          MTP (--speculative-config method=mtp)
-                        </span>
-                      </CheckboxRow>
+                      {has("trust_remote_code") && (
+                        <CheckboxRow
+                          id="adv-trc"
+                          checked={trustRemoteCode}
+                          onChange={setTrustRemoteCode}
+                        >
+                          <span className="font-mono text-[11px]">--trust-remote-code</span>
+                        </CheckboxRow>
+                      )}
+                      {has("enable_auto_tool_choice") && (
+                        <CheckboxRow
+                          id="adv-autotool"
+                          checked={enableAutoTool}
+                          onChange={setEnableAutoTool}
+                        >
+                          <span className="font-mono text-[11px]">--enable-auto-tool-choice</span>
+                        </CheckboxRow>
+                      )}
+                      {has("enable_chunked_prefill") && (
+                        <CheckboxRow
+                          id="adv-chunked"
+                          checked={chunkedPrefill}
+                          onChange={setChunkedPrefill}
+                        >
+                          <span className="font-mono text-[11px]">--enable-chunked-prefill</span>
+                        </CheckboxRow>
+                      )}
+                      {has("enable_prefix_caching") && (
+                        <CheckboxRow
+                          id="adv-prefix"
+                          checked={prefixCaching}
+                          onChange={setPrefixCaching}
+                        >
+                          <span className="font-mono text-[11px]">--enable-prefix-caching</span>
+                        </CheckboxRow>
+                      )}
+                      {has("mtp") && (
+                        <CheckboxRow id="adv-mtp" checked={mtp} onChange={setMtp}>
+                          <span className="font-mono text-[11px]">
+                            MTP (--speculative-config method=mtp)
+                          </span>
+                        </CheckboxRow>
+                      )}
                     </div>
                   </div>
+                  )}
                   <div className="sm:col-span-2 lg:col-span-3">
                     <Field label="Docker env (KEY=VALUE per line)" htmlFor="adv-dockerenv">
                       <textarea
@@ -1016,7 +1109,7 @@ export default function ServerPage() {
                     </Field>
                   </div>
                   <div className="sm:col-span-2 lg:col-span-3">
-                    <Field label="Extra free-form vLLM flags" htmlFor="adv-extra">
+                    <Field label={`Extra ${engLabel} flags`} htmlFor="adv-extra">
                       <textarea
                         id="adv-extra"
                         className={cn(inputCls, "min-h-[56px] font-mono text-xs")}
@@ -1045,7 +1138,7 @@ export default function ServerPage() {
                 : "border-[color:var(--animus-accent-edge)] bg-[color:var(--animus-accent-wash)]",
             )}
           >
-            <Seq n={step.launch} label="Launch" hint="starts a real vLLM container on this host" />
+            <Seq n={step.launch} label="Launch" hint={`starts a real ${engLabel} container`} />
             <div className="animus-rule mt-3" aria-hidden />
             <div className="mt-3.5 flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
               <div className="min-w-0 space-y-1.5">
@@ -1071,14 +1164,14 @@ export default function ServerPage() {
                 <p className="max-w-lg text-[11px] leading-relaxed text-lab-muted">
                   {startDisabledReason
                     ? `${startDisabledReason}.`
-                    : "Stops running vLLM containers first, then boots the configured serve. Live output docks below."}
+                    : "Stops running serve containers first, then boots the configured serve. Live output docks below."}
                 </p>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] tabular-nums text-lab-muted">
                   <span className="truncate">{model.trim() || "no target"}</span>
                   <Tick />
-                  <span>auto</span>
+                  <span>{engLabel}</span>
                   <Tick />
-                  <span>:{port || "8000"}</span>
+                  <span>:{port || eng?.default_port || "8000"}</span>
                 </div>
               </div>
               {/* pointer-events-none on a disabled button swallows hover, so the
@@ -1288,6 +1381,17 @@ function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked
             <div className={cn("space-y-3.5 transition-opacity duration-300", stale && "opacity-60")}>
               <dl>
                 <Readout label="Served model" value={healthy ? serve?.model_id : null} unset="No model" />
+                <Readout
+                  label="Engine"
+                  value={
+                    healthy && serve?.engine?.name
+                      ? [engineLabel(serve.engine.name), serve.engine.version && `v${serve.engine.version}`]
+                          .filter(Boolean)
+                          .join(" ")
+                      : undefined
+                  }
+                  unset="Unknown"
+                />
                 <Readout label="OpenAI base URL">
                   {bases ? (
                     <span className="inline-flex items-center gap-1.5">
@@ -1323,7 +1427,7 @@ function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked
                 <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Containers</div>
                 {containers.length === 0 && (
                   <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] px-2.5 py-2">
-                    <Unset>No vLLM containers</Unset>
+                    <Unset>No serve containers</Unset>
                   </div>
                 )}
                 {containers.map((c) => (
@@ -1357,7 +1461,7 @@ function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked
                     setArmedAt(null);
                     onStop();
                   }}
-                  title={stopBlocked ? "Wait for the start request to register" : "Stops every serve container on this host (two clicks)"}
+                  title={stopBlocked ? "Wait for the start request to register" : "Stops every serve container (any engine) on every node (two clicks)"}
                 >
                   {confirming ? "Confirm stop" : modelShort ? `Stop ${modelShort}` : "Stop containers"}
                 </Btn>

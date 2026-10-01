@@ -37,7 +37,7 @@ export default function ConfigurePage() {
         <div className="page-header">
           <div>
             <h1 className="page-title">Configure</h1>
-            <p className="page-sub">vLLM / llama.cpp · default model · backend URLs</p>
+            <p className="page-sub">vLLM / SGLang / llama.cpp / TensorFold · default model · backend URLs</p>
           </div>
         </div>
         <Callout
@@ -98,7 +98,7 @@ export default function ConfigurePage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Configure</h1>
-          <p className="page-sub">vLLM / llama.cpp · default model · backend URLs</p>
+          <p className="page-sub">vLLM / SGLang / llama.cpp / TensorFold · default model · backend URLs</p>
         </div>
       </div>
 

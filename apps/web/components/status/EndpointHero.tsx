@@ -5,7 +5,8 @@ import { memo, useEffect, useState } from "react";
 import type { LabStatus } from "@/lib/api";
 import type { EndpointSample } from "@/lib/lab-status-store";
 import { fmtKvPct, fmtTokensK, forecastLine, kvForecast } from "@/lib/status/forecast";
-import { engineLabel, fmtAgo, fmtRate, fmtUptime } from "@/lib/status/format";
+import { engineLabel } from "@/lib/engines";
+import { fmtAgo, fmtRate, fmtUptime } from "@/lib/status/format";
 import { parseQuant } from "@/lib/status/quant";
 import { Badge, CopyButton, Eyebrow, Nil, Panel, Sparkline, Stat, useCopy } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -60,13 +61,11 @@ const Unit = ({ children }: { children: React.ReactNode }) => (
 
 export const EndpointHero = memo(function EndpointHero({
   serve,
-  defaultBackend,
   endpoint,
   serverNow,
   stale,
 }: {
   serve: Serve;
-  defaultBackend?: string;
   /** the endpoint's 60 s rate series from the store */
   endpoint: readonly EndpointSample[];
   serverNow: number | null;
@@ -81,6 +80,8 @@ export const EndpointHero = memo(function EndpointHero({
   const engine = serve.engine ?? {};
   const modelId = serve.model_id || null;
   const version = engine.version ?? serve.version?.version ?? null;
+  // What is actually serving (owned_by / metrics prefix), not the configured default backend.
+  const engineName = engineLabel(engine.name);
   const cluster = serve.cluster;
   const tp = cluster?.summary?.multi?.tensor_parallel_hint ?? cluster?.nodes?.find((n) => n.tensor_parallel_size != null)?.tensor_parallel_size ?? null;
   const quant = parseQuant(modelId);
@@ -111,7 +112,7 @@ export const EndpointHero = memo(function EndpointHero({
       action={
         <span className="flex items-center gap-2">
           {flash && <Eyebrow className="text-lab-ok">{flash}</Eyebrow>}
-          <Badge tone="ok">{engineLabel(defaultBackend || "vllm")}</Badge>
+          {engineName ? <Badge tone="ok">{engineName}</Badge> : <Nil word="Awaiting" />}
           {version && <span className="lab-num font-mono text-[10px] text-lab-muted">v{version}</span>}
         </span>
       }

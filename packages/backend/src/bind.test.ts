@@ -54,8 +54,8 @@ describe("tokenMatches", () => {
 });
 
 describe("allowQueryToken / public paths / CORS", () => {
-  test("query token only on ws, job logs and stream-run events", () => {
-    expect(allowQueryToken("/ws")).toBe(true);
+  test("query token only on job logs and stream-run events", () => {
+    expect(allowQueryToken("/ws")).toBe(false); // WS hub retired
     expect(allowQueryToken("/api/jobs/abc/logs")).toBe(true);
     expect(allowQueryToken("/api/streams/runs/abc/events")).toBe(true);
     expect(allowQueryToken("/api/streams/runs/abc/stop")).toBe(false);

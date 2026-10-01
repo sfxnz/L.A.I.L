@@ -52,7 +52,6 @@ export function tokenMatches(
 
 /** Query-string tokens are only for transports that cannot set headers. */
 export function allowQueryToken(pathname: string): boolean {
-  if (pathname === "/ws") return true;
   return /^\/api\/jobs\/[^/]+\/logs$/.test(pathname) || /^\/api\/streams\/runs\/[^/]+\/events$/.test(pathname);
 }
 

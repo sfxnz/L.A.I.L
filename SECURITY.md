@@ -21,6 +21,9 @@ Use [`.env.example`](./.env.example) as the template. Treat `HF_TOKEN`, `LAIL_TO
 
 - Loopback bind: no token required.
 - Off-loopback bind (`0.0.0.0`, `::`, a LAN IP): set `LAIL_TOKEN` or the process refuses to start.
-- Send the token as `Authorization: Bearer <token>` or `X-Lail-Token`. WebSocket and EventSource: `?token=`.
+- Send the token as `Authorization: Bearer <token>` or `X-Lail-Token`. EventSource (job logs, stream-run events) only: `?token=`.
+- Lab artifacts play from `/api/lab/play/<id>/<key>/…`: the key is an HMAC of the run id under `LAIL_TOKEN`, so iframes need no token, a link opens only that run, and rotating the token revokes links. Artifacts are served with a strict CSP and `sandbox allow-scripts` (opaque origin).
+- CORS trusts only the web origin (`:3000`, `LAIL_WEB_PORT`, `LAIL_CORS_ORIGINS`). With or without a token, a cross-site non-GET is refused unless it is JSON (preflighted). curl and Hermes send no `Origin` and are unaffected.
+- The `/v1` proxy never forwards `LAIL_TOKEN` or cookies to the model backend.
 - The web UI does **not** inject the operator secret. If a request returns 401, paste `LAIL_TOKEN` into the banner; it is kept in `sessionStorage` and sent as `X-Lail-Token` / `?token=`.
 - Docker Compose publishes `127.0.0.1:PORT:PORT` and sets `LAIL_INSECURE_BIND=1` for the container-internal `0.0.0.0` listen. If you publish those ports on `0.0.0.0`, set `LAIL_TOKEN` and enter it in the UI. Do not rely on the escape hatch.

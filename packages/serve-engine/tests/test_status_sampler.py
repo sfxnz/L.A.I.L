@@ -13,7 +13,7 @@ from app.services.status_sampler import StatusSampler
 
 STATUS_KEYS = {
     "healthy", "base_url", "model_id", "models", "version", "metrics", "engine", "hardware",
-    "containers", "headroom", "error", "presets", "serve_examples", "tool_eval", "cluster",
+    "containers", "headroom", "error", "cluster",
     "sampled_at", "sampled_at_ms",
 }
 
@@ -61,10 +61,6 @@ def _fake_collectors(monkeypatch, calls: Counter) -> None:
             "summary": {"healthy": True},
         }
 
-    def fake_tool_eval():
-        calls["tool_eval"] += 1
-        return {"available": False}
-
     def fake_inspect(name):
         calls["inspect"] += 1
         return {"cmd": ["--port", "8000"], "started_at": "2026-09-05T15:53:25.963708557Z"}
@@ -74,7 +70,7 @@ def _fake_collectors(monkeypatch, calls: Counter) -> None:
     monkeypatch.setattr(metadata, "list_vllm_containers", fake_containers)
     monkeypatch.setattr(metadata, "docker_inspect_flags", fake_inspect)
     monkeypatch.setattr(cluster, "collect_cluster", fake_cluster)
-    monkeypatch.setattr(agentic, "tool_eval_available", fake_tool_eval)
+    monkeypatch.setattr(agentic, "tool_eval_available", lambda: pytest.fail("tool-eval probed by the sampler"))
     monkeypatch.setattr(cluster, "PeerStream", FakeStream)
 
 
@@ -101,7 +97,7 @@ class FakeStream:
         self.stopped = True
 
     def reading(self):
-        return dict(self.line)
+        return None if self.line is None else dict(self.line)
 
 
 def _no_collectors(monkeypatch) -> None:
@@ -220,7 +216,6 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
     # 30 GiB available on a serving GB10 is healthy, not "tight" (old fixed 60 GiB line)
     assert snap["headroom"] == "ok"
     assert snap["containers"][0]["name"] == "spark-vllm"
-    assert snap["tool_eval"] == {"available": False}
     assert snap["sampled_at"].endswith("+00:00")
     assert isinstance(snap["sampled_at_ms"], int)
     # the endpoint rate lives on serve.metrics only — never copied onto TP nodes
@@ -245,7 +240,7 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
     # reads never re-run collectors
     assert dict(calls) == {
         "probe": 1, "version": 1, "hw": 1, "containers": 1, "cluster": 1, "cluster_reused_ps": 0,
-        "tool_eval": 1, "inspect": 1,
+        "inspect": 1,
     }
     assert s.probe() == _probe()
 
@@ -300,9 +295,8 @@ def test_cluster_tick_republishes_without_waiting_for_the_fast_tick(monkeypatch)
     before, after = asyncio.run(go())
     # after a fast tick, the slow tick reuses its `docker ps` instead of running its own
     assert calls["cluster_reused_ps"] == 1 and calls["containers"] == 1
-    assert before["cluster"]["pending"] is True and before["tool_eval"] is None
+    assert before["cluster"]["pending"] is True
     assert after["cluster"]["nodes"][0]["power_w"] == 11.5
-    assert after["tool_eval"] == {"available": False}
     assert after["sampled_at"] == before["sampled_at"]
 
 
@@ -446,21 +440,40 @@ def test_publish_overlays_fresh_telemetry_without_mutating_the_slow_tick_cluster
             {"id": "c", "local": False, "online": True, "power_w": 6.0, "sampled_at": now - 1_000},
         ]
     }
-    fresh_b, older_c = FakeStream("b"), FakeStream("c")
-    older_c.line = {"power_w": 99.0, "sampled_at": now - 2_000}
-    older_c.error = "telemetry stream exited (255)"
+    fresh_b, broken_c = FakeStream("b"), FakeStream("c")
+    # a stream that exited has no line (PeerStream drops it), only an error
+    broken_c.line = None
+    broken_c.error = "telemetry stream exited (255)"
     out = status_sampler._publish_cluster(
-        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": now}, {"b": fresh_b, "c": older_c}
+        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": now}, {"b": fresh_b, "c": broken_c}
     )
     a, b, c = out["nodes"]
     assert a["power_w"] == 11.0 and a["sampled_at"] == now
     assert b["power_w"] == 13.3 and b["available_gib"] == 18.5 and b["sampled_at"] == fresh_b.line["sampled_at"]
-    # an older stream line never overwrites a newer slow-tick reading; its error is surfaced
+    # no stream line: the slow-tick reading stays, and the stream's error is surfaced
     assert c["power_w"] == 6.0 and c["sampled_at"] == now - 1_000
     assert c["telemetry_error"] == "telemetry stream exited (255)"
     assert b["mem_pressure"] == "ok" and c["mem_pressure"] is None
     # the cached slow-tick dicts (and earlier snapshots built from them) are untouched
     assert info["nodes"][0]["power_w"] == 9.0 and "mem_pressure" not in info["nodes"][1]
+
+
+def test_a_fresh_stream_line_wins_over_a_newer_stamped_slow_tick_reading():
+    """The slow tick's one-shot probe is stamped by the peer's clock and has no 1 s deltas.
+
+    Seen live: every 10 s it looked newer than the stream line, and the published
+    node lost cpu_util_pct and rail_rates for one snapshot.
+    """
+    now = _now_ms()
+    node = {"id": "b", "local": False, "online": True, "power_w": 7.0, "cpu_util_pct": None,
+            "rail_rates": {}, "sampled_at": now + 300}  # peer clock a little ahead
+    stream = FakeStream("b")
+    stream.line = {"power_w": 31.0, "cpu_util_pct": 12.5,
+                   "rail_rates": {"enp1s0f1np1": {"rx_bps": 1.2e8, "tx_bps": 1.1e8}}, "sampled_at": now - 400}
+    b = status_sampler._publish_cluster({"nodes": [node]}, None, {"b": stream})["nodes"][0]
+    assert b["cpu_util_pct"] == 12.5
+    assert b["rail_rates"] == {"enp1s0f1np1": {"rx_bps": 1.2e8, "tx_bps": 1.1e8}}
+    assert b["power_w"] == 31.0 and b["sampled_at"] == now - 400
 
 
 def test_a_dead_peer_never_shows_its_last_stream_line_as_current():
@@ -646,3 +659,77 @@ def test_cluster_cache_age_gate():
     s._cluster_mono = 0.0  # ancient
     assert s.cluster() is s._published_cluster
     assert s.cluster(max_age_s=30) is None
+
+
+# ─── long poll (the controller's live stream) ─────────────────────────────────
+
+
+def test_long_poll_returns_as_soon_as_a_newer_snapshot_is_published(monkeypatch):
+    calls: Counter = Counter()
+    _fake_collectors(monkeypatch, calls)
+    s = StatusSampler("http://127.0.0.1:8000")
+
+    async def go():
+        await s.sample_cluster()
+        first = await s.sample()
+        at = first["sampled_at_ms"]
+        # a caller that is behind gets the current snapshot at once
+        behind = await asyncio.wait_for(s.status(after_ms=at - 1, wait_s=5), 0.5)
+        waiter = asyncio.create_task(s.status(after_ms=at, wait_s=5))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()  # nothing newer yet: it waits instead of answering stale
+        await asyncio.sleep(0.01)  # a later wall-clock ms for the next publish
+        t0 = time.monotonic()
+        await s.sample()
+        newer = await asyncio.wait_for(waiter, 1.0)
+        # nothing published: the poll gives up after `wait_s` with the current snapshot
+        idle = await s.status(after_ms=newer["sampled_at_ms"], wait_s=0.05)
+        return at, behind, newer, time.monotonic() - t0, idle
+
+    at, behind, newer, latency, idle = asyncio.run(go())
+    assert behind["sampled_at_ms"] == at
+    assert newer["sampled_at_ms"] > at and latency < 0.5
+    assert idle["sampled_at_ms"] == newer["sampled_at_ms"]
+
+
+def test_status_route_long_poll_params(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main_mod
+
+    monkeypatch.setattr(main_mod, "_LAIL_TOKEN", "")
+    s = _sampled(monkeypatch)
+    monkeypatch.setattr(status_sampler, "SAMPLER", s)
+    _no_collectors(monkeypatch)
+    client = TestClient(main_mod.app)
+    at = client.get("/api/status").json()["sampled_at_ms"]
+    r = client.get(f"/api/status?after={at}&wait=0.05")
+    assert r.status_code == 200 and r.json()["sampled_at_ms"] == at
+    assert client.get(f"/api/status?after={at}&wait=60").status_code == 422
+
+
+def test_serve_examples_route_carries_the_static_presets(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main_mod
+    from app.config import MODEL_PRESETS, SERVE_EXAMPLES
+
+    monkeypatch.setattr(main_mod, "_LAIL_TOKEN", "")
+    body = TestClient(main_mod.app).get("/api/serve/examples").json()
+    assert body == {"examples": SERVE_EXAMPLES, "presets": list(MODEL_PRESETS.keys())}
+
+
+def test_published_models_drop_per_call_noise(monkeypatch):
+    calls: Counter = Counter()
+    _fake_collectors(monkeypatch, calls)
+
+    async def noisy_probe(base_url, timeout=5.0, **kw):
+        p = _probe(base_url)
+        p["models"] = [{"id": "org/m", "max_model_len": 8192, "created": time.time(), "permission": [{"id": "x"}]}]
+        return p
+
+    monkeypatch.setattr(metadata, "probe_endpoint", noisy_probe)
+    s = StatusSampler("http://127.0.0.1:8000")
+    snap = asyncio.run(s.sample())
+    assert snap["models"] == [{"id": "org/m", "max_model_len": 8192}]
+    assert s.probe()["models"][0]["permission"]  # envelopes still get the full probe

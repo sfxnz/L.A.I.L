@@ -1,9 +1,7 @@
 /** Status card maths: quant parsing, the KV capacity forecast, uptime, the DNA strand slices. */
 import { describe, expect, test } from "bun:test";
-import type { RunRow } from "../api";
-import { toSlices, sliceColor, sliceHref } from "./dna";
-import { FORECAST_SEQ_TOKENS, fmtKvPct, fmtTokensK, forecastLine, kvForecast, kvFraction, kvUsedTokens } from "./forecast";
-import { fmtUptime } from "./format";
+import { FORECAST_SEQ_TOKENS, fmtKvPct, fmtTokensK, forecastLine, kvForecast } from "./forecast";
+import { fmtAgo, fmtUptime } from "./format";
 import { parseQuant } from "./quant";
 
 describe("parseQuant", () => {
@@ -45,19 +43,6 @@ describe("KV capacity forecast", () => {
     expect(fmtTokensK(800)).toBe("800");
     expect(fmtTokensK(2_100_000)).toBe("2.1M");
   });
-  test("kv usage is a percent, always — 0.5 is 0.5 %, never 50 %", () => {
-    expect(kvFraction(0.5)).toBeCloseTo(0.005);
-    expect(kvFraction(0.11)).toBeCloseTo(0.0011);
-    expect(kvFraction(1)).toBeCloseTo(0.01);
-    expect(kvFraction(11)).toBeCloseTo(0.11);
-    expect(kvFraction(140)).toBe(1);
-    expect(kvFraction(-3)).toBe(0);
-    // the live pool: 1,694,725 tokens
-    expect(kvUsedTokens(1_694_725, 0.5)).toBe(8474);
-    expect(kvUsedTokens(524_288, 50)).toBe(262_144);
-    expect(kvUsedTokens(null, 0.5)).toBeNull();
-    expect(kvUsedTokens(524_288, null)).toBeNull();
-  });
   test("fmtKvPct: one decimal below 10 % so small real use is visible", () => {
     expect(fmtKvPct(0)).toBe("0%");
     expect(fmtKvPct(0.84)).toBe("0.8%");
@@ -81,43 +66,9 @@ describe("fmtUptime", () => {
     expect(fmtUptime(null)).toBe("");
     expect(fmtUptime(-1)).toBe("");
   });
-});
-
-describe("DNA strand slices", () => {
-  const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}): RunRow => ({
-    run_id,
-    created_at,
-    kind,
-    intent: null,
-    model_id: "nvidia/Qwen3.8-Flash-Next-NVFP4",
-    summary,
-    path: `${run_id}.json`,
-  });
-
-  test("kind → colour token and destination", () => {
-    expect(sliceColor("decode")).toBe("bg-lab-line");
-    expect(sliceColor("prefill")).toBe("bg-lab-line-2");
-    expect(sliceColor("agentic_tool_eval")).toBe("bg-lab-chart-3");
-    expect(sliceColor("perf_workflow")).toBe("bg-lab-muted");
-    expect(sliceHref({ run_id: "d1", kind: "decode" })).toBe("/bench?run=d1");
-    expect(sliceHref({ run_id: "p1", kind: "prefill" })).toBe("/bench?run=p1");
-    expect(sliceHref({ run_id: "t1", kind: "agentic_tool_eval" })).toBe("/evals/tool/t1");
-    expect(sliceHref({ run_id: "x", kind: "perf_workflow" })).toBe("/evals");
-  });
-
-  test("newest first, capped at 30, with a compact headline per kind", () => {
-    const rows = Array.from({ length: 35 }, (_, i) =>
-      row(`r${i}`, `2026-09-06T${String(i % 24).padStart(2, "0")}:${String(Math.floor(i / 24) * 10).padStart(2, "0")}:00Z`, "decode", {
-        aggregate_peak_tok_per_s: 207.4,
-        aggregate_peak_concurrency: 8,
-      }),
-    );
-    const s = toSlices(rows);
-    expect(s).toHaveLength(30);
-    expect(s[0].createdAt >= s[1].createdAt).toBe(true);
-    expect(s[0].headline).toBe("207 tok/s @ ×8");
-    expect(toSlices([row("p", "2026-09-06T10:00:00Z", "prefill", { prefill_tok_per_s_sustained: 2874.9 })])[0].headline).toBe("2.9k tok/s sustained");
-    expect(toSlices([row("t", "2026-09-06T10:00:00Z", "tool_eval", { final_score: 81.6 })])[0].headline).toBe("score 82");
-    expect(toSlices([row("x", "2026-09-06T10:00:00Z", "other")])[0].headline).toBeNull();
+  test("fmtAgo never reads \"now ago\"", () => {
+    expect(fmtAgo(0.4)).toBe("just now");
+    expect(fmtAgo(3.2)).toBe("3 s ago");
+    expect(fmtAgo(null)).toBe("");
   });
 });

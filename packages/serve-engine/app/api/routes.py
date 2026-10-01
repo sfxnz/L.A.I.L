@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field  # Field used by ServeRequest
 from sse_starlette.sse import EventSourceResponse
 
 from .. import db
-from ..config import DEFAULT_BASE_URL, RUNS_DIR, SERVE_EXAMPLES
+from ..config import DEFAULT_BASE_URL, MODEL_PRESETS, RUNS_DIR, SERVE_EXAMPLES
 from ..services import agentic, autoconfig, cluster, jobs, metadata, serve, status_sampler
 
 router = APIRouter()
@@ -23,12 +23,17 @@ router = APIRouter()
 
 
 @router.get("/status")
-async def status() -> dict[str, Any]:
+async def status(
+    after: int | None = Query(None, description="sampled_at_ms the caller already has"),
+    wait: float = Query(0.0, ge=0.0, le=status_sampler.MAX_WAIT_S),
+) -> dict[str, Any]:
     """Cached snapshot from the background sampler, plus `sampled_at` (ISO) and `stale_s`.
 
     Never runs collectors on the request path; waits (≤2 s) only for the first sample.
+    `?after=<sampled_at_ms>&wait=<s>` long-polls: it answers as soon as a newer
+    snapshot is published (or after `wait` seconds with the current one).
     """
-    return await status_sampler.SAMPLER.status()
+    return await status_sampler.SAMPLER.status(after_ms=after, wait_s=wait)
 
 
 # Handlers that shell out, ssh, or read sqlite / envelopes are plain `def`: FastAPI
@@ -130,7 +135,8 @@ async def serve_start(body: ServeRequest) -> dict[str, str]:
 
 @router.get("/serve/examples")
 async def serve_examples() -> dict[str, Any]:
-    return {"examples": SERVE_EXAMPLES}
+    """Static serve presets: proven example configs and the model-id hints (not on /status)."""
+    return {"examples": SERVE_EXAMPLES, "presets": list(MODEL_PRESETS.keys())}
 
 
 @router.get("/serve/recommend")
@@ -177,12 +183,6 @@ async def serve_recipes() -> dict[str, Any]:
 @router.post("/serve/stop")
 async def serve_stop() -> dict[str, str]:
     job_id = await jobs.start_job("stop", serve.stop_all)
-    return {"job_id": job_id}
-
-
-@router.post("/serve/agent-restore")
-async def serve_agent_restore() -> dict[str, str]:
-    job_id = await jobs.start_job("agent_restore", serve.agent_restore)
     return {"job_id": job_id}
 
 

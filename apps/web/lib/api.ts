@@ -8,7 +8,7 @@ import type {
 
 const BASE = "";
 
-function lailTokenHeader(): Record<string, string> {
+export function lailTokenHeader(): Record<string, string> {
   const t = getClientToken();
   return t ? { "X-Lail-Token": t } : {};
 }
@@ -23,6 +23,17 @@ export class ApiError extends Error {
   ) {
     super(body);
     this.name = "ApiError";
+  }
+}
+
+/** The controller's JSON error body ({error, message, run_id}) of a failed call, or just its text. */
+export function parseApiError(e: unknown): { error?: string; message: string; run_id?: string } {
+  const msg = e instanceof Error ? e.message : String(e);
+  try {
+    const j = JSON.parse(msg) as { error?: string; message?: string; run_id?: string };
+    return { error: j.error, message: j.message || msg, run_id: j.run_id };
+  } catch {
+    return { message: msg };
   }
 }
 
@@ -86,6 +97,8 @@ export type ClusterNode = {
   sampled_at?: number | null;
   /** server epoch ms of the slow inventory (containers, endpoint, rails) */
   inventory_at?: number | null;
+  /** bytes/s per RoCE netdev from the RDMA port counters (null until two reads) */
+  rail_rates?: Record<string, { tx_bps: number; rx_bps: number }> | null;
   /** why the ~1 s remote telemetry stream is down, when it is */
   telemetry_error?: string | null;
   endpoint_healthy?: boolean;
@@ -149,6 +162,8 @@ export type ServeMetrics = {
   last_burst?: { decode_tok_per_s?: number | null; tokens?: number; ended_at?: number } | null;
   /** latest non-null prefill_tok_per_s and when (epoch ms) — "last", never live */
   last_prefill?: { tok_per_s: number; at: number } | null;
+  /** latest non-null ttft_s and when (epoch ms) — "last", never live */
+  last_ttft?: { s: number; at: number } | null;
   /** server epoch ms of the /metrics scrape */
   sampled_at?: number | null;
 };
@@ -157,6 +172,8 @@ export type ClusterStatus = {
   name?: string;
   updated_from?: string;
   error?: string;
+  /** the first inventory has not finished yet (serve-engine just started) */
+  pending?: boolean;
   nodes: ClusterNode[];
   fabric?: {
     ok?: boolean;
@@ -229,21 +246,10 @@ export type LabStatus = {
     headroom?: string;
     error?: string;
     unreachable?: boolean;
-    presets?: string[];
-    serve_examples?: Record<string, ServeExample>;
-    tool_eval?: {
-      available: boolean;
-      path?: string | null;
-      via?: string;
-      version?: string | null;
-      install?: string;
-      repo?: string;
-    };
     cluster?: ClusterStatus;
     /** server epoch ms when this snapshot was published */
     sampled_at_ms?: number | null;
   } | null;
-  cluster?: ClusterStatus | null;
 };
 
 export type ServeExample = {
@@ -378,7 +384,7 @@ export type ServeRecommend = {
 };
 
 export const api = {
-  labStatus: () => req<LabStatus>("/api/lab-status"),
+  labStatus: (signal?: AbortSignal) => req<LabStatus>("/api/lab-status", { signal }),
   configure: {
     get: () => req<Settings>("/api/configure"),
     put: (body: Partial<Settings>) =>
@@ -387,8 +393,9 @@ export const api = {
   usage: () => req<UsageSummary>("/api/usage"),
   startServe: (body: Record<string, unknown>) =>
     req<{ job_id: string }>("/api/serve/start", { method: "POST", body: JSON.stringify(body) }),
+  serveExamples: () =>
+    req<{ examples: Record<string, ServeExample>; presets: string[] }>("/api/serve/examples"),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
-  agentRestore: () => req<{ job_id: string }>("/api/serve/agent-restore", { method: "POST" }),
   recommendServe: (model: string, fetchRemote = true) =>
     req<ServeRecommend>(
       `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}`,

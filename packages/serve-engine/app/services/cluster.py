@@ -69,6 +69,7 @@ TELEMETRY_FIELDS = (
     "soc_temp_c",
     "nvme_temp_c",
     "nic_temp_c",
+    "rail_rates",
 )
 
 

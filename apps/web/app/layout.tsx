@@ -38,7 +38,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {/* Resolve the theme before first paint — otherwise the wrong world flashes. */}
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
       </head>
-      <body className="h-full overflow-hidden antialiased animus-grain animus-vignette animus-scanlines">
+      <body className="h-full overflow-hidden antialiased animus-vignette">
         <AppShell>{children}</AppShell>
       </body>
     </html>

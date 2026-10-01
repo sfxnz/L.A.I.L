@@ -32,7 +32,7 @@ export function HistoryStrip({
   className?: string;
 }) {
   return (
-    <Panel title="Sequences" className={cn("streams-history", className)} action={<Eyebrow className="lab-num">{runs.length} recent</Eyebrow>}>
+    <Panel title="Run history" className={cn("streams-history", className)} action={<Eyebrow className="lab-num">{runs.length} recent</Eyebrow>}>
       {!runs.length ? (
         <EmptyState title="No sequences yet">Run to draw the first strand.</EmptyState>
       ) : (

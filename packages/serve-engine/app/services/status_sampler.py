@@ -7,13 +7,18 @@ tick is scheduled from the previous deadline, not from when work finished):
   fast (1 s)  endpoint probe (/metrics → live rates, /health, /v1/models),
               this host's telemetry, docker ps (+ docker inspect of the serving
               container when it changes, or once per slow interval)
-  slow (10 s) cluster inventory (all nodes in parallel) + tool-eval binary;
-              keeps one persistent telemetry stream per remote node
+  slow (10 s) cluster inventory (all nodes in parallel); keeps one persistent
+              telemetry stream per remote node
 
 Every publish overlays the freshest telemetry onto the cluster nodes — the local
 node from the fast tick, remote nodes from their streams — each with its own
 `sampled_at` (server epoch ms). Because the sampler is the only caller of
 `metadata.probe_endpoint`, the live-rate counter deltas have a single writer.
+
+The snapshot carries only what changes: static data (serve presets/examples, the
+tool-eval binary) has its own routes. `status(after_ms=…, wait_s=…)` is a long poll
+that returns as soon as a newer snapshot is published, so the controller's live
+stream forwards each 1 s sample the moment it lands instead of polling on a beat.
 """
 from __future__ import annotations
 
@@ -25,14 +30,16 @@ from typing import Any
 
 import httpx
 
-from ..config import DEFAULT_BASE_URL, MEM_FLOOR_GIB, MODEL_PRESETS, SERVE_EXAMPLES
-from . import agentic, cluster, metadata, node_probe
+from ..config import DEFAULT_BASE_URL, MEM_FLOOR_GIB
+from . import cluster, metadata, node_probe
 
 log = logging.getLogger(__name__)
 
 FAST_INTERVAL_S = 1.0
 SLOW_INTERVAL_S = 10.0
 FIRST_SAMPLE_TIMEOUT_S = 2.0
+# Upper bound of one long poll (`status(after_ms=…, wait_s=…)`).
+MAX_WAIT_S = 10.0
 # /metrics is a local GET; a slow vLLM must not stall host telemetry for long.
 ENDPOINT_TIMEOUT_S = 1.5
 
@@ -81,6 +88,10 @@ def _publish_cluster(
     A remote node takes its stream's line only while the node is online and the
     line is fresh (≤ STREAM_STALE_INTERVALS stream intervals old): a dead peer or a
     wedged stream never keeps its last numbers on screen as if they were current.
+    A fresh line always wins over the slow tick's one-shot reading, even when that
+    one's `sampled_at` looks newer: the two are stamped by different clocks (the
+    peer's own vs this host's receive time), and only the stream carries the 1 s
+    deltas (CPU %, rail rates) — dropping them every slow tick would blank them.
     Never mutates `info` — earlier snapshots keep the numbers they were served with.
     """
     now_ms = int(time.time() * 1000)
@@ -98,7 +109,6 @@ def _publish_cluster(
                 reading
                 and node.get("online")
                 and now_ms - at <= STREAM_STALE_INTERVALS * stream.interval_s * 1000
-                and at >= (node.get("sampled_at") or 0)
             ):
                 cluster.apply_telemetry(node, reading)
             node["telemetry_error"] = stream.error if stream else None
@@ -137,7 +147,6 @@ class StatusSampler:
         self._cluster_mono: float | None = None
         self._published_cluster: dict[str, Any] = self._cluster
         self._streams: dict[str, cluster.PeerStream] = {}
-        self._tool_eval: dict[str, Any] | None = None
         self._snapshot: dict[str, Any] | None = None
         self._sampled_mono: float | None = None
         self._sampled_at: str | None = None
@@ -146,6 +155,8 @@ class StatusSampler:
         # Events are created in start() so they bind to the running loop.
         self._ready: asyncio.Event | None = None
         self._cluster_ready: asyncio.Event | None = None
+        # Set (and dropped) on every publish: long polls wait on it for the next snapshot.
+        self._next: asyncio.Event | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -227,7 +238,7 @@ class StatusSampler:
         return self._snapshot or {}
 
     async def sample_cluster(self) -> None:
-        """Slow tick: cluster inventory (parallel), tool-eval binary, peer streams, endpoint URL."""
+        """Slow tick: cluster inventory (parallel), peer streams, endpoint URL."""
         try:
             # Reuse the fast tick's telemetry and `docker ps` (once it has run) for this host.
             info = await asyncio.to_thread(
@@ -239,7 +250,6 @@ class StatusSampler:
             info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
         self._cluster = info
         self._cluster_mono = time.monotonic()
-        self._tool_eval = await asyncio.to_thread(agentic.tool_eval_available)
         await self._sync_streams(info.get("nodes") or [])
         self._follow_endpoint(info.get("nodes") or [])
         if self._probe is not None:
@@ -306,7 +316,13 @@ class StatusSampler:
             "healthy": probe.get("healthy"),
             "base_url": self.base_url,
             "model_id": model_id,
-            "models": probe.get("models"),
+            # /v1/models minus the per-call noise (vLLM stamps `created` and a fresh
+            # permission id on every answer): what is served, and its context window.
+            "models": [
+                {"id": m.get("id"), "max_model_len": m.get("max_model_len")}
+                for m in probe.get("models") or []
+                if isinstance(m, dict)
+            ],
             "version": probe.get("version"),
             "metrics": probe.get("metrics"),
             "engine": metadata.build_engine(probe, self._inspect),
@@ -315,13 +331,13 @@ class StatusSampler:
             # Worst node: under TP, any one rank running out of memory takes the serve down.
             "headroom": max(pressures, key=_PRESSURE_ORDER.__getitem__),
             "error": probe.get("error"),
-            "presets": list(MODEL_PRESETS.keys()),
-            "serve_examples": SERVE_EXAMPLES,
-            "tool_eval": self._tool_eval,
             "cluster": published,
             "sampled_at": self._sampled_at,
             "sampled_at_ms": int(time.time() * 1000),
         }
+        ev, self._next = self._next, None
+        if ev is not None:
+            ev.set()
 
     # ── readers ──────────────────────────────────────────────────────────────
 
@@ -341,13 +357,36 @@ class StatusSampler:
             return None
         return self._published_cluster
 
-    async def status(self, timeout: float = FIRST_SAMPLE_TIMEOUT_S) -> dict[str, Any]:
-        """Cached snapshot plus `stale_s`. Waits (bounded) only for the very first sample."""
+    async def status(
+        self,
+        timeout: float = FIRST_SAMPLE_TIMEOUT_S,
+        *,
+        after_ms: int | None = None,
+        wait_s: float = 0.0,
+    ) -> dict[str, Any]:
+        """Cached snapshot plus `stale_s`. Waits (bounded) for the very first sample.
+
+        With `after_ms` (a snapshot's `sampled_at_ms` the caller already has) it also
+        waits up to `wait_s` for a newer one to be published, and returns the newest
+        snapshot either way — a long poll, never a busy loop.
+        """
         if self._snapshot is None and self._ready is not None and self._cluster_ready is not None:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(self._ready.wait(), self._cluster_ready.wait()), timeout
                 )
+            except asyncio.TimeoutError:
+                pass
+        if (
+            after_ms is not None
+            and wait_s > 0
+            and self._snapshot is not None
+            and (self._snapshot.get("sampled_at_ms") or 0) <= after_ms
+        ):
+            if self._next is None:
+                self._next = asyncio.Event()
+            try:
+                await asyncio.wait_for(self._next.wait(), min(wait_s, MAX_WAIT_S))
             except asyncio.TimeoutError:
                 pass
         if self._snapshot is None or self._sampled_mono is None:
@@ -363,9 +402,6 @@ class StatusSampler:
                 "containers": [],
                 "headroom": "ok",
                 "error": "status sampler warming up",
-                "presets": list(MODEL_PRESETS.keys()),
-                "serve_examples": SERVE_EXAMPLES,
-                "tool_eval": self._tool_eval,
                 "cluster": self._published_cluster,
                 "sampled_at": None,
                 "sampled_at_ms": None,

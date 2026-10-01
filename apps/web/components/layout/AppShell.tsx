@@ -12,15 +12,18 @@ import {
   Waves,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { setClientToken } from "@/lib/auth-token";
 import { fmtKvPct } from "@/lib/status/forecast";
-import { serveHealthy, startLabStatusPolling, tightestNode, useLabStatusStore } from "@/lib/lab-status-store";
+import { fmtRate } from "@/lib/status/format";
+import { serveHealthy, tightestNode, useLabStatusStore, useStale } from "@/lib/lab-status-store";
+import { startLive } from "@/lib/live-connection";
 import { WORKSPACE_NAV, isProseRoute } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
 import { Eyebrow, SyncRing, Tick, type SyncState } from "@/components/ui";
-import { AnimusField } from "@/components/animus/AnimusField";
 import { ThemeToggle } from "@/components/animus/ThemeToggle";
 import { CommandPalette } from "@/components/command/CommandPalette";
+import { LiveAge } from "@/components/status/LiveAge";
 import { useGlobalShortcuts } from "@/lib/shortcuts";
 
 const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
@@ -32,47 +35,48 @@ const NAV_ICONS: Record<string, React.ComponentType<{ className?: string; stroke
   Configure: Settings2,
 };
 
-const TOKEN_COPY = "LAIL_TOKEN required — paste it to synchronize.";
+const TOKEN_COPY = "LAIL_TOKEN required — paste it to connect.";
 
-function fmtRate(v: number) {
-  return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
-}
-
-export function AppShell({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
-  const { status, loading, needToken, unreachable, liveRun } = useLabStatusStore();
-  const [tokenDraft, setTokenDraft] = useState("");
-
-  // The ONE lab-status poll: 2s while visible, paused while hidden.
-  useEffect(() => startLabStatusPolling(), []);
-  useGlobalShortcuts();
-
-  const serve = status?.serve;
-  const healthy = serveHealthy(status);
+/**
+ * The header's live readout: ring · model · decode tok/s · requests · KV · free.
+ * Its own component with narrow store selectors, so a 1 s sample re-renders this
+ * strip, never the page under it. One source for the rate everywhere: the
+ * endpoint's per-stream decode tok/s (serve.metrics) — a Streams/Bench run in
+ * this tab shows its own numbers on its own page.
+ */
+function HeaderReadout() {
+  const { loading, needToken, unreachable, serve, healthy } = useLabStatusStore(
+    useShallow((s) => ({
+      loading: s.loading,
+      needToken: s.needToken,
+      unreachable: s.unreachable,
+      serve: s.status?.serve ?? null,
+      healthy: serveHealthy(s.status),
+    })),
+  );
+  const stale = useStale();
   const servedId = serve?.model_id;
-  const model =
-    healthy && servedId && servedId !== "auto" && servedId !== "default" ? servedId : null;
-  // Header truth: while a run streams, the header shows the run's own aggregate
-  // (the number Streams/Bench show), labelled "run"; otherwise the endpoint's
-  // per-stream decode rate (busy time, serve.metrics), labelled "endpoint". When
-  // the endpoint is idle, the previous burst is shown dimmed and labelled "last" —
+  const model = healthy && servedId && servedId !== "auto" && servedId !== "default" ? servedId : null;
+  // When the endpoint is idle, the previous burst is shown dimmed and labelled "last" —
   // never as live — or "— idle" before any burst. The slot stays rendered while the
-  // endpoint is up, so the header never shifts. Never two unexplained numbers.
+  // endpoint is up, so the header never shifts.
   const metrics = healthy ? serve?.metrics : null;
+  const liveTokS = metrics?.decode_tok_per_s ?? null;
   const lastBurst = metrics?.last_burst?.decode_tok_per_s ?? null;
-  const liveTokS = liveRun ? liveRun.tok_s : (metrics?.decode_tok_per_s ?? null);
   const tokS = liveTokS ?? lastBurst;
-  const rateSource = liveRun ? "run" : liveTokS != null ? "endpoint" : lastBurst != null ? "last" : "idle";
+  const rateSource = liveTokS != null ? "decode" : lastBurst != null ? "last" : "idle";
   const engine = serve?.engine;
-  const running = liveRun?.running ?? engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
-  const waiting = liveRun?.waiting ?? engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
+  const running = engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
+  const waiting = engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
   const kvPct = engine?.kv_usage_pct ?? null;
   // Free memory of the tightest live node (under TP, the first rank to run out takes the
   // serve down); this host's reading when there is no cluster inventory yet.
-  const clusterNodes = (status?.cluster ?? serve?.cluster)?.nodes;
+  const clusterNodes = serve?.cluster?.nodes;
   const tightest = tightestNode(clusterNodes);
   const freeGib = tightest?.available_gib ?? serve?.hardware?.available_gib;
   const freeMulti = !!tightest && (clusterNodes?.filter((n) => n.local || n.online).length ?? 0) > 1;
+  // While the controller is unreachable the last numbers are not shown at all.
+  const showNumbers = !loading && !needToken && !unreachable;
 
   const ring: SyncState | null = needToken
     ? "token"
@@ -80,41 +84,152 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       ? "offline"
       : loading
         ? null
-        : healthy
-          ? "serving"
-          : "idle";
+        : stale
+          ? "stale"
+          : healthy
+            ? "serving"
+            : "idle";
   const word = needToken
     ? "token"
     : unreachable
       ? "unreachable"
       : loading
         ? "…"
-        : healthy
-          ? "serving"
-          : "idle";
+        : stale
+          ? "stale"
+          : healthy
+            ? "serving"
+            : "idle";
   const probeNote = needToken
     ? TOKEN_COPY
     : unreachable
-      ? "Controller unreachable on :8787 — bun run dev."
+      ? "Controller unreachable — is bun run dev up?"
       : loading
-        ? "Checking lab…"
+        ? "Connecting…"
         : healthy
-          ? `Controller up · serving ${model ? model.split("/").pop() : "a model"}`
-          : "Controller up · no model loaded";
+          ? `Serving ${model ? model.split("/").pop() : "a model"}`
+          : "Controller up · no model serving";
+
+  return (
+    <div
+      // Instrument strip — the side that yields: `min-w-0 flex-1` soaks up the
+      // remaining space and its cells hide progressively at md/lg/xl/2xl, so the nav
+      // always renders in full. Left-aligned: cells that appear with the first
+      // sample extend it to the right instead of shoving the ring sideways.
+      className="lab-num flex min-w-0 flex-1 items-center justify-start gap-2 overflow-hidden sm:gap-2.5"
+    >
+      <span className="sr-only" aria-live="polite">
+        {probeNote}
+      </span>
+
+      <span className="flex items-center gap-1.5" title={probeNote}>
+        <SyncRing state={ring} label={stale && !unreachable ? "Live data not updating" : probeNote} />
+        {/* stale: LiveAge beside it says "not updating · N s" — not the same word twice */}
+        {!(stale && showNumbers) && <Eyebrow className="hidden tracking-[0.18em] lg:inline">{word}</Eyebrow>}
+      </span>
+      {showNumbers && <LiveAge quiet className="hidden sm:inline" />}
+
+      <div className={cn("flex min-w-0 items-center gap-2 transition-opacity duration-300 sm:gap-2.5", stale && "opacity-50")}>
+        {showNumbers && model && (
+          <>
+            {/* only where it fits whole: at 1440 the strip squeezed it to "Qwen…" */}
+            <Tick className="hidden 2xl:block" />
+            <span className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim 2xl:inline" title={model}>
+              {model.split("/").pop()}
+            </span>
+          </>
+        )}
+
+        {showNumbers && healthy && (
+          <>
+            <Tick className="hidden md:block" />
+            <span
+              className="hidden shrink-0 items-baseline gap-1.5 font-mono text-[10px] text-lab-text md:inline-flex"
+              title={
+                liveTokS != null
+                  ? `Per-stream decode rate over busy time (serve-engine, 1 s)${
+                      metrics?.throughput_tok_per_s != null ? ` · all streams ${fmtRate(metrics.throughput_tok_per_s)} tok/s` : ""
+                    }`
+                  : lastBurst != null
+                    ? "Endpoint idle — decode rate of the last burst, not live"
+                    : "Endpoint idle — no burst measured yet"
+              }
+            >
+              {/* fixed widths: a request starting or ending never resizes the strip */}
+              <Eyebrow className="inline-block w-[44px] text-right text-[8px]">{rateSource}</Eyebrow>
+              <span className={rateSource !== "decode" ? "text-lab-muted" : undefined}>
+                <span className="inline-block min-w-[5ch] text-right">{tokS != null ? fmtRate(tokS) : "—"}</span>{" "}
+                <span className="text-lab-muted">tok/s</span>
+              </span>
+            </span>
+          </>
+        )}
+
+        {showNumbers && (running != null || waiting != null) && (
+          <>
+            <Tick className="hidden lg:block" />
+            <Eyebrow className="hidden shrink-0 lg:inline" title="Requests running / queued on the engine">
+              <span className="inline-block min-w-[2ch] text-right">{running ?? 0}</span> running ·{" "}
+              <span className="inline-block min-w-[2ch] text-right">{waiting ?? 0}</span> queued
+            </Eyebrow>
+          </>
+        )}
+
+        {showNumbers && kvPct != null && (
+          <>
+            {/* lowest priority: only on the widest screens (Status and Serve show it anyway) */}
+            <Tick className="hidden 2xl:block" />
+            <Eyebrow className="hidden shrink-0 2xl:inline" title="KV cache in use">
+              KV {fmtKvPct(kvPct)}
+            </Eyebrow>
+          </>
+        )}
+
+        {showNumbers && freeGib != null && (
+          <>
+            <Tick className="hidden lg:block" />
+            <Eyebrow
+              className="hidden shrink-0 tracking-[0.12em] lg:inline"
+              title={
+                freeMulti
+                  ? `MemAvailable on ${tightest?.label || tightest?.id}, the tightest live node (/proc/meminfo)`
+                  : "MemAvailable on this host (/proc/meminfo)"
+              }
+            >
+              {freeGib.toFixed(1)} GiB free
+            </Eyebrow>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function AppShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const needToken = useLabStatusStore((s) => s.needToken);
+  const [tokenDraft, setTokenDraft] = useState("");
+
+  // The ONE live connection (stream, polling fallback) for every page.
+  useEffect(() => startLive(), []);
+  useGlobalShortcuts();
 
   // Instrument pages get the 1440px bento; prose pages keep the 1152px measure.
   const measure = isProseRoute(pathname || "/") ? "max-w-6xl" : "max-w-[1440px]";
 
   return (
     <div className="relative isolate flex h-full min-h-0 flex-col bg-lab-bg text-lab-text">
-      {/* Reconstruction field — z-0, behind every layer of chrome. */}
-      <AnimusField />
+      {/* Still atmosphere — two static CSS blooms, z-0, behind every layer of chrome. */}
+      <div className="animus-atmosphere" aria-hidden="true">
+        <span className="animus-haze animus-haze-1" />
+        <span className="animus-haze animus-haze-2" />
+      </div>
 
       <a href="#main" className="lab-skip-link">
         Skip to content
       </a>
 
-      <header className="sticky top-0 z-20 shrink-0 border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-xl backdrop-saturate-150">
+      <header className="sticky top-0 z-20 shrink-0 overflow-x-clip border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)]">
         <div
           className={cn(
             "animus-bracketed relative mx-auto flex h-14 items-center gap-3 px-4 md:gap-5 md:px-6",
@@ -181,115 +296,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             })}
           </nav>
 
-          <div
-            // Instrument strip: SyncRing · model · live tok/s · strands · free GiB.
-            // This is the side that yields — `min-w-0 flex-1` soaks up the
-            // remaining space and its cells hide progressively at md/lg/xl, so
-            // the nav above always renders in full.
-            className="lab-num flex min-w-0 flex-1 items-center justify-end gap-2 overflow-hidden sm:gap-2.5"
-            aria-live="polite"
-            aria-atomic="true"
-          >
-            <span className="sr-only">{probeNote}</span>
-
-            <span className="flex items-center gap-1.5" title={probeNote}>
-              <SyncRing
-                state={ring}
-                label={
-                  needToken
-                    ? "Token required"
-                    : unreachable
-                      ? "Controller unreachable"
-                      : loading
-                        ? "Controller status unknown"
-                        : healthy
-                          ? "Serving"
-                          : "Idle"
-                }
-              />
-              <Eyebrow className="hidden tracking-[0.18em] lg:inline">{word}</Eyebrow>
-            </span>
-
-            {model && (
-              <>
-                <Tick className="hidden xl:block" />
-                <span
-                  className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim xl:inline"
-                  title={model}
-                >
-                  {model.split("/").pop()}
-                </span>
-              </>
-            )}
-
-            {(liveRun || healthy) && (
-              <>
-                <Tick className="hidden md:block" />
-                <span
-                  className="hidden shrink-0 items-baseline gap-1.5 font-mono text-[10px] text-lab-text md:inline-flex"
-                  title={
-                    liveRun
-                      ? `Live ${liveRun.source} run aggregate (usage-calibrated) · peak ${fmtRate(liveRun.peak)}`
-                      : liveTokS != null
-                        ? `Per-stream decode rate over busy time (serve-engine, 1 s)${
-                            metrics?.throughput_tok_per_s != null ? ` · all streams ${fmtRate(metrics.throughput_tok_per_s)} tok/s` : ""
-                          }${metrics?.spec_accept_rate != null ? ` · spec accept ${Math.round(metrics.spec_accept_rate * 100)}%` : ""}`
-                        : lastBurst != null
-                          ? "Endpoint idle — decode rate of the last burst, not live"
-                          : "Endpoint idle — no burst measured yet"
-                  }
-                >
-                  <Eyebrow className={cn("text-[8px]", liveRun ? "text-lab-target" : undefined)}>{rateSource}</Eyebrow>
-                  <span className={rateSource === "last" || rateSource === "idle" ? "text-lab-muted" : undefined}>
-                    {tokS != null ? fmtRate(tokS) : "—"} <span className="text-lab-muted">tok/s</span>
-                  </span>
-                </span>
-              </>
-            )}
-
-            {!loading && !needToken && !unreachable && (running != null || waiting != null) && (
-              <>
-                <Tick className="hidden lg:block" />
-                <Eyebrow
-                  className="hidden shrink-0 lg:inline"
-                  title={liveRun ? "Strands in the live run" : "Requests running / waiting on the engine"}
-                >
-                  {running ?? 0} running / {waiting ?? 0} waiting
-                </Eyebrow>
-              </>
-            )}
-
-            {kvPct != null && (
-              <>
-                <Tick className="hidden xl:block" />
-                <Eyebrow className="hidden shrink-0 xl:inline" title="KV cache in use">
-                  KV {fmtKvPct(kvPct)}
-                </Eyebrow>
-              </>
-            )}
-
-            {freeGib != null && (
-              <>
-                <Tick className="hidden lg:block" />
-                <Eyebrow
-                  className="hidden shrink-0 tracking-[0.12em] lg:inline"
-                  title={
-                    freeMulti
-                      ? `MemAvailable on ${tightest?.label || tightest?.id}, the tightest live node (/proc/meminfo)`
-                      : "MemAvailable on this host (/proc/meminfo)"
-                  }
-                >
-                  {freeMulti ? `${tightest?.id} ` : ""}
-                  {freeGib.toFixed(1)} GiB free
-                </Eyebrow>
-              </>
-            )}
-          </div>
+          <HeaderReadout />
 
           <Tick className="hidden sm:block" />
 
           <CommandPalette />
-          <ThemeToggle />
+          {/* Below sm the toggle would push the page sideways; the palette has Theme commands. */}
+          <div className="hidden sm:flex">
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
@@ -317,7 +332,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             type="submit"
             className="shrink-0 bg-lab-accent px-2 py-1 font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-white"
           >
-            Synchronize
+            Connect
           </button>
         </form>
       )}
@@ -326,18 +341,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className={cn("mx-auto px-4 py-5 md:px-6 md:py-6", measure)}>{children}</div>
       </main>
 
-      <footer className="relative z-10 shrink-0 border-t border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-md">
-        <div
-          className={cn(
-            "mx-auto flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6",
-            measure,
-          )}
-        >
-          <span className="font-[family-name:var(--font-display)] text-[10px] font-medium uppercase leading-none tracking-[0.18em] text-lab-muted">
-            Serve · bench · streams · Hermes
-          </span>
-        </div>
-      </footer>
     </div>
   );
 }

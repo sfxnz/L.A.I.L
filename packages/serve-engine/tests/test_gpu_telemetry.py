@@ -166,3 +166,36 @@ def test_telemetry_sample_shape(monkeypatch):
     assert second["available_gib"] == 13.3 and second["swap_used_gib"] == 8.09
     assert second["soc_temp_c"] == 46.8 and isinstance(second["sampled_at"], int)
     assert set(cluster.TELEMETRY_FIELDS) <= set(second)
+
+
+def _roce_dev(root, dev: str, net: str, tx_words: int, rx_words: int) -> None:
+    (root / dev / "device" / "net" / net).mkdir(parents=True, exist_ok=True)
+    counters = root / dev / "ports" / "1" / "counters"
+    counters.mkdir(parents=True, exist_ok=True)
+    (counters / "port_xmit_data").write_text(f"{tx_words}\n")
+    (counters / "port_rcv_data").write_text(f"{rx_words}\n")
+
+
+def test_roce_counters_are_4_byte_words_keyed_by_netdev(tmp_path):
+    _roce_dev(tmp_path, "rocep1s0f1", "enp1s0f1np1", 100, 50)
+    _roce_dev(tmp_path, "roceP2p1s0f1", "enP2p1s0f1np1", 0, 0)
+    (tmp_path / "broken" / "device" / "net" / "x").mkdir(parents=True)  # no counters → skipped
+    assert node_probe.read_roce_bytes(str(tmp_path)) == {
+        "enp1s0f1np1": (400, 200),
+        "enP2p1s0f1np1": (0, 0),
+    }
+    assert node_probe.read_roce_bytes(str(tmp_path / "missing")) == {}
+
+
+def test_rail_rates_are_byte_deltas_over_time_never_a_guess():
+    prev = (10.0, {"a": (1_000, 2_000), "b": (500, 500)})
+    cur = (12.0, {"a": (5_000, 2_000), "b": (100, 900), "c": (9, 9)})
+    assert node_probe.rail_rates(None, cur) is None  # first read: no rate yet
+    rates = node_probe.rail_rates(prev, cur)
+    # idle rail reads 0 B/s; a counter that went backwards and a new rail have no rate
+    assert rates == {"a": {"tx_bps": 2_000, "rx_bps": 0}}
+    assert node_probe.rail_rates(cur, cur) is None
+
+
+def test_rail_rates_ride_the_live_telemetry_set():
+    assert "rail_rates" in cluster.TELEMETRY_FIELDS

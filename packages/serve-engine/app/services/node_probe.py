@@ -4,7 +4,7 @@ Remote nodes get this file's source piped over ssh — `ssh host python3 -u - '<
 — so it is stdlib-only and has no package imports. Two halves:
 
   telemetry  — cheap per-second readings: /proc/meminfo, /proc/stat, PSI, hwmon
-               temperatures, nvidia-smi GPU + compute-apps. `stream` mode prints
+               temperatures, nvidia-smi GPU + compute-apps, RoCE byte counters. `stream` mode prints
                one JSON line per interval for as long as the ssh session lives.
   inventory  — slow topology facts: serve containers (docker ps + one docker
                inspect), the OpenAI endpoint on candidate ports, RoCE rails,
@@ -204,11 +204,62 @@ def read_temps(root: str = "/sys/class/hwmon") -> dict[str, float | None]:
     }
 
 
+def read_roce_bytes(root: str = "/sys/class/infiniband") -> dict[str, tuple[int, int]]:
+    """netdev → (bytes sent, bytes received) on each RoCE device's port 1.
+
+    port_xmit_data / port_rcv_data count 4-byte words (IB PortCounters), so ×4 is
+    bytes — the same total `ethtool -S` reports as tx/rx_vport_rdma_unicast_bytes.
+    NCCL tensor-parallel traffic rides RDMA, which the netdev byte counters never see.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    try:
+        devs = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for dev in devs:
+        try:
+            nets = sorted(os.listdir(os.path.join(root, dev, "device", "net")))
+        except OSError:
+            continue
+        base = os.path.join(root, dev, "ports", "1", "counters")
+        try:
+            tx = int((_read(os.path.join(base, "port_xmit_data")) or "").strip())
+            rx = int((_read(os.path.join(base, "port_rcv_data")) or "").strip())
+        except ValueError:
+            continue
+        if nets:
+            out[nets[0]] = (tx * 4, rx * 4)
+    return out
+
+
+def rail_rates(
+    prev: tuple[float, dict[str, tuple[int, int]]] | None,
+    cur: tuple[float, dict[str, tuple[int, int]]],
+) -> dict[str, dict[str, float]] | None:
+    """Bytes/s per RoCE netdev between two counter reads; None until there are two.
+
+    A counter that went backwards (driver reload) has no rate this interval.
+    """
+    if not prev:
+        return None
+    dt = cur[0] - prev[0]
+    if dt <= 0:
+        return None
+    out: dict[str, dict[str, float]] = {}
+    for iface, (tx, rx) in cur[1].items():
+        before = prev[1].get(iface)
+        if before is None or tx < before[0] or rx < before[1]:
+            continue
+        out[iface] = {"tx_bps": round((tx - before[0]) / dt), "rx_bps": round((rx - before[1]) / dt)}
+    return out
+
+
 class Telemetry:
-    """Per-node live readings. Holds the previous /proc/stat sample for CPU %."""
+    """Per-node live readings. Holds the previous /proc/stat and RoCE counter reads for rates."""
 
     def __init__(self) -> None:
         self._cpu_prev: tuple[float, float] | None = None
+        self._roce_prev: tuple[float, dict[str, tuple[int, int]]] | None = None
 
     def sample(self) -> dict[str, Any]:
         gpu = parse_gpu_telemetry(
@@ -218,8 +269,12 @@ class Telemetry:
         cpu = parse_cpu_times(_read("/proc/stat"))
         util = cpu_util_pct(self._cpu_prev, cpu)
         self._cpu_prev = cpu
+        roce = (time.monotonic(), read_roce_bytes())
+        rails = rail_rates(self._roce_prev, roce)
+        self._roce_prev = roce
         return {
             "sampled_at": int(time.time() * 1000),
+            "rail_rates": rails,
             **gpu,
             "engine_reserved_gib": parse_compute_apps(apps) if gpu["gpu_sku"] else None,
             **parse_meminfo(_read("/proc/meminfo")),

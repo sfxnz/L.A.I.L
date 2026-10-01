@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type ToolEvalBoardRow } from "@/lib/api";
 import { Badge, Btn, Callout, EmptyState, Panel, Skeleton, btnClass } from "@/components/ui";
+import { Absent, Cell, CornerTicks, ScoreGauge, Section, scoreTone } from "@/components/evals/parts";
 import { cn } from "@/lib/utils";
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -24,144 +25,6 @@ function shortDate(iso?: string) {
   } catch {
     return iso;
   }
-}
-
-/** An absent reading is a deliberate HUD state — never a bare em-dash. */
-function Absent({ children = "none" }: { children?: ReactNode }) {
-  return (
-    <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.18em] text-lab-muted">
-      {children}
-    </span>
-  );
-}
-
-/**
- * Restrained corner ticks for the score frame.
- *
- * Deliberately NOT .animus-bracketed: that utility pins its brackets at -1px,
- * which the Panel's `overflow-hidden` clips, and its `border-top: 1px solid`
- * shorthand resets the colour to currentColor. These sit inside the box and
- * ride --animus-tick, so they read as hairline structure in both worlds.
- */
-function CornerTicks() {
-  const arm = "pointer-events-none absolute h-2.5 w-2.5 border-[color:var(--animus-tick)]";
-  return (
-    <span aria-hidden>
-      <span className={cn(arm, "left-1.5 top-1.5 border-l border-t")} />
-      <span className={cn(arm, "right-1.5 top-1.5 border-r border-t")} />
-      <span className={cn(arm, "bottom-1.5 left-1.5 border-b border-l")} />
-      <span className={cn(arm, "bottom-1.5 right-1.5 border-b border-r")} />
-    </span>
-  );
-}
-
-/**
- * A page section hung off the vertical spine.
- *
- * The spine is a hairline rail down the left edge; every section branches off
- * it with a crimson node + eyebrow + horizontal rule, so the eye is carried
- * score → categories → scenarios with no dead vertical gap.
- */
-function Section({
-  label,
-  meta,
-  children,
-  className,
-}: {
-  label: string;
-  meta?: ReactNode;
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <section className={cn("relative space-y-3 pl-4", className)}>
-      {/* spine rail */}
-      <span
-        aria-hidden
-        className="absolute bottom-1 left-0 top-2 w-px bg-[color:var(--animus-hairline)]"
-      />
-      {/* branch node */}
-      <span aria-hidden className="absolute left-0 top-2 h-3 w-px bg-lab-accent" />
-      <span aria-hidden className="absolute left-0 top-[13px] h-px w-2 bg-[color:var(--animus-hairline)]" />
-
-      <div className="flex items-center gap-3">
-        <h2 className="animus-eyebrow shrink-0 text-lab-text-dim">{label}</h2>
-        <span aria-hidden className="animus-rule min-w-8 flex-1" />
-        {meta ? <div className="shrink-0">{meta}</div> : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-/** 0–100 gauge with a hairline graticule. Crimson fill; dimmed for non-leaders. */
-function Gauge({
-  pct,
-  label,
-  lead = true,
-  divisions = 10,
-  className,
-}: {
-  pct: number | null | undefined;
-  label: string;
-  lead?: boolean;
-  divisions?: number;
-  className?: string;
-}) {
-  const v = Math.max(0, Math.min(100, Number(pct) || 0));
-  const step = 100 / divisions;
-  return (
-    <div
-      className={cn("relative h-[6px] w-full overflow-hidden bg-lab-hover", className)}
-      role="img"
-      aria-label={pct == null ? `${label}: no reading` : `${label}: ${Math.round(v)} of 100`}
-    >
-      {pct != null && (
-        <div
-          className={cn(
-            "h-full transition-[width] duration-700 ease-out",
-            lead
-              ? "bg-lab-accent"
-              : "bg-[color:color-mix(in_srgb,var(--color-lab-accent)_45%,transparent)]",
-          )}
-          style={{ width: `${v}%` }}
-        />
-      )}
-      <span
-        aria-hidden
-        className="pointer-events-none absolute inset-0"
-        style={{
-          backgroundImage: `repeating-linear-gradient(90deg, transparent 0 calc(${step}% - 1px), var(--animus-hairline) calc(${step}% - 1px), var(--animus-hairline) ${step}%)`,
-        }}
-      />
-    </div>
-  );
-}
-
-/** Hairline readout cell — the HUD replacement for a stat card. */
-function Cell({
-  label,
-  children,
-  className,
-}: {
-  label: string;
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("min-w-0 px-4 py-3", className)}>
-      <div className="animus-eyebrow truncate text-[10px]">{label}</div>
-      <div className="mt-1.5 truncate text-[13px] text-lab-text">{children}</div>
-    </div>
-  );
-}
-
-function scoreTone(score: number | null | undefined) {
-  if (score == null) return "muted" as const;
-  if (score >= 90) return "ok" as const;
-  if (score >= 75) return "accent" as const;
-  if (score >= 50) return "warn" as const;
-  return "danger" as const;
 }
 
 export default function ToolEvalBoardPage() {
@@ -251,8 +114,8 @@ export default function ToolEvalBoardPage() {
           <Btn variant="secondary" size="sm" onClick={refresh} loading={loading && rows.length > 0}>
             Refresh
           </Btn>
-          <Link href="/server" className={btnClass("secondary", "sm")}>
-            Run on Serve
+          <Link href="/evals#agentic" className={btnClass("secondary", "sm")}>
+            Run a suite
           </Link>
           <Btn
             size="sm"
@@ -306,7 +169,7 @@ export default function ToolEvalBoardPage() {
                       </span>
                     </div>
                     <div className="mt-3">
-                      <Gauge pct={champion.final_score} label="Best final score" />
+                      <ScoreGauge pct={champion.final_score} label="Best final score" />
                     </div>
                     <div
                       className="mt-3 truncate font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase tracking-[0.1em] text-lab-text"
@@ -334,7 +197,7 @@ export default function ToolEvalBoardPage() {
                       yet
                     </div>
                     <div className="mt-3">
-                      <Gauge pct={null} label="Best final score" />
+                      <ScoreGauge pct={null} label="Best final score" />
                     </div>
                   </>
                 )}
@@ -444,12 +307,12 @@ export default function ToolEvalBoardPage() {
                 />
               }
               action={
-                <Link href="/server" className={btnClass("primary", "sm")}>
-                  Open Serve → Agentic
+                <Link href="/evals#agentic" className={btnClass("primary", "sm")}>
+                  Run tool-eval-bench
                 </Link>
               }
             >
-              Run tool-eval-bench from Serve when a model is healthy. Results land here score-first.
+              Run tool-eval-bench from Evals when a model is serving. Results land here score-first.
             </EmptyState>
           </Panel>
         </Section>
@@ -521,7 +384,7 @@ export default function ToolEvalBoardPage() {
                     </div>
 
                     <div className="mt-2.5">
-                      <Gauge
+                      <ScoreGauge
                         pct={r.final_score}
                         label={`${r.model_short} final score`}
                         lead={win}
@@ -679,7 +542,7 @@ export default function ToolEvalBoardPage() {
                                 >
                                   {r.model_short}
                                 </span>
-                                <Gauge
+                                <ScoreGauge
                                   pct={pct ?? null}
                                   label={`${r.model_short} · ${c.label || c.id}`}
                                   lead={isLead}
@@ -790,7 +653,7 @@ export default function ToolEvalBoardPage() {
                               <span className="font-[family-name:var(--font-display)] text-[22px] font-semibold leading-none tabular-nums text-lab-text">
                                 {r.final_score}
                               </span>
-                              <Gauge
+                              <ScoreGauge
                                 pct={r.final_score}
                                 label={`${r.model_short} score`}
                                 lead={r.run_id === champion?.run_id}
@@ -855,7 +718,7 @@ export default function ToolEvalBoardPage() {
           <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums text-lab-muted">
             {selectedRows.length < 2
               ? "select 1 more"
-              : `${selectedRows.length} armed · hit compare`}
+              : `${selectedRows.length} selected · compare`}
           </span>
         </div>
       )}

@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { api } from "@/lib/api";
+import { api, parseApiError } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import type { StreamPack, StreamRunRow } from "@/lib/stream-run-types";
 import { copyText, downloadText } from "@/lib/streams/clipboard";
 import { exportStem, jsonSnapshot, markdownSummary, type RunControls } from "@/lib/streams/export";
@@ -52,16 +53,6 @@ function canonUrl(raw: string): string {
   }
 }
 
-function parseApiError(e: unknown): { error?: string; message: string; run_id?: string } {
-  const msg = e instanceof Error ? e.message : String(e);
-  try {
-    const j = JSON.parse(msg) as { error?: string; message?: string; run_id?: string };
-    return { error: j.error, message: j.message || msg, run_id: j.run_id };
-  } catch {
-    return { message: msg };
-  }
-}
-
 export default function StreamsPage() {
   return (
     <Suspense fallback={<PageSkeleton rows={4} />}>
@@ -77,7 +68,16 @@ function StreamsRoom() {
   const wall = search.get("wall") === "1";
   const urlRun = search.get("run");
 
-  const { status, loading, needToken, unreachable, error: statusError } = useLabStatus();
+  // Narrow selectors: this page re-renders for the run, not for every 1 s lab sample.
+  const { loading, needToken, unreachable, statusError, anyUp } = useLabStatusStore(
+    useShallow((s) => ({
+      loading: s.loading,
+      needToken: s.needToken,
+      unreachable: s.unreachable,
+      statusError: s.error,
+      anyUp: serveHealthy(s.status) || Object.values(s.status?.backends ?? {}).some((b) => b.ok),
+    })),
+  );
   const [packs, setPacks] = useState<StreamPack[]>([]);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [controls, setControls] = useState<StreamControls>(DEFAULT_CONTROLS);
@@ -101,7 +101,6 @@ function StreamsRoom() {
   const strands = state.strands;
   const nowAt = Math.max(tickAt, state.clock?.at ?? 0);
 
-  const anyUp = serveHealthy(status) || Object.values(status?.backends ?? {}).some((b) => b.ok);
   const canRun = anyUp && !needToken && !unreachable && !!controls.base_url;
   const runDisabledReason = needToken
     ? "LAIL_TOKEN required — paste it in the banner"
@@ -185,15 +184,21 @@ function StreamsRoom() {
   }, [finished, refreshRuns]);
 
   // ── Desync (latched per strand for the run — evidence stays) ─────────────
+  // Cards only read `desync` and `reason`: an unchanged verdict keeps its object, so
+  // the 1 Hz clock does not re-render every memoised StrandCard.
+  const prevDesyncs = useRef<Desync[]>([]);
   const desyncs = useMemo(() => {
     const latch = desyncLatch.current;
-    return strands.map((s) => {
+    const next = strands.map((s, k) => {
       const held = latch.get(s.i);
       if (held) return held;
       const d = strandDesync(s, nowAt);
       if (d.desync) latch.set(s.i, d);
-      return d;
+      const prev = prevDesyncs.current[k];
+      return prev && prev.desync === d.desync && prev.reason === d.reason ? prev : d;
     });
+    prevDesyncs.current = next;
+    return next;
   }, [strands, nowAt]);
 
   // ── Actions ──────────────────────────────────────────────────────────────
@@ -315,6 +320,10 @@ function StreamsRoom() {
   // ── Keyboard ─────────────────────────────────────────────────────────────
   const keys = useRef({ run, doStop, copyAll, copyStrand, toggleThinking, focused, hovered, sheet, wall, setWall, live, strands });
   keys.current = { run, doStop, copyAll, copyStrand, toggleThinking, focused, hovered, sheet, wall, setWall, live, strands };
+  // Stable callbacks for the memoised StrandCards (fresh arrows defeated the memo,
+  // re-rendering every card's full transcript on every flushed frame).
+  const toggleFocus = useCallback((i: number) => setFocused((f) => (f === i ? null : i)), []);
+  const copyOne = useCallback((i: number) => void keys.current.copyStrand(i), []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const k = keys.current;
@@ -386,13 +395,13 @@ function StreamsRoom() {
       : loading
         ? "Checking…"
         : live
-          ? "Synchronizing"
+          ? "Running"
           : finished
             ? state.done?.summary.status === "cancelled"
               ? "Sequence cancelled"
               : state.done?.summary.status === "error"
                 ? "Sequence failed"
-                : "Sequence synchronized"
+                : "Run done"
             : anyUp
               ? "Endpoint live"
               : "No model serving";
@@ -451,7 +460,7 @@ function StreamsRoom() {
               </Link>
             }
           >
-            No memory loaded. Serve a model to begin synchronization — strands need a live endpoint.
+            No model serving. Start one on Serve — streams need a live endpoint.
           </Corridor>
         </Panel>
       ) : (
@@ -525,9 +534,9 @@ function StreamsRoom() {
                       thinkingMuted={mutedThinking.has(s.i)}
                       wall={wall}
                       onHover={setHovered}
-                      onFocus={(i) => setFocused((f) => (f === i ? null : i))}
+                      onFocus={toggleFocus}
                       onExpand={setSheet}
-                      onCopy={(i) => void copyStrand(i)}
+                      onCopy={copyOne}
                       onToggleThinking={toggleThinking}
                     />
                   </div>
@@ -544,7 +553,7 @@ function StreamsRoom() {
           ) : (
             <section aria-label="Preview" className="space-y-2">
               <div className="flex items-center gap-2.5">
-                <Eyebrow className="text-lab-text-dim">Run to synchronize {controls.n} strand{controls.n === 1 ? "" : "s"}</Eyebrow>
+                <Eyebrow className="text-lab-text-dim">Run to start {controls.n} strand{controls.n === 1 ? "" : "s"}</Eyebrow>
                 <div aria-hidden className="animus-rule min-w-6 flex-1" />
                 <Eyebrow className="lab-num">
                   {packLabel(controls.pack)} · {fmtInt(controls.max_tokens)} tok · {controls.arrival}
@@ -589,7 +598,7 @@ function StreamsRoom() {
         onOpenChange={(open) => {
           if (!open) setSheet(null);
         }}
-        onCopy={(i) => void copyStrand(i)}
+        onCopy={copyOne}
       />
     </div>
   );

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, type LabStatus, type ServeExample, type ServeRecommend } from "@/lib/api";
+import { api, type ServeExample, type ServeRecommend } from "@/lib/api";
 import {
   Badge,
   Btn,
@@ -14,24 +14,23 @@ import {
   LogView,
   Panel,
   ProgressBar,
-  SegmentedControl,
   Skeleton,
   SyncRing,
   Tick,
   inputCls,
-  btnClass,
+  CopyButton,
+  useCopy,
 } from "@/components/ui";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, tightestNode, useLabStatusStore, useStale } from "@/lib/lab-status-store";
+import { CONFIRM_WINDOW_MS, confirmStep } from "@/lib/confirm-click";
+import { LiveAge } from "@/components/status/LiveAge";
+import { hermesBases } from "@/components/status/EndpointHero";
 import { useJobWatch } from "@/lib/use-job-watch";
 import { cn } from "@/lib/utils";
 
-// Throughput / latency live on /bench, smoke and the run log on /evals.
-type Tab = "serve" | "agentic";
-
-const TAB_HINTS: Record<Tab, string> = {
-  serve: "target · envelope · flags · launch",
-  agentic: "tool-calling quality suites",
-};
+// Serve is for serving: throughput / latency live on /bench, smoke, tool-calling
+// suites and the run log on /evals.
 
 /* ---------------------------------------------------------------------------
    Local HUD atoms. Everything chromatic here resolves through lab-* tokens so
@@ -155,8 +154,8 @@ function Telem({
 }
 
 export default function ServerPage() {
-  const [tab, setTab] = useState<Tab>("serve");
-  const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
+  // No live subscription here: the form must not re-render on every sample. The live
+  // endpoint panel subscribes on its own and is the one place that says what serves.
   const [model, setModel] = useState("");
   const [util, setUtil] = useState("");
   const [maxLen, setMaxLen] = useState("");
@@ -184,37 +183,41 @@ export default function ServerPage() {
   const [recBusy, setRecBusy] = useState(false);
   const [recError, setRecError] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   const [startBusy, setStartBusy] = useState(false);
   const [advOpen, setAdvOpen] = useState(false);
   const [formFlash, setFormFlash] = useState<string | null>(null);
   const [appliedExample, setAppliedExample] = useState<string | null>(null);
   const jobPanelRef = useRef<HTMLDivElement>(null);
 
-  // Lab status comes from the shell's shared 2s poll; Refresh forces one tick.
-  const refresh = (opts?: { soft?: boolean }) => {
-    if (!opts?.soft) setRefreshing(true);
-    return refreshStatus().finally(() => setRefreshing(false));
-  };
-
-  const jobWatch = useJobWatch({ onSettled: () => void refresh({ soft: true }) });
+  const jobWatch = useJobWatch();
   const { logs, message: jobMsg, progress: jobProgress } = jobWatch.job;
   const jobStatus = jobWatch.job.status ?? "";
   const jobRunning = jobWatch.running;
 
-  const examples = (status?.serve?.serve_examples || {}) as Record<string, ServeExample>;
-  const modelHints = status?.serve?.presets || [];
+  // Static presets: fetched once, not carried on the 1 s live snapshot.
+  // null while loading: the section keeps its place (skeleton cards) so the steps below
+  // neither jump down nor renumber when the answer lands.
+  const [examples, setExamples] = useState<Record<string, ServeExample> | null>(null);
+  const [modelHints, setModelHints] = useState<string[]>([]);
+  useEffect(() => {
+    api
+      .serveExamples()
+      .then((r) => {
+        setExamples(r.examples || {});
+        setModelHints(r.presets || []);
+      })
+      .catch(() => setExamples({}));
+  }, []);
   /**
    * Spine numbering. The presets block is conditional, so hardcoded numerals
    * render 01 → 02 → 04 when no presets exist — a skipped step reads as a
    * missing section. Derive the sequence from what is actually on screen.
    */
-  const hasPresets = Object.keys(examples).length > 0;
+  const hasPresets = examples == null || Object.keys(examples).length > 0;
   const step = (() => {
     let n = 0;
     const next = () => String(++n).padStart(2, "0");
     return {
-      envelope: next(),
       target: next(),
       presets: hasPresets ? next() : "",
       flags: next(),
@@ -281,7 +284,10 @@ export default function ServerPage() {
       .jobs()
       .then(async (list) => {
         if (cancelled) return;
-        const active = list.find((j) => j.status === "running" || j.status === "queued");
+        // Serve and stop jobs dock here; agentic suites dock on Evals.
+        const active = list.find(
+          (j) => (j.status === "running" || j.status === "queued") && (j.kind === "serve" || j.kind === "stop"),
+        );
         if (!active?.job_id) return;
         const updated = active.updated_at ? Date.parse(active.updated_at) : NaN;
         if (Number.isFinite(updated) && Date.now() - updated > STALE_MS) {
@@ -458,30 +464,16 @@ export default function ServerPage() {
     try {
       const { job_id } = await api.stopServe();
       track(job_id);
-      setTimeout(refresh, 2000);
     } catch (e) {
       setStartError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function restore() {
-    try {
-      const { job_id } = await api.agentRestore();
-      track(job_id);
-    } catch (e) {
-      setStartError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  const serve = status?.serve;
-  const healthy = serveHealthy(status);
-  const avail = serve?.hardware?.available_gib;
-  const headroom = serve?.headroom;
   const confTone =
     rec?.confidence === "high" ? "ok" : rec?.confidence === "medium" ? "warn" : "muted";
 
   // Presentation only — mirrors the existing disabled expression exactly so the
-  // launch control can explain WHY it is disarmed instead of just dimming.
+  // launch control can explain WHY it is not ready instead of just dimming.
   const hasModel = !!model.trim();
   const startDisabledReason = !hasModel
     ? "Enter a model id first"
@@ -495,101 +487,20 @@ export default function ServerPage() {
     <div className="space-y-4 lab-fade-in">
       <div className="page-header">
         <div>
-          <div className="animus-eyebrow mb-1 flex items-center gap-2">
-            <span aria-hidden className="h-2.5 w-px bg-lab-accent" />
-            Launch control
-          </div>
           <h1 className="page-title">Serve</h1>
           <p className="page-sub">
-            Arm a vLLM container on this host. Auto-configure reads the live model card, the
-            envelope caps memory, advanced flags stay folded until you need them.
+            Start a vLLM container on this host. Auto-configure reads the live model card and sizes
+            memory; advanced flags stay folded until you need them.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2" aria-live="polite">
-          {statusLoading ? (
-            <Badge tone="muted">checking…</Badge>
-          ) : (
-            <Badge tone={healthy ? "ok" : "muted"} dot>
-              {healthy ? "endpoint up" : "no model"}
-            </Badge>
-          )}
-          {avail != null && (
-            <Badge
-              tone={
-                headroom === "critical" ? "danger" : headroom === "tight" ? "warn" : "ok"
-              }
-            >
-              free {avail} GiB
-            </Badge>
-          )}
-          <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing}>
-            Refresh
-          </Btn>
+        <div className="flex flex-wrap items-center gap-2">
           <Btn variant="ghost" size="sm" onClick={clearForm}>
             Clear form
           </Btn>
         </div>
       </div>
 
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <SegmentedControl
-            ariaLabel="Serve sections"
-            value={tab}
-            onChange={setTab}
-            options={[
-              { id: "serve", label: "Serve" },
-              { id: "agentic", label: "Agentic" },
-            ]}
-          />
-          <Tick className="hidden sm:block" />
-          <Eyebrow className="hidden tracking-[0.18em] sm:inline">{TAB_HINTS[tab]}</Eyebrow>
-        </div>
-        <div className="animus-rule" aria-hidden />
-      </div>
-
-      {tab === "serve" && (
-        <div className="space-y-4">
-          {/* 01 · CONTROLS — stop / restore. Memory envelope is chosen by Auto-configure. */}
-          <section className="animus-chamfer border border-lab-border bg-[color:var(--animus-glass)] px-4 py-3.5">
-            <Seq
-              n={step.envelope}
-              label="Host"
-              hint="stop running serves · reserved UMA is automatic"
-              action={
-                <>
-                  <Btn
-                    variant="danger"
-                    onClick={stop}
-                    disabled={startBusy}
-                    title={
-                      startBusy ? "Wait for start request to register" : "Stop all vLLM containers"
-                    }
-                  >
-                    Stop all
-                  </Btn>
-                  <Btn
-                    variant="secondary"
-                    onClick={restore}
-                    disabled={jobRunning}
-                    title={
-                      jobRunning
-                        ? "Wait for the current job to finish"
-                        : "Restore agent-friendly serve"
-                    }
-                  >
-                    Agent restore
-                  </Btn>
-                </>
-              }
-            />
-            <p className="mt-3 max-w-xl text-[11px] leading-snug text-lab-muted">
-              Auto-configure sizes util, context, vision, and tensor parallel from the
-              researched recipe plus live hardware. Start still refuses when weights
-              cannot fit.
-            </p>
-          </section>
-
+      <div className="space-y-4">
           <div className="grid gap-3 lg:grid-cols-3">
             <Panel className="lg:col-span-2">
               <div className="space-y-3.5 p-4">
@@ -665,7 +576,7 @@ export default function ServerPage() {
                 {rec && (
                   <div className="animus-chamfer-sm animus-bracketed relative border border-lab-border bg-lab-editor p-3.5 text-xs space-y-2.5 before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!">
                     <div className="animus-eyebrow text-[9px] tracking-[0.2em]">
-                      Reconstruction · card analysis
+                      Auto-config result
                     </div>
                     <div className="flex flex-wrap gap-2 items-center">
                     <Badge tone={confTone}>confidence: {rec.confidence}</Badge>
@@ -817,102 +728,10 @@ export default function ServerPage() {
               </div>
             </Panel>
 
-            <Panel>
-              <div className="space-y-3.5 p-4">
-                <Seq
-                  n="——"
-                  label="Live endpoint"
-                  action={
-                    <SyncRing
-                      state={
-                        statusLoading
-                          ? null
-                          : healthy
-                            ? "serving"
-                            : serve?.unreachable
-                              ? "offline"
-                              : "idle"
-                      }
-                      label={
-                        statusLoading
-                          ? "Checking endpoint"
-                          : healthy
-                            ? "Endpoint healthy"
-                            : serve?.unreachable
-                              ? "Engine down"
-                              : "Endpoint idle"
-                      }
-                    />
-                  }
-                />
-                <div className="animus-rule" aria-hidden />
-                {statusLoading ? (
-                  <div className="space-y-3" aria-busy="true" aria-label="Loading live status">
-                    <Skeleton className="h-4 w-full" />
-                    <Skeleton className="h-4 w-[80%]" />
-                    <Skeleton className="h-4 w-[60%]" />
-                    <Skeleton className="h-4 w-[66%]" />
-                  </div>
-                ) : (
-                  <>
-                    <dl>
-                      <Readout label="Served model" value={serve?.model_id} unset="No model" />
-                      <Readout label="Endpoint" value={serve?.base_url} unset="Not set" />
-                      <Readout
-                        label="Memory free"
-                        value={
-                          avail != null
-                            ? `${avail} GiB${headroom ? ` · ${headroom}` : ""}`
-                            : undefined
-                        }
-                        unset="Unknown"
-                      />
-                      <Readout
-                        label="GPU"
-                        mono={false}
-                        value={
-                          String(serve?.hardware?.gpu_sku || "")
-                            .replace(/\s*,?\s*\[?N\/A\]?/gi, "")
-                            .replace(/\s{2,}/g, " ")
-                            .trim() || undefined
-                        }
-                        unset="Unknown"
-                      />
-                      <Readout label="Health">
-                        <Badge tone={healthy ? "ok" : "muted"} dot>
-                          {healthy ? "Healthy" : serve?.unreachable ? "Engine down" : "Idle"}
-                        </Badge>
-                      </Readout>
-                    </dl>
-                    <div className="space-y-1.5">
-                      <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Containers</div>
-                      {(serve?.containers || []).length === 0 && (
-                        <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] px-2.5 py-2">
-                          <Unset>No vLLM containers</Unset>
-                        </div>
-                      )}
-                      {(serve?.containers || []).map((c) => (
-                        <div
-                          key={c.name}
-                          className={cn(
-                            "animus-notch flex items-center justify-between gap-2 border border-l-2 border-lab-border-subtle px-2.5 py-1.5 text-[11px]",
-                            c.status.includes("Up")
-                              ? "border-l-lab-ok"
-                              : "border-l-[color:var(--animus-hairline)]",
-                          )}
-                        >
-                          <span className="truncate font-mono text-lab-text-dim">{c.name}</span>
-                          <Badge tone={c.status.includes("Up") ? "ok" : "muted"}>{c.status}</Badge>
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
-            </Panel>
+            <LiveEndpoint onStop={() => void stop()} stopBlocked={startBusy} />
           </div>
 
-          {Object.keys(examples).length > 0 && (
+          {hasPresets && (
             <Panel>
               <div className="space-y-3.5 p-4">
                 <Seq
@@ -937,7 +756,9 @@ export default function ServerPage() {
                   </Callout>
                 )}
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                  {Object.entries(examples).map(([k, ex]) => {
+                  {examples == null &&
+                    [0, 1].map((i) => <Skeleton key={i} className="h-[54px] w-full" />)}
+                  {Object.entries(examples ?? {}).map(([k, ex]) => {
                     const selected =
                       appliedExample === k || appliedExample === (ex.label || ex.model);
                     return (
@@ -1211,9 +1032,9 @@ export default function ServerPage() {
           </Panel>
 
           {/*
-            05 · LAUNCH — the one primary CTA on this surface. Armed when a
+            LAUNCH — the one primary CTA on this surface. Ready when a
             model is set and no job is in flight; otherwise deliberately
-            disarmed with the reason spelled out both in the title attribute
+            not ready, with the reason spelled out both in the title attribute
             and on the plate itself.
           */}
           <section
@@ -1244,12 +1065,12 @@ export default function ServerPage() {
                       startDisabledReason ? "text-lab-muted" : "text-lab-accent-bright",
                     )}
                   >
-                    {startBusy ? "Arming" : startDisabledReason ? "Disarmed" : "Armed"}
+                    {startBusy ? "Starting" : startDisabledReason ? "Not ready" : "Ready"}
                   </span>
                 </div>
                 <p className="max-w-lg text-[11px] leading-relaxed text-lab-muted">
                   {startDisabledReason
-                    ? `${startDisabledReason}. Start stays disarmed until then.`
+                    ? `${startDisabledReason}.`
                     : "Stops running vLLM containers first, then boots the configured serve. Live output docks below."}
                 </p>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] tabular-nums text-lab-muted">
@@ -1275,18 +1096,9 @@ export default function ServerPage() {
               </span>
             </div>
           </section>
-        </div>
-      )}
+      </div>
 
-      {tab === "agentic" && (
-        <AgenticTab
-          track={track}
-          healthy={healthy}
-          toolEval={status?.serve?.tool_eval}
-        />
-      )}
-
-      {/* Job log always visible so Agentic jobs aren't invisible on other tabs */}
+      {/* Serve and stop output */}
       <div
         ref={jobPanelRef}
         id="serve-job-dock"
@@ -1306,7 +1118,7 @@ export default function ServerPage() {
             <Seq
               n={step.job}
               label="Job dock"
-              hint="serve · stop · bench · agentic telemetry"
+              hint="serve · stop output"
               action={
                 <>
                   {jobRunning && (
@@ -1386,12 +1198,12 @@ export default function ServerPage() {
                 <LogView
                   text={logs}
                   live={jobRunning}
-                  empty="Job output appears here when you start a serve, stop, bench, or agentic run."
+                  empty="Output appears here when you start or stop a serve."
                 />
               </>
             ) : (
               <EmptyState title="No job">
-                Start a serve, stop, bench, or agentic run — live logs stream into this dock.
+                Start or stop a serve — its live log streams here.
               </EmptyState>
             )}
           </div>
@@ -1401,178 +1213,162 @@ export default function ServerPage() {
   );
 }
 
-function AgenticTab({
-  track,
-  healthy,
-  toolEval,
-}: {
-  track: (id: string) => void;
-  healthy: boolean;
-  toolEval?: NonNullable<LabStatus["serve"]>["tool_eval"];
-}) {
-  const [err, setErr] = useState<string | null>(null);
-  const [preset, setPreset] = useState<"short" | "full" | "hardmode" | "coding">("short");
-  const [teb, setTeb] = useState<{
-    available: boolean;
-    path?: string | null;
-    version?: string | null;
-    install?: string;
-    repo?: string;
-  } | null>(toolEval ?? null);
-
+/**
+ * What is serving right now and how to reach it — its own store subscription, so a
+ * live sample re-renders this panel, not the form beside it. Stop lives here, next
+ * to what it stops, behind a second click: a stray click on a 15–30 min NVFP4 load
+ * costs the operator half an hour.
+ */
+function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked: boolean }) {
+  const { loading, healthy, serve, engineError } = useLabStatusStore(
+    useShallow((s) => ({
+      loading: s.loading,
+      healthy: serveHealthy(s.status),
+      serve: s.status?.serve ?? null,
+      engineError: s.engineError,
+    })),
+  );
+  // Frozen data is never shown as live: the last snapshot dims, with its age.
+  const stale = useStale();
+  const [armedAt, setArmedAt] = useState<number | null>(null);
+  const confirming = armedAt != null;
   useEffect(() => {
-    api.toolEvalStatus().then(setTeb).catch(() => {});
-  }, []);
+    if (armedAt == null) return;
+    const t = setTimeout(() => setArmedAt(null), CONFIRM_WINDOW_MS);
+    return () => clearTimeout(t);
+  }, [armedAt]);
 
-  const available = !!(teb?.available ?? toolEval?.available);
+  const containers = serve?.containers ?? [];
+  const up = containers.filter((c) => c.status.includes("Up"));
+  const modelShort = healthy ? (serve?.model_id || "").split("/").pop() || null : null;
+  const tightest = tightestNode(serve?.cluster?.nodes);
+  const freeGib = tightest?.available_gib ?? serve?.hardware?.available_gib ?? null;
+  const pressure = tightest?.mem_pressure ?? serve?.headroom ?? null;
+  const bases = hermesBases(serve?.base_url, "127.0.0.1");
+  const env = bases && healthy && serve?.model_id ? `OPENAI_BASE_URL=${bases.local}\nOPENAI_API_KEY=local\nOPENAI_MODEL=${serve.model_id}` : null;
+  const [flash, copy] = useCopy();
+  const canStop = up.length > 0 && !stopBlocked;
 
   return (
-    <div className="space-y-4">
-      <Panel>
-        <div className="space-y-3.5 p-4">
-          <Seq
-            n="——"
-            label="Golden tools"
-            hint="12-case tool-selection smoke"
-            action={
-              <Badge tone={healthy ? "ok" : "muted"} dot={healthy}>
-                {healthy ? "endpoint ready" : "endpoint down"}
-              </Badge>
-            }
-          />
-          <div className="animus-rule" aria-hidden />
-          <p className="text-[11px] leading-relaxed text-lab-muted">
-            Fast 12-case smoke: does the model pick the right tool (or none)? Needs{" "}
-            <code className="font-mono text-[10.5px] text-lab-text-dim">
-              --enable-auto-tool-choice
-            </code>{" "}
-            + tool-call parser on serve. Logs stream into the job dock below.
-          </p>
-          {!healthy && (
-            <Callout tone="warn" title="Endpoint down">
-              Start a model on Serve first. Agentic benches need a healthy OpenAI-compatible
-              endpoint.
-            </Callout>
-          )}
-          {err && (
-            <Callout tone="danger" title="Agentic action failed" onDismiss={() => setErr(null)}>
-              {err}
-            </Callout>
-          )}
-          <Btn
-            onClick={async () => {
-              setErr(null);
-              try {
-                const { job_id } = await api.benchAgentic({ suite: "golden" });
-                track(job_id);
-              } catch (e) {
-                setErr(e instanceof Error ? e.message : String(e));
-              }
-            }}
-            disabled={!healthy}
-            title={!healthy ? "Start a model first" : undefined}
-          >
-            Run golden tools
-          </Btn>
-        </div>
-      </Panel>
-
-      <Panel>
-        <div className="space-y-3.5 p-4">
-          <Seq
-            n="——"
-            label="Tool Eval Bench"
-            hint="full tool-calling quality suite"
-            action={
-              <Badge tone={available ? "ok" : "warn"} dot>
-                {available
-                  ? `installed${teb?.version ? ` · ${teb.version}` : ""}`
-                  : "not installed"}
-              </Badge>
-            }
-          />
-          <div className="animus-rule" aria-hidden />
-          <p className="max-w-xl text-[11px] leading-relaxed text-lab-muted">
-            Full tool-calling quality suite (
-            <a
-              href="https://github.com/SeraphimSerapis/tool-eval-bench"
-              target="_blank"
-              rel="noreferrer"
-              className="text-lab-accent-bright underline-offset-2 hover:underline"
-            >
-              SeraphimSerapis/tool-eval-bench
-            </a>
-            ) — selection, params, multi-step, restraint, safety, structured output. Scores 0–100
-            with safety gating.
-          </p>
-
-          {!available && (
-            <Callout tone="warn" title="Not installed">
-              <div className="space-y-2">
-                <span>
-                  Install on this host, then restart{" "}
-                  <code className="font-mono text-[10.5px]">bun run dev</code>:
-                </span>
-                <pre className="overflow-x-auto rounded-[2px] border border-l-2 border-lab-border border-l-lab-warn bg-lab-editor p-2.5 font-mono text-[11px] text-lab-text-dim">
-                  {teb?.install ||
-                    "uv tool install git+https://github.com/SeraphimSerapis/tool-eval-bench.git"}
-                </pre>
-              </div>
-            </Callout>
-          )}
-
-          {available && (
-            <>
-              <SegmentedControl
-                ariaLabel="tool-eval-bench preset"
-                value={preset}
-                onChange={setPreset}
-                options={[
-                  { id: "short", label: "Short (15)" },
-                  { id: "full", label: "Full (69)" },
-                  { id: "hardmode", label: "Hard mode" },
-                  { id: "coding", label: "Coding cats" },
-                ]}
+    <Panel>
+      <div className="space-y-3.5 p-4">
+        <Seq
+          n="——"
+          label="Live endpoint"
+          action={
+            <span className="flex items-center gap-2">
+              {stale && <LiveAge />}
+              <SyncRing
+                state={loading ? null : engineError ? "offline" : stale ? "stale" : healthy ? "serving" : "idle"}
+                label={
+                  loading
+                    ? "Checking endpoint"
+                    : engineError
+                      ? `Serve-engine not answering (${engineError})`
+                      : stale
+                        ? "Live data not updating"
+                        : healthy
+                          ? "Endpoint healthy"
+                          : "Endpoint idle"
+                }
               />
-              <p className="text-[11px] leading-relaxed text-lab-muted">
-                Runs with <code className="font-mono text-[10.5px]">--no-think</code> against the
-                live OpenAI-compatible endpoint. Short ≈ minutes; full suite can take much longer
-                on 27B.
-              </p>
-              <div className="animus-rule" aria-hidden />
-              <div className="flex flex-wrap items-center gap-2">
-                <Btn
-                  onClick={async () => {
-                    setErr(null);
-                    try {
-                      const { job_id } = await api.benchAgentic({
-                        suite: "tool_eval",
-                        preset,
-                      });
-                      track(job_id);
-                    } catch (e) {
-                      setErr(e instanceof Error ? e.message : String(e));
-                    }
-                  }}
-                  disabled={!healthy || !available}
-                  title={
-                    !healthy
-                      ? "Start a model first"
-                      : !available
-                        ? "Install tool-eval-bench on this host first"
-                        : undefined
+            </span>
+          }
+        />
+        <div className="animus-rule" aria-hidden />
+        {loading ? (
+          // about the panel's height while serving, so the steps below do not jump on the first sample
+          <div className="min-h-[240px] space-y-3" aria-busy="true" aria-label="Loading live status">
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-[80%]" />
+            <Skeleton className="h-4 w-[60%]" />
+          </div>
+        ) : (
+          <>
+            <div className={cn("space-y-3.5 transition-opacity duration-300", stale && "opacity-60")}>
+              <dl>
+                <Readout label="Served model" value={healthy ? serve?.model_id : null} unset="No model" />
+                <Readout label="OpenAI base URL">
+                  {bases ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      {bases.local}
+                      <CopyButton text={bases.local} label="Base URL" />
+                    </span>
+                  ) : (
+                    <Unset>Not set</Unset>
+                  )}
+                </Readout>
+                <Readout
+                  label="Memory free"
+                  value={
+                    freeGib != null
+                      ? `${freeGib.toFixed(1)} GiB${tightest && (serve?.cluster?.nodes?.length ?? 0) > 1 ? ` on ${tightest.id}` : ""}${pressure && pressure !== "ok" ? ` · ${pressure}` : ""}`
+                      : undefined
                   }
-                >
-                  Run tool-eval-bench ({preset})
-                </Btn>
-                <a href="/evals/tool" className={btnClass("secondary", "md")}>
-                  Open results board →
-                </a>
+                  unset="Unknown"
+                />
+              </dl>
+              {env && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Btn variant="secondary" size="sm" onClick={() => copy("Hermes env", env)} title={env}>
+                    Copy Hermes env
+                  </Btn>
+                  <a href="/connect" className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase tracking-[0.14em] text-lab-accent-bright hover:text-lab-accent">
+                    More ways to connect →
+                  </a>
+                  {flash && <Eyebrow className="text-lab-ok">{flash}</Eyebrow>}
+                </div>
+              )}
+              <div className="space-y-1.5">
+                <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Containers</div>
+                {containers.length === 0 && (
+                  <div className="animus-notch border border-l-2 border-lab-border-subtle border-l-[color:var(--animus-hairline)] px-2.5 py-2">
+                    <Unset>No vLLM containers</Unset>
+                  </div>
+                )}
+                {containers.map((c) => (
+                  <div
+                    key={c.name}
+                    className={cn(
+                      "animus-notch flex items-center justify-between gap-2 border border-l-2 border-lab-border-subtle px-2.5 py-1.5 text-[11px]",
+                      c.status.includes("Up") ? "border-l-lab-ok" : "border-l-[color:var(--animus-hairline)]",
+                    )}
+                  >
+                    <span className="truncate font-mono text-lab-text-dim">{c.name}</span>
+                    <Badge tone={c.status.includes("Up") ? "ok" : "muted"}>{c.status}</Badge>
+                  </div>
+                ))}
               </div>
-            </>
-          )}
-        </div>
-      </Panel>
-    </div>
+            </div>
+            {up.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 border-t border-[color:var(--animus-hairline)] pt-3">
+                <Btn
+                  variant={confirming ? "danger" : "secondary"}
+                  size="sm"
+                  disabled={!canStop}
+                  onClick={() => {
+                    const now = Date.now();
+                    const step = confirmStep(armedAt, now);
+                    if (step === "ignore") return; // the second click of a double-click
+                    if (step === "arm") {
+                      setArmedAt(now);
+                      return;
+                    }
+                    setArmedAt(null);
+                    onStop();
+                  }}
+                  title={stopBlocked ? "Wait for the start request to register" : "Stops every serve container on this host (two clicks)"}
+                >
+                  {confirming ? "Confirm stop" : modelShort ? `Stop ${modelShort}` : "Stop containers"}
+                </Btn>
+                {confirming && (
+                  <span className="text-[11px] text-lab-warn">Click again within 4 s — reloading takes minutes.</span>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Panel>
   );
 }

@@ -51,12 +51,14 @@ export function CommandPalette() {
   const open = useCommandUi((s) => s.paletteOpen);
   const setPalette = useCommandUi((s) => s.setPalette);
   const setSheet = useCommandUi((s) => s.setSheet);
-  const { status, needToken, liveRun } = useLabStatusStore();
-  // `liveRun` is published by useStreamRun while a Streams/Bench run streams.
-  const strands = useMemo(
-    () => ({ running: liveRun?.running ?? 0, waiting: liveRun?.waiting ?? 0 }),
-    [liveRun],
-  );
+  // Closed, the palette subscribes to nothing that changes every second: `status` is
+  // only read while it is open, so a live sample never re-renders a hidden palette.
+  const status = useLabStatusStore((s) => (open ? s.status : null));
+  const needToken = useLabStatusStore((s) => s.needToken);
+  // Strand counts are published by useStreamRun while a Streams/Bench run streams.
+  const running = useLabStatusStore((s) => s.liveRun?.running ?? 0);
+  const waiting = useLabStatusStore((s) => s.liveRun?.waiting ?? 0);
+  const strands = useMemo(() => ({ running, waiting }), [running, waiting]);
 
   const [query, setQuery] = useState("");
   const [runs, setRuns] = useState<RunRow[] | null>(null);
@@ -77,7 +79,7 @@ export function CommandPalette() {
     if (open) setQuery("");
   }, [open]);
 
-  // Sequences: fetch the recent run index once per open, debounced behind the first keystroke.
+  // Runs: fetch the recent run index once per open, debounced behind the first keystroke.
   useEffect(() => {
     if (!open || runs !== null || query.trim().length < 2) return;
     const t = window.setTimeout(() => {
@@ -113,7 +115,7 @@ export function CommandPalette() {
     const rows = runs.flatMap((r) => {
       const href = runHref(r);
       return href
-        ? [{ run: r, href, label: r.run_id, hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "), group: "Sequences" }]
+        ? [{ run: r, href, label: r.run_id, hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "), group: "Runs" }]
         : [];
     });
     return filterCommands(rows, query).slice(0, 8);
@@ -163,7 +165,7 @@ export function CommandPalette() {
             </Command.Group>
           ))}
           {sequences.length > 0 && (
-            <Command.Group heading={<Eyebrow>Sequences</Eyebrow>}>
+            <Command.Group heading={<Eyebrow>Runs</Eyebrow>}>
               {sequences.map((s) => (
                 <Command.Item
                   key={s.run.run_id}

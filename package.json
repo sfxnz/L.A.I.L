@@ -14,6 +14,7 @@
   ],
   "scripts": {
     "dev": "bun run scripts/dev.ts",
+    "start:prod": "LAIL_WEB_MODE=prod bun run scripts/dev.ts",
     "dev:web": "bun run --filter @lail/web dev",
     "dev:api": "bun run --filter @lail/backend dev",
     "build": "bun run --filter @lail/web build && bun run --filter @lail/backend build",

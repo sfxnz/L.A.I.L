@@ -1,21 +1,18 @@
 /**
- * Front page: Spark instruments and the "Last synchronization" card (the retired
+ * Front page: Spark instruments, the served-model panel and the "Last decode bench" card (the retired
  * DecodeBench panel's replacement — the bench itself lives on /bench).
  */
 import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { readFileSync } from "fs";
-import { join } from "path";
-import { ClusterPanel } from "../components/ClusterPanel";
+import { ClusterPanel, flowDurS } from "../components/ClusterPanel";
 import { LastSyncCard } from "../components/bench/LastSyncCard";
-import { Nil } from "../components/ui";
+import { EndpointHero, hermesBases } from "../components/status/EndpointHero";
 import type { ClusterNode, RunRow } from "./api";
 import { lastSync, latestDecodeRuns } from "./bench/last-sync";
 import { CONCURRENCY_LEVELS, PACK_LABELS, sortConcurrencies } from "./bench/levels";
 import type { DecodeResult } from "./bench/result";
 
-const webRoot = join(import.meta.dir, "..");
 
 const MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4";
 const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}, model_id = MODEL): RunRow => ({
@@ -52,7 +49,7 @@ describe("bench domain kept from the retired decode bench", () => {
 
 });
 
-describe("Last synchronization (Status card)", () => {
+describe("Last decode bench (Status card)", () => {
   const rows = [
     row("old-prefill", "2026-09-06T10:00:00Z", "prefill", { prefill_tok_per_s_sustained: 2874.9 }),
     row("d1", "2026-09-06T11:00:00Z", "decode", HEADLINE(34.2, 71.8, 4)),
@@ -144,14 +141,14 @@ describe("Last synchronization (Status card)", () => {
 
   test("renders the empty state with a Bench CTA, and the hero when a run exists", () => {
     const empty = renderToStaticMarkup(createElement(LastSyncCard, { runs: [], loading: false, servingModel: null }));
-    expect(empty).toContain("Run a decode sync to draw the first slice.");
+    expect(empty).toContain("Run a decode bench to get the first curve.");
     expect(empty).toContain('href="/bench"');
     expect(empty).not.toContain("—");
     const unbenched = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false, servingModel: "org/new-model" }));
     expect(unbenched).toContain("No bench for this model yet");
 
     const html = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false, servingModel: MODEL }));
-    expect(html).toContain("Last synchronization");
+    expect(html).toContain("Last decode bench");
     expect(html).toContain("80.5");
     expect(html).toContain("peak aggregate @ ×4");
     expect(html).toContain("+12 % vs previous");
@@ -160,35 +157,22 @@ describe("Last synchronization (Status card)", () => {
   });
 });
 
-describe("shipped Spark card metric slots", () => {
-  const panel = readFileSync(join(webRoot, "components/ClusterPanel.tsx"), "utf8");
-
-  test("shows temperature, usage, tok/s, and prefill slots", () => {
-    expect(panel).toContain('label="Temperature"');
-    expect(panel).toContain('label="Usage"');
-    expect(panel).toContain('label="tok/s"');
-    expect(panel).toContain('label="Prefill"');
-  });
-
-  test("keeps AWAITING / NONE nil treatment for missing readings", () => {
-    // The shared <Nil/> renders the state word behind a hollow diamond.
-    expect(renderToStaticMarkup(createElement(Nil))).toContain("Awaiting");
-    expect(renderToStaticMarkup(createElement(Nil, { word: "None" }))).toContain("None");
-    expect(panel).toContain("<Nil");
-    expect(panel).toContain("TrafficValue");
-    expect(panel).not.toContain('{"—"}');
-  });
-});
-
-describe("shipped ClusterPanel render", () => {
+describe("Sparks panel (per-node hardware)", () => {
+  const NOW = 1_790_000_000_000;
   const serving: ClusterNode = {
     id: "spark1",
     label: "spark1",
     state: "serving",
     local: true,
     hostname: "spark1",
+    cpu: "10× Cortex-X925 + 10× Cortex-A725",
+    sampled_at: NOW - 400,
     temperature_c: 47,
+    soc_temp_c: 51,
+    nic_temp_c: 50,
+    nvme_temp_c: 43,
     gpu_util_pct: 83,
+    cpu_util_pct: 12,
     power_w: 32.1,
     available_gib: 13.3,
     ram_gib: 121.7,
@@ -197,150 +181,196 @@ describe("shipped ClusterPanel render", () => {
     swap_used_gib: 8.1,
     mem_pressure: "ok",
     tp_rank: 0,
+    rail_rates: { enp1s0f1np1: { tx_bps: 118_000_000, rx_bps: 117_000_000 } },
   };
   const worker: ClusterNode = {
     id: "spark2",
     label: "spark2",
     state: "serving_worker",
+    online: true,
     hostname: "spark2",
     tp_rank: 1,
+    sampled_at: NOW - 900,
     temperature_c: 42,
   };
-  const idle: ClusterNode = {
-    id: "spark2",
-    label: "spark2",
-    state: "idle",
-    hostname: "spark2",
-  };
+  const link = (iface: string, extra = {}) => ({
+    from: "spark1",
+    to: "spark2",
+    iface,
+    target_ip: "10.0.0.2",
+    ok: true,
+    rtt_ms: 0.6,
+    from_speed_mbps: 200_000,
+    ...extra,
+  });
+  const render = (props: Parameters<typeof ClusterPanel>[0]) => renderToStaticMarkup(createElement(ClusterPanel, props));
 
-  test("serving Spark shows temperature, usage, the endpoint tok/s, prefill, memory and swap", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [serving],
-          summary: {
-            healthy: true,
-            nodes_online: 1,
-            nodes_total: 1,
-            nodes_serving: 1,
-          },
-        },
-        metrics: { decode_tok_per_s: 41.2, throughput_tok_per_s: 80.4, prefill_tok_per_s: 210 },
-        engine: { kv_usage_pct: 0.84, kv_capacity_tokens: 1_694_725 },
-      }),
-    );
-    expect(html).toContain("Temperature");
-    expect(html).toContain("47°C");
-    expect(html).toContain("Usage");
-    expect(html).toContain("83%");
-    expect(html).toContain("tok/s");
-    expect(html).toContain("41.2");
-    expect(html).toContain("Prefill");
-    expect(html).toContain("210");
-    expect(html).toContain("Per-stream decode rate");
-    expect(html).toContain("all streams 80.4 tok/s");
-    // 0.84 % of the pool is 0.8 %, never 84 %
-    expect(html).toContain("KV 0.8%");
-    expect(html).not.toContain("KV 84");
+  test("a serving Spark shows its hardware truth: temps, power, GPU util, CPU, memory split and swap", () => {
+    const html = render({
+      cluster: { nodes: [serving], summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 } },
+      serverNow: NOW,
+    });
+    for (const s of ["GPU temp", "47", "Power", "32.1", "GPU util", "83", "CPU", "12%", "SoC 51°C", "NIC 50°C", "NVMe 43°C"]) {
+      expect(html).toContain(s);
+    }
     expect(html).toContain("108.4");
     expect(html).toContain("91.9 GiB engine reservation + 16.5 GiB other used · 13.3 GiB available");
-    expect(html).toContain("swap 8.1");
+    expect(html).toContain("engine 91.9");
+    expect(html).toContain("free 13.3");
+    expect(html).toContain("swap 8.1 / 16");
+    expect(html).toContain(">live<");
+    // the endpoint rate is not on node cards (it lives once, in the served-model panel)
+    expect(html).not.toContain("tok/s");
     expect(html).not.toContain("—");
   });
 
-  test("a TP worker shows its rank, not a second copy of the endpoint rate", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [serving, worker],
-          summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 2 },
-        },
-        metrics: { decode_tok_per_s: 41.2 },
-      }),
-    );
-    expect(html.match(/41\.2/g)?.length).toBe(2); // head hero + load strip, not the worker
-    expect(html).toContain("TP rank 1");
+  test("a TP worker is labelled with its rank; the fabric shows every rail and its real RDMA traffic", () => {
+    const html = render({
+      cluster: {
+        nodes: [serving, worker],
+        fabric: { ok: true, links: [link("enp1s0f1np1"), link("enP2p1s0f1np1", { target_ip: "10.0.1.2" })] },
+        summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 2, multi: { mode: "multi_aligned", tensor_parallel_hint: 2 } },
+      },
+      serverNow: NOW,
+    });
+    expect(html).toContain("TP worker · rank 1");
+    expect(html).toContain("Tensor parallel");
+    // each fact once: the online count, no TP= or model message repeated from the hero
+    expect(html).toContain("2/2 online");
+    expect(html).not.toContain("TP=");
+    expect(html).not.toContain("serving</");
+    expect(html).toContain("enp1s0f1np1");
+    expect(html).toContain("enP2p1s0f1np1");
+    expect(html).toContain("↑ 118 MB/s");
+    // the busy rail flows, the rail with no counters reading does not
+    expect(html.match(/data-flowing="true"/g)?.length).toBe(1);
   });
 
-  test("between requests the last prefill is dimmed and labelled 'last', never shown as live", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [serving],
-          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
-        },
-        metrics: { decode_tok_per_s: null, prefill_tok_per_s: null, last_prefill: { tok_per_s: 1234, at: Date.now() - 95_000 } },
-      }),
-    );
-    expect(html).toContain("last 1234");
-    expect(html).toContain("1 m 35 s ago — not live");
-    expect(html).not.toMatch(/text-lab-ok">1234</);
+  test("nothing flows while the data is stale, even with traffic on the last reading", () => {
+    const html = render({
+      cluster: { nodes: [serving, worker], fabric: { ok: true, links: [link("enp1s0f1np1")] }, summary: { nodes_online: 2, nodes_total: 2 } },
+      serverNow: NOW,
+      stale: true,
+    });
+    expect(html).not.toContain('data-flowing="true"');
   });
 
-  test("a remote node serving on its own never shows the local endpoint's rates or KV", () => {
-    const remote: ClusterNode = { ...serving, id: "spark2", label: "spark2", hostname: "spark2", local: false };
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [{ ...serving, state: "idle" }, remote],
-          summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 1 },
-        },
-        metrics: { decode_tok_per_s: 41.2, prefill_tok_per_s: 210 },
-        engine: { kv_usage_pct: 12, kv_capacity_tokens: 1_694_725 },
-      }),
-    );
-    expect(html).not.toContain("41.2");
-    expect(html).not.toContain("210");
-    expect(html).not.toContain("KV 12%");
+  test("a node whose telemetry is old is dimmed with its age, not shown as live", () => {
+    const html = render({
+      cluster: { nodes: [{ ...worker, sampled_at: NOW - 12_000 }], summary: { nodes_online: 1, nodes_total: 1 } },
+      serverNow: NOW,
+    });
+    expect(html).toContain("12 s old");
+    expect(html).not.toContain(">live<");
+    expect(html).toContain("opacity-55");
   });
 
-  test("usage tooltip leaves out a GPU reading it does not have — never 'GPU 0%'", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [{ ...serving, gpu_util_pct: null, cpu_util_pct: 37, cpu: "Cortex-X925" }],
-          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
-        },
-      }),
-    );
-    expect(html).toContain('title="CPU 37% (Cortex-X925)"');
-    expect(html).not.toContain("GPU 0%");
-  });
-
-  test("an ssh failure on a pinging host reads differently from a host that is down", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [
-            { id: "a", label: "a", state: "unreachable" },
-            { id: "b", label: "b", state: "offline" },
-          ],
-          summary: { healthy: false, nodes_online: 0, nodes_total: 2 },
-        },
-      }),
-    );
+  test("ssh failure reads differently from a host that is down; neither shows numbers", () => {
+    const html = render({
+      cluster: {
+        nodes: [
+          { id: "a", label: "a", state: "unreachable", temperature_c: 40 },
+          { id: "b", label: "b", state: "offline" },
+        ],
+        summary: { healthy: false, nodes_online: 0, nodes_total: 2 },
+      },
+      serverNow: NOW,
+    });
     expect(html).toContain("SSH failed");
     expect(html).toContain("Offline");
+    expect(html).not.toContain(">40<");
   });
 
-  test("idle Spark keeps tok/s and prefill as None, not zero", () => {
-    const html = renderToStaticMarkup(
-      createElement(ClusterPanel, {
-        cluster: {
-          nodes: [idle],
-          summary: {
-            healthy: true,
-            nodes_online: 1,
-            nodes_total: 1,
-            nodes_serving: 0,
-          },
-        },
+  test("while the first inventory runs, the panel says it is probing — never a red 0/0", () => {
+    const html = render({ cluster: { nodes: [], pending: true, summary: { healthy: false } } });
+    expect(html).toContain("probing the Sparks");
+    expect(html).not.toContain("0/0");
+  });
+
+  test("the fabric's flow speed moves in steps, so 1 s rate jitter never re-phases the animation", () => {
+    // 120 vs 132 MB/s on a 200 Gb/s rail: same step
+    expect(flowDurS(120e6, 200_000)).toBe(flowDurS(132e6, 200_000));
+    expect(flowDurS(1e6, 200_000)).toBe(2.4);
+    expect(flowDurS(5e9, 200_000)).toBe(0.45);
+    expect(flowDurS(120e6, null)).toBe(1.2);
+  });
+
+  test("three nodes: every card renders and every link gets a row", () => {
+    const n3 = { ...worker, id: "spark3", label: "spark3", tp_rank: 2 };
+    const html = render({
+      cluster: {
+        nodes: [serving, worker, n3],
+        fabric: { ok: true, links: [link("a"), { ...link("b"), to: "spark3" }, { ...link("c"), from: "spark2", to: "spark3" }] },
+        summary: { nodes_online: 3, nodes_total: 3 },
+      },
+      serverNow: NOW,
+    });
+    expect(html).toContain("spark3");
+    expect(html).toContain("Fabric · 3 links");
+    expect(html).toContain("spark2 → spark3");
+  });
+});
+
+describe("Served model panel", () => {
+  const NOW = 1_790_000_000_000;
+  const base = {
+    healthy: true,
+    model_id: "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    base_url: "http://127.0.0.1:8000",
+    engine: { kv_usage_pct: 0.84, kv_capacity_tokens: 1_694_725, requests_running: 1, requests_waiting: 0, max_model_len: 262_144, version: "0.30.0", flags_fingerprint: "8488b677", flags: ["--port", "8000"] },
+    cluster: { nodes: [], summary: { multi: { tensor_parallel_hint: 2 } } },
+  };
+  const render = (metrics: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    renderToStaticMarkup(
+      createElement(EndpointHero, {
+        serve: { ...base, metrics, ...extra } as never,
+        defaultBackend: "vllm",
+        endpoint: [],
+        serverNow: NOW,
       }),
     );
-    expect(html).toContain("tok/s");
-    expect(html).toContain("Prefill");
-    expect(html).toContain("None");
-    expect(html).not.toContain("0 tok");
-    expect(html).not.toContain(">0%<");
+
+  test("live: per-stream decode, throughput, TTFT, requests, spec acceptance and KV — each once", () => {
+    const html = render({ decode_tok_per_s: 84.1, throughput_tok_per_s: 160.4, ttft_s: 0.174, spec_accept_rate: 0.84, spec_tokens_per_step: 3.52, prefill_tok_per_s: 402 });
+    expect(html.match(/84\.1/g)?.length).toBe(1);
+    expect(html).toContain("160");
+    expect(html).toContain("174 ms");
+    expect(html).toContain("84%");
+    expect(html).toContain("3.52/step");
+    expect(html).toContain("402 tok/s");
+    expect(html).toContain('1 <span class="text-lab-muted">running</span>');
+    // 0.84 % of the pool is 0.8 %, never 84 %
+    expect(html).toContain("0.8%");
+    expect(html).toContain("TP=2");
+    expect(html).toContain("NVFP4");
+    expect(html).toContain("http://127.0.0.1:8000/v1");
+    expect(html).toContain("copy env");
+  });
+
+  test("idle: the last burst is dimmed and labelled with its age, never shown as live", () => {
+    const html = render(
+      { decode_tok_per_s: null, throughput_tok_per_s: 0, last_burst: { decode_tok_per_s: 83.37, tokens: 128, ended_at: NOW - 12_000 }, last_prefill: { tok_per_s: 1234, at: NOW - 95_000 }, spec_accept_rate_lifetime: 0.8432 },
+      { engine: { ...base.engine, requests_running: 0 } },
+    );
+    expect(html).toContain("83.4");
+    expect(html).toContain("last burst · 128 tok · 12 s ago");
+    expect(html).toContain("last 1234 · 1 m 35 s ago");
+    expect(html).toContain("84% lifetime");
+    expect(html).toContain("text-lab-muted");
+  });
+
+  test("mid-decode TTFT: no request started this second, so the last one shows dimmed with its age — never 'Idle'", () => {
+    const html = render({ decode_tok_per_s: 46.7, throughput_tok_per_s: 46.7, ttft_s: null, last_ttft: { s: 0.174, at: NOW - 4_000 } });
+    expect(html).toContain("last 174 ms · 4 s ago");
+    expect(html).not.toContain(">Idle<");
+  });
+
+  test("hermesBases follows the port that answers and adds the page host when it is not loopback", () => {
+    expect(hermesBases("http://127.0.0.1:8888", "127.0.0.1")).toEqual({ local: "http://127.0.0.1:8888/v1", remote: null });
+    expect(hermesBases("http://127.0.0.1:8000", "spark1.tailnet")).toEqual({
+      local: "http://127.0.0.1:8000/v1",
+      remote: "http://spark1.tailnet:8000/v1",
+    });
+    expect(hermesBases(null, "x")).toBeNull();
   });
 });

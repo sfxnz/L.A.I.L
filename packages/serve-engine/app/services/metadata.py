@@ -374,12 +374,14 @@ LIVE_RATE_KEYS = (
 
 # Single writer (the sampler's fast tick): previous counters, the burst in progress,
 # and the last finished burst.
-_LIVE_RATE: dict[str, Any] = {"t": None, "prev": None, "burst": None, "last_burst": None, "last_prefill": None}
+_LIVE_RATE: dict[str, Any] = {
+    "t": None, "prev": None, "burst": None, "last_burst": None, "last_prefill": None, "last_ttft": None,
+}
 
 
 def reset_live_rate_state() -> None:
     """Forget counters and bursts — the endpoint or serving container changed."""
-    _LIVE_RATE.update(t=None, prev=None, burst=None, last_burst=None, last_prefill=None)
+    _LIVE_RATE.update(t=None, prev=None, burst=None, last_burst=None, last_prefill=None, last_ttft=None)
 
 
 def _ratio(num: float | None, den: float | None, digits: int = 2) -> float | None:
@@ -404,6 +406,8 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     ttft_s                mean time to first token of requests that got one this window.
     spec_accept_rate      accepted ÷ drafted tokens; spec_tokens_per_step = 1 + accepted ÷ drafts.
     last_prefill          the latest non-null prefill_tok_per_s with its time (`at`, epoch ms).
+    last_ttft             the latest non-null ttft_s (`s`) with its time (`at`, epoch ms) —
+                          mid-decode no request starts, so ttft_s is None while one runs.
     last_burst            the previous busy period: per-stream decode rate and tokens,
                           `ended_at` epoch ms. Closed at the first scrape with no request
                           running, so ended_at is at most one window after the last token.
@@ -422,13 +426,14 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     _LIVE_RATE.update(t=now, prev=cur)
     out["last_burst"] = _LIVE_RATE["last_burst"]
     out["last_prefill"] = _LIVE_RATE["last_prefill"]
+    out["last_ttft"] = _LIVE_RATE["last_ttft"]
     if prev is None or prev_t is None or now - prev_t < 0.2:
         return out
     d = {k: cur[k] - prev[k] for k in _RATE_COUNTERS if cur[k] is not None and prev.get(k) is not None}
     if any(v < 0 for v in d.values()):
         # Counters went backwards: the engine restarted. Re-baseline, show nothing stale.
-        _LIVE_RATE.update(burst=None, last_burst=None, last_prefill=None)
-        out["last_burst"] = out["last_prefill"] = None
+        _LIVE_RATE.update(burst=None, last_burst=None, last_prefill=None, last_ttft=None)
+        out["last_burst"] = out["last_prefill"] = out["last_ttft"] = None
         return out
 
     dt = now - prev_t
@@ -450,6 +455,8 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
             }
     if first:
         out["ttft_s"] = _ratio(d.get("ttft_sum"), first, 3)
+        if out["ttft_s"] is not None:
+            _LIVE_RATE["last_ttft"] = out["last_ttft"] = {"s": out["ttft_s"], "at": int(time.time() * 1000)}
     out["spec_accept_rate"] = _ratio(d.get("spec_accepted"), d.get("spec_draft_tokens"), 4)
     if d.get("spec_drafts") and d.get("spec_accepted") is not None:
         out["spec_tokens_per_step"] = round(1 + d["spec_accepted"] / d["spec_drafts"], 2)

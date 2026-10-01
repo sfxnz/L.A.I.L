@@ -160,11 +160,11 @@ export function DecodeInstrument({
   const header = (() => {
     switch (status) {
       case "starting":
-        return { title: "Synchronizing…", ring: "loading" as const };
+        return { title: "Running…", ring: "loading" as const };
       case "running":
-        return { title: "Synchronizing…", ring: "loading" as const };
+        return { title: "Running…", ring: "loading" as const };
       case "done":
-        return { title: `Synchronized · ${fmtDuration(elapsedMs)}`, ring: "serving" as const };
+        return { title: `Done · ${fmtDuration(elapsedMs)}`, ring: "serving" as const };
       case "cancelled":
         return { title: "Stopped · partial sequence kept", ring: "offline" as const };
       case "error":

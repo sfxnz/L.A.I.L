@@ -7,20 +7,22 @@ Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to 
 | Layer | Stack |
 |-------|--------|
 | UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
-| Controller | Bun + Hono · lab-status, configure, usage, lab gallery, proxy to serve-engine |
+| Controller | Bun + Hono · live status stream, configure, usage, lab gallery, proxy to serve-engine |
 | Serve-engine | Python FastAPI · vLLM auto-configure, smoke, benches, run history |
 | Models | **vLLM** and **llama.cpp** (no Ollama) |
 
 ## Product surface
 
-Top nav (`apps/web/lib/ide-chrome.ts`):
+Top nav (`apps/web/lib/ide-chrome.ts`); Connect (`/connect`) is linked from Status and Serve:
 
 | Page | Path | Role |
 |------|------|------|
-| **Status** | `/status` | Health, headroom, containers, recent runs |
-| **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
-| **Evals** | `/evals` | Smoke + perf jobs + run history |
-| **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
+| **Status** | `/status` | Live: the served model (decode / throughput / TTFT / requests / KV, Hermes wiring), each Spark's hardware, the fabric, the last decode bench |
+| **Serve** | `/server` | Auto-config, flags, start/stop, job logs |
+| **Bench** | `/bench` | Decode and prefill benches |
+| **Streams** | `/streams` | Concurrent strands, live |
+| **Evals** | `/evals` | Smoke, golden tools, tool-eval-bench, run log |
+| **Connect** | `/connect` | Hermes / OpenAI base URL snippets, Tailscale URL, curl probes |
 | **Configure** | `/configure` | Default backend / model |
 
 `/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench`, `/integrations` and `/models` are retired and redirect to live pages — Hermes is the agent; Serve’s “Download weights first” fetches into the HF cache.
@@ -35,7 +37,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
                              │ REST :8787
 ┌────────────────────────────▼─────────────────────────────────┐
 │  LabController (Bun + Hono)                                  │
-│  lab-status · configure · usage · serve/* · bench/* proxy    │
+│  /api/live stream · configure · usage · serve/* bench/* proxy│
 └──────────────┬─────────────────────────────┬─────────────────┘
                │                             │
                ▼                             ▼
@@ -46,9 +48,20 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
                └──────────▶ Hermes / laptop clients
 ```
 
+### Live data
+
+serve-engine samples every second (endpoint `/metrics`, this host, a persistent ssh
+telemetry stream per remote Spark). The controller long-polls it
+(`/api/status?after=<sampled_at_ms>`) and fans each sample out to every open tab over
+one server-sent event stream, `GET /api/live` (`meta` once, `history` on connect,
+`tick` per sample). The browser reads it with `fetch()` and the `X-Lail-Token`
+header, and falls back to polling `/api/lab-status` only if the stream cannot get
+through. Every timestamp is the serve-engine host's clock; sparklines sit on a real
+time axis and stale data is dimmed with its age, never shown as live.
+
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
 
 ### Model resolution
 
@@ -89,6 +102,17 @@ bun run dev
 ```
 
 Open http://127.0.0.1:3000 — **`/` redirects to Status**.
+
+`bun run dev` serves the web app with `next dev` (hot reload, the React development
+build: several MB of unminified JS, re-checked on every render). For the console you
+leave open all day, run the same stack with the production web build instead:
+
+```bash
+bun run start:prod   # next build (into apps/web/.next-prod), then next start
+```
+
+Same ports, same env, same controller and serve-engine; only the web server differs.
+Stop the dev stack first — both bind :3000.
 
 | Service | URL |
 |---------|-----|
@@ -132,7 +156,9 @@ Then open http://127.0.0.1:3000. Replace `$USER@<lab-host>` with your SSH login.
 
 ## Connect (Hermes)
 
-On **`/connect`**, copy the snippets for the live OpenAI-compatible endpoint.
+Status (the served-model panel) and Serve (the live endpoint panel) show the OpenAI
+base URL of the port that answers, with copy buttons for it, the model id and a
+ready env block. **`/connect`** has the rest: the Tailscale URL and curl probes.
 
 **Hermes on the same host** (loopback):
 
@@ -146,9 +172,8 @@ OPENAI_MODEL=<served-model-id>
 
 ## Serve (vLLM serve & evals)
 
-- Auto-configure + start · stop · agent-restore
-- HF auto-configure · live job logs
-- Smoke · perf · golden tools · run history envelopes
+- Auto-configure + start · stop (two clicks) · live job logs
+- Bench (decode / prefill) on `/bench`; smoke, golden tools and tool-eval-bench on `/evals`
 
 Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first**, then bench.
 

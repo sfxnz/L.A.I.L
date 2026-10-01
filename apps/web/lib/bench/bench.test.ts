@@ -16,6 +16,7 @@ import { benchMarkdown, decodeMarkdown, prefillMarkdown, quantFromModelId } from
 import { fmtDuration, fmtMs, fmtSize, fmtTokS } from "./format";
 import { findKnee, interpretDecode, interpretPrefill, referenceGain, spread, suggestLevels } from "./interpret";
 import { previousComparable } from "./last-sync";
+import { appendHardware } from "./live";
 import type { RunRow } from "../api";
 import {
   CONCURRENCY_LEVELS,
@@ -493,5 +494,20 @@ describe("comparability", () => {
     ];
     expect(previousComparable(rows, cur)?.run_id).toBe("d");
     expect(previousComparable(rows.filter((r) => r.run_id !== "d" && r.run_id !== "e"), cur)).toBeNull();
+  });
+});
+
+describe("hardware strip sampler (server clock)", () => {
+  const s = (t: number, power: number) => ({ t, power, util: 50, temp: 45, mem: 100, rails: null });
+  const nodes = [{ id: "spark1", label: "spark1" }];
+
+  test("appends only samples from the run start on, each once, keyed by the server's sampled_at", () => {
+    const since = 10_000;
+    let series = appendHardware([], { spark1: [s(9_000, 9), s(10_000, 20), s(11_000, 21)] }, nodes, since);
+    expect(series[0].samples.map((x) => x.t)).toEqual([10_000, 11_000]);
+    const same = appendHardware(series, { spark1: [s(10_000, 20), s(11_000, 21)] }, nodes, since);
+    expect(same).toBe(series); // nothing new → same array, no re-render
+    series = appendHardware(series, { spark1: [s(11_000, 21), s(12_000, 22)] }, nodes, since);
+    expect(series[0].samples.map((x) => x.power)).toEqual([20, 21, 22]);
   });
 });

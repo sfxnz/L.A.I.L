@@ -14,13 +14,22 @@ from __future__ import annotations
 
 import os
 import shlex
+from pathlib import Path
 from typing import Any
 
 from . import Engine, Rank, ServeSpec, bash_wrap, parse_extra, strip_flags
 
 MASTER_PORT = 29551
 # A source pip accepts; a prebuilt image that already has `tensorfold` skips the install.
-PIP_SOURCE = os.environ.get("LAIL_TENSORFOLD_PIP", "git+https://github.com/ashhart/TensorFold.git")
+# Pinned to the commit this adapter's flags and metric names were verified against (a full
+# sha, so pip also caches the wheel it builds).
+PIP_SOURCE = os.environ.get(
+    "LAIL_TENSORFOLD_PIP", "git+https://github.com/ashhart/TensorFold.git@c4646171139ee8a3c38103eaa1699dad226ec12b"
+)
+# Host cache mounted over the container's /root/.cache: pip's wheel cache and torch's JIT
+# extension builds (~/.cache/torch_extensions) survive the `docker rm -f` of every Stop,
+# so only the first start pays the install + CUDA kernel compile.
+CACHE_DIR = os.environ.get("LAIL_TENSORFOLD_CACHE", str(Path.home() / ".cache" / "lail-tensorfold"))
 KV_DTYPES = ("bf16", "int8", "int4")
 _OWNED = ("--host", "--port", "--name", "--no-update-check", "--tp", "--rank", "--master", "--master-port")
 
@@ -61,7 +70,8 @@ def container_args(image: str, cmd: list[str], multi: bool) -> list[str]:
 
 def derive(m: dict[str, Any], health: Any) -> dict[str, Any]:
     """Counters from /health: completion tokens are live; prefill/decode seconds, cached
-    tokens and draft counts are folded in when a request finishes."""
+    tokens and draft counts are folded in when a request finishes. `rounds_total` is not
+    read: upstream does not say whether it counts drafting rounds only, so no tokens/step."""
     if not isinstance(health, dict):
         return m
     num = lambda k: float(health[k]) if isinstance(health.get(k), (int, float)) and not isinstance(health.get(k), bool) else None  # noqa: E731
@@ -74,7 +84,6 @@ def derive(m: dict[str, Any], health: Any) -> dict[str, Any]:
         ("prefill_seconds_total", "prefill_time_s_sum"),
         ("drafted_total", "spec_draft_tokens"),
         ("accepted_total", "spec_accepted"),
-        ("rounds_total", "spec_drafts"),
         ("context_length", "context_length"),
     ):
         if num(src) is not None:
@@ -115,10 +124,12 @@ ENGINE = Engine(
     master_port=MASTER_PORT,
     host_network=True,
     prom_keys=PROM_KEYS,
+    prom_hists=(("tensorfold:time_to_first_token_seconds", "ttft"),),
     derive=derive,
-    docker_opts=("--ipc", "host"),
+    docker_opts=("-v", f"{CACHE_DIR}:/root/.cache"),
     notes=(
         "Installs from GitHub at container start unless the image already has `tensorfold` "
-        "(set LAIL_TENSORFOLD_IMAGE to a prebuilt one). TP ≤ 2; GLM-5.3-Flash needs 2 ranks."
+        "(set LAIL_TENSORFOLD_IMAGE to a prebuilt one); pip and kernel-build caches persist in "
+        "~/.cache/lail-tensorfold. TP ≤ 2; GLM-5.3-Flash needs 2 ranks."
     ),
 )

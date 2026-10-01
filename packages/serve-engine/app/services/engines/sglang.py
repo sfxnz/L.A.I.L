@@ -67,10 +67,18 @@ def container_args(image: str, cmd: list[str], multi: bool) -> list[str]:
 
 
 def derive(m: dict[str, Any], _health: Any) -> dict[str, Any]:
-    """SGLang counts generated tokens at request END (`generation_tokens_total`), but its
-    TTFT and inter-token histograms advance per streamed chunk: the first token, then
-    every later token (bucket counts += new tokens; _sum += the chunk's interval). Their
-    counts are the live token count; the ITL sum is the busy decode time."""
+    """Per-stream decode from the histograms that advance per streamed chunk.
+
+    Upstream @ b51d4a04: `generation_tokens_total` is incremented only in
+    observe_one_finished_request (metrics_collector.py:1808), so it cannot drive a live
+    rate. tokenizer_manager.collect_metrics (:3090-3115) observes TTFT once on a request's
+    first chunk, then for each later chunk calls observe_inter_token_latency(interval,
+    num_new_tokens), which adds `num_new_tokens` to the bucket counts and the chunk's
+    interval to _sum (metrics_collector.py:1859-1881). So Δitl_count ÷ Δitl_sum is tokens
+    per second of streaming time — the per-stream decode rate. A first chunk carrying
+    several tokens (a non-streaming reply arrives as one chunk) counts once, so this token
+    count is streamed tokens only: aggregate throughput comes from the scheduler's
+    `gen_throughput` gauge instead (see live_gauges)."""
     if m.get("ttft_count") is not None and m.get("itl_count") is not None:
         m["generation_tokens_total"] = m["ttft_count"] + m["itl_count"]
     if m.get("kv_used_tokens") is not None and m.get("kv_available_tokens") is not None:
@@ -79,8 +87,18 @@ def derive(m: dict[str, Any], _health: Any) -> dict[str, Any]:
 
 
 def live_gauges(m: dict[str, Any]) -> dict[str, Any]:
-    """Spec-decode acceptance is a scheduler gauge for the batch now running (not a counter)."""
+    """Gauges the scheduler computes for the batch now running (not counters).
+
+    `gen_throughput` is generated tokens ÷ wall time over the last decode_log_interval
+    steps, every request streamed or not (metrics_reporter.py:900); it holds for up to 30 s
+    after decode stops, so it is read only while requests run. When requests run but no
+    chunk streamed this window (non-streaming replies), there is no per-stream reading."""
     if (m.get("requests_running") or 0) > 0:
+        gen = m.get("gen_throughput_gauge")
+        if gen is not None:
+            m["throughput_tok_per_s"] = round(gen, 2)
+            if gen > 0 and m.get("decode_tok_per_s") == 0.0:
+                m["decode_tok_per_s"] = None
         if m.get("spec_accept_rate_gauge"):
             m["spec_accept_rate"] = round(m["spec_accept_rate_gauge"], 4)
         if m.get("spec_accept_length_gauge"):
@@ -91,6 +109,7 @@ def live_gauges(m: dict[str, Any]) -> dict[str, Any]:
 PROM_KEYS: tuple[tuple[str, str], ...] = (
     ("sglang:num_running_reqs", "requests_running"),
     ("sglang:num_queue_reqs", "requests_waiting"),
+    ("sglang:gen_throughput", "gen_throughput_gauge"),
     ("sglang:token_usage", "gpu_kv_cache_usage"),
     ("sglang:kv_used_tokens", "kv_used_tokens"),
     ("sglang:kv_available_tokens", "kv_available_tokens"),
@@ -121,9 +140,13 @@ ENGINE = Engine(
     version=("/server_info", "version"),
     master_port=MASTER_PORT,
     prom_keys=PROM_KEYS,
+    prom_hists=(
+        ("sglang:inter_token_latency_seconds", "itl"),
+        ("sglang:time_to_first_token_seconds", "ttft"),
+    ),
     # Scheduler gauges are per TP rank / mostrecent: the same batch seen by each rank.
     prom_max_keys=frozenset({
-        "requests_running", "requests_waiting", "gpu_kv_cache_usage", "kv_used_tokens",
+        "requests_running", "requests_waiting", "gen_throughput_gauge", "gpu_kv_cache_usage", "kv_used_tokens",
         "kv_available_tokens", "spec_accept_rate_gauge", "spec_accept_length_gauge",
     }),
     derive=derive,

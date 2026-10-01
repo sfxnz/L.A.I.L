@@ -235,6 +235,11 @@ class StatusSampler:
                 probe["metrics"] = {
                     **probe["metrics"], **dict.fromkeys(metadata.LIVE_RATE_KEYS), "last_burst": None, "last_prefill": None
                 }
+        if probe.get("engine") not in (None, hint):
+            # The version came from the guessed engine's route (an unlabelled container
+            # guesses vLLM): drop it and ask the detected engine's route next tick.
+            probe["version"] = None
+            self._need_version = True
         self._engine = probe.get("engine") or self._engine
         prev = {} if moved else (self._probe or {})  # the old endpoint's scrape is not this one's
         if not self._need_version:

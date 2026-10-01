@@ -87,7 +87,8 @@ def test_single_node_commands_bind_loopback_label_and_enable_metrics():
                  "--trust-remote-code", "--chunked-prefill-size 4096"):
         assert frag in j, frag
     assert j.count("--enable-metrics") == 1 and j.count("--port") == 1  # extras never duplicate owned flags
-    assert "HF_TOKEN=hf_x" in cmd
+    # The token is passed by name (docker reads it from its environment), never on argv.
+    assert "hf_x" not in j and "-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN" in j
 
     lc = engines.get("llamacpp")
     cmd = serve.build_single_node_docker_cmd(
@@ -106,8 +107,10 @@ def test_single_node_commands_bind_loopback_label_and_enable_metrics():
         env_list=[], container=tf.container)
     assert "--network" in cmd and cmd[cmd.index("--network") + 1] == "host" and "-p" not in cmd
     assert cmd[cmd.index("--ipc") + 1] == "host"
+    assert f"{engines.tensorfold.CACHE_DIR}:/root/.cache" in cmd  # pip + kernel builds survive Stop
     i = cmd.index(tf.image())
     assert cmd[i + 1] == "-lc" and "pip install" in cmd[i + 2] and "command -v tensorfold" in cmd[i + 2]
+    assert "TensorFold.git@c4646171139ee8a3c38103eaa1699dad226ec12b" in cmd[i + 2]  # the verified commit
     argv = cmd[cmd.index("--") + 1:]
     assert argv[:3] == ["tensorfold", "serve", "zai-org/GLM-5.3-Flash"]
     assert argv[argv.index("--host") + 1] == "127.0.0.1" and "--no-update-check" in argv
@@ -142,18 +145,34 @@ def test_tensorfold_ranks_tp2_rank_master_and_rdma_devices():
         assert argv[argv.index("--master") + 1] == "10.100.8.1" and argv[argv.index("--master-port") + 1] == "29551"
         assert argv[argv.index("--context") + 1] == "32768"  # both ranks must agree
         assert "/dev/infiniband" in cmd and "IPC_LOCK" in cmd and "memlock=-1:-1" in cmd
+        assert f"{engines.tensorfold.CACHE_DIR}:/root/.cache" in cmd  # engine docker_opts reach every rank
+        assert cmd.count("--ipc") == 1
     assert engines.get("tensorfold").max_tp == 2
 
 
-def test_every_rank_gets_the_real_hf_token():
-    """ENG-8: the head got no token on TP=2 (gated models failed); the token lives in the
-    executed command of every rank, never masked there."""
+def test_every_rank_gets_the_real_hf_token_never_on_a_command_line():
+    """ENG-8: the head got no token on TP=2 (gated models failed). Every rank now asks
+    docker for HF_TOKEN by name; the value never appears in any argv (`ps` shows argv)."""
     for name in ("vllm", "sglang", "tensorfold"):
         _eng, launch = _launch(name)
         for cmd in (launch["head"]["cmd"], launch["workers"][0]["cmd"]):
-            assert "HF_TOKEN=hf_realtoken1234567890" in cmd, name
-    assert "hf_realtoken" not in serve.redact_cmd(launch["head"]["cmd"])
-    assert "HF_TOKEN=***" in serve.redact_cmd(launch["head"]["cmd"])
+            j = shlex.join(cmd)
+            assert "-e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN" in j and "hf_realtoken" not in j, name
+
+
+def test_launch_hands_the_token_over_stdin_and_env_only(monkeypatch):
+    eng, launch = _launch("sglang")
+    seen: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(serve.subprocess, "run", lambda cmd, **kw: seen.append((list(cmd), kw)) or _Proc())
+    monkeypatch.setattr(serve, "wait_ready", lambda *a, **k: None)
+    serve._launch_multi_node(launch, engine=eng, hf_token="hf_realtoken1234567890")
+    worker = next((c, kw) for c, kw in seen if c[0] == "ssh" and "docker run" in c[-1])
+    head = next((c, kw) for c, kw in seen if c[:2] == ["docker", "run"])
+    for cmd, _kw in (worker, head):
+        assert not any("hf_realtoken" in a for a in cmd)
+    assert worker[1]["input"] == "hf_realtoken1234567890\n"
+    assert worker[0][-1].startswith("IFS= read -r HF_TOKEN && export HF_TOKEN")
+    assert head[1]["env"]["HF_TOKEN"] == head[1]["env"]["HUGGING_FACE_HUB_TOKEN"] == "hf_realtoken1234567890"
 
 
 def test_preview_shows_the_process_command_per_rank():
@@ -178,10 +197,48 @@ def test_sglang_metrics_live_decode_from_itl_histogram_kv_fraction_and_spec_gaug
     # 180 tokens after the first in 2.0 s of per-stream busy time → 90 tok/s per stream;
     # the finish-only generation_tokens_total (unchanged) never drives the live rate.
     assert t1["decode_tok_per_s"] == 90.0
-    assert t1["throughput_tok_per_s"] == 180.0
+    # Aggregate throughput is the scheduler's gen_throughput gauge (every request, streamed
+    # or not), not the streamed-chunk count.
+    assert t1["throughput_tok_per_s"] == 176.4
     assert t1["spec_accept_rate"] == 0.71 and t1["spec_tokens_per_step"] == 3.13
     eng = metadata.build_engine({"engine": "sglang", "metrics": t1, "models": [{"id": "m", "max_model_len": 65536}]}, None)
     assert eng["name"] == "sglang" and eng["kv_usage_pct"] == 12.0 and eng["kv_capacity_tokens"] == 100000
+
+
+def test_window_latency_percentiles_from_histogram_buckets():
+    """ENG-9: ITL p50/p95 and TTFT p50 over the window, from bucket deltas (never lifetime)."""
+    inf = float("inf")
+    # vLLM's live ITL edges: 2455 tokens ≤ 50 ms, 740 more ≤ 75 ms, 4 ≤ 100 ms (window delta).
+    delta = {0.01: 0.0, 0.025: 0.0, 0.05: 2455.0, 0.075: 3195.0, 0.1: 3199.0, inf: 3199.0}
+    assert metadata.bucket_quantile(0.5, delta) == 0.0413  # 0.025 + 0.025 × 1599.5 / 2455
+    assert metadata.bucket_quantile(0.95, delta) == 0.0697  # 0.05 + 0.025 × 584.05 / 740
+    assert metadata.bucket_quantile(0.5, {0.05: 0.0, inf: 0.0}) is None
+    assert metadata.bucket_quantile(0.99, {0.05: 1.0, inf: 10.0}) == 0.05  # beyond the last edge
+
+    metadata.reset_live_rate_state()
+    t0 = metadata.parse_prometheus(_fix("sglang_metrics_t0.prom"), 10.0, engine="sglang")
+    assert t0["itl_p50_s"] is None  # one scrape is no window
+    t1 = metadata.parse_prometheus(_fix("sglang_metrics_t1.prom"), 11.0, engine="sglang")
+    # 180 new tokens, all in the ≤ 20 ms bucket; no new first token in the window.
+    assert t1["itl_p50_s"] == 0.01 and t1["itl_p95_s"] == 0.019 and t1["ttft_p50_s"] is None
+    assert not any(isinstance(k, float) for k in t1)  # buckets stay internal
+
+
+def test_sglang_non_streaming_reply_is_not_read_as_zero_decode():
+    """A non-streaming reply reaches the tokenizer as one chunk: TTFT counts it once, the
+    ITL histogram never moves. Upstream undercounts those tokens in the histograms, so the
+    live numbers come from the scheduler gauge and per-stream decode reads as no-reading."""
+    metadata.reset_live_rate_state()
+    t1 = _fix("sglang_metrics_t1.prom")
+    metadata.parse_prometheus(t1, 10.0, engine="sglang")
+    one_chunk = t1.replace('is_streaming="true"} 10.0', 'is_streaming="true"} 11.0')
+    out = metadata.parse_prometheus(one_chunk, 11.0, engine="sglang")
+    assert out["requests_running"] == 2
+    assert out["decode_tok_per_s"] is None  # not 0.0: tokens are moving, just not streamed
+    assert out["throughput_tok_per_s"] == 176.4
+    idle = metadata.parse_prometheus(one_chunk.replace("} 2.0\n", "} 0.0\n", 1), 12.0, engine="sglang")
+    # The gauge holds for 30 s after decode stops upstream; never shown once idle.
+    assert idle["requests_running"] == 0 and idle["throughput_tok_per_s"] == 0.0
 
 
 def test_llamacpp_rates_only_when_requests_finish():
@@ -213,7 +270,8 @@ def test_tensorfold_live_decode_from_health_and_exact_last_burst():
     assert live.get("gpu_kv_cache_usage") is None  # kv_cache_usage_ratio is per-stream fill, not a pool
     done = metadata.parse_prometheus(m2, 12.0, engine="tensorfold", health=health["t2"])
     assert done["prefill_tok_per_s"] == 4000.0  # 800 uncached prompt tokens in 0.2 s
-    assert done["spec_accept_rate"] == 0.75 and done["spec_tokens_per_step"] == 1.82
+    assert done["spec_accept_rate"] == 0.75
+    assert done["spec_tokens_per_step"] is None  # rounds_total's meaning is unverified
     assert done["ttft_s"] == 0.25
     idle = metadata.parse_prometheus(m2, 13.0, engine="tensorfold", health=health["t2"])
     # 100 tokens − 1 first token over the request's own 1.6 s of decode time
@@ -310,8 +368,8 @@ def test_multinode_launch_records_state_first_clears_stale_ranks_and_tears_down_
         calls.append(line)
         if "docker run" in line and cmd[0] == "ssh":
             state_when_worker_started.append(serve._MULTINODE_STATE.exists())
-            # the real token, shell-quoted for the remote shell — never "HF_TOKEN=***"
-            assert "HF_TOKEN=hf_realtoken1234567890" in cmd[-1] and "***" not in cmd[-1]
+            # the real token, on stdin — never "HF_TOKEN=***" and never on the command line
+            assert kw.get("input") == "hf_realtoken1234567890\n" and "hf_realtoken" not in line
         return _Proc()
 
     monkeypatch.setattr(serve.subprocess, "run", fake_run)
@@ -322,7 +380,7 @@ def test_multinode_launch_records_state_first_clears_stale_ranks_and_tears_down_
 
     monkeypatch.setattr(serve, "wait_ready", dies)
     with pytest.raises(RuntimeError, match="exited"):
-        serve._launch_multi_node({**launch, "image": ""}, engine=eng)
+        serve._launch_multi_node({**launch, "image": ""}, engine=eng, hf_token="hf_realtoken1234567890")
     assert state_when_worker_started == [True]  # Stop can find the ranks while they load
     rm_before = [i for i, c in enumerate(calls) if "docker rm -f spark-vllm-n" in c]
     first_run = next(i for i, c in enumerate(calls) if "docker run" in c)
@@ -365,6 +423,70 @@ def test_wait_ready_honours_cancel_and_reports_progress(monkeypatch):
         serve.wait_ready(engines.get("sglang"), 30000, container="lail-sglang", timeout_s=60,
                          progress=report, cancel=cancel)
     assert progress and "42%" in progress[0][1] and 0.35 <= progress[0][0] < 0.95
+
+
+@pytest.mark.parametrize(
+    "rc,out,err,want",
+    [
+        (0, "running 0", "", None),
+        (0, "exited 1", "", "exited 1"),
+        (1, "", "Error: No such object: lail-sglang", "missing"),
+        (1, "", "permission denied while trying to connect to the Docker daemon socket", None),
+        (255, "", "ssh: connect to host spark2 port 22: Connection timed out", None),
+    ],
+)
+def test_container_dead_is_a_verdict_only_when_docker_says_so(monkeypatch, rc, out, err, want):
+    """A daemon hiccup or ssh failure must not abort (and tear down) a 30-minute load."""
+    def fake_run(cmd, **kw):
+        p = _Proc(rc, out)
+        p.stderr = err
+        return p
+
+    monkeypatch.setattr(serve.subprocess, "run", fake_run)
+    assert serve._container_dead("lail-sglang") == want
+    assert serve._container_dead("lail-sglang-n1", "spark2") == want
+
+
+def test_cancel_during_the_image_pull_never_touches_the_running_serve(monkeypatch):
+    """Cancel while a 20-30 GB image pulls: the serve that is up stays up, nothing is run."""
+    cancel = threading.Event()
+    calls: list[str] = []
+    stopped: list[bool] = []
+    monkeypatch.setattr(serve.subprocess, "run", lambda cmd, **kw: calls.append(" ".join(cmd)) or _Proc(1))
+    monkeypatch.setattr(serve, "_resolve_hf_token_for_container", lambda: "")
+    monkeypatch.setattr(serve, "stop_all", lambda **k: stopped.append(True) or {"ok": True})
+    monkeypatch.setattr(serve, "stop_multi_node", lambda **k: stopped.append(True) or {"ok": True})
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: {"nodes": 2, "node_list": [HEAD, WORKER], "head": HEAD, "workers": [WORKER]})
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.0)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": None})
+
+    def pull(argv, *, what, cancel=None, **kw):
+        cancel.set()  # the operator presses Cancel mid-pull
+        raise JobCancelled(f"cancelled during {what}")
+
+    monkeypatch.setattr(serve, "_run_watched", pull)
+    for tp in (1, 2):
+        with pytest.raises(JobCancelled):
+            serve.serve_model(model="org/m", engine="sglang", tensor_parallel_size=tp, cancel=cancel)
+        cancel.clear()
+    assert not stopped and not any("docker run" in c for c in calls)
+
+    # Cancel that lands after the pull finished (the download step, the token check) is
+    # also honoured before Stop.
+    monkeypatch.setattr(serve, "_ensure_image_present", lambda *a, **k: cancel.set())
+    with pytest.raises(JobCancelled):
+        serve.serve_model(model="org/m", engine="sglang", cancel=cancel)
+    assert not stopped
+
+
+def test_run_watched_kills_the_pull_on_cancel_and_on_timeout():
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    with pytest.raises(JobCancelled):
+        serve._run_watched(["sleep", "30"], what="docker pull x", cancel=cancel)
+    with pytest.raises(TimeoutError):
+        serve._run_watched(["sleep", "30"], what="docker pull x", timeout_s=0.5)
+    assert serve._run_watched(["sh", "-c", "echo pulled; exit 3"], what="x") == (3, "pulled\n")
 
 
 def test_serve_cancel_removes_the_loading_container(monkeypatch):

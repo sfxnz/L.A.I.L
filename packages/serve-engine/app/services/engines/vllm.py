@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from ...config import DEFAULT_IMAGE_MAX, DEFAULT_PORT, WORKFLOW_MAX_LEN, WORKFLOW_UTIL
-from . import Engine, Rank, ServeSpec, bash_wrap, parse_extra, strip_flag
+from . import Engine, Rank, ServeSpec, bash_wrap, parse_extra, strip_flag, strip_flags
 
 MASTER_PORT = 25000
 
@@ -185,22 +185,7 @@ _STRUCTURED = (
 def strip_structured_flags(args: list[str]) -> list[str]:
     """Remove flags the multi-node launcher sets per rank, so one extra_flags blob is
     reused verbatim for head and workers without duplicates."""
-    out: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in _STRUCTURED:
-            if i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
-                i += 2
-            else:
-                i += 1
-            continue
-        if any(a.startswith(f + "=") for f in _STRUCTURED):
-            i += 1
-            continue
-        out.append(a)
-        i += 1
-    return out
+    return strip_flags(args, _STRUCTURED)
 
 
 def needs_bash_entrypoint(image: str) -> bool:
@@ -284,6 +269,10 @@ ENGINE = Engine(
     version=("/version", "version"),
     master_port=MASTER_PORT,
     prom_keys=PROM_KEYS,
+    prom_hists=(
+        ("vllm:inter_token_latency_seconds", "itl"),
+        ("vllm:time_to_first_token_seconds", "ttft"),
+    ),
     # A pool fraction per engine: summing engines would exceed 1 — report the fullest one.
     prom_max_keys=frozenset({"gpu_kv_cache_usage"}),
 )

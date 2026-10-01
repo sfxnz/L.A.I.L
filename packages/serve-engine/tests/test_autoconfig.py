@@ -1430,7 +1430,7 @@ def test_worker_docker_pull_quotes_image(monkeypatch):
         return R()
 
     monkeypatch.setattr(serve.subprocess, "run", fake_run)
-    # Minimal launch with one worker so _launch_multi_node hits the pull path.
+    # Minimal launch with one worker so _ensure_images hits the worker pull path.
     launch = {
         "nnodes": 2,
         "image": image,
@@ -1466,7 +1466,14 @@ def test_worker_docker_pull_quotes_image(monkeypatch):
         return real_fake(cmd, **kwargs)
 
     monkeypatch.setattr(serve.subprocess, "run", sequenced)
-    serve._launch_multi_node(launch)
+
+    def watched(argv, **kw):
+        captured.append(list(argv))
+        return 0, "ok"
+
+    # Pulls run through the cancellable runner, before anything is stopped.
+    monkeypatch.setattr(serve, "_run_watched", watched)
+    serve._ensure_images(launch)
 
     ssh_pulls = [
         c for c in captured
@@ -4453,7 +4460,7 @@ def test_recommend_llamacpp_spark_pack(monkeypatch):
 
 
 def _gguf_multiquant_http(fixture):
-    api = json.dumps({"siblings": fixture["siblings"], "tags": fixture.get("tags") or ["gguf"]})
+    api = json.dumps({"siblings": fixture["siblings"], "tags": fixture.get("tags") or ["gguf"], "gguf": fixture.get("gguf")})
 
     def fake_http(url, timeout=20.0):
         if "blobs=true" in url or "api/models" in url:
@@ -4512,6 +4519,37 @@ def test_recommend_llamacpp_multiquant_hf_quant_and_mtp(monkeypatch):
     assert "spec-draft-n-max" in argv
     topo_w = (rec.get("topology") or {}).get("weights_gib")
     assert topo_w is not None and 20.5 <= float(topo_w) <= 22.0
+
+
+def test_recommend_llamacpp_ctx_never_exceeds_the_trained_window(monkeypatch):
+    """Start launches -c as recommended: Qwen3-8B (40960-token window, GGUF header) must
+    not get a 1M context, and KV is sized from the layer geometry when config.json has it."""
+    siblings = [{"rfilename": "Qwen3-8B-UD-Q4_K_XL.gguf", "size": 5 * 1024**3}]
+    api = json.dumps({"siblings": siblings, "tags": ["gguf"], "gguf": {"context_length": 40960}})
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (api, None))
+    monkeypatch.setattr(ac, "fetch_hf_card", lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": ["gguf"]}})
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: _one_node_topo(ram_gib=121.7, gpu_sku="NVIDIA GB10"))
+    rec = ac.recommend_llamacpp("unsloth/Qwen3-8B-GGUF", fetch_remote=False)
+    assert rec["config"]["ctx_size"] == 40960
+    assert "-c 40960" in rec["argv"] or "--ctx-size 40960" in rec["argv"]
+
+    # Geometry known (36 layers × 8 KV heads × 128 × K+V × f16 = 144 KiB/token) and a tight
+    # node: 256k would need ~38.7 GiB of KV, so the ladder steps down to 131072 (~19.3 GiB).
+    api = json.dumps({"siblings": siblings, "tags": ["gguf"], "gguf": {"context_length": 262144}})
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (api, None))
+    hf = {"num_hidden_layers": 36, "num_key_value_heads": 8, "num_attention_heads": 32, "head_dim": 128, "hidden_size": 4096}
+    monkeypatch.setattr(ac, "fetch_hf_card", lambda *a, **k: {"config": hf, "fetched": [], "api": {"tags": ["gguf"]}})
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: _one_node_topo(ram_gib=50.0, gpu_sku="NVIDIA GB10"))
+    rec = ac.recommend_llamacpp("unsloth/Qwen3-8B-GGUF", fetch_remote=True)
+    assert rec["config"]["ctx_size"] == 131072
+
+    # No window anywhere: the 8192 floor, said out loud.
+    api = json.dumps({"siblings": siblings, "tags": ["gguf"]})
+    monkeypatch.setattr(ac, "_http_get", lambda *a, **k: (api, None))
+    monkeypatch.setattr(ac, "fetch_hf_card", lambda *a, **k: {"config": None, "fetched": [], "api": {"tags": ["gguf"]}})
+    rec = ac.recommend_llamacpp("unsloth/Qwen3-8B-GGUF", fetch_remote=False)
+    assert rec["config"]["ctx_size"] == 8192
+    assert any("window unknown" in w for w in rec["warnings"])
 
 
 def test_recommend_safetensors_stays_vllm(monkeypatch):

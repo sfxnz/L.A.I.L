@@ -4,6 +4,7 @@
   "spark_quant": "UD-Q4_K_XL",
   "spark_gib": 21.28,
   "tags": ["gguf", "llama.cpp", "qwen"],
+  "gguf": {"total": 34660610688, "architecture": "qwen35moe", "context_length": 262144},
   "siblings": [
     {"rfilename": "Qwen3.6-35B-A3B-UD-IQ1_M.gguf", "size": 10737418240},
     {"rfilename": "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf", "size": 11596411699},

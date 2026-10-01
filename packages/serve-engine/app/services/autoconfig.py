@@ -1104,6 +1104,11 @@ def _select_weight_blobs(siblings: list) -> list[dict]:
     return primary + extras
 
 
+def _int_or_none(v: Any) -> Optional[int]:
+    """A positive int from a JSON number, else None."""
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+
+
 def _hub_blob_measure(model: str) -> Optional[dict[str, Any]]:
     """Hub blob sizes. Safetensors: one weight dump (not consolidated+shards). GGUF: one Spark quant."""
     hub_id, want_quant = _hf_repo_ref(model)
@@ -1155,6 +1160,8 @@ def _hub_blob_measure(model: str) -> Optional[dict[str, Any]]:
             "quant": picked.get("quant") or want_quant,
             "siblings": siblings,
             "mtp": _gguf_siblings_have_mtp(hub_id, siblings),
+            # The Hub's GGUF header summary: the trained context window.
+            "context_length": _int_or_none((d.get("gguf") or {}).get("context_length")),
         }
     return None
 
@@ -1689,22 +1696,7 @@ def _strip_flag_from_extra(extra: str, flag: str) -> str:
         parts = shlex.split(s)
     except ValueError:
         parts = s.split()
-    out: list[str] = []
-    i = 0
-    while i < len(parts):
-        p = parts[i]
-        if p == flag:
-            # skip flag + following value if present
-            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
-                i += 2
-            else:
-                i += 1
-            continue
-        if p.startswith(flag + "="):
-            i += 1
-            continue
-        out.append(p)
-        i += 1
+    out = engines.strip_flag(parts, flag)
     return " ".join(shlex.quote(x) if (" " in x or "{" in x) else x for x in out)
 
 
@@ -5561,13 +5553,25 @@ def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, An
     ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
     w = float(weights_gib or 0.0)
     leftover = ram - w - _UMA_RESERVE_GIB
+    # Never past the trained window (GGUF header, else config.json).
+    text_cfg = (hf_config or {}).get("text_config") if isinstance((hf_config or {}).get("text_config"), dict) else {}
+    native = (blob or {}).get("context_length") or _int_or_none(
+        (hf_config or {}).get("max_position_embeddings") or text_cfg.get("max_position_embeddings")
+    )
+    # llama-server's KV cache is f16 unless extra flags say otherwise. Without the layer
+    # geometry, budget 256 KiB/token (64 layers × 8 KV heads × 128 dims × K+V × f16).
+    has_shape = bool((hf_config or {}).get("num_hidden_layers") or text_cfg.get("num_hidden_layers"))
+    bpt = _kv_bytes_per_token(hf_config, kv_cache_dtype="f16", family="") if has_shape else 256 * 1024.0
     ctx = 8192
-    for cand in _CONTEXT_LADDER:
-        # Unknown GQA/arch: budget ~0.25 GiB KV per 8k tokens (q8 cache, conservative).
-        need = (float(cand) / 8192.0) * 0.25
-        if leftover >= need + _RUNTIME_PAD_GIB:
-            ctx = int(cand)
-            break
+    if native:
+        ctx = min(8192, native)
+        for cand in (native, *(c for c in _CONTEXT_LADDER if c < native)):
+            if leftover >= bpt * cand / (1024**3) * 1.10 + _RUNTIME_PAD_GIB:
+                ctx = max(ctx, int(cand))
+                break
+        rationale.append(f"Trained context window {native} tokens; KV ≈ {bpt / 1024:.0f} KiB/token (f16)")
+    else:
+        warnings.append("Trained context window unknown — -c 8192; raise it if the model allows more")
     if leftover < 8.0:
         warnings.append(
             "Weights leave little UMA headroom — shrink --ctx-size if llama-server OOMs"

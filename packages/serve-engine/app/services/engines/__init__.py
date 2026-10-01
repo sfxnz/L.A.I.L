@@ -102,6 +102,8 @@ class Engine:
     # Prometheus name → normalized key (summed across label sets; *max_keys take the max).
     prom_keys: tuple[tuple[str, str], ...] = ()
     prom_max_keys: frozenset[str] = frozenset()
+    # Prometheus histogram base name → "itl" | "ttft": window percentiles from its buckets.
+    prom_hists: tuple[tuple[str, str], ...] = ()
     # (metrics, /health JSON or None) → metrics: derived counters before the rate maths.
     derive: Callable[[dict[str, Any], Any], dict[str, Any]] | None = None
     # metrics → metrics: live gauges the engine computes itself, applied after the rates.

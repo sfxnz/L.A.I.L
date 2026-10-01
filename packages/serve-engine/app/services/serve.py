@@ -34,6 +34,8 @@ _SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 
 READY_POLL_S = 5.0
 MULTI_READY_TIMEOUT_S = 30 * 60
+# A stalled `docker pull` (SGLang / NGC images are 20-30 GB) gives up after this.
+PULL_TIMEOUT_S = 45 * 60
 # Remote ranks are checked over ssh every this many polls (30 s), the local head every poll.
 WORKER_CHECK_EVERY = 6
 _TOKEN_ENV = ("HF_TOKEN=", "HUGGING_FACE_HUB_TOKEN=")
@@ -51,9 +53,30 @@ def redact_cmd(parts: list[str]) -> str:
 
 
 def _hf_env(hf_token: str | None) -> list[str]:
+    """`-e NAME` without a value: docker copies it from its own environment, so the token
+    is never on a command line (`ps` shows argv to every user). See _token_env / _ssh_run."""
     if not hf_token:
         return []
-    return ["-e", f"HF_TOKEN={hf_token}", "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
+    return ["-e", "HF_TOKEN", "-e", "HUGGING_FACE_HUB_TOKEN"]
+
+
+def _token_env(hf_token: str | None) -> dict[str, str] | None:
+    """Environment for a local `docker run` whose argv carries `_hf_env` names."""
+    if not hf_token:
+        return None
+    return {**os.environ, "HF_TOKEN": hf_token, "HUGGING_FACE_HUB_TOKEN": hf_token}
+
+
+def _ssh_run(host: str, cmd: list[str], *, hf_token: str | None = None, timeout: float = 120) -> subprocess.CompletedProcess[str]:
+    """Run `cmd` on `host`. The token travels on stdin into the remote shell's environment,
+    never on the ssh or remote command line."""
+    remote = shlex.join(cmd)
+    if hf_token:
+        remote = f'IFS= read -r HF_TOKEN && export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" && {remote}'
+    return subprocess.run(
+        [*_SSH, host, remote], input=(hf_token + "\n") if hf_token else None,
+        capture_output=True, text=True, timeout=timeout,
+    )
 
 
 def _hf_mount() -> list[str]:
@@ -84,7 +107,7 @@ def build_single_node_docker_cmd(
         "--gpus", "all",
     ]
     if engine.host_network:
-        cmd += ["--network", "host"]
+        cmd += ["--network", "host", "--ipc", "host"]
     else:
         cmd += ["--shm-size=32g", "-p", f"127.0.0.1:{spec.port}:{spec.port}"]
     cmd += [*engine.docker_opts, *_hf_mount(), "-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}"]
@@ -125,6 +148,7 @@ def build_multi_node_launch(
             # NCCL fails at init with "unhandled system error".
             "--cap-add", "IPC_LOCK",
             "--ulimit", "memlock=-1:-1",
+            *engine.docker_opts,
             *_hf_mount(),
         ]
         for e in shared_env:
@@ -156,11 +180,34 @@ def build_multi_node_launch(
     }
 
 
+def _run_watched(
+    argv: list[str], *, what: str, cancel: threading.Event | None = None, timeout_s: float = PULL_TIMEOUT_S,
+) -> tuple[int, str]:
+    """Run a long command (an image pull) that Cancel can stop: killed and JobCancelled when
+    `cancel` is set, killed and TimeoutError after `timeout_s`. Returns (rc, output)."""
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            out, _ = p.communicate(timeout=1.0)
+            return p.returncode, out or ""
+        except subprocess.TimeoutExpired:
+            cancelled = cancel is not None and cancel.is_set()
+            if not cancelled and time.monotonic() < deadline:
+                continue
+            p.kill()
+            p.communicate()
+            if cancelled:
+                raise JobCancelled(f"cancelled during {what}") from None
+            raise TimeoutError(f"{what} gave up after {int(timeout_s // 60)} min") from None
+
+
 def _ensure_image_present(
     image: str,
     *,
     log: Any = None,
     progress: Callable | None = None,
+    cancel: threading.Event | None = None,
 ) -> None:
     """Pull the serve image if it is not already present locally."""
     image = (image or "").strip()
@@ -181,11 +228,40 @@ def _ensure_image_present(
     if probe.returncode == 0:
         return
     w(f"Image {image} not local — pulling…", 0.12)
-    pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True)
-    if pull.returncode != 0:
-        err = (pull.stderr or pull.stdout or "").strip()[-800:]
-        raise RuntimeError(f"Failed to pull required image {image}: {err}")
+    rc, out = _run_watched(["docker", "pull", image], what=f"docker pull {image}", cancel=cancel)
+    if rc != 0:
+        raise RuntimeError(f"Failed to pull required image {image}: {out.strip()[-800:]}")
     w(f"Pulled {image}", 0.18)
+
+
+def _ensure_images(
+    launch: dict[str, Any],
+    *,
+    log: Any = None,
+    progress: Callable | None = None,
+    cancel: threading.Event | None = None,
+) -> None:
+    """The image on the head and on every worker rank, before anything is stopped."""
+    image = (launch.get("image") or "").strip()
+    if not image:
+        return
+    _ensure_image_present(image, log=log, progress=progress, cancel=cancel)
+    iq = shlex.quote(image)
+    for wc in launch["workers"]:
+        host = wc.get("ssh_host")
+        if not host:
+            continue
+        if log:
+            log.write(f"Ensuring image on worker {wc.get('node')} ({host})…")
+        if progress:
+            progress(0.15, f"Ensuring image on worker {wc.get('node')} ({host})…")
+        # Quote image so tags/repos with special shell chars are safe over SSH.
+        rc, out = _run_watched(
+            [*_SSH, host, f"docker image inspect {iq} >/dev/null 2>&1 || docker pull {iq}"],
+            what=f"docker pull {image} on {host}", cancel=cancel,
+        )
+        if rc != 0:
+            raise RuntimeError(f"Failed to pull {image} on {host}: {out.strip()[-800:]}")
 
 
 # ─── readiness ────────────────────────────────────────────────────────────────
@@ -198,16 +274,16 @@ def _container_dead(name: str, host: str | None = None) -> str | None:
     try:
         if host:
             st = subprocess.run([*_SSH, host, shlex.join(inspect)], capture_output=True, text=True, timeout=20)
-            if st.returncode == 255:  # ssh itself failed
-                return None
         else:
             st = subprocess.run(inspect, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
         return None
+    if st.returncode != 0:
+        # Only docker saying the container is gone is a verdict; an ssh failure (255), a
+        # daemon hiccup or a permission error is not — the next check decides.
+        return "missing" if "no such" in (st.stderr or "").lower() else None
     status = (st.stdout or "").strip()
-    if not status:
-        return "missing"
-    return None if status.startswith("running") else status
+    return None if not status or status.startswith("running") else status
 
 
 def _tail_logs(name: str, n: int = 120, host: str | None = None) -> str:
@@ -334,15 +410,17 @@ def _launch_multi_node(
     launch: dict[str, Any],
     *,
     engine: Engine = engines.VLLM,
+    hf_token: str | None = None,
     log: Any = None,
     progress: Callable | None = None,
     cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Start the worker ranks (ssh), then the head, then wait for the head's readiness.
 
-    The state file is written before anything starts, so Stop can always find every
-    rank; any failure (a rank that will not start or dies, timeout, cancel) tears down
-    whatever was started — a stray rank would otherwise pin its node's memory.
+    Images are already on every node (_ensure_images). The state file is written before
+    anything starts, so Stop can always find every rank; any failure (a rank that will
+    not start or dies, timeout, cancel) tears down whatever was started — a stray rank
+    would otherwise pin its node's memory.
     """
 
     def w(msg: str, p: float = 0.3) -> None:
@@ -353,25 +431,6 @@ def _launch_multi_node(
 
     nnodes = launch["nnodes"]
     port = launch["port"]
-    image = (launch.get("image") or "").strip()
-    # Ensure image on head + each worker before docker run (common DSpark failure mode).
-    if image:
-        _ensure_image_present(image, log=log, progress=progress)
-        for wc in launch["workers"]:
-            host = wc.get("ssh_host")
-            if not host:
-                continue
-            w(f"Ensuring image on worker {wc.get('node')} ({host})…", 0.22)
-            # Quote image so tags/repos with special shell chars are safe over SSH.
-            iq = shlex.quote(image)
-            probe = subprocess.run(
-                [*_SSH, host, f"docker image inspect {iq} >/dev/null 2>&1 || docker pull {iq}"],
-                capture_output=True, text=True, timeout=600,
-            )
-            if probe.returncode != 0:
-                err = (probe.stderr or probe.stdout or "").strip()[-800:]
-                raise RuntimeError(f"Failed to pull {image} on {host}: {err}")
-
     head_name = launch["head"]["container"]
     try:
         _write_multinode_state(launch)
@@ -385,13 +444,13 @@ def _launch_multi_node(
             _rm_remote(wc["ssh_host"], wc["container"])
 
         # 1) worker ranks first (TensorFold requires rank 1 up before rank 0), over ssh.
-        #    The executed command carries the real token; only the log line is redacted.
+        #    Every rank gets the real token (on stdin / in the environment, never argv).
         for wc in launch["workers"]:
             host = wc["ssh_host"]
             w(f"Starting worker rank {wc['rank']} on {wc['node']} ({host})…")
             if log:
                 log.write(f"$ ssh {host} {redact_cmd(wc['cmd'])}")
-            r = subprocess.run([*_SSH, host, shlex.join(wc["cmd"])], capture_output=True, text=True, timeout=120)
+            r = _ssh_run(host, wc["cmd"], hf_token=hf_token)
             if r.returncode != 0:
                 raise RuntimeError(f"worker {wc['node']} failed to start: {r.stderr or r.stdout}")
             w(f"worker {wc['node']} up")
@@ -400,7 +459,7 @@ def _launch_multi_node(
         w("Starting head (rank 0, API)…", 0.5)
         if log:
             log.write(f"$ {redact_cmd(launch['head']['cmd'])}")
-        hr = subprocess.run(launch["head"]["cmd"], capture_output=True, text=True, timeout=120)
+        hr = subprocess.run(launch["head"]["cmd"], capture_output=True, text=True, timeout=120, env=_token_env(hf_token))
         if hr.returncode != 0:
             raise RuntimeError(f"head failed to start: {hr.stderr or hr.stdout}")
 
@@ -781,13 +840,17 @@ def serve_model(
     if ignored:
         w(f"{eng.label} has no flag for: {', '.join(ignored)} — not passed (use extra flags)", 0.16)
 
-    _ensure_image_present(image, log=log, progress=progress)
     hf_token = _resolve_hf_token_for_container()
     if not hf_token:
         w(
             "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
             0.19,
         )
+
+    def not_cancelled() -> None:
+        # Everything before this point (download, image pulls) leaves the running serve alone.
+        if cancel is not None and cancel.is_set():
+            raise JobCancelled("cancelled before the running serve was stopped")
 
     # Multi-node (TP across Sparks): one container per rank, workers over ssh.
     if tp_n >= 2:
@@ -817,13 +880,17 @@ def serve_model(
             engine=eng, spec=spec, image=image, env_list=env_list,
             head=head, workers=workers, hf_token=hf_token,
         )
+        _ensure_images(launch, log=log, progress=progress, cancel=cancel)
+        not_cancelled()
         if stop_first:
             w("Stopping existing serve containers (head + workers)…", 0.05)
             stop_multi_node(log=log)
             stop_all(log=log)
         w(f"Multi-node {eng.label} launch: TP={tp_n} across {tp_n} node(s) on QSFP RoCE", 0.2)
-        return _launch_multi_node(launch, engine=eng, log=log, progress=progress, cancel=cancel)
+        return _launch_multi_node(launch, engine=eng, hf_token=hf_token, log=log, progress=progress, cancel=cancel)
 
+    _ensure_image_present(image, log=log, progress=progress, cancel=cancel)
+    not_cancelled()
     if stop_first:
         w("Stopping existing serve containers…", 0.05)
         stop_all(log=log)
@@ -838,7 +905,7 @@ def serve_model(
     w(f"docker_env={env_list}", 0.26)
     w(f"$ {redact_cmd(cmd)}", 0.3)
 
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=_token_env(hf_token))
     if r.returncode != 0:
         raise RuntimeError(r.stderr or r.stdout or "docker run failed")
     if log:

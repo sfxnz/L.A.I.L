@@ -5,6 +5,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import math
 import platform
 import re
 import subprocess
@@ -320,8 +321,11 @@ def parse_prometheus(
     data-parallel engines, SGLang is_streaming); the adapter's max-keys take the fullest."""
     eng = engines.get(engine)
     names = {name for name, _ in eng.prom_keys}
+    hists = {f"{name}_bucket": key for name, key in eng.prom_hists}
     by_name: dict[str, list[float]] = {}
     out: dict[str, Any] = {}
+    # Cumulative bucket counts per histogram, summed across label sets: {key: {le: count}}.
+    buckets: dict[str, dict[float, float]] = {}
     for line in text.splitlines():
         if line.startswith("#") or not line.strip():
             continue
@@ -338,6 +342,13 @@ def parse_prometheus(
                 out["sleep_state"] = sm.group(1)
             continue
         m = _PROM_LINE_RE.match(line)
+        if m and m.group(1) in hists:
+            le = re.search(r'\ble="([^"]+)"', line)
+            if le:
+                b = buckets.setdefault(hists[m.group(1)], {})
+                edge = math.inf if le.group(1) == "+Inf" else float(le.group(1))
+                b[edge] = b.get(edge, 0.0) + float(m.group(2))
+            continue
         if not m or m.group(1) not in names:
             continue
         val = float(m.group(2))
@@ -352,7 +363,7 @@ def parse_prometheus(
         out["prefix_cache_hit_rate"] = out.get("prefix_cache_hits", 0.0) / out["prefix_cache_queries"]
     if eng.derive is not None:
         out = eng.derive(out, health)
-    out = live_token_rates(out, now=now, mode=eng.rate_mode)
+    out = live_token_rates(out, now=now, mode=eng.rate_mode, buckets=buckets)
     if eng.live_gauges is not None:
         out = eng.live_gauges(out)
     return out
@@ -382,19 +393,46 @@ LIVE_RATE_KEYS = (
     "spec_accept_rate",
     "spec_tokens_per_step",
     "prefix_cache_hit_rate_live",
+    "ttft_p50_s",
+    "itl_p50_s",
+    "itl_p95_s",
     "rate_window_s",
 )
 
 # Single writer (the sampler's fast tick): previous counters, the burst in progress,
 # and the last finished burst.
 _LIVE_RATE: dict[str, Any] = {
-    "t": None, "prev": None, "burst": None, "last_burst": None, "last_prefill": None, "last_ttft": None,
+    "t": None, "prev": None, "prev_buckets": None, "burst": None, "last_burst": None, "last_prefill": None,
+    "last_ttft": None,
 }
 
 
 def reset_live_rate_state() -> None:
     """Forget counters and bursts — the endpoint or serving container changed."""
-    _LIVE_RATE.update(t=None, prev=None, burst=None, last_burst=None, last_prefill=None, last_ttft=None)
+    _LIVE_RATE.update(
+        t=None, prev=None, prev_buckets=None, burst=None, last_burst=None, last_prefill=None, last_ttft=None
+    )
+
+
+def bucket_quantile(q: float, delta: dict[float, float]) -> float | None:
+    """`q` quantile of a window's histogram (cumulative counts per upper edge), linearly
+    interpolated inside the bucket like Prometheus histogram_quantile. Resolution is the
+    engine's bucket edges. None when the window observed nothing."""
+    edges = sorted(delta)
+    total = delta.get(math.inf, delta[edges[-1]] if edges else 0.0)
+    if total <= 0:
+        return None
+    rank = q * total
+    lo, below = 0.0, 0.0
+    for edge in edges:
+        cum = delta[edge]
+        if cum >= rank:
+            if edge == math.inf:
+                return round(lo, 4)  # above the last finite edge: report that edge
+            span = cum - below
+            return round(lo + (edge - lo) * ((rank - below) / span if span > 0 else 1.0), 4)
+        lo, below = edge, cum
+    return round(lo, 4)
 
 
 def _ratio(num: float | None, den: float | None, digits: int = 2) -> float | None:
@@ -403,7 +441,13 @@ def _ratio(num: float | None, den: float | None, digits: int = 2) -> float | Non
     return round(num / den, digits)
 
 
-def live_token_rates(metrics: dict[str, Any], *, now: float | None = None, mode: str = "step") -> dict[str, Any]:
+def live_token_rates(
+    metrics: dict[str, Any],
+    *,
+    now: float | None = None,
+    mode: str = "step",
+    buckets: dict[str, dict[float, float]] | None = None,
+) -> dict[str, Any]:
     """Live rates from counter deltas over the window since the previous scrape.
 
     decode_tok_per_s      per-stream decode speed over BUSY time: tokens after each
@@ -418,6 +462,9 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None, mode:
                           in the window (vLLM records it at finish; cache hits excluded).
     ttft_s                mean time to first token of requests that got one this window.
     spec_accept_rate      accepted ÷ drafted tokens; spec_tokens_per_step = 1 + accepted ÷ drafts.
+    ttft_p50_s, itl_p50_s, itl_p95_s
+                          percentiles of the TTFT / inter-token latency histograms over the
+                          window (bucket deltas, interpolated within the engine's edges).
     last_prefill          the latest non-null prefill_tok_per_s with its time (`at`, epoch ms).
     last_ttft             the latest non-null ttft_s (`s`) with its time (`at`, epoch ms) —
                           mid-decode no request starts, so ttft_s is None while one runs.
@@ -444,7 +491,8 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None, mode:
 
     cur = {k: metrics.get(k) for k in _RATE_COUNTERS}
     prev, prev_t = _LIVE_RATE["prev"], _LIVE_RATE["t"]
-    _LIVE_RATE.update(t=now, prev=cur)
+    prev_buckets = _LIVE_RATE["prev_buckets"] or {}
+    _LIVE_RATE.update(t=now, prev=cur, prev_buckets=buckets or {})
     out["last_burst"] = _LIVE_RATE["last_burst"]
     out["last_prefill"] = _LIVE_RATE["last_prefill"]
     out["last_ttft"] = _LIVE_RATE["last_ttft"]
@@ -486,6 +534,18 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None, mode:
     if d.get("spec_drafts") and d.get("spec_accepted") is not None:
         out["spec_tokens_per_step"] = round(1 + d["spec_accepted"] / d["spec_drafts"], 2)
     out["prefix_cache_hit_rate_live"] = _ratio(d.get("prefix_cache_hits"), d.get("prefix_cache_queries"), 4)
+    for key, now_b in (buckets or {}).items():
+        before = prev_buckets.get(key)
+        if not before:
+            continue
+        delta = {le: c - before.get(le, 0.0) for le, c in now_b.items()}
+        if any(v < 0 for v in delta.values()):
+            continue
+        if key == "itl":
+            out["itl_p50_s"] = bucket_quantile(0.5, delta)
+            out["itl_p95_s"] = bucket_quantile(0.95, delta)
+        elif key == "ttft":
+            out["ttft_p50_s"] = bucket_quantile(0.5, delta)
 
     burst = _LIVE_RATE["burst"]
     active = bool(running or gen or d.get("prefill_time_s_sum"))

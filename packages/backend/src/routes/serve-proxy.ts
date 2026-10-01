@@ -8,12 +8,25 @@ const FORWARDED = /^\/(status|cluster|smoke|jobs(\/.+)?|serve\/.+|bench\/.+|runs
 
 /**
  * A wedged serve-engine handler must not hang the dashboard. Most calls answer in
- * milliseconds (jobs run in the background); recommend (Hub card fetches) and
- * smoke (a real completion) are synchronous and slow by design.
+ * milliseconds (jobs run in the background). The synchronous ones get a budget
+ * above their own upstream timeouts, so the proxy never 504s a call that is
+ * still going to succeed:
+ * - smoke: two sequential httpx calls at 180 s each (/v1/models, then a completion)
+ * - recommend: Hub card / vendor recipe fetches
+ * - cluster: local probes plus an ssh probe per remote node (up to 18 s each)
  */
+const SLOW_MS: Record<string, number> = {
+  "/smoke": 370_000,
+  "/serve/recommend": 200_000,
+  "/cluster": 60_000,
+};
+
 export function proxyTimeoutMs(path: string): number {
-  return /^\/(serve\/recommend|smoke)$/.test(path) ? 200_000 : 15_000;
+  return SLOW_MS[path] ?? 15_000;
 }
+
+/** Bun.serve hands itself to app.fetch as the env (absent under app.request in tests). */
+type BunServerEnv = { timeout?: (req: Request, seconds: number) => void } | undefined;
 
 /** Hop-by-hop or re-encoded by fetch (bodies arrive decoded), so never copied back. */
 const DROP_RESPONSE = ["connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length"];
@@ -29,6 +42,11 @@ serveProxy.all("/*", async (c) => {
   const accept = c.req.header("accept");
   if (accept) headers.set("accept", accept);
   if (config.token) headers.set("x-lail-token", config.token);
+
+  // Bun.serve closes a request that has sent nothing for 10 s (its idleTimeout),
+  // which would cut smoke/recommend/cluster and quiet log streams long before the
+  // bounds below. This proxy bounds every call itself, so lift Bun's cap.
+  (c.env as BunServerEnv)?.timeout?.(c.req.raw, 0);
 
   // SSE lives as long as the browser keeps it open; everything else is bounded.
   // Either way the browser's disconnect is propagated upstream.

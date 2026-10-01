@@ -67,11 +67,22 @@ describe("serve-engine proxy", () => {
     expect(res.headers.get("content-encoding")).toBeNull();
   });
 
+  test("lifts Bun.serve's 10 s idle cap for forwarded calls (the proxy bounds them itself)", async () => {
+    fakeEngine(() => Response.json({ ok: true }));
+    const lifted: Array<[Request, number]> = [];
+    const server = { timeout: (req: Request, s: number) => lifted.push([req, s]) };
+    const res = await createApp().request("/api/smoke", { method: "POST" }, server);
+    expect(res.status).toBe(200);
+    expect(lifted.length).toBe(1);
+    expect(lifted[0][1]).toBe(0);
+  });
+
   test("a wedged handler times out as 504; slow-by-design routes get a long budget", async () => {
     expect(proxyTimeoutMs("/status")).toBe(15_000);
     expect(proxyTimeoutMs("/serve/start")).toBe(15_000);
     expect(proxyTimeoutMs("/serve/recommend")).toBe(200_000);
-    expect(proxyTimeoutMs("/smoke")).toBe(200_000);
+    expect(proxyTimeoutMs("/smoke")).toBe(370_000); // > 2 x serve-engine's 180 s httpx timeout
+    expect(proxyTimeoutMs("/cluster")).toBe(60_000); // > one 18 s ssh probe plus local probes
     const calls = fakeEngine(() => {
       throw new DOMException("The operation timed out.", "TimeoutError");
     });

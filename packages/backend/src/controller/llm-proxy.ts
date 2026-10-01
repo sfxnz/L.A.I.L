@@ -1,5 +1,4 @@
-import { openAiBase, getSettings, listServedModelIds, resolveModelId } from "./settings";
-import { recordUsage } from "./usage";
+import { openAiBase, listServedModelIds, resolveModelId } from "./settings";
 
 const SERVED_TTL_MS = 5000;
 const servedCache = new Map<string, { at: number; ids: string[] }>();
@@ -14,7 +13,6 @@ async function servedIds(base: string): Promise<string[]> {
 }
 
 export async function proxyOpenAI(req: Request, path: string): Promise<Response> {
-  const settings = getSettings();
   const targetBase = openAiBase();
   const url = `${targetBase}${path.startsWith("/") ? path : `/${path}`}${new URL(req.url).search}`;
 
@@ -54,7 +52,6 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
 
   // Stream pass-through
   if (ct.includes("text/event-stream") || bodyText?.includes('"stream":true')) {
-    // Tee usage approximately on stream end is hard; meter after clone for non-stream only.
     return new Response(upstream.body, {
       status: upstream.status,
       headers: {
@@ -64,25 +61,7 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
     });
   }
 
-  const text = await upstream.text();
-  try {
-    const j = JSON.parse(text) as {
-      model?: string;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-    if (j.usage) {
-      recordUsage({
-        model: j.model || settings.defaultModel,
-        prompt: j.usage.prompt_tokens || 0,
-        completion: j.usage.completion_tokens || 0,
-        source: "proxy",
-      });
-    }
-  } catch {
-    /* not json */
-  }
-
-  return new Response(text, {
+  return new Response(await upstream.text(), {
     status: upstream.status,
     headers: { "Content-Type": ct || "application/json" },
   });

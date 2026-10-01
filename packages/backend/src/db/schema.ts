@@ -16,8 +16,9 @@ export function getDb(): Database {
 
 /**
  * Older databases also hold the retired agent/workbench tables (workspaces,
- * sessions, messages, agent_runs, patches). They are left on disk untouched;
- * nothing creates, reads or writes them any more.
+ * sessions, messages, agent_runs, patches) and usage_events (controller-side
+ * metering that saw only proxied, non-streamed calls). They are left on disk
+ * untouched; nothing creates, reads or writes them any more.
  */
 function migrate(database: Database) {
   database.exec(`
@@ -26,16 +27,25 @@ function migrate(database: Database) {
       value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS usage_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
+    -- Engine-metered token usage (controller/usage.ts): per-minute deltas of the
+    -- backend's Prometheus counters, and the last reading each delta is taken from.
+    CREATE TABLE IF NOT EXISTS usage_minutes (
+      minute TEXT NOT NULL,
       model TEXT NOT NULL,
       prompt_tokens INTEGER NOT NULL DEFAULT 0,
       completion_tokens INTEGER NOT NULL DEFAULT 0,
-      session_id TEXT,
-      source TEXT NOT NULL DEFAULT 'proxy'
+      requests INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (minute, model)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
+    CREATE TABLE IF NOT EXISTS usage_counters (
+      backend TEXT NOT NULL,
+      model TEXT NOT NULL,
+      prompt REAL NOT NULL,
+      completion REAL NOT NULL,
+      requests REAL NOT NULL,
+      start_time REAL,
+      PRIMARY KEY (backend, model)
+    );
   `);
 }

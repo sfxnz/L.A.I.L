@@ -15,7 +15,8 @@ import {
 } from "recharts";
 import { api, type UsageSummary } from "@/lib/api";
 import { formatTokens } from "@/lib/utils";
-import { Metric, Panel } from "@/components/ui";
+import { isUnauthorizedError } from "@/lib/auth-token";
+import { Callout, Metric, Panel } from "@/components/ui";
 
 /*
   recharts takes literal colour strings, so the chart palette is read from the
@@ -52,14 +53,42 @@ function useChartPalette(): Palette | null {
 
 export default function UsagePage() {
   const [u, setU] = useState<UsageSummary | null>(null);
+  const [err, setErr] = useState<unknown>(null);
   const palette = useChartPalette();
 
+  // The controller folds engine counters in every 15 s; poll at that pace, never while hidden.
   useEffect(() => {
-    api.usage().then(setU).catch(console.error);
-    const t = setInterval(() => api.usage().then(setU).catch(() => {}), 10000);
-    return () => clearInterval(t);
+    const load = () =>
+      api
+        .usage()
+        .then((next) => {
+          setU(next);
+          setErr(null);
+        })
+        .catch(setErr);
+    const onVisible = () => {
+      if (!document.hidden) void load();
+    };
+    void load();
+    const t = setInterval(onVisible, 15000);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
+  if (!u && err) {
+    return isUnauthorizedError(err) ? (
+      <Callout tone="warn" title="LAIL_TOKEN required">
+        The controller is up. Paste the token in the banner.
+      </Callout>
+    ) : (
+      <Callout tone="danger" title="Couldn’t load usage">
+        {err instanceof Error ? err.message : String(err)}
+      </Callout>
+    );
+  }
   if (!u || !palette) return <div className="text-sm text-lab-muted">Loading usage…</div>;
 
   const COLORS = [palette.series1, palette.series2];
@@ -81,7 +110,7 @@ export default function UsagePage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Usage</h1>
-          <p className="page-sub">Local token metering · proxy + Composer</p>
+          <p className="page-sub">Every request the engine served (Hermes, proxy, benches) · from vLLM counters</p>
         </div>
       </div>
 
@@ -139,7 +168,7 @@ export default function UsagePage() {
         <h2 className="mb-3 text-sm font-semibold">Activity heatmap</h2>
         <div className="flex flex-wrap gap-1">
           {u.heatmap.length === 0 && (
-            <span className="text-sm text-lab-muted">No data yet — run Composer or proxy chat.</span>
+            <span className="text-sm text-lab-muted">No data yet — counted from the served engine every 15 s.</span>
           )}
           {u.heatmap.map((h) => {
             const intensity = h.tokens / maxHeat;

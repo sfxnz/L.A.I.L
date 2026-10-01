@@ -2,6 +2,7 @@ import { createApp } from "./app";
 import { assertSafeBind } from "./bind";
 import { config } from "./config";
 import { getDb } from "./db/schema";
+import { startUsageMeter } from "./controller/usage";
 import { mkdirSync } from "fs";
 
 assertSafeBind({
@@ -12,6 +13,7 @@ assertSafeBind({
 
 mkdirSync(config.dataDir, { recursive: true });
 getDb();
+startUsageMeter();
 
 const app = createApp();
 

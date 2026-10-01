@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createApp } from "../app";
 import { config } from "../config";
-import { importLabRun, playKey } from "./store";
+import { importLabRun, playKey, publishLabRun } from "./store";
 
 const prevToken = config.token;
 const src = mkdtempSync(join(tmpdir(), "lail-play-src-"));
@@ -17,6 +17,8 @@ beforeAll(() => {
   writeFileSync(join(src, "game", "index.html"), '<script src="js/main.js"></script>');
   mkdirSync(join(src, "game", "js"));
   writeFileSync(join(src, "game", "js", "main.js"), "console.log(1)");
+  writeFileSync(join(src, "game", "js", "level.mjs"), "export const level = 1;");
+  writeFileSync(join(src, "game", "level.json"), '{"level":1}');
   writeFileSync(join(src, "game", "run.sh"), "rm -rf /");
   run = importLabRun({ title: "game", from: join(src, "game") });
   other = importLabRun({ title: "other", from: join(src, "game", "index.html") });
@@ -52,7 +54,6 @@ describe("private lab play (capability URL)", () => {
     const app = createApp();
     expect((await app.request(`/api/lab/play/${run.id}/${"0".repeat(32)}/index.html`)).status).toBe(404);
     expect((await app.request(`/api/lab/play/${run.id}/${playKey(other.id)}/index.html`)).status).toBe(404);
-    expect((await app.request(`${run.artifacts_url}run.sh`)).status).toBe(403);
     expect((await app.request(`${run.artifacts_url}..%2Fmeta.json`)).status).not.toBe(200);
     // The old token-only /files route is gone; with a token set it is simply unauthorized.
     expect((await app.request(`/api/lab/runs/${run.id}/files/artifacts/index.html`)).status).toBe(401);
@@ -68,11 +69,44 @@ describe("private lab play (capability URL)", () => {
     }
   });
 
-  test("the authed /play alias redirects to the capability URL", async () => {
+  test("the sandboxed (Origin: null) page may load its module scripts and data", async () => {
+    const app = createApp();
+    for (const [f, type] of [
+      ["js/level.mjs", "text/javascript; charset=utf-8"],
+      ["level.json", "application/json"],
+    ]) {
+      const res = await app.request(`${run.artifacts_url}${f}`, { headers: { origin: "null" } });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("access-control-allow-origin")).toBe("*");
+      expect(res.headers.get("access-control-allow-credentials")).toBeNull();
+      expect(res.headers.get("content-type")).toBe(type);
+    }
+  });
+
+  test("non-web files (the run's sources) download as opaque bytes instead of rendering", async () => {
+    const res = await createApp().request(`${run.artifacts_url}run.sh`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+    expect(res.headers.get("content-type")).toBe("application/octet-stream");
+    expect(await res.text()).toBe("rm -rf /");
+  });
+
+  test("the retired /runs/:id/play alias is gone", async () => {
     const res = await createApp().request(`/api/lab/runs/${run.id}/play`, {
       headers: { "x-lail-token": "op-secret" },
     });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe(run.play_url);
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("public lab share", () => {
+  test("same CORS allowance for the opaque origin; non-web files stay private", async () => {
+    const shared = publishLabRun(run.id, true);
+    const base = `/api/lab/p/${shared.share!.slug}/`;
+    const app = createApp();
+    const mod = await app.request(`${base}js/level.mjs`, { headers: { origin: "null" } });
+    expect(mod.status).toBe(200);
+    expect(mod.headers.get("access-control-allow-origin")).toBe("*");
+    expect((await app.request(`${base}run.sh`)).status).toBe(403);
   });
 });

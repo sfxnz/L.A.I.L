@@ -221,23 +221,21 @@ export function createApp() {
     }
   });
 
-  app.get("/api/lab/runs/:id/play", (c) => {
-    const run = getLabRun(c.req.param("id"));
-    if (!run) return c.json({ error: "not_found" }, 404);
-    return c.redirect(run.play_url, 302);
-  });
-
   // Private play: the path's key is the capability (no token: iframes cannot send
-  // one). Same CSP as public shares — model-written HTML is untrusted.
+  // one). Same CSP as public shares — model-written HTML is untrusted. Files that
+  // are not web assets (the run's sources) download instead of rendering.
   app.get("/api/lab/play/:id/:key/*", (c) => {
     const { id, key } = c.req.param();
     if (!playKeyMatches(id, key)) return c.json({ error: "not_found" }, 404);
     const rel = c.req.path.slice(`/api/lab/play/${id}/${key}/`.length);
     try {
-      const { abs, contentType } = resolveRunArtifact(id, rel);
-      return new Response(readFileSync(abs), {
-        headers: { ...publicPlayHeaders(contentType), "Cache-Control": "private, no-cache" },
-      });
+      const { abs, contentType, playable } = resolveRunArtifact(id, rel);
+      const headers: Record<string, string> = {
+        ...publicPlayHeaders(contentType),
+        "Cache-Control": "private, no-cache",
+      };
+      if (!playable) headers["Content-Disposition"] = "attachment";
+      return new Response(readFileSync(abs), { headers });
     } catch (e) {
       const err = e as Error & { code?: string };
       const status = err.code === "forbidden_type" ? 403 : err.code === "bad_path" ? 400 : 404;

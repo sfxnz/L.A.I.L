@@ -329,16 +329,22 @@ export function getPublicBySlug(slug: string): {
   return { slug, meta, dir };
 }
 
-export function resolvePublicFile(slug: string, relPath: string): { abs: string; contentType: string } {
+type ArtifactFile = { abs: string; contentType: string; playable: boolean };
+
+export function resolvePublicFile(slug: string, relPath: string): ArtifactFile {
   const pub = getPublicBySlug(slug);
   if (!pub) throw Object.assign(new Error("not found"), { code: "not_found" });
-  return resolveArtifactFile(pub.dir, relPath);
+  return resolveArtifactFile(pub.dir, relPath, false);
 }
 
-/** A private run's artifact, for the capability play path (same rules as public shares). */
-export function resolveRunArtifact(id: string, relPath: string): { abs: string; contentType: string } {
+/**
+ * A private run's artifact, for the capability play path. Same rules as public
+ * shares, except that other file types (sources Hermes wrote, e.g. .py) are
+ * returned with playable=false so the route serves them as downloads.
+ */
+export function resolveRunArtifact(id: string, relPath: string): ArtifactFile {
   if (!readMeta(id)) throw Object.assign(new Error("not found"), { code: "not_found" });
-  return resolveArtifactFile(join(labRoot(), id, "artifacts"), relPath);
+  return resolveArtifactFile(join(labRoot(), id, "artifacts"), relPath, true);
 }
 
 const PLAYABLE_EXTS = new Set([
@@ -366,7 +372,7 @@ const PLAYABLE_EXTS = new Set([
   ".map",
 ]);
 
-function resolveArtifactFile(dir: string, relPath: string): { abs: string; contentType: string } {
+function resolveArtifactFile(dir: string, relPath: string, anyType: boolean): ArtifactFile {
   let clean = (relPath || "index.html").replace(/^\/+/, "").replace(/\\/g, "/");
   if (!clean || clean.endsWith("/")) clean = `${clean}index.html`;
   if (clean.includes("..") || clean.includes("\0")) {
@@ -379,14 +385,15 @@ function resolveArtifactFile(dir: string, relPath: string): { abs: string; conte
   }
   // Allowlist extensions for play (no server configs)
   const ext = extname(clean).toLowerCase() || ".html";
-  if (!PLAYABLE_EXTS.has(ext)) {
+  const playable = PLAYABLE_EXTS.has(ext);
+  if (!playable && !anyType) {
     throw Object.assign(new Error("type not allowed"), { code: "forbidden_type" });
   }
   const abs = safeResolveUnder(dir, clean);
   if (!existsSync(abs) || !statSync(abs).isFile()) {
     throw Object.assign(new Error("file not found"), { code: "not_found" });
   }
-  return { abs, contentType: mimeFor(abs) };
+  return { abs, contentType: playable ? mimeFor(abs) : "application/octet-stream", playable };
 }
 
 /** Safe response headers for untrusted model-generated HTML/JS. */
@@ -397,6 +404,11 @@ export function publicPlayHeaders(contentType: string): Record<string, string> {
     "X-Robots-Tag": "noindex, nofollow",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    // The sandbox below gives the artifact an opaque origin (Origin: null), so its
+    // own module scripts, fetch()ed JSON/WASM and @font-face loads are CORS
+    // requests. Allow them; no credentials are involved and the URL (capability
+    // key or public slug) is the only access check.
+    "Access-Control-Allow-Origin": "*",
     // Lock down what the game page can do. Model HTML is untrusted.
     "Content-Security-Policy": [
       "default-src 'none'",
@@ -502,6 +514,8 @@ function mimeFor(path: string): string {
     ".html": "text/html; charset=utf-8",
     ".htm": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".map": "application/json",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json",
     ".png": "image/png",
@@ -513,6 +527,12 @@ function mimeFor(path: string): string {
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".wasm": "application/wasm",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
   };
   return map[e] || "application/octet-stream";
 }

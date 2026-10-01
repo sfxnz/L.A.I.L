@@ -17,7 +17,7 @@
        the ONE target. Crimson is the single interactive accent. Amber/orange is
        warning only; red is desync only.
     2. Corners are cut, not rounded. Radii are 2-4px; chamfers do the shaping.
-    3. Every surface sits on the field — grain, constellation, vignette.
+    3. Every surface sits on the field — a still constellation and vignette.
     4. Motion explains state: enter instant, exit ≤150ms, payoff once. Nothing
        pulses forever.
 */
@@ -148,15 +148,12 @@
   --animus-field-line: rgba(76, 194, 255, 0.3);
   --animus-field-poly: rgba(76, 194, 255, 0.06);
   --animus-field-glow: rgba(126, 224, 200, 1);
-  --animus-grain-opacity: 0.055;
-  --animus-grain-blend: overlay;
   --animus-vignette: radial-gradient(
     118% 88% at 50% 42%,
     transparent 34%,
     rgba(4, 6, 10, 0.5) 78%,
     rgba(2, 3, 6, 0.82) 100%
   );
-  --animus-scan-opacity: 0.035;
 
   /* Breathing atmosphere: cyan depth with one crimson ember, so the void
      reads as a lit volume rather than flat black. Two pools; the gradient
@@ -165,16 +162,15 @@
   --animus-haze-b: rgba(168, 31, 43, 0.34);
 
   /* --- Elevation ---
-     Panels are HUD projections, not opaque cards: the reconstruction field
-     must read THROUGH them. Translucency + backdrop blur is what separates
-     "floating HUD panel" from "dark SaaS card". */
+     Panels are HUD projections over the (still) reconstruction field: mostly
+     opaque, with the lattice faintly through them. No backdrop blur — over a
+     static field it bought nothing and cost a blur pass per panel per frame. */
   --animus-panel-bg: linear-gradient(
     168deg,
-    rgba(24, 34, 48, 0.7) 0%,
-    rgba(16, 23, 32, 0.76) 62%,
-    rgba(13, 19, 27, 0.82) 100%
+    rgba(24, 34, 48, 0.84) 0%,
+    rgba(16, 23, 32, 0.88) 62%,
+    rgba(13, 19, 27, 0.92) 100%
   );
-  --animus-panel-blur: saturate(150%) blur(10px);
   --animus-panel-shadow: 0 1px 0 rgba(160, 225, 245, 0.06) inset,
     0 18px 44px -26px rgba(0, 0, 0, 0.95);
   --animus-panel-shadow-hover: 0 1px 0 rgba(160, 225, 245, 0.12) inset,
@@ -241,8 +237,6 @@
   --animus-field-line: rgba(11, 92, 173, 0.34);
   --animus-field-poly: rgba(11, 92, 173, 0.06);
   --animus-field-glow: rgba(11, 92, 173, 0.95);
-  --animus-grain-opacity: 0.07;
-  --animus-grain-blend: multiply;
   --animus-vignette: radial-gradient(
     120% 92% at 56% 40%,
     rgba(255, 255, 255, 0.72) 0%,
@@ -250,7 +244,6 @@
     rgba(125, 139, 153, 0.14) 84%,
     rgba(125, 139, 153, 0.28) 100%
   );
-  --animus-scan-opacity: 0.02;
 
   /* On the white plate the haze is a cool blue/silver bloom — depth in the
      paper, never a coloured stain. */
@@ -259,11 +252,10 @@
 
   --animus-panel-bg: linear-gradient(
     168deg,
-    rgba(255, 255, 255, 0.84) 0%,
-    rgba(250, 251, 252, 0.8) 60%,
-    rgba(244, 246, 248, 0.82) 100%
+    rgba(255, 255, 255, 0.92) 0%,
+    rgba(250, 251, 252, 0.9) 60%,
+    rgba(244, 246, 248, 0.92) 100%
   );
-  --animus-panel-blur: saturate(130%) blur(10px);
   --animus-panel-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset,
     0 12px 30px -22px rgba(16, 24, 32, 0.4);
   --animus-panel-shadow-hover: 0 1px 0 rgba(255, 255, 255, 1) inset,
@@ -346,91 +338,25 @@ html.animus-theming .lab-card {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   The field — grain, scanlines, vignette. Fixed, non-interactive, behind all.
+   The field — vignette. Fixed, non-interactive, behind all.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Fractal noise plate: real texture, one gzipped data URI, no image request. */
-.animus-grain::after {
-  content: "";
-  position: fixed;
-  inset: -50%;
-  pointer-events: none;
-  z-index: 0;
-  opacity: var(--animus-grain-opacity);
-  mix-blend-mode: var(--animus-grain-blend);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='220' height='220' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 220px 220px;
-  will-change: transform;
-  animation: animus-grain-drift 7s steps(6) infinite;
-}
-
-@keyframes animus-grain-drift {
-  0% {
-    transform: translate3d(0, 0, 0);
-  }
-  16% {
-    transform: translate3d(-2%, 1.5%, 0);
-  }
-  33% {
-    transform: translate3d(1.5%, -2%, 0);
-  }
-  50% {
-    transform: translate3d(-1%, -1%, 0);
-  }
-  66% {
-    transform: translate3d(2%, 1%, 0);
-  }
-  83% {
-    transform: translate3d(-1.5%, 2%, 0);
-  }
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-/*
-  Vignette + CRT sync lines share ONE pseudo-element.
-  They must: grain owns ::after (it needs its own blend mode), so a second
-  ::after on the same host would silently replace it. Both of these composite
-  with normal blending, so they stack cleanly as two background layers.
-*/
-.animus-vignette::before,
-.animus-scanlines::before {
+/* Vignette: one static gradient on the body's ::before. (The animated grain and
+   CRT scanlines that used to sit on top are gone: a full-viewport blended layer
+   re-composited the page on every change.) */
+.animus-vignette::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: 0;
-  background-image: repeating-linear-gradient(
-      0deg,
-      color-mix(in srgb, var(--color-lab-line) 55%, transparent) 0 1px,
-      transparent 1px 3px
-    ),
-    var(--animus-vignette);
-  background-blend-mode: normal;
-}
-/* Scanline strength rides its own token without dimming the vignette. */
-.animus-scanlines::before {
-  background-image: repeating-linear-gradient(
-      0deg,
-      color-mix(
-          in srgb,
-          var(--color-lab-line) calc(var(--animus-scan-opacity) * 1600%),
-          transparent
-        )
-        0 1px,
-      transparent 1px 3px
-    ),
-    var(--animus-vignette);
+  background-image: var(--animus-vignette);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Volumetric atmosphere — the field BREATHES
-   Two large radial blooms on independent slow clocks (19s/26s — coprime so the
-   composite never visibly loops), each drifting AND swelling. Sits under the
-   lattice canvas, above the page background. Softness comes from the gradient
-   falloff alone: no `filter: blur()`, so nothing here is on the filter path and
-   the panels' backdrop blur is not recomposited against a filtered layer.
+   Atmosphere — two large, still radial blooms under the lattice canvas (cyan
+   depth, one crimson ember), so the void reads as a lit volume rather than flat
+   black. Softness comes from the gradient falloff alone; nothing animates.
    ═══════════════════════════════════════════════════════════════════════════ */
 .animus-atmosphere {
   position: fixed;
@@ -444,7 +370,6 @@ html.animus-theming .lab-card {
   position: absolute;
   display: block;
   border-radius: 50%;
-  will-change: transform, opacity;
 }
 .animus-haze-1 {
   width: 72vw;
@@ -457,7 +382,6 @@ html.animus-theming .lab-card {
     color-mix(in srgb, var(--animus-haze-a) 45%, transparent) 38%,
     transparent 100%
   );
-  animation: animus-breathe-1 19s ease-in-out infinite;
 }
 .animus-haze-2 {
   width: 64vw;
@@ -470,64 +394,8 @@ html.animus-theming .lab-card {
     color-mix(in srgb, var(--animus-haze-b) 45%, transparent) 38%,
     transparent 100%
   );
-  animation: animus-breathe-2 26s ease-in-out infinite;
 }
 
-/*
-  Wandering paths, not oscillations.
-
-  Two-stop keyframes (0 → 50 → back) are a pure sine on one axis: the pool
-  retraces the same line forever and the eye stops registering it as movement.
-  Six irregular stops make each pool drift a closed but non-obvious loop,
-  scaling and fading out of phase with its own travel, so the field keeps
-  rearranging itself. Transform and opacity only — both composite on the GPU.
-*/
-@keyframes animus-breathe-1 {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0) scale(1);
-    opacity: 0.6;
-  }
-  19% {
-    transform: translate3d(17vw, 8vh, 0) scale(1.34);
-    opacity: 1;
-  }
-  37% {
-    transform: translate3d(6vw, 18vh, 0) scale(0.84);
-    opacity: 0.68;
-  }
-  58% {
-    transform: translate3d(-11vw, 10vh, 0) scale(1.28);
-    opacity: 1;
-  }
-  79% {
-    transform: translate3d(-7vw, -6vh, 0) scale(0.88);
-    opacity: 0.74;
-  }
-}
-@keyframes animus-breathe-2 {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0) scale(1.18);
-    opacity: 1;
-  }
-  24% {
-    transform: translate3d(-18vw, -12vh, 0) scale(0.82);
-    opacity: 0.58;
-  }
-  46% {
-    transform: translate3d(-8vw, 7vh, 0) scale(1.3);
-    opacity: 0.95;
-  }
-  68% {
-    transform: translate3d(9vw, -10vh, 0) scale(0.86);
-    opacity: 0.64;
-  }
-  87% {
-    transform: translate3d(3vw, 5vh, 0) scale(1.1);
-    opacity: 1;
-  }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Chamfer — the Animus corner. Cut, never rounded.
@@ -687,9 +555,6 @@ html.animus-theming .lab-card {
   position: relative;
   border: 1px solid var(--color-lab-border);
   background: var(--animus-panel-bg);
-  /* Standard property only — writing the -webkit- alias alongside it makes
-     Lightning CSS drop the unprefixed one and the blur silently dies. */
-  backdrop-filter: var(--animus-panel-blur);
   border-radius: var(--radius-lg);
   box-shadow: var(--animus-panel-shadow);
   transition:
@@ -842,18 +707,6 @@ html.animus-theming .lab-card {
   transform: rotate(45deg);
   opacity: 0.55;
   pointer-events: none;
-  animation: animus-drift 9s var(--ease-standard) infinite alternate;
-  animation-delay: calc(var(--i, 0) * -1.3s);
-}
-@keyframes animus-drift {
-  from {
-    transform: rotate(45deg) translate3d(0, 0, 0);
-    opacity: 0.25;
-  }
-  to {
-    transform: rotate(45deg) translate3d(14px, -22px, 0);
-    opacity: 0.7;
-  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1114,14 +967,9 @@ input[type="checkbox"]:disabled {
   .lab-progress-indeterminate,
   .lab-flow::before,
   .lab-spin,
-  .sync-ring-bloom::after,
-  .animus-fragment,
-  .animus-grain::after,
-  .animus-haze {
+  .sync-ring-bloom::after {
     animation: none !important;
   }
-  /* The atmosphere stays — it just stops breathing. Removing it would flatten
-     the depth the whole surface is built on. */
   .lab-rise,
   .lab-fade-in {
     animation: lab-opacity-in var(--dur-tap) linear both;

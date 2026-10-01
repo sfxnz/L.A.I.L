@@ -219,7 +219,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         Skip to content
       </a>
 
-      <header className="sticky top-0 z-20 shrink-0 overflow-x-clip border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-xl backdrop-saturate-150">
+      <header className="sticky top-0 z-20 shrink-0 overflow-x-clip border-b border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)]">
         <div
           className={cn(
             "animus-bracketed relative mx-auto flex h-14 items-center gap-3 px-4 md:gap-5 md:px-6",
@@ -331,18 +331,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className={cn("mx-auto px-4 py-5 md:px-6 md:py-6", measure)}>{children}</div>
       </main>
 
-      <footer className="relative z-10 shrink-0 border-t border-[color:var(--animus-hairline)] bg-[color:var(--animus-glass)] backdrop-blur-md">
-        <div
-          className={cn(
-            "mx-auto flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2 md:px-6",
-            measure,
-          )}
-        >
-          <span className="font-[family-name:var(--font-display)] text-[10px] font-medium uppercase leading-none tracking-[0.18em] text-lab-muted">
-            Serve · bench · streams · Hermes
-          </span>
-        </div>
-      </footer>
     </div>
   );
 }

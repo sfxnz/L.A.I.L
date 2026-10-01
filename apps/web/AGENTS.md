@@ -5,7 +5,7 @@ Next.js 16 App Router + React 19 + Tailwind v4. Product chrome lives in `lib/ide
 ## CSS (hard)
 
 - **Never hand-write a `-webkit-` prefix next to the standard property.** Tailwind v4 compiles through Lightning CSS, which collapses the pair and keeps only the prefixed one — the standard property is silently dropped and the effect dies in every browser. Write the standard property alone; the compiler emits both. Cost a debugging cycle on `backdrop-filter` (2026-08-08). Verify compiled output, not source: `curl -s $(curl -s http://127.0.0.1:3000/status | grep -o '/_next/static/chunks/[^"]*\.css' | head -1 | sed 's|^|http://127.0.0.1:3000|')`.
-- **One `::after` per element.** `app/layout.tsx` stacks field classes on `<body>`; two classes both defining `::after` means the later one silently replaces the earlier. Grain owns `::after` (it needs its own `mix-blend-mode`); vignette + scanlines share `::before` as stacked background layers.
+- **One `::after` per element.** `app/layout.tsx` puts field classes on `<body>`; two classes both defining the same pseudo-element means the later one silently replaces the earlier. The vignette owns `body::before`; stack layers as backgrounds of one pseudo-element instead of adding a second.
 
 ## Verify
 

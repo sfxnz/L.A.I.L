@@ -5,22 +5,19 @@ import { useEffect, useRef } from "react";
 /**
  * AnimusField — the reconstruction lattice behind the console.
  *
- * A fixed, inert, full-viewport canvas: faint low-poly plates drifting at the
- * back, a slow constellation of nodes and hairline edges in front, a handful of
- * "scanned" nodes breathing on top. Every colour comes from the --animus-field-*
- * custom properties, so the field re-skins with the theme instead of fighting it.
+ * A fixed, inert, full-viewport canvas: faint low-poly plates at the back, a
+ * constellation of nodes and hairline edges in front, a handful of "scanned"
+ * nodes on top. Every colour comes from the --animus-field-* custom properties,
+ * so the field re-skins with the theme instead of fighting it.
  *
- * The whole thing is imperative — no React state, no re-renders, one rAF loop.
+ * Drawn once (and on resize / theme change) — a still backdrop, not an
+ * animation: nothing behind the instruments moves except the data.
  */
 
 type FieldNode = {
   x: number;
   y: number;
-  vx: number;
-  vy: number;
   r: number;
-  /** parallax weight, 0.45..1 — front nodes swing further with the pointer */
-  depth: number;
   /** 0 = inert, otherwise pulse rate in rad/s */
   pulse: number;
   phase: number;
@@ -41,13 +38,6 @@ const DPR1_AREA = 2.5e6;
 const AREA_PER_NODE = 16000;
 const MIN_NODES = 40;
 const MAX_NODES = 140;
-/** pointer-driven shift, css px — nodes lean in, plates lean out */
-const NODE_PARALLAX = 16;
-const PLATE_PARALLAX = 7;
-/** parallax follow rate, 1/s — high enough to feel live, low enough to never jitter */
-const EASE = 2.6;
-/** clamp frame delta so a stalled tab can't teleport the field */
-const MAX_DT = 0.05;
 
 function rand(min: number, max: number): number {
   return min + Math.random() * (max - min);
@@ -67,7 +57,6 @@ export function AnimusField() {
     if (!ctx) return;
 
     const root = document.documentElement;
-    const reduceQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 
     let w = 0;
     let h = 0;
@@ -104,8 +93,6 @@ export function AnimusField() {
     let rows = 1;
 
     const spawn = (i: number): FieldNode => {
-      const speed = rand(2, 6); // css px/s — ~15s to cross 60px
-      const dir = Math.random() * TAU;
       // Jittered grid, not pure random: uniform randomness clumps into blobs and
       // leaves dead voids. Stratifying keeps the lattice evenly woven.
       const col = i % cols;
@@ -113,10 +100,7 @@ export function AnimusField() {
       return {
         x: ((col + rand(0.12, 0.88)) * w) / cols,
         y: ((row + rand(0.12, 0.88)) * h) / rows,
-        vx: Math.cos(dir) * speed,
-        vy: Math.sin(dir) * speed,
         r: rand(1, 1.6),
-        depth: rand(0.45, 1),
         pulse: 0,
         phase: Math.random() * TAU,
       };
@@ -186,30 +170,16 @@ export function AnimusField() {
       }
     };
 
-    // ── pointer parallax ─────────────────────────────────────────────────────
-    let tx = 0;
-    let ty = 0;
-    let cx = 0;
-    let cy = 0;
-
-    const onPointer = (e: PointerEvent) => {
-      if (!w || !h) return;
-      tx = clamp((e.clientX / w) * 2 - 1, -1, 1);
-      ty = clamp((e.clientY / h) * 2 - 1, -1, 1);
-    };
-
     // ── render ───────────────────────────────────────────────────────────────
     const draw = (time: number) => {
       const count = nodes.length;
       ctx.clearRect(0, 0, w, h);
 
       ctx.fillStyle = color.poly;
-      const plx = -cx * PLATE_PARALLAX;
-      const ply = -cy * PLATE_PARALLAX;
       for (const p of plates) {
         // Sine sway rather than linear drift: no wrap, so nothing ever pops.
-        const dx = Math.sin(time * p.drift + p.phase) * p.amp + plx;
-        const dy = Math.cos(time * p.drift * 0.8 + p.phase) * p.amp * 0.55 + ply;
+        const dx = Math.sin(time * p.drift + p.phase) * p.amp;
+        const dy = Math.cos(time * p.drift * 0.8 + p.phase) * p.amp * 0.55;
         ctx.beginPath();
         ctx.moveTo(p.pts[0] * w + dx, p.pts[1] * h + dy);
         ctx.lineTo(p.pts[2] * w + dx, p.pts[3] * h + dy);
@@ -218,12 +188,9 @@ export function AnimusField() {
         ctx.fill();
       }
 
-      const nox = cx * NODE_PARALLAX;
-      const noy = cy * NODE_PARALLAX;
       for (let i = 0; i < count; i++) {
-        const n = nodes[i];
-        sx[i] = n.x + nox * n.depth;
-        sy[i] = n.y + noy * n.depth;
+        sx[i] = nodes[i].x;
+        sy[i] = nodes[i].y;
       }
 
       // Edges. Squared distance only — no sqrt in the hot pair loop.
@@ -278,93 +245,38 @@ export function AnimusField() {
       ctx.globalAlpha = 1;
     };
 
-    // ── loop ─────────────────────────────────────────────────────────────────
-    let raf = 0;
-    let last = -1;
-    let elapsed = 0;
-
-    const frame = (ts: number) => {
-      raf = requestAnimationFrame(frame);
-      const now = ts / 1000;
-      const dt = last < 0 ? 0 : Math.min(now - last, MAX_DT);
-      last = now;
-      elapsed += dt;
-
-      const k = 1 - Math.exp(-dt * EASE);
-      cx += (tx - cx) * k;
-      cy += (ty - cy) * k;
-
-      for (const n of nodes) {
-        n.x += n.vx * dt;
-        n.y += n.vy * dt;
-        wrap(n);
-      }
-
-      draw(elapsed);
-    };
-
-    const start = () => {
-      if (raf || reduceQuery.matches || document.hidden) return;
-      last = -1;
-      raf = requestAnimationFrame(frame);
-    };
-
-    const stop = () => {
-      if (!raf) return;
-      cancelAnimationFrame(raf);
-      raf = 0;
-    };
-
-    // ── listeners ────────────────────────────────────────────────────────────
+    // ── static frame ─────────────────────────────────────────────────────────
+    // Drawn once, and again only on resize or a theme change. The console is
+    // open all day: a full-viewport canvas animating at display rate behind
+    // translucent panels re-composited the whole page every frame for nothing
+    // the operator reads.
     let resizeRaf = 0;
     const onResize = () => {
       if (resizeRaf) return;
       resizeRaf = requestAnimationFrame(() => {
         resizeRaf = 0;
         resize();
-        if (!raf) draw(elapsed); // paused or reduced-motion: refresh the held frame
+        draw(0);
       });
-    };
-
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
-    };
-
-    const onMotion = () => {
-      if (reduceQuery.matches) {
-        stop();
-        draw(elapsed);
-      } else {
-        start();
-      }
     };
 
     const themeObserver = new MutationObserver(() => {
       readColors();
-      if (!raf) draw(elapsed);
+      draw(0);
     });
 
     readColors();
     resize();
     buildPlates();
-    draw(elapsed);
-    start();
+    draw(0);
 
     themeObserver.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
     window.addEventListener("resize", onResize);
-    window.addEventListener("pointermove", onPointer, { passive: true });
-    document.addEventListener("visibilitychange", onVisibility);
-    reduceQuery.addEventListener("change", onMotion);
 
     return () => {
-      stop();
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       themeObserver.disconnect();
       window.removeEventListener("resize", onResize);
-      window.removeEventListener("pointermove", onPointer);
-      document.removeEventListener("visibilitychange", onVisibility);
-      reduceQuery.removeEventListener("change", onMotion);
     };
   }, []);
 

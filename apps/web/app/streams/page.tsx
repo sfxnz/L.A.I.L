@@ -184,15 +184,21 @@ function StreamsRoom() {
   }, [finished, refreshRuns]);
 
   // ── Desync (latched per strand for the run — evidence stays) ─────────────
+  // Cards only read `desync` and `reason`: an unchanged verdict keeps its object, so
+  // the 1 Hz clock does not re-render every memoised StrandCard.
+  const prevDesyncs = useRef<Desync[]>([]);
   const desyncs = useMemo(() => {
     const latch = desyncLatch.current;
-    return strands.map((s) => {
+    const next = strands.map((s, k) => {
       const held = latch.get(s.i);
       if (held) return held;
       const d = strandDesync(s, nowAt);
       if (d.desync) latch.set(s.i, d);
-      return d;
+      const prev = prevDesyncs.current[k];
+      return prev && prev.desync === d.desync && prev.reason === d.reason ? prev : d;
     });
+    prevDesyncs.current = next;
+    return next;
   }, [strands, nowAt]);
 
   // ── Actions ──────────────────────────────────────────────────────────────
@@ -314,6 +320,10 @@ function StreamsRoom() {
   // ── Keyboard ─────────────────────────────────────────────────────────────
   const keys = useRef({ run, doStop, copyAll, copyStrand, toggleThinking, focused, hovered, sheet, wall, setWall, live, strands });
   keys.current = { run, doStop, copyAll, copyStrand, toggleThinking, focused, hovered, sheet, wall, setWall, live, strands };
+  // Stable callbacks for the memoised StrandCards (fresh arrows defeated the memo,
+  // re-rendering every card's full transcript on every flushed frame).
+  const toggleFocus = useCallback((i: number) => setFocused((f) => (f === i ? null : i)), []);
+  const copyOne = useCallback((i: number) => void keys.current.copyStrand(i), []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const k = keys.current;
@@ -524,9 +534,9 @@ function StreamsRoom() {
                       thinkingMuted={mutedThinking.has(s.i)}
                       wall={wall}
                       onHover={setHovered}
-                      onFocus={(i) => setFocused((f) => (f === i ? null : i))}
+                      onFocus={toggleFocus}
                       onExpand={setSheet}
-                      onCopy={(i) => void copyStrand(i)}
+                      onCopy={copyOne}
                       onToggleThinking={toggleThinking}
                     />
                   </div>
@@ -588,7 +598,7 @@ function StreamsRoom() {
         onOpenChange={(open) => {
           if (!open) setSheet(null);
         }}
-        onCopy={(i) => void copyStrand(i)}
+        onCopy={copyOne}
       />
     </div>
   );

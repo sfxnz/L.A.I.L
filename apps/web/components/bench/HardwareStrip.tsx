@@ -13,8 +13,10 @@ import { cn } from "@/lib/utils";
  * stays a record of what the hardware did under the curve.
  */
 export function useHardwareSamples(active: boolean, runKey: string | null): HardwareSeries[] {
-  const samples = useLabStatusStore((s) => s.samples.nodes);
-  const nodes = useLabStatusStore((s) => s.status?.serve?.cluster?.nodes);
+  // Subscribed only while a run is live: an idle Bench page must not re-render on
+  // every 1 s sample.
+  const samples = useLabStatusStore((s) => (active ? s.samples.nodes : null));
+  const nodes = useLabStatusStore((s) => (active ? s.status?.serve?.cluster?.nodes : undefined));
   const [series, setSeries] = useState<HardwareSeries[]>([]);
   const key = useRef<string | null>(null);
   const since = useRef<number>(0);
@@ -27,7 +29,7 @@ export function useHardwareSamples(active: boolean, runKey: string | null): Hard
     }
   }, [runKey]);
   useEffect(() => {
-    if (!active) return;
+    if (!active || !samples) return;
     setSeries((prev) => appendHardware(prev, samples, nodes, since.current));
   }, [active, samples, nodes]);
   return series;

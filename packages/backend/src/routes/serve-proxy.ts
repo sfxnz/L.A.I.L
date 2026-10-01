@@ -3,8 +3,26 @@ import { config } from "../config";
 
 export const serveProxy = new Hono();
 
-async function forward(c: { req: { raw: Request; url: string; method: string; header: (n: string) => string | undefined } }, path: string) {
-  const target = `${config.serveEngineUrl}${path}${new URL(c.req.url).search}`;
+/** serve-engine routes reachable through the controller (paths below /api). */
+const FORWARDED = /^\/(status|cluster|smoke|jobs(\/.+)?|serve\/.+|bench\/.+|runs(\/.+)?)$/;
+
+/**
+ * A wedged serve-engine handler must not hang the dashboard. Most calls answer in
+ * milliseconds (jobs run in the background); recommend (Hub card fetches) and
+ * smoke (a real completion) are synchronous and slow by design.
+ */
+export function proxyTimeoutMs(path: string): number {
+  return /^\/(serve\/recommend|smoke)$/.test(path) ? 200_000 : 15_000;
+}
+
+/** Hop-by-hop or re-encoded by fetch (bodies arrive decoded), so never copied back. */
+const DROP_RESPONSE = ["connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length"];
+
+serveProxy.all("/*", async (c) => {
+  const path = c.req.path.replace(/^\/api/, "");
+  if (!FORWARDED.test(path)) return c.notFound();
+  const target = `${config.serveEngineUrl}/api${path}${new URL(c.req.url).search}`;
+
   const headers = new Headers();
   const ct = c.req.header("content-type");
   if (ct) headers.set("content-type", ct);
@@ -12,42 +30,47 @@ async function forward(c: { req: { raw: Request; url: string; method: string; he
   if (accept) headers.set("accept", accept);
   if (config.token) headers.set("x-lail-token", config.token);
 
-  const init: RequestInit = { method: c.req.method, headers };
+  // SSE lives as long as the browser keeps it open; everything else is bounded.
+  // Either way the browser's disconnect is propagated upstream.
+  const sse = (accept || "").includes("text/event-stream") || /^\/jobs\/[^/]+\/logs$/.test(path);
+  const signal = sse
+    ? c.req.raw.signal
+    : AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(proxyTimeoutMs(path))]);
+
+  const init: RequestInit = { method: c.req.method, headers, signal };
   if (c.req.method !== "GET" && c.req.method !== "HEAD") {
     init.body = await c.req.raw.arrayBuffer();
   }
 
   try {
     const res = await fetch(target, init);
-    // SSE / stream passthrough
+    const out = new Headers(res.headers);
+    for (const h of DROP_RESPONSE) out.delete(h);
     const rct = res.headers.get("content-type") || "application/json";
-    if (rct.includes("text/event-stream") || rct.includes("stream")) {
-      return new Response(res.body, {
-        status: res.status,
-        headers: {
-          "Content-Type": rct,
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          // Never let an intermediary compress or buffer an event stream.
-          // Next's dev proxy honours the browser's `Accept-Encoding: gzip` and
-          // gzips this response; gzip buffers, so the browser holds an open
-          // connection and receives ZERO bytes until the stream closes — the
-          // job dock sits on "running / 0 log bytes" for the whole serve while
-          // curl (which sends no Accept-Encoding by default) streams fine.
-          // `identity` opts the stream out of compression; `X-Accel-Buffering`
-          // does the same for nginx-style proxies in front of the lab.
-          "Content-Encoding": "identity",
-          "X-Accel-Buffering": "no",
-        },
-      });
+    out.set("content-type", rct);
+    if (rct.includes("text/event-stream")) {
+      out.set("cache-control", "no-cache");
+      // Never let an intermediary compress or buffer an event stream.
+      // Next's dev proxy honours the browser's `Accept-Encoding: gzip` and
+      // gzips this response; gzip buffers, so the browser holds an open
+      // connection and receives ZERO bytes until the stream closes — the
+      // job dock sits on "running / 0 log bytes" for the whole serve while
+      // curl (which sends no Accept-Encoding by default) streams fine.
+      // `identity` opts the stream out of compression; `X-Accel-Buffering`
+      // does the same for nginx-style proxies in front of the lab.
+      out.set("content-encoding", "identity");
+      out.set("x-accel-buffering", "no");
+      return new Response(res.body, { status: res.status, headers: out });
     }
-    const buf = await res.arrayBuffer();
-    return new Response(buf, {
-      status: res.status,
-      headers: { "Content-Type": rct },
-    });
+    return new Response(await res.arrayBuffer(), { status: res.status, headers: out });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
+    if (e instanceof DOMException && e.name === "TimeoutError") {
+      return Response.json(
+        { error: "serve_engine_timeout", message: `serve-engine did not answer ${path} in ${proxyTimeoutMs(path) / 1000} s` },
+        { status: 504 },
+      );
+    }
     return Response.json(
       {
         error: "serve_engine_unreachable",
@@ -57,34 +80,4 @@ async function forward(c: { req: { raw: Request; url: string; method: string; he
       { status: 502 },
     );
   }
-}
-
-// Explicit routes for Hono
-serveProxy.all("/status", (c) => forward(c, "/api/status"));
-serveProxy.all("/cluster", (c) => forward(c, "/api/cluster"));
-serveProxy.all("/hardware", (c) => forward(c, "/api/hardware"));
-serveProxy.all("/serve/*", (c) => {
-  const u = new URL(c.req.url);
-  const sub = u.pathname.replace(/^\/api/, "");
-  return forward(c, `/api${sub}`);
 });
-serveProxy.all("/jobs", (c) => forward(c, "/api/jobs"));
-serveProxy.all("/jobs/*", (c) => {
-  const u = new URL(c.req.url);
-  const sub = u.pathname.replace(/^\/api/, "");
-  return forward(c, `/api${sub}`);
-});
-serveProxy.all("/smoke", (c) => forward(c, "/api/smoke"));
-serveProxy.all("/chat", (c) => forward(c, "/api/chat"));
-serveProxy.all("/bench/*", (c) => {
-  const u = new URL(c.req.url);
-  const sub = u.pathname.replace(/^\/api/, "");
-  return forward(c, `/api${sub}`);
-});
-serveProxy.all("/runs", (c) => forward(c, "/api/runs"));
-serveProxy.all("/runs/*", (c) => {
-  const u = new URL(c.req.url);
-  const sub = u.pathname.replace(/^\/api/, "");
-  return forward(c, `/api${sub}`);
-});
-

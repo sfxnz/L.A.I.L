@@ -5,8 +5,6 @@
 import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { readFileSync } from "fs";
-import { join } from "path";
 import { ClusterPanel } from "../components/ClusterPanel";
 import { LastSyncCard } from "../components/bench/LastSyncCard";
 import { EndpointHero, hermesBases } from "../components/status/EndpointHero";
@@ -15,7 +13,6 @@ import { lastSync, latestDecodeRuns } from "./bench/last-sync";
 import { CONCURRENCY_LEVELS, PACK_LABELS, sortConcurrencies } from "./bench/levels";
 import type { DecodeResult } from "./bench/result";
 
-const webRoot = join(import.meta.dir, "..");
 
 const MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4";
 const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}, model_id = MODEL): RunRow => ({

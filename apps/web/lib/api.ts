@@ -26,6 +26,17 @@ export class ApiError extends Error {
   }
 }
 
+/** The controller's JSON error body ({error, message, run_id}) of a failed call, or just its text. */
+export function parseApiError(e: unknown): { error?: string; message: string; run_id?: string } {
+  const msg = e instanceof Error ? e.message : String(e);
+  try {
+    const j = JSON.parse(msg) as { error?: string; message?: string; run_id?: string };
+    return { error: j.error, message: j.message || msg, run_id: j.run_id };
+  } catch {
+    return { message: msg };
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
     ...init,

@@ -2,7 +2,8 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { api, parseApiError } from "@/lib/api";
+import { isEditableTarget } from "@/lib/shortcuts";
 import { isUnauthorizedError } from "@/lib/auth-token";
 import { useShallow } from "zustand/react/shallow";
 import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
@@ -38,23 +39,6 @@ import { PrefillInstrument } from "@/components/bench/PrefillInstrument";
 
 type Tab = "decode" | "prefill";
 type Notice = { tone: "warn" | "danger" | "muted"; title: string; body?: string };
-
-function parseApiError(e: unknown): { error?: string; message: string; run_id?: string } {
-  const msg = e instanceof Error ? e.message : String(e);
-  try {
-    const j = JSON.parse(msg) as { error?: string; message?: string; run_id?: string };
-    return { error: j.error, message: j.message || msg, run_id: j.run_id };
-  } catch {
-    return { message: msg };
-  }
-}
-
-function isEditable(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  if (!el) return false;
-  const tag = el.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
-}
 
 export default function BenchPage() {
   return (
@@ -374,7 +358,7 @@ function BenchRoom() {
         if (result) setCopyRequest((n) => n + 1);
         return;
       }
-      if (mod || e.altKey || isEditable(e.target)) return;
+      if (mod || e.altKey || isEditableTarget(e.target)) return;
       if (e.key === "r") {
         e.preventDefault();
         if (canRun) run();

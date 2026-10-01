@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { api } from "@/lib/api";
+import { api, parseApiError } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
 import { useShallow } from "zustand/react/shallow";
 import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
@@ -50,16 +50,6 @@ function canonUrl(raw: string): string {
     return `${u.origin}${u.pathname.replace(/\/+$/, "").replace(/\/v1$/, "")}`;
   } catch {
     return raw;
-  }
-}
-
-function parseApiError(e: unknown): { error?: string; message: string; run_id?: string } {
-  const msg = e instanceof Error ? e.message : String(e);
-  try {
-    const j = JSON.parse(msg) as { error?: string; message?: string; run_id?: string };
-    return { error: j.error, message: j.message || msg, run_id: j.run_id };
-  } catch {
-    return { message: msg };
   }
 }
 

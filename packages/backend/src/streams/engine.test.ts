@@ -32,6 +32,8 @@ type MockState = {
   leaseMode: "ok" | "busy" | "down";
   leases: string[];
   statusCalls: number;
+  /** The serve-engine reports this mock as the endpoint it detected serving. */
+  serving: boolean;
 };
 const state: MockState = {
   requests: [],
@@ -48,6 +50,7 @@ const state: MockState = {
   leaseMode: "ok",
   leases: [],
   statusCalls: 0,
+  serving: false,
 };
 const isWarmup = (r: Record<string, unknown>) => String((r.messages as Array<{ content: string }>)[0].content).startsWith("Warmup");
 const measured = () => state.requests.filter((r) => !isWarmup(r));
@@ -159,6 +162,8 @@ const server = Bun.serve({
       state.statusCalls++;
       return Response.json({
         sampled_at: `2026-10-01T00:00:${String(state.statusCalls).padStart(2, "0")}Z`,
+        healthy: state.serving,
+        base_url: `http://127.0.0.1:${url.port}`,
         engine: { flags_fingerprint: "fp-mock" },
         // every node carries its own fresh reading and `sampled_at`; a down peer has none
         cluster: {
@@ -458,6 +463,19 @@ describe("load run", () => {
     expect(text).toBe(engine.snapshot(run_id)!.strands[0].text);
     const toks = text.trim().split(/\s+/);
     expect(new Set(toks).size).toBe(toks.length); // tok0 … tok119, each exactly once
+  });
+
+  test("no base_url: the run measures the endpoint the serve-engine detected serving", async () => {
+    state.serving = true;
+    try {
+      // The configured default backend (:8000) is not this mock; the detected one is.
+      const run_id = await engine.createRun({ mode: "load", pack: "prose", n: 1, max_tokens: 3 });
+      expect(engine.snapshot(run_id)!.hello.base_url).toBe(BASE);
+      engine.stop(run_id);
+      while (engine.snapshot(run_id)!.status === "running") await Bun.sleep(5);
+    } finally {
+      state.serving = false;
+    }
   });
 
   test("a load run nobody ever subscribes to is aborted too", async () => {

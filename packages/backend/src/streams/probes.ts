@@ -130,7 +130,13 @@ function seHeaders(): Record<string, string> {
 
 /** One node's live reading; `at` is its own `sampled_at` (epoch ms), null when the node has no current reading. */
 export type NodeReading = { id: string; at: number | null; temp: number | null; power: number | null; avail: number | null };
-export type StatusReading = { sampled_at: string | null; fingerprint: string | null; nodes: NodeReading[] };
+/** `serving_base`: the endpoint the serve-engine detected answering (any engine, any port), null when nothing is healthy. */
+export type StatusReading = {
+  sampled_at: string | null;
+  fingerprint: string | null;
+  nodes: NodeReading[];
+  serving_base: string | null;
+};
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
@@ -144,6 +150,8 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
     if (!r.ok) return null;
     const j = (await r.json()) as {
       sampled_at?: string;
+      healthy?: boolean | null;
+      base_url?: string | null;
       engine?: { flags_fingerprint?: string | null };
       cluster?: { nodes?: Array<Record<string, unknown>> };
     };
@@ -156,7 +164,12 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
       power: num(n.power_w),
       avail: num(n.available_gib),
     }));
-    return { sampled_at: j.sampled_at ?? null, fingerprint: j.engine?.flags_fingerprint ?? null, nodes };
+    return {
+      sampled_at: j.sampled_at ?? null,
+      fingerprint: j.engine?.flags_fingerprint ?? null,
+      nodes,
+      serving_base: j.healthy && typeof j.base_url === "string" && j.base_url ? j.base_url.replace(/\/+$/, "") : null,
+    };
   } catch {
     return null;
   }

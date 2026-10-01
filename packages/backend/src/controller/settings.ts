@@ -89,8 +89,7 @@ export function isPlaceholderModel(model: string | undefined | null): boolean {
   return !m || m === "default" || m === "auto" || m === "none";
 }
 
-export async function listServedModelIds(kind?: BackendKind): Promise<string[]> {
-  const base = openAiBase(kind);
+export async function listServedModelIds(kind?: BackendKind, base: string = openAiBase(kind)): Promise<string[]> {
   try {
     const r = await fetch(`${base}/models`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return [];

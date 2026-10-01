@@ -3,6 +3,7 @@ import { createApp } from "./app";
 import { config } from "./config";
 import {
   LiveHub,
+  MAX_QUEUED_BYTES,
   compactStatus,
   liveResponse,
   probeBackends,
@@ -172,6 +173,22 @@ describe("liveResponse", () => {
   });
 });
 
+describe("slow subscriber", () => {
+  test("a reader that stops reading is dropped once ~1 MiB is queued, and leaves the hub", async () => {
+    const pad = "x".repeat(300_000);
+    const eng = fakeEngine([1000, 2000, 3000, 4000, 5000, 6000].map((at) => snapshot(at, { pad })));
+    const hub = new LiveHub(eng.fetchStatus, NO_BACKENDS, 0);
+    const res = liveResponse(hub, new AbortController().signal);
+    expect(hub.size).toBe(1);
+    // never read: the queue grows by ~300 KB a tick until it passes the byte budget
+    for (let i = 0; i < 30 && hub.size; i++) await tick();
+    expect(hub.size).toBe(0);
+    expect(eng.calls.length).toBeLessThan(7);
+    expect(MAX_QUEUED_BYTES).toBe(1 << 20);
+    await expect(res.body!.getReader().read()).rejects.toThrow("too slow");
+  });
+});
+
 describe("routes", () => {
   test("/api/lab-status: one cluster copy, no share block, backends probed once per TTL", async () => {
     config.token = "";
@@ -199,6 +216,22 @@ describe("routes", () => {
     const r = await app.request("/api/live");
     expect(r.status).toBe(401);
     expect((await r.json()).error).toBe("unauthorized");
+  });
+
+  test("an expired probe is answered from cache at once and refreshed in the background", async () => {
+    globalThis.fetch = (async () => Response.json({})) as unknown as typeof fetch;
+    const first = await probeBackends();
+    let calls = 0;
+    // a backend that blackholes: the refresh never answers within the test
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof fetch;
+    const t0 = Date.now();
+    const again = await probeBackends(Date.now() + 60_000);
+    expect(Date.now() - t0).toBeLessThan(50);
+    expect(again).toBe(first);
+    expect(calls).toBe(Object.keys(first).length); // the refresh did start
   });
 
   test("backend probes are shared while one is in flight", async () => {

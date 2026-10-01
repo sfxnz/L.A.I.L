@@ -52,16 +52,32 @@ const REPLAY_MS = 3000;
  * next tab opened gets full sparklines from the history at once.
  */
 export const LINGER_MS = 10 * 60_000;
-/** A subscriber this far behind (bytes queued) is dropped rather than buffered forever. */
-const MAX_QUEUED_BYTES = 1 << 20;
+/**
+ * A subscriber this far behind (bytes queued, ~2.5 min of ticks) is dropped rather
+ * than buffered forever. The stream measures its queue in bytes (ByteLengthQueuingStrategy),
+ * so `desiredSize` below is a byte count.
+ */
+export const MAX_QUEUED_BYTES = 1 << 20;
 
 let backendsCache: { at: number; value: Backends } | null = null;
 let backendsInflight: Promise<Backends> | null = null;
 
-/** Enabled backends' /v1/models reachability, probed at most once per BACKENDS_TTL_MS. */
+/**
+ * Enabled backends' /v1/models reachability, probed at most once per BACKENDS_TTL_MS.
+ * Stale-while-revalidate: once a result exists it is answered at once and an expired
+ * one is refreshed in the background, so a backend that blackholes (2 s timeout) never
+ * holds back a live tick or a lab-status read. Only the very first call waits.
+ */
 export function probeBackends(now = Date.now()): Promise<Backends> {
   if (backendsCache && now - backendsCache.at < BACKENDS_TTL_MS) return Promise.resolve(backendsCache.value);
-  if (backendsInflight) return backendsInflight;
+  if (backendsCache) {
+    if (!backendsInflight) void refreshBackends();
+    return Promise.resolve(backendsCache.value);
+  }
+  return backendsInflight ?? refreshBackends();
+}
+
+function refreshBackends(): Promise<Backends> {
   const settings = getSettings();
   const out: Backends = {};
   backendsInflight = Promise.all(
@@ -281,41 +297,49 @@ export const liveHub = new LiveHub();
 export function liveResponse(hub: LiveHub, signal: AbortSignal): Response {
   const enc = new TextEncoder();
   let cleanup = () => {};
-  const body = new ReadableStream<Uint8Array>({
-    start(ctrl) {
-      let closed = false;
-      const close = () => {
-        if (closed) return;
-        closed = true;
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(ctrl) {
+        let closed = false;
+        const close = () => {
+          if (closed) return;
+          closed = true;
+          cleanup();
+          try {
+            ctrl.close();
+          } catch {
+            /* already closed */
+          }
+        };
+        const write = (chunk: string) => {
+          if (closed) return;
+          if ((ctrl.desiredSize ?? 0) < -MAX_QUEUED_BYTES) {
+            // A reader this far behind is gone or stuck; it will reconnect. error()
+            // (not close()) drops what is queued instead of keeping it for a reader
+            // that is not reading.
+            closed = true;
+            cleanup();
+            ctrl.error(new Error("live subscriber too slow"));
+            return;
+          }
+          ctrl.enqueue(enc.encode(chunk));
+        };
+        write(`retry: 2000\n\n`);
+        const unsubscribe = hub.subscribe((event, data) => write(`event: ${event}\ndata: ${data}\n\n`));
+        const ping = setInterval(() => write(`: ping\n\n`), PING_MS);
+        cleanup = () => {
+          clearInterval(ping);
+          unsubscribe();
+        };
+        if (signal.aborted) close();
+        else signal.addEventListener("abort", close, { once: true });
+      },
+      cancel() {
         cleanup();
-        try {
-          ctrl.close();
-        } catch {
-          /* already closed */
-        }
-      };
-      const write = (chunk: string) => {
-        if (closed) return;
-        if ((ctrl.desiredSize ?? 0) < -MAX_QUEUED_BYTES) {
-          close(); // a reader this far behind is gone or stuck; it will reconnect
-          return;
-        }
-        ctrl.enqueue(enc.encode(chunk));
-      };
-      write(`retry: 2000\n\n`);
-      const unsubscribe = hub.subscribe((event, data) => write(`event: ${event}\ndata: ${data}\n\n`));
-      const ping = setInterval(() => write(`: ping\n\n`), PING_MS);
-      cleanup = () => {
-        clearInterval(ping);
-        unsubscribe();
-      };
-      if (signal.aborted) close();
-      else signal.addEventListener("abort", close, { once: true });
+      },
     },
-    cancel() {
-      cleanup();
-    },
-  });
+    new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }),
+  );
   return new Response(body, {
     headers: {
       "content-type": "text/event-stream",

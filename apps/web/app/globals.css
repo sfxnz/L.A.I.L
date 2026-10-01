@@ -143,11 +143,6 @@
   --color-lab-chart-3: #e9b44c;
   --color-lab-chart-4: #b68cff;
 
-  /* --- Animus field (background reconstruction canvas) --- */
-  --animus-field-node: rgba(160, 222, 255, 0.78);
-  --animus-field-line: rgba(76, 194, 255, 0.3);
-  --animus-field-poly: rgba(76, 194, 255, 0.06);
-  --animus-field-glow: rgba(126, 224, 200, 1);
   --animus-vignette: radial-gradient(
     118% 88% at 50% 42%,
     transparent 34%,
@@ -155,16 +150,16 @@
     rgba(2, 3, 6, 0.82) 100%
   );
 
-  /* Breathing atmosphere: cyan depth with one crimson ember, so the void
+  /* Still atmosphere: cyan depth with one crimson ember, so the void
      reads as a lit volume rather than flat black. Two pools; the gradient
      falloff itself is the softness — no blur filter. */
   --animus-haze-a: rgba(46, 150, 210, 0.55);
   --animus-haze-b: rgba(168, 31, 43, 0.34);
 
   /* --- Elevation ---
-     Panels are HUD projections over the (still) reconstruction field: mostly
-     opaque, with the lattice faintly through them. No backdrop blur — over a
-     static field it bought nothing and cost a blur pass per panel per frame. */
+     Panels are HUD projections over the still atmosphere: mostly opaque, with
+     the haze faintly through them. No backdrop blur — over a static backdrop
+     it bought nothing and cost a blur pass per panel per frame. */
   --animus-panel-bg: linear-gradient(
     168deg,
     rgba(24, 34, 48, 0.84) 0%,
@@ -230,13 +225,7 @@
   --color-lab-chart-3: #c07a0a;
   --color-lab-chart-4: #7a4fc9;
 
-  /* Light needs more alpha than dark for equal legibility: ink on a silver
-     plate loses contrast far faster than cyan on a void, and the reference
-     plates carry a clearly-read lattice, not a whisper. Blue/silver — never red. */
-  --animus-field-node: rgba(16, 24, 32, 0.85);
-  --animus-field-line: rgba(11, 92, 173, 0.34);
-  --animus-field-poly: rgba(11, 92, 173, 0.06);
-  --animus-field-glow: rgba(11, 92, 173, 0.95);
+  /* Light plate vignette: a cool blue/silver falloff — never red. */
   --animus-vignette: radial-gradient(
     120% 92% at 56% 40%,
     rgba(255, 255, 255, 0.72) 0%,
@@ -354,7 +343,7 @@ html.animus-theming .lab-card {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Atmosphere — two large, still radial blooms under the lattice canvas (cyan
+   Atmosphere — two large, still radial blooms behind the console (cyan
    depth, one crimson ember), so the void reads as a lit volume rather than flat
    black. Softness comes from the gradient falloff alone; nothing animates.
    ═══════════════════════════════════════════════════════════════════════════ */

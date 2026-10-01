@@ -4,7 +4,8 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import type { StreamPack, StreamRunRow } from "@/lib/stream-run-types";
 import { useStreamRun } from "@/lib/use-stream-run";
 import {
@@ -68,7 +69,9 @@ function BenchRoom() {
   const pathname = usePathname();
   const search = useSearchParams();
 
-  const { status: lab, needToken, unreachable } = useLabStatus();
+  const { healthy, needToken, unreachable } = useLabStatusStore(
+    useShallow((s) => ({ healthy: serveHealthy(s.status), needToken: s.needToken, unreachable: s.unreachable })),
+  );
   const [tab, setTab] = useState<Tab>(() => (search.get("tab") === "prefill" ? "prefill" : "decode"));
   const [decodeCfg, setDecodeCfg] = useState<DecodeConfig>(() => decodeConfigFromQuery(search));
   const [prefillCfg, setPrefillCfg] = useState<PrefillConfig>(() => prefillConfigFromQuery(search));
@@ -106,12 +109,12 @@ function BenchRoom() {
 
   const hardware = useHardwareSamples(running, runId);
 
-  const canRun = serveHealthy(lab) && !needToken && !unreachable && !running;
+  const canRun = healthy && !needToken && !unreachable && !running;
   const reason = needToken
     ? "LAIL_TOKEN required — paste it in the banner"
     : unreachable
       ? "Controller unreachable"
-      : !serveHealthy(lab)
+      : !healthy
         ? "No model served"
         : undefined;
 

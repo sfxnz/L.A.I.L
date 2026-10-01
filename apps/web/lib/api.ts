@@ -8,7 +8,7 @@ import type {
 
 const BASE = "";
 
-function lailTokenHeader(): Record<string, string> {
+export function lailTokenHeader(): Record<string, string> {
   const t = getClientToken();
   return t ? { "X-Lail-Token": t } : {};
 }
@@ -86,6 +86,8 @@ export type ClusterNode = {
   sampled_at?: number | null;
   /** server epoch ms of the slow inventory (containers, endpoint, rails) */
   inventory_at?: number | null;
+  /** bytes/s per RoCE netdev from the RDMA port counters (null until two reads) */
+  rail_rates?: Record<string, { tx_bps: number; rx_bps: number }> | null;
   /** why the ~1 s remote telemetry stream is down, when it is */
   telemetry_error?: string | null;
   endpoint_healthy?: boolean;
@@ -157,6 +159,8 @@ export type ClusterStatus = {
   name?: string;
   updated_from?: string;
   error?: string;
+  /** the first inventory has not finished yet (serve-engine just started) */
+  pending?: boolean;
   nodes: ClusterNode[];
   fabric?: {
     ok?: boolean;
@@ -233,7 +237,6 @@ export type LabStatus = {
     /** server epoch ms when this snapshot was published */
     sampled_at_ms?: number | null;
   } | null;
-  cluster?: ClusterStatus | null;
 };
 
 export type ServeExample = {
@@ -368,7 +371,7 @@ export type ServeRecommend = {
 };
 
 export const api = {
-  labStatus: () => req<LabStatus>("/api/lab-status"),
+  labStatus: (signal?: AbortSignal) => req<LabStatus>("/api/lab-status", { signal }),
   configure: {
     get: () => req<Settings>("/api/configure"),
     put: (body: Partial<Settings>) =>

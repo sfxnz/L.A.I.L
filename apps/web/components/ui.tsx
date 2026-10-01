@@ -62,9 +62,12 @@ export function Eyebrow({
  * The one null treatment: an absent value is a condensed STATE WORD behind a
  * hollow diamond, never a bare em-dash (which reads as broken data).
  * "Awaiting" = a live readout that hasn't reported yet; "None" = settled and
- * genuinely empty.
+ * genuinely empty; "Offline" = its source is down, nothing will arrive; "Idle" =
+ * a rate with no traffic to measure.
  */
-export function Nil({ word = "Awaiting" }: { word?: "Awaiting" | "None" }) {
+export type NilWord = "Awaiting" | "None" | "Offline" | "Idle";
+
+export function Nil({ word = "Awaiting" }: { word?: NilWord }) {
   return (
     <span className="inline-flex items-center gap-1.5 align-middle">
       <span
@@ -93,10 +96,11 @@ export function Tick({ className }: { className?: string }) {
  *   loading  dashed
  *   offline  notched, danger
  *   token    hourglass   (LAIL_TOKEN required — never "offline")
+ *   stale    hollow, warn (the numbers on screen stopped updating)
  *   null     faint hollow (not probed yet)
  * Still by design. It blooms once, 700ms, on the transition TO serving.
  */
-export type SyncState = "serving" | "idle" | "loading" | "offline" | "token";
+export type SyncState = "serving" | "idle" | "loading" | "offline" | "token" | "stale";
 
 export function syncStateFromNode(state?: string | null): SyncState | null {
   switch (state) {
@@ -107,6 +111,10 @@ export function syncStateFromNode(state?: string | null): SyncState | null {
     case "loading":
     case "offline":
       return state;
+    case "unreachable":
+      return "offline";
+    case "stray":
+      return "loading";
     default:
       return null;
   }
@@ -118,6 +126,7 @@ const SYNC_LABEL: Record<SyncState, string> = {
   loading: "Loading",
   offline: "Offline",
   token: "Token required",
+  stale: "Not updating",
 };
 
 export function SyncRing({
@@ -166,6 +175,7 @@ export function SyncRing({
             strokeWidth="1.25"
           />
         )}
+        {state === "stale" && <path d={D} className="stroke-lab-warn" strokeWidth="1.25" opacity="0.8" />}
         {state === "token" && (
           <>
             <path d={D} className="stroke-lab-muted" strokeWidth="0.9" opacity="0.45" />
@@ -312,12 +322,20 @@ export function SyncBar({
   );
 }
 
+export type SparkPoint = { t: number; v: number | null };
+
 /**
- * Sparkline — one series, ≤120 points, SVG. Colour comes from `currentColor`,
- * so pass a `text-lab-*` token class; never a literal.
+ * Sparkline — one series on a REAL time axis: x is the sample's timestamp within
+ * `domain` (default: first → last point), so a 60 s window is 60 s wide whatever
+ * the sample count. The line breaks at a null value and wherever two samples are
+ * more than `gapMs` apart (a missed sample, a dead stream, a hidden tab): a gap is
+ * drawn as a gap, never joined across. A lone point draws as a dot. Colour comes
+ * from `currentColor`, so pass a `text-lab-*` token class; never a literal.
  */
 export function Sparkline({
   points,
+  domain,
+  gapMs = 3500,
   width = 120,
   height = 28,
   min,
@@ -326,7 +344,9 @@ export function Sparkline({
   label,
   className,
 }: {
-  points: readonly number[];
+  points: readonly SparkPoint[];
+  domain?: readonly [number, number];
+  gapMs?: number;
   width?: number;
   height?: number;
   min?: number;
@@ -335,13 +355,30 @@ export function Sparkline({
   label?: string;
   className?: string;
 }) {
-  const pts = points.slice(-120);
-  const lo = min ?? Math.min(0, ...pts);
-  const hi = Math.max(max ?? -Infinity, ...pts, lo + 1e-9);
-  const n = pts.length;
-  const x = (i: number) => (n > 1 ? (i / (n - 1)) * width : width);
+  const t0 = domain ? domain[0] : (points[0]?.t ?? 0);
+  const t1 = domain ? domain[1] : (points[points.length - 1]?.t ?? 0);
+  const span = Math.max(1, t1 - t0);
+  const visible = points.filter((p) => p.t >= t0 && p.t <= t1);
+  const values = visible.map((p) => p.v).filter((v): v is number => v != null);
+  const lo = min ?? Math.min(0, ...values);
+  const hi = Math.max(max ?? -Infinity, ...values, lo + 1e-9);
+  const x = (t: number) => ((t - t0) / span) * width;
   const y = (v: number) => height - 1 - ((v - lo) / (hi - lo)) * (height - 2);
-  const line = pts.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
+
+  // Split into runs of consecutive, close-enough, non-null points.
+  const runs: SparkPoint[][] = [];
+  let run: SparkPoint[] = [];
+  for (const p of visible) {
+    const prev = run[run.length - 1];
+    if (p.v == null || (prev && p.t - prev.t > gapMs)) {
+      if (run.length) runs.push(run);
+      run = p.v == null ? [] : [p];
+    } else {
+      run.push(p);
+    }
+  }
+  if (run.length) runs.push(run);
+
   return (
     <svg
       viewBox={`0 0 ${width} ${height}`}
@@ -353,22 +390,25 @@ export function Sparkline({
       aria-label={label}
       aria-hidden={label ? undefined : true}
     >
-      {n > 1 && area && (
-        <path
-          d={`${line} L${width} ${height} L0 ${height} Z`}
-          fill="currentColor"
-          fillOpacity="0.12"
-        />
-      )}
-      {n > 0 && (
-        <path
-          d={n > 1 ? line : `M0 ${y(pts[0]).toFixed(1)} L${width} ${y(pts[0]).toFixed(1)}`}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.25"
-          vectorEffect="non-scaling-stroke"
-        />
-      )}
+      {runs.map((r, i) => {
+        const pts = r.map((p) => `${x(p.t).toFixed(1)} ${y(p.v as number).toFixed(1)}`);
+        if (r.length === 1) {
+          return <circle key={i} cx={x(r[0].t)} cy={y(r[0].v as number)} r={1.2} fill="currentColor" />;
+        }
+        const line = `M${pts.join(" L")}`;
+        return (
+          <g key={i}>
+            {area && (
+              <path
+                d={`${line} L${x(r[r.length - 1].t).toFixed(1)} ${height} L${x(r[0].t).toFixed(1)} ${height} Z`}
+                fill="currentColor"
+                fillOpacity="0.12"
+              />
+            )}
+            <path d={line} fill="none" stroke="currentColor" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />
+          </g>
+        );
+      })}
     </svg>
   );
 }
@@ -405,24 +445,32 @@ export function Stat({
 }
 
 /**
- * SparkStat — a Stat with its 60 s history beside it: label, last value + unit,
- * sparkline. Node cards (tok/s, power) and the bench hardware strip share it.
+ * SparkStat — a Stat with its history beside it: label, current value + unit, and
+ * a time-axis sparkline. `value` defaults to the newest point; pass it explicitly
+ * when the current reading is known apart from the series (e.g. offline → null).
  */
 export function SparkStat({
   label,
   unit = "",
-  values,
+  points,
+  value,
+  domain,
+  min = 0,
   max,
   tone = "text-lab-line",
   format = (n) => String(Math.round(n)),
   title,
   width = 72,
   height = 22,
+  nil = "Awaiting",
   className,
 }: {
   label: string;
   unit?: string;
-  values: readonly number[];
+  points: readonly SparkPoint[];
+  value?: number | null;
+  domain?: readonly [number, number];
+  min?: number;
   max?: number;
   /** a text-lab-* token class; drives the sparkline colour via currentColor */
   tone?: string;
@@ -430,32 +478,34 @@ export function SparkStat({
   title?: string;
   width?: number;
   height?: number;
+  nil?: NilWord;
   className?: string;
 }) {
-  const last = values.length ? values[values.length - 1] : null;
+  const last = value !== undefined ? value : (points[points.length - 1]?.v ?? null);
   return (
     <div className={cn("flex min-w-0 items-center gap-2", className)} title={title}>
       <div className="min-w-0">
         <Eyebrow className="block text-[9px]">{label}</Eyebrow>
         <div className="lab-num mt-0.5 font-mono text-[12px] text-lab-text">
-          {last !== null ? (
+          {last != null ? (
             <>
               {format(last)}
               <span className="text-lab-muted">{unit}</span>
             </>
           ) : (
-            <Nil />
+            <Nil word={nil} />
           )}
         </div>
       </div>
       <Sparkline
-        points={values}
+        points={points}
+        domain={domain}
         width={width}
         height={height}
-        min={0}
+        min={min}
         max={max}
         className={cn("shrink-0", tone)}
-        label={`${label} over the last 60 s`}
+        label={`${label} over time`}
       />
     </div>
   );
@@ -514,8 +564,7 @@ export function CopyButton({
 
 /**
  * Corridor — the empty state when nothing is loaded: a horizon grid, six
- * drifting fragments, and the instruction. "No memory loaded. Serve a model to
- * begin synchronization."
+ * fragments, and the instruction.
  */
 const FRAGMENTS = [
   [12, 18],
@@ -527,8 +576,8 @@ const FRAGMENTS = [
 ] as const;
 
 export function Corridor({
-  title = "No memory loaded",
-  children = "Serve a model to begin synchronization.",
+  title = "No model serving",
+  children = "Start one on Serve.",
   action,
   className,
 }: {
@@ -900,6 +949,12 @@ export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(inputCls, props.className)} {...props} />;
 }
 
+/**
+ * A job's log. While live it follows the tail — but only when the reader is
+ * already at the bottom, so scrolling up to read an earlier error is not undone
+ * by the next line. Not an aria-live region: a log streaming several lines a
+ * second would flood a screen reader; job state changes are announced elsewhere.
+ */
 export function LogView({
   text,
   empty = "Waiting for output…",
@@ -912,21 +967,26 @@ export function LogView({
   className?: string;
 }) {
   const ref = useRef<HTMLPreElement>(null);
+  const pinned = useRef(true);
 
   useEffect(() => {
-    if (!live || !ref.current) return;
-    ref.current.scrollTop = ref.current.scrollHeight;
+    const el = ref.current;
+    if (!live || !el || !pinned.current) return;
+    el.scrollTop = el.scrollHeight;
   }, [text, live]);
 
   return (
     <pre
       ref={ref}
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+      }}
       className={cn(
         "max-h-72 overflow-auto rounded-[2px] border border-lab-border bg-lab-editor p-3.5 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap",
         live && "border-l-2 border-l-lab-accent",
         className,
       )}
-      aria-live={live ? "polite" : undefined}
     >
       {text || empty}
     </pre>

@@ -947,23 +947,36 @@ input[type="checkbox"]:disabled {
 /* ═══════════════════════════════════════════════════════════════════════════
    Living connectors — fabric spine, data flow
    ═══════════════════════════════════════════════════════════════════════════ */
-@keyframes lab-fabric-flow {
+/* A RoCE rail. The dashes move only while the RDMA byte counters say traffic is
+   crossing it (data-flowing, set from the live rate; --flow-dur scales with link
+   utilisation), and the motion is a transform on a pseudo-element — compositor
+   only, no repaint, no filter. Idle or unmeasured, the line is still. */
+.lab-flow {
+  position: relative;
+  height: 2px;
+  overflow: hidden;
+}
+.lab-flow::before {
+  content: "";
+  position: absolute;
+  inset: 0 -24px 0 0;
+  background-image: repeating-linear-gradient(90deg, currentColor 0 9px, transparent 9px 24px);
+  opacity: 0.4;
+}
+.lab-flow[data-flowing="true"]::before {
+  opacity: 1;
+  will-change: transform;
+  animation: lab-flow-x var(--flow-dur, 1.2s) linear infinite;
+}
+@keyframes lab-flow-x {
   to {
-    background-position: -24px 0;
+    transform: translateX(-24px);
   }
 }
-/* Denser, brighter dashes than a hairline divider: this is a LINK carrying
-   traffic, and it has to read as one at a glance. A glow underlay keeps it
-   visible against the panel without thickening the stroke. */
-.lab-fabric-line {
-  background-image: repeating-linear-gradient(
-    90deg,
-    currentColor 0 9px,
-    transparent 9px 24px
-  );
-  background-size: 24px 100%;
-  filter: drop-shadow(0 0 4px currentColor);
-  animation: lab-fabric-flow 1.2s linear infinite;
+
+/* A live bar segment: values move by transition, never by jumping. */
+.lab-bar {
+  transition: width var(--dur-sync) var(--ease-animus-out);
 }
 
 /* Horizontal HUD rule that terminates in a bracket, AC menu style. */
@@ -1013,22 +1026,6 @@ input[type="checkbox"]:disabled {
 }
 .lab-rise-3 {
   animation-delay: calc(var(--stagger) * 6);
-}
-
-@keyframes lab-strip-shimmer {
-  to {
-    background-position: -200% 0;
-  }
-}
-.lab-strip-live {
-  background-image: linear-gradient(
-    100deg,
-    transparent 30%,
-    color-mix(in srgb, var(--color-lab-ok) 18%, transparent) 50%,
-    transparent 70%
-  );
-  background-size: 200% 100%;
-  animation: lab-strip-shimmer 2.6s linear infinite;
 }
 
 @keyframes lab-fade-in {
@@ -1115,8 +1112,7 @@ input[type="checkbox"]:disabled {
   }
   .lab-skeleton,
   .lab-progress-indeterminate,
-  .lab-fabric-line,
-  .lab-strip-live,
+  .lab-flow::before,
   .lab-spin,
   .sync-ring-bloom::after,
   .animus-fragment,

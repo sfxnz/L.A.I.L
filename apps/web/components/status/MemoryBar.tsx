@@ -1,17 +1,16 @@
 "use client";
 
-import { Eyebrow, Nil } from "@/components/ui";
-import { fmtKvPct, fmtTokensK, kvFraction, kvUsedTokens } from "@/lib/status/forecast";
+import { Eyebrow, Nil, Sparkline, type SparkPoint } from "@/components/ui";
 import { fmtGib } from "@/lib/status/format";
 import { cn } from "@/lib/utils";
 
 /**
- * The unified-memory story in one bar: engine reservation | other used | free, in GiB,
- * swap beside it and, when the engine reports it, the KV pool's utilisation as a thin
- * sub-track (tooltip in tokens). Warn colour follows the node's memory PRESSURE (RAM and
- * swap running out together), not a fixed "free < 15 GiB" line that a healthy GB10 serve
- * always crosses. Nothing is fabricated — an unknown reading is <Nil/>, and a segment or
- * track is drawn only when its source actually reported.
+ * The unified-memory story of one Spark: engine reservation | other used | free, in
+ * GiB, spelled out under the bar (no hover needed), swap beside it, and the last
+ * 60 s of memory in use as a trend line. Warn colour follows the node's memory
+ * PRESSURE (RAM and swap running out together), not a fixed "free < 15 GiB" line
+ * that a healthy GB10 serve always crosses. An unknown reading is <Nil/>, and a
+ * segment is drawn only when its source actually reported.
  */
 export function MemoryBar({
   usedGib,
@@ -20,9 +19,10 @@ export function MemoryBar({
   swapUsedGib,
   swapTotalGib,
   pressure,
-  kvUsage,
-  kvCapacityTokens,
   source,
+  trend,
+  domain,
+  offline,
   className,
 }: {
   usedGib: number | null | undefined;
@@ -33,11 +33,13 @@ export function MemoryBar({
   swapTotalGib?: number | null;
   /** node mem_pressure from the serve-engine */
   pressure?: "ok" | "tight" | "critical" | null;
-  /** engine.kv_usage_pct — a percent, 0–100 */
-  kvUsage?: number | null;
-  kvCapacityTokens?: number | null;
   /** where used/total came from, for the tooltip */
   source?: string;
+  /** memory in use over time (GiB) */
+  trend?: readonly SparkPoint[];
+  domain?: readonly [number, number];
+  /** the node is down: say so instead of "awaiting" */
+  offline?: boolean;
   className?: string;
 }) {
   const known = usedGib != null && totalGib != null && totalGib > 0;
@@ -46,15 +48,12 @@ export function MemoryBar({
   const reserved = known && reservedGib != null && reservedGib > 0 ? Math.min(reservedGib, usedGib) : null;
   const reservedPct = reserved != null ? (reserved / totalGib!) * 100 : 0;
   const warn = pressure === "tight" || pressure === "critical";
-  const kv = kvUsage == null ? null : kvFraction(kvUsage);
-  const kvTokens = kvUsedTokens(kvCapacityTokens, kvUsage);
-  const kvTip =
-    kvUsage == null
-      ? undefined
-      : kvCapacityTokens && kvTokens != null
-        ? `KV ${fmtKvPct(kvUsage)} · ${fmtTokensK(kvTokens)} / ${fmtTokensK(kvCapacityTokens)} tokens`
-        : `KV ${fmtKvPct(kvUsage)} of the pool`;
   const swapKnown = swapUsedGib != null && swapTotalGib != null && swapTotalGib > 0;
+  // Trend scale: a ±1 GiB band around what was seen, so a model loading (tens of GiB)
+  // reads as a ramp and 50 MB of page cache churn stays flat.
+  const seen = (trend ?? []).map((p) => p.v).filter((v): v is number => v != null);
+  const trendLo = seen.length ? Math.max(0, Math.floor(Math.min(...seen) - 1)) : 0;
+  const trendHi = seen.length ? Math.ceil(Math.max(...seen) + 1) : undefined;
   const memTip = known
     ? [
         reserved != null
@@ -77,19 +76,14 @@ export function MemoryBar({
             <>
               <span className={cn("text-lab-text", warn && "text-lab-warn")}>{usedGib.toFixed(1)}</span>
               <span className="text-lab-muted"> / {totalGib.toFixed(1)} GiB</span>
-              {swapKnown && (
-                <span className={cn("text-lab-muted", warn && swapUsedGib > 0 && "text-lab-warn")}>
-                  {" "}· swap {swapUsedGib.toFixed(1)}
-                </span>
-              )}
             </>
           ) : (
-            <Nil />
+            <Nil word={offline ? "Offline" : "Awaiting"} />
           )}
         </span>
       </div>
       <div
-        className="mt-1.5 flex h-[5px] w-full overflow-hidden bg-lab-hover"
+        className="mt-1.5 flex h-[6px] w-full overflow-hidden bg-lab-hover"
         role={known ? "img" : undefined}
         aria-label={memTip}
         title={memTip}
@@ -98,16 +92,13 @@ export function MemoryBar({
           <>
             {reserved != null && (
               <div
-                className={cn(
-                  "h-full shrink-0 bg-lab-line transition-[width] duration-[var(--dur-sync)] ease-[var(--ease-animus-out)]",
-                  warn && "bg-lab-warn",
-                )}
+                className={cn("lab-bar h-full shrink-0 bg-lab-line", warn && "bg-lab-warn")}
                 style={{ width: `${reservedPct}%` }}
               />
             )}
             <div
               className={cn(
-                "h-full shrink-0 transition-[width] duration-[var(--dur-sync)] ease-[var(--ease-animus-out)]",
+                "lab-bar h-full shrink-0",
                 reserved != null ? "bg-lab-line/45" : "bg-lab-line",
                 warn && (reserved != null ? "bg-lab-warn/55" : "bg-lab-warn"),
               )}
@@ -116,16 +107,41 @@ export function MemoryBar({
           </>
         )}
       </div>
-      {kv != null && (
-        <div className="mt-px flex items-center gap-2" title={kvTip}>
-          <div className="h-[3px] flex-1 overflow-hidden bg-lab-hover" role="img" aria-label={kvTip}>
-            <div
-              className="h-full origin-left bg-lab-line-2 transition-transform duration-[var(--dur-sync)] ease-[var(--ease-animus-out)]"
-              style={{ transform: `scaleX(${kv})`, width: "100%" }}
-            />
-          </div>
-          <span className="lab-num shrink-0 font-mono text-[9px] text-lab-muted">KV {fmtKvPct(kvUsage!)}</span>
+      {known && (
+        <div className="lab-num mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 font-mono text-[10px] text-lab-muted">
+          {reserved != null && (
+            <span>
+              <span aria-hidden className="mr-1 inline-block h-1.5 w-1.5 bg-lab-line align-middle" />
+              engine {reserved.toFixed(1)}
+            </span>
+          )}
+          <span>
+            <span aria-hidden className="mr-1 inline-block h-1.5 w-1.5 bg-lab-line/45 align-middle" />
+            {reserved != null ? "other" : "used"} {(usedGib - (reserved ?? 0)).toFixed(1)}
+          </span>
+          <span>
+            <span aria-hidden className="mr-1 inline-block h-1.5 w-1.5 border border-lab-border bg-lab-hover align-middle" />
+            free {freeGib!.toFixed(1)}
+          </span>
+          {swapKnown && (
+            <span className={cn(warn && swapUsedGib > 0 && "text-lab-warn")}>
+              swap {swapUsedGib.toFixed(1)} / {swapTotalGib.toFixed(0)}
+            </span>
+          )}
         </div>
+      )}
+      {trend && trend.length > 0 && (
+        <Sparkline
+          points={trend}
+          domain={domain}
+          width={240}
+          height={16}
+          min={trendLo}
+          max={trendHi}
+          area={false}
+          className="mt-1 w-full text-lab-line"
+          label={`Memory in use over the last 60 s (${trendLo}–${trendHi ?? ""} GiB)`}
+        />
       )}
     </div>
   );

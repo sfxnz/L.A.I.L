@@ -51,12 +51,14 @@ export function CommandPalette() {
   const open = useCommandUi((s) => s.paletteOpen);
   const setPalette = useCommandUi((s) => s.setPalette);
   const setSheet = useCommandUi((s) => s.setSheet);
-  const { status, needToken, liveRun } = useLabStatusStore();
-  // `liveRun` is published by useStreamRun while a Streams/Bench run streams.
-  const strands = useMemo(
-    () => ({ running: liveRun?.running ?? 0, waiting: liveRun?.waiting ?? 0 }),
-    [liveRun],
-  );
+  // Closed, the palette subscribes to nothing that changes every second: `status` is
+  // only read while it is open, so a live sample never re-renders a hidden palette.
+  const status = useLabStatusStore((s) => (open ? s.status : null));
+  const needToken = useLabStatusStore((s) => s.needToken);
+  // Strand counts are published by useStreamRun while a Streams/Bench run streams.
+  const running = useLabStatusStore((s) => s.liveRun?.running ?? 0);
+  const waiting = useLabStatusStore((s) => s.liveRun?.waiting ?? 0);
+  const strands = useMemo(() => ({ running, waiting }), [running, waiting]);
 
   const [query, setQuery] = useState("");
   const [runs, setRuns] = useState<RunRow[] | null>(null);

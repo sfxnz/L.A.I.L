@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { RunRow } from "@/lib/api";
 import { fmtDate, fmtPct, fmtTokS, modelShort } from "@/lib/bench/format";
 import { lastSync, latestDecodeRuns } from "@/lib/bench/last-sync";
@@ -13,10 +13,11 @@ import { cn } from "@/lib/utils";
 import { MiniCurve } from "./DecodeCharts";
 
 /**
- * Status → "Last synchronization": the latest decode run of the served model — its hero,
+ * Status → "Last decode bench": the latest decode run of the served model — its hero,
  * curve, delta against the previous comparable run — and two ways back into /bench.
+ * Memoised: Status re-renders every live sample, this card only when its runs change.
  */
-export function LastSyncCard({
+export const LastSyncCard = memo(function LastSyncCard({
   runs,
   loading,
   servingModel,
@@ -44,17 +45,17 @@ export function LastSyncCard({
   const sync = lastSync(runs, servingModel, envelopes.id === cur?.run_id ? envelopes : { current: null, previous: null });
 
   return (
-    <Panel title="Last synchronization" padded className={className} action={sync ? <Eyebrow className="lab-num">{fmtDate(sync.createdAt)}</Eyebrow> : undefined}>
+    <Panel title="Last decode bench" padded className={className} action={sync ? <Eyebrow className="lab-num">{fmtDate(sync.createdAt)}</Eyebrow> : undefined}>
       {loading && !sync ? (
-        <div className="space-y-3" aria-busy="true" aria-label="Loading last synchronization">
+        <div className="space-y-3" aria-busy="true" aria-label="Loading the last decode bench">
           <Skeleton className="h-12 w-40" />
           <Skeleton className="h-20 w-60" />
         </div>
       ) : !sync ? (
         <div className="flex flex-col items-start gap-3 py-2">
-          <Eyebrow>{servingModel ? "No bench for this model yet" : "No sequences yet"}</Eyebrow>
+          <Eyebrow>{servingModel ? "No bench for this model yet" : "No decode bench yet"}</Eyebrow>
           <p className="max-w-[44ch] text-[13px] leading-snug text-lab-text-dim">
-            {servingModel ? `No decode run of ${modelShort(servingModel)} on record. Run one to draw its first slice.` : "Run a decode sync to draw the first slice."}
+            {servingModel ? `No decode run of ${modelShort(servingModel)} on record. Run one to get its curve.` : "Run a decode bench to get the first curve."}
           </p>
           <Link href="/bench" className={btnClass("primary", "sm")}>
             Run a bench
@@ -121,4 +122,4 @@ export function LastSyncCard({
       )}
     </Panel>
   );
-}
+});

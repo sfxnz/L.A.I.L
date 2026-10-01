@@ -102,9 +102,10 @@ export type HardwareSeries = { id: string; label: string; samples: HardwareSampl
 export const HARDWARE_KEEP = 120;
 
 /**
- * Fold the store's per-node ring buffer (the ONE sampler, lab-status-store)
- * into the run's series: append every sample newer than what we hold and not
- * older than `since` (the run start). Nodes come and go, so series are keyed by id.
+ * Fold the store's per-node series (the ONE sampler, lab-status-store) into the
+ * run's series: append every sample newer than what we hold and not older than
+ * `since` (the run start). Both are the serve-engine host's clock (sample `t` is a
+ * node's server `sampled_at`). Nodes come and go, so series are keyed by id.
  */
 export function appendHardware(
   prev: HardwareSeries[],

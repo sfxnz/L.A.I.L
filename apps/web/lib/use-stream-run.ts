@@ -342,16 +342,15 @@ export function flushPlan(queued: number, hidden: boolean): "now" | "timer" | "f
 }
 
 /**
- * What the header's instrument strip shows while this run is live: the run's
- * own aggregate (the number Streams/Bench display), not the endpoint counter
- * rate. Null once the run is done, errored, or detached.
+ * The run's strand counts while it is live in this tab (the palette offers "stop",
+ * Status refreshes its bench card when it ends). Rates are not published: the header
+ * shows the endpoint's own rate, the run's page shows the run's. Null once the run
+ * is done, errored, or detached.
  */
 export function liveRunOf(state: StreamRunState): LiveRun | null {
   if (!state.hello || state.done || state.error) return null;
   const l = state.latest;
   return {
-    tok_s: l?.tok_s ?? 0,
-    peak: l?.peak_tok_s ?? 0,
     running: l?.running ?? 0,
     waiting: l?.waiting ?? 0,
     source: state.hello.mode === "load" ? "streams" : "bench",
@@ -365,7 +364,7 @@ export function liveRunOf(state: StreamRunState): LiveRun | null {
 export function useStreamRun(runId: string | null) {
   const [state, setState] = useState<StreamRunState>(initialStreamRunState);
 
-  // Publish the run aggregate to the shared store (the header reads it).
+  // Publish the run's strand counts to the shared store.
   // setLiveRun is a no-op when nothing changed, so this cannot loop hydration.
   useEffect(() => {
     useLabStatusStore.getState().setLiveRun(runId ? liveRunOf(state) : null);

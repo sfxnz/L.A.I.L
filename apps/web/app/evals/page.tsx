@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { runHref } from "@/lib/run-href";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import {
   Badge,
   Btn,
@@ -153,7 +154,9 @@ function scoreTone(score: number | null | undefined) {
 }
 
 export default function EvalsPage() {
-  const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
+  const { healthy, hasStatus, statusLoading } = useLabStatusStore(
+    useShallow((s) => ({ healthy: serveHealthy(s.status), hasStatus: !!s.status, statusLoading: s.loading })),
+  );
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [latestTool, setLatestTool] = useState<RunRow | null>(null);
   const [runsTotal, setRunsTotal] = useState<number | null>(null);
@@ -185,14 +188,13 @@ export default function EvalsPage() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await Promise.all([refreshStatus(), loadRuns()]);
+      await loadRuns();
     } finally {
       setRefreshing(false);
     }
-  }, [refreshStatus, loadRuns]);
+  }, [loadRuns]);
 
   const loading = statusLoading || !runsLoaded;
-  const healthy = serveHealthy(status);
 
   const latestScore =
     typeof latestTool?.summary?.final_score === "number"
@@ -239,7 +241,7 @@ export default function EvalsPage() {
         </div>
       </div>
 
-      {!loading && !healthy && status && (
+      {!loading && !healthy && hasStatus && (
         <Callout
           tone="warn"
           title="vLLM isn’t healthy"

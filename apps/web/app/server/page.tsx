@@ -21,7 +21,8 @@ import {
   inputCls,
   btnClass,
 } from "@/components/ui";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import { useJobWatch } from "@/lib/use-job-watch";
 import { cn } from "@/lib/utils";
 
@@ -156,7 +157,9 @@ function Telem({
 
 export default function ServerPage() {
   const [tab, setTab] = useState<Tab>("serve");
-  const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
+  const { status, statusLoading, refreshStatus } = useLabStatusStore(
+    useShallow((s) => ({ status: s.status, statusLoading: s.loading, refreshStatus: s.refresh })),
+  );
   const [model, setModel] = useState("");
   const [util, setUtil] = useState("");
   const [maxLen, setMaxLen] = useState("");

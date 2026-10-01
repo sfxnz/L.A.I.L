@@ -1,9 +1,9 @@
 "use client";
 
-import type { ClusterNode, ClusterStatus, EngineStatus, ServeMetrics } from "@/lib/api";
-import { ownsEndpoint, type NodeSample } from "@/lib/lab-status-store";
-import { forecastLine, kvForecast } from "@/lib/status/forecast";
-import { fmtUptime } from "@/lib/status/format";
+import { memo, type CSSProperties } from "react";
+import type { ClusterNode, ClusterStatus } from "@/lib/api";
+import { STALE_AFTER_S, type NodeSample } from "@/lib/lab-status-store";
+import { fmtAge, fmtBytesRate, fmtPct, fmtTemp, fmtWatts } from "@/lib/status/format";
 import {
   Badge,
   EmptyState,
@@ -12,36 +12,33 @@ import {
   Panel,
   Skeleton,
   SparkStat,
-  Sparkline,
-  Stat,
   SyncRing,
   Tick,
   syncStateFromNode,
+  type SparkPoint,
 } from "@/components/ui";
 import { MemoryBar } from "@/components/status/MemoryBar";
 import { cn } from "@/lib/utils";
 
 /*
-  Cluster readout — the hero instrument on Status.
+  The Sparks — one card per node with its own hardware truth (GPU / SoC / NIC /
+  NVMe temperatures, power, GPU util, CPU, memory with a 60 s trend), and the
+  fabric between them: one line per RoCE rail, moving only while the RDMA byte
+  counters say traffic is crossing it. The served model's rates live once, in the
+  endpoint panel above — never copied onto TP nodes, which would read as 2×.
 
-  Two node cards bridged by the fabric spine. Everything here obeys the Animus
-  contract in app/globals.css: cut corners, condensed uppercase eyebrows, cyan/
-  slate hairlines as STRUCTURE, crimson reserved for the page's single accent
-  (so TP hints ride lab-line, not lab-accent). All state colour goes through
-  color-mix on a lab-* token so the light reconstruction plate resolves too.
-
-  Null treatment is the shared <Nil/> from components/ui: an absent value is a
-  condensed STATE WORD, never a bare em-dash. "Awaiting" = hasn't reported yet,
-  "None" = settled and genuinely empty.
+  Honesty rules: every sparkline sits on a real 60 s time axis ending at the
+  server's "now" (gaps stay gaps); a node whose telemetry is older than
+  STALE_AFTER_S is dimmed with its age; a down node says Offline / SSH failed and
+  shows no numbers; nothing animates while the data is stale.
 */
 
-/** Eyebrow + value stack — the shared Stat; the value type is the caller's. */
-const Readout = Stat;
+export const WINDOW_MS = 60_000;
+const TEMP_WARN_C = 80;
+/** Below this the rail is idle (control traffic only): no flow drawn. */
+const FLOW_MIN_BPS = 1024;
 
-/** Display-face 15 px reading — the second rank of number on a node card. */
-const READING = "font-[family-name:var(--font-display)] text-[15px] font-semibold leading-none tabular-nums";
-
-function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
+function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" {
   switch (state) {
     case "serving":
     case "serving_worker":
@@ -52,24 +49,18 @@ function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent
     case "offline":
     case "unreachable":
       return "danger";
-    case "idle":
-      return "muted";
     default:
       return "muted";
   }
 }
 
-/**
- * Human label for a node state — used for BOTH the dot's accessible name and
- * the badge, so the raw enum never leaks. `serving_worker` is a headless
- * multi-node TP worker: it has no /v1/models by design and counts as serving.
- */
-function stateLabel(state?: string): string {
-  switch (state) {
+/** Human label for a node state — the dot's accessible name and the badge share it. */
+function stateLabel(node: ClusterNode): string {
+  switch (node.state) {
     case "serving":
       return "Serving";
     case "serving_worker":
-      return "TP worker";
+      return node.tp_rank != null ? `TP worker · rank ${node.tp_rank}` : "TP worker";
     case "offline":
       return "Offline";
     case "unreachable":
@@ -81,32 +72,18 @@ function stateLabel(state?: string): string {
     case "idle":
       return "Idle";
     default:
-      return state || "Unknown";
+      return node.state || "Unknown";
   }
 }
 
-function multiTone(mode?: string): "ok" | "warn" | "danger" | "muted" | "accent" {
-  switch (mode) {
-    case "multi_aligned":
-      return "ok";
-    case "single":
-      return "accent";
-    case "loading":
-    case "multi_partial":
-      return "warn";
-    case "multi_mismatch":
-      return "danger";
-    default:
-      return "muted";
-  }
-}
+const isDown = (n: ClusterNode) => n.state === "offline" || n.state === "unreachable";
 
-function multiLabel(mode?: string): string {
+function placementLabel(mode?: string): string {
   switch (mode) {
     case "multi_aligned":
-      return "Multi-node aligned";
+      return "Tensor parallel";
     case "single":
-      return "Single-node serve";
+      return "Single node";
     case "loading":
       return "Loading";
     case "multi_partial":
@@ -120,496 +97,332 @@ function multiLabel(mode?: string): string {
   }
 }
 
-function fmtTemp(v: number) {
-  return `${Math.round(v)}°C`;
-}
-
-function fmtPct(v: number) {
-  return `${Math.round(v)}%`;
-}
-
-function fmtWatts(v: number) {
-  return Number.isInteger(v) ? String(v) : v.toFixed(1);
-}
-
-function fmtRate(v: number) {
-  return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
-}
-
-function HardwareValue({
-  value,
-  format,
-  warn,
-}: {
-  value: number | null | undefined;
-  format: (n: number) => string;
-  warn?: boolean;
-}) {
-  if (value == null) return <Nil />;
-  return (
-    <span className={warn ? "text-lab-warn" : "text-lab-text-dim"}>{format(value)}</span>
-  );
-}
-
-function TrafficValue({
-  serving,
-  value,
-  format,
-}: {
-  serving: boolean;
-  value: number | null | undefined;
-  format: (n: number) => string;
-}) {
-  if (!serving) return <Nil word="None" />;
-  if (value == null) return <Nil />;
-  return <span className="text-lab-ok">{format(value)}</span>;
-}
-
-/** Used / total GiB for the memory bar: GPU memory when reported, else unified memory (total − available). */
-function nodeMemory(node: ClusterNode): { used: number | null; total: number | null; source: string; uma: boolean } {
-  if (node.gpu_mem_used_gib != null && node.gpu_mem_total_gib != null) {
-    return { used: node.gpu_mem_used_gib, total: node.gpu_mem_total_gib, source: "GPU memory", uma: false };
+function placementTone(mode?: string): "ok" | "warn" | "danger" | "muted" {
+  switch (mode) {
+    case "multi_aligned":
+    case "single":
+      return "ok";
+    case "loading":
+    case "multi_partial":
+      return "warn";
+    case "multi_mismatch":
+      return "danger";
+    default:
+      return "muted";
   }
-  if (node.ram_gib != null && node.available_gib != null) {
-    return {
-      used: Math.max(0, node.ram_gib - node.available_gib),
-      total: node.ram_gib,
-      source: "unified memory: MemTotal − MemAvailable",
-      uma: true,
-    };
-  }
-  return { used: null, total: null, source: "", uma: false };
 }
 
-function series(samples: NodeSample[] | undefined, pick: (s: NodeSample) => number | null): number[] {
-  const out: number[] = [];
-  for (const s of samples ?? []) {
-    const v = pick(s);
-    if (v !== null) out.push(v);
-  }
-  return out;
+function speedLabel(mbps?: number | null): string | null {
+  if (!mbps || mbps <= 0) return null;
+  return mbps >= 1000 ? `${Math.round(mbps / 1000)}G` : `${mbps}M`;
 }
 
-function NodeCard({
+function pts(samples: NodeSample[] | undefined, pick: (s: NodeSample) => number | null): SparkPoint[] {
+  return (samples ?? []).map((s) => ({ t: s.t, v: pick(s) }));
+}
+
+/** Age (s) of a server-clock timestamp, from the snapshot's server "now". */
+function ageS(serverNow: number | null | undefined, at: number | null | undefined): number | null {
+  return serverNow != null && at != null ? Math.max(0, (serverNow - at) / 1000) : null;
+}
+
+const NodeCard = memo(function NodeCard({
   node,
   samples,
-  engine,
-  metrics,
+  serverNow,
+  stale,
 }: {
   node: ClusterNode;
   samples?: NodeSample[];
-  engine?: EngineStatus | null;
-  /** the endpoint's live rates — shown on the node that owns the endpoint only */
-  metrics?: ServeMetrics | null;
+  serverNow?: number | null;
+  stale?: boolean;
 }) {
-  const modelShort = node.model_id?.split("/").pop() || null;
-  const mem = nodeMemory(node);
-  const tokHistory = series(samples, (s) => s.tok_s);
-  const powerHistory = series(samples, (s) => s.power);
-  const forecast = kvForecast(engine?.kv_capacity_tokens);
-  const speed =
-    node.qsfp_speed_mbps && node.qsfp_speed_mbps > 0
-      ? node.qsfp_speed_mbps >= 1000
-        ? `${Math.round(node.qsfp_speed_mbps / 1000)}G`
-        : `${node.qsfp_speed_mbps}M`
-      : null;
+  const down = isDown(node);
   const serving = node.state === "serving" || node.state === "serving_worker";
-  // The endpoint (and its tok/s, KV pool) belongs to the LOCAL serving head the
-  // serve-engine probes; a TP worker produces the same tokens, so it shows its rank
-  // instead of a second copy, and a remote serve of its own is not what was probed.
-  const head = ownsEndpoint(node);
-  const worker = node.state === "serving_worker";
-  const decode = head ? metrics?.decode_tok_per_s : null;
-  const prefill = head ? metrics?.prefill_tok_per_s : null;
-  // Between requests: the last finished request's prefill, dimmed and labelled — never live.
-  const lastPrefill = head && prefill == null ? metrics?.last_prefill : null;
-  const label = stateLabel(node.state);
-  const tempsTip = [
-    node.temperature_c != null ? `GPU ${fmtTemp(node.temperature_c)}` : null,
+  const age = down ? null : ageS(serverNow, node.sampled_at);
+  const old = stale || (age != null && age > STALE_AFTER_S);
+  const domain = serverNow != null ? ([serverNow - WINDOW_MS, serverNow] as const) : undefined;
+  const series = down ? [] : samples;
+  const nil = down ? "Offline" : "Awaiting";
+  const memUsed = node.ram_gib != null && node.available_gib != null ? Math.max(0, node.ram_gib - node.available_gib) : null;
+  const hot = node.temperature_c != null && node.temperature_c >= TEMP_WARN_C;
+  const label = stateLabel(node);
+  const minorTemps = [
     node.soc_temp_c != null ? `SoC ${fmtTemp(node.soc_temp_c)}` : null,
     node.nic_temp_c != null ? `NIC ${fmtTemp(node.nic_temp_c)}` : null,
     node.nvme_temp_c != null ? `NVMe ${fmtTemp(node.nvme_temp_c)}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  // Missing readings are left out, never shown as 0.
-  const usageTip = [
-    node.gpu_util_pct != null ? `GPU ${fmtPct(node.gpu_util_pct)}` : null,
-    node.cpu_util_pct != null ? `CPU ${fmtPct(node.cpu_util_pct)}${node.cpu ? ` (${node.cpu})` : ""}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const hasAddrs = !!(node.qsfp_ip || node.tailscale_ip || node.lan_ip);
+  ].filter(Boolean);
+  const rails = node.rails ?? [];
 
   return (
     <div
       className={cn(
-        // Cut corners, not radius. The chamfer clips box-shadow, so the serving
-        // tell is an INSET bloom rather than an outer glow.
-        "animus-chamfer animus-bracketed relative flex min-h-[220px] flex-col border bg-[color:var(--animus-glass)] p-3.5",
-        // The chamfer clip-path would shear brackets sitting on the -1px edge —
-        // inset them so all four corners actually render (same trick as Panel).
-        "before:top-[3px]! before:left-[3px]! after:right-[3px]! after:bottom-[3px]!",
-        "transition-[border-color,box-shadow] duration-300",
-        serving &&
-          "border-[color:color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-lab-ok)_10%,transparent),inset_0_0_30px_-14px_color-mix(in_srgb,var(--color-lab-ok)_75%,transparent)]",
+        "animus-chamfer relative flex min-w-0 flex-col border bg-[color:var(--animus-glass)] p-3.5 transition-[border-color,opacity] duration-300",
+        serving && "border-[color:color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)]",
         (node.state === "loading" || node.state === "stray") &&
           "border-[color:color-mix(in_srgb,var(--color-lab-warn)_40%,transparent)]",
-        (node.state === "offline" || node.state === "unreachable") &&
-          "border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)]",
-        !serving &&
-          node.state !== "loading" &&
-          node.state !== "stray" &&
-          node.state !== "offline" &&
-          node.state !== "unreachable" &&
-          "border-lab-border",
+        down && "border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)]",
+        !serving && !down && node.state !== "loading" && node.state !== "stray" && "border-lab-border",
       )}
+      aria-label={`${node.label || node.id}: ${label}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
-            <SyncRing state={syncStateFromNode(node.state)} label={label} />
+            <SyncRing state={old && !down ? "stale" : syncStateFromNode(node.state)} label={label} />
             <span className="truncate font-[family-name:var(--font-display)] text-[15px] font-semibold uppercase leading-none tracking-[0.14em] text-lab-text">
               {node.label || node.id}
             </span>
-            {/* Always render the origin tag, never only for the local node —
-                an occupied slot on one card and an empty one on the other
-                breaks the mirror the two-column composition rests on. */}
             <span className="animus-chamfer-sm shrink-0 border border-[color:var(--animus-hairline)] px-1.5 py-[3px] font-[family-name:var(--font-display)] text-[9px] font-semibold uppercase leading-none tracking-[0.16em] text-lab-muted">
               {node.local ? "local" : "remote"}
             </span>
           </div>
-          <div className="mt-1.5 truncate font-mono text-[10px] text-lab-muted">
+          <div className="mt-1.5 truncate font-mono text-[10px] text-lab-muted" title={node.cpu || undefined}>
             {node.hostname || node.id}
             {node.role ? ` · ${node.role}` : ""}
+            {node.cpu ? ` · ${node.cpu}` : ""}
           </div>
         </div>
-        <Badge tone={stateTone(node.state)} dot>
-          {label}
-        </Badge>
+        <div className="flex shrink-0 flex-col items-end gap-1.5">
+          <Badge tone={stateTone(node.state)} dot>
+            {label}
+          </Badge>
+          {!down && (
+            <Eyebrow
+              className={cn("lab-num text-[9px]", old ? "text-lab-warn" : "text-lab-muted")}
+              title={node.local ? "Telemetry sampled on this host every second" : "Telemetry streamed over ssh every second"}
+            >
+              {age == null ? "no reading" : old ? `${fmtAge(age)} old` : "live"}
+            </Eyebrow>
+          )}
+        </div>
       </div>
 
-      <div aria-hidden className="animus-rule my-3" />
+      <div className={cn("flex flex-1 flex-col", (old || down) && "opacity-55")}>
+        <div aria-hidden className="animus-rule my-3" />
 
-      {/* Rank 1: the endpoint rate on the Spark that owns it, hero weight, with its last 60 s. */}
-      <div className="flex items-end justify-between gap-3">
-        <Readout label="tok/s">
-          <div
-            className="lab-num flex items-baseline gap-1.5 font-[family-name:var(--font-display)] text-[30px] font-bold leading-none tabular-nums text-lab-text"
-            title={
-              head
-                ? `Per-stream decode rate over busy time (endpoint, 1 s)${
-                    metrics?.throughput_tok_per_s != null ? ` · all streams ${fmtRate(metrics.throughput_tok_per_s)} tok/s` : ""
-                  }`
-                : worker
-                  ? "Headless TP worker: its tokens are the head's endpoint rate"
-                  : undefined
-            }
-          >
-            {worker ? (
-              <span className="font-mono text-[12px] font-normal text-lab-muted">
-                TP rank {node.tp_rank ?? "?"} · rate on head
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 sm:grid-cols-3">
+          <SparkStat
+            label="GPU temp"
+            unit="°C"
+            points={pts(series, (s) => s.temp)}
+            value={down ? null : (node.temperature_c ?? null)}
+            domain={domain}
+            min={25}
+            max={95}
+            nil={nil}
+            tone={hot ? "text-lab-warn" : "text-lab-line"}
+            className={hot ? "text-lab-warn" : undefined}
+            title={hot ? `At or above ${TEMP_WARN_C}°C` : "nvidia-smi temperature.gpu"}
+          />
+          <SparkStat
+            label="Power"
+            unit=" W"
+            points={pts(series, (s) => s.power)}
+            value={down ? null : (node.power_w ?? null)}
+            domain={domain}
+            nil={nil}
+            format={fmtWatts}
+            tone="text-lab-line-2"
+            title="GPU power draw (nvidia-smi)"
+          />
+          <SparkStat
+            label="GPU util"
+            unit="%"
+            points={pts(series, (s) => s.util)}
+            value={down ? null : (node.gpu_util_pct ?? null)}
+            domain={domain}
+            max={100}
+            nil={nil}
+            tone="text-lab-line"
+            title="nvidia-smi utilization.gpu"
+          />
+        </div>
+
+        <div className="lab-num mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 font-mono text-[10px] text-lab-muted">
+          <span title="All CPU cores, from /proc/stat">
+            CPU {down || node.cpu_util_pct == null ? <Nil word={nil} /> : <span className="text-lab-text-dim">{fmtPct(node.cpu_util_pct)}</span>}
+          </span>
+          {!down &&
+            minorTemps.map((t) => (
+              <span key={t} title="hwmon: acpitz (SoC), mlx5 (NIC), nvme (composite)">
+                {t}
               </span>
-            ) : (
-              <TrafficValue serving={serving} value={decode} format={fmtRate} />
-            )}
-            {head && decode != null && (
-              <span className="font-mono text-[10px] font-normal text-lab-muted">tok/s</span>
-            )}
-          </div>
-        </Readout>
-        <Sparkline
-          points={tokHistory}
-          width={120}
-          height={30}
-          min={0}
-          className="shrink-0 text-lab-line"
-          label="Decode rate over the last 60 s"
+            ))}
+        </div>
+
+        <MemoryBar
+          className="mt-3"
+          usedGib={down ? null : memUsed}
+          totalGib={down ? null : node.ram_gib}
+          reservedGib={node.engine_reserved_gib}
+          swapUsedGib={node.swap_used_gib}
+          swapTotalGib={node.swap_total_gib}
+          pressure={node.mem_pressure}
+          source="/proc/meminfo: MemTotal − MemAvailable"
+          trend={series ? pts(series, (s) => s.mem) : undefined}
+          domain={domain}
+          offline={down}
         />
-        <Readout label="Prefill" className="items-end text-right">
-          <div
-            className={cn("lab-num", READING)}
-            title={
-              lastPrefill
-                ? `Last finished request's prefill, ${fmtUptime((Date.now() - lastPrefill.at) / 1000) || "0 s"} ago — not live`
-                : head
-                  ? "Computed prompt tok/s of the requests that finished this second (cache hits excluded)"
-                  : undefined
-            }
-          >
-            {worker ? (
-              <Nil word="None" />
-            ) : lastPrefill ? (
-              <span className="text-lab-muted">last {fmtRate(lastPrefill.tok_per_s)}</span>
-            ) : (
-              <TrafficValue serving={serving} value={prefill} format={fmtRate} />
-            )}
-          </div>
-        </Readout>
+
+        <div className="mt-auto flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-[color:var(--animus-hairline)] pt-2.5 font-mono text-[10px] text-lab-muted">
+          {rails.length ? (
+            rails.map((r) => (
+              <span key={r.if} className="inline-flex items-center gap-1" title={`${r.if} ${r.ip}/${r.prefix}`}>
+                <span
+                  aria-hidden
+                  className={cn("h-1.5 w-1.5 rotate-45", r.carrier === 1 ? "bg-lab-ok" : r.carrier === 0 ? "bg-lab-danger" : "bg-lab-muted")}
+                />
+                {r.ip}
+                {speedLabel(r.speed_mbps) ? <span className="text-lab-text-dim">{speedLabel(r.speed_mbps)}</span> : null}
+                {r.carrier === 0 ? <span className="text-lab-danger">down</span> : null}
+              </span>
+            ))
+          ) : node.qsfp_ip ? (
+            <span>qsfp {node.qsfp_ip}</span>
+          ) : null}
+          {node.tailscale_ip && <span>ts {node.tailscale_ip}</span>}
+          {node.lan_ip && <span>lan {node.lan_ip}</span>}
+          {!rails.length && !node.qsfp_ip && !node.tailscale_ip && !node.lan_ip && <Nil word="None" />}
+        </div>
       </div>
 
-      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] items-end gap-3">
-        <Readout label="Model">
-          <div
-            className="truncate text-[13px] font-medium tracking-[-0.01em] text-lab-text"
-            title={node.model_id || undefined}
-          >
-            {modelShort ?? <Nil word="None" />}
-          </div>
-        </Readout>
-        {node.tensor_parallel_size != null && (
-          <div className="font-mono text-[10px] tabular-nums text-lab-line-bright">
-            TP={node.tensor_parallel_size}
-            {node.ray_hint ? " · ray" : ""}
-          </div>
-        )}
-      </div>
-
-      {/* Rank 2: memory — used / free, KV pool as a sub-track, capacity forecast. */}
-      <MemoryBar
-        className="mt-3"
-        usedGib={mem.used}
-        totalGib={mem.total}
-        reservedGib={mem.uma ? node.engine_reserved_gib : null}
-        swapUsedGib={node.swap_used_gib}
-        swapTotalGib={node.swap_total_gib}
-        pressure={node.mem_pressure}
-        source={mem.source}
-        kvUsage={head ? engine?.kv_usage_pct : null}
-        kvCapacityTokens={engine?.kv_capacity_tokens}
-      />
-      <div className="lab-num mt-1.5 font-mono text-[10px] text-lab-muted" title="Whole 32k-token sequences that fit the KV pool">
-        {forecast && head ? forecastLine(forecast) : <Nil word={head ? "Awaiting" : "None"} />}
-      </div>
-
-      <div className="mt-auto grid grid-cols-3 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
-        <Readout label="Temperature" title={tempsTip || undefined}>
-          <div className={READING}>
-            <HardwareValue
-              value={node.temperature_c}
-              format={fmtTemp}
-              warn={node.temperature_c != null && node.temperature_c >= 80}
-            />
-          </div>
-        </Readout>
-        <Readout
-          label="Usage"
-          title={usageTip || undefined}
-        >
-          <div className={READING}>
-            <HardwareValue value={node.gpu_util_pct} format={fmtPct} />
-          </div>
-        </Readout>
-        <SparkStat
-          label="Power"
-          unit=" W"
-          values={powerHistory.length ? powerHistory : node.power_w != null ? [node.power_w] : []}
-          tone="text-lab-line-2"
-          format={fmtWatts}
-          title="GPU power over the last 60 s"
-        />
-        <Readout label="QSFP">
-          <div className={cn(READING, "uppercase")}>
-            {node.qsfp_carrier === 1 ? (
-              <span className="text-lab-ok">{speed || "up"}</span>
-            ) : node.qsfp_carrier === 0 ? (
-              <span className="text-lab-danger">down</span>
-            ) : (
-              <Nil />
-            )}
-          </div>
-        </Readout>
-        <Readout label="Addrs" className="col-span-2">
-          <div className="space-y-0.5 font-mono text-[10px] leading-[1.5] text-lab-muted">
-            {node.qsfp_ip && (
-              <div className="truncate">
-                <span className="text-lab-line">qsfp</span> {node.qsfp_ip}
-              </div>
-            )}
-            {node.tailscale_ip && (
-              <div className="truncate">
-                <span className="text-lab-line">ts</span> {node.tailscale_ip}
-              </div>
-            )}
-            {node.lan_ip && (
-              <div className="truncate">
-                <span className="text-lab-line">lan</span> {node.lan_ip}
-              </div>
-            )}
-            {!hasAddrs && <Nil word="None" />}
-          </div>
-        </Readout>
-      </div>
-
-      {node.probe_error && (
+      {(node.probe_error || node.telemetry_error) && (
         <div
-          className="animus-chamfer-sm mt-3 truncate border border-[color:color-mix(in_srgb,var(--color-lab-danger)_35%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] px-2 py-1 font-mono text-[10px] text-lab-danger"
-          title={node.probe_error}
+          className="animus-chamfer-sm mt-2.5 truncate border border-[color:color-mix(in_srgb,var(--color-lab-danger)_35%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_10%,transparent)] px-2 py-1 font-mono text-[10px] text-lab-danger"
+          title={node.probe_error || node.telemetry_error || undefined}
         >
-          {node.probe_error}
+          {node.probe_error || `telemetry: ${node.telemetry_error}`}
         </div>
       )}
     </div>
   );
+});
+
+type Link = NonNullable<NonNullable<ClusterStatus["fabric"]>["links"]>[number];
+
+/** Live RDMA bytes/s on a link's rail, from the sending side's counters. */
+function linkRate(link: Link, byId: Map<string, ClusterNode>): { tx: number; rx: number } | null {
+  const node = byId.get(link.from);
+  const r = link.iface ? node?.rail_rates?.[link.iface] : undefined;
+  if (!node || isDown(node) || !r) return null;
+  return { tx: r.tx_bps, rx: r.rx_bps };
 }
 
 /**
- * The spine. Animated dashes (.lab-fabric-line, gated on prefers-reduced-motion
- * in globals.css) run node → node through a diamond hub, so a live QSFP fabric
- * reads as flow rather than as a static divider.
+ * One rail: a line that flows only while RDMA bytes cross it (speed scales with
+ * link utilisation), a static dashed line when idle or unmeasured, red when down.
  */
-function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
-  const link = cluster.fabric?.links?.[0];
-  const ok = !!cluster.fabric?.ok;
-  const rtt = link?.rtt_ms;
-  const speed = link?.from_speed_mbps || link?.to_speed_mbps;
-  const speedG = speed && speed > 0 ? Math.round(speed / 1000) : null;
-  const readout =
-    [speedG ? `${speedG}G` : null, rtt != null ? `${rtt.toFixed(1)} ms` : null]
-      .filter(Boolean)
-      .join(" · ") ||
-    link?.target_ip ||
-    null;
-
+function RailLine({ link, rate, stale }: { link: Link; rate: { tx: number; rx: number } | null; stale?: boolean }) {
+  const up = !!link.ok;
+  const speed = link.from_speed_mbps || link.to_speed_mbps || null;
+  const peak = rate ? Math.max(rate.tx, rate.rx) : 0;
+  const flowing = up && !stale && peak >= FLOW_MIN_BPS;
+  // 0 % → 2.4 s per dash cycle, ≥ 10 % of the link → 0.45 s
+  const util = speed ? Math.min(1, (peak * 8) / (speed * 1e6) / 0.1) : 0;
+  const dur = `${(2.4 - 1.95 * util).toFixed(2)}s`;
   return (
-    <div
-      className="flex min-h-[220px] flex-col items-center justify-center gap-3 px-1 py-4 lg:w-[172px]"
-      role="img"
-      aria-label={
-        ok
-          ? `QSFP RoCE fabric up${speedG ? `, ${speedG}G` : ""}${rtt != null ? `, ${rtt.toFixed(1)} ms` : ""}`
-          : "Cluster fabric down"
-      }
-    >
-      <div className="animus-eyebrow">Fabric</div>
-
+    <div className="min-w-0">
+      <div className="flex items-baseline justify-between gap-2 font-mono text-[9.5px] text-lab-muted">
+        <span className="truncate" title={`${link.from} ${link.iface ?? ""} → ${link.to} ${link.target_ip ?? ""}`}>
+          {link.iface ?? link.target_ip ?? "link"}
+        </span>
+        <span className="lab-num shrink-0">
+          {[speedLabel(speed), link.rtt_ms != null ? `${link.rtt_ms.toFixed(1)} ms` : null].filter(Boolean).join(" · ")}
+        </span>
+      </div>
       <div
         aria-hidden
-        className={cn(
-          "flex w-full min-w-[124px] items-center",
-          ok ? "text-lab-ok" : "text-lab-danger",
+        className={cn("lab-flow mt-1", up ? "text-lab-ok" : "text-lab-danger")}
+        data-flowing={flowing ? "true" : undefined}
+        style={{ "--flow-dur": dur } as CSSProperties}
+      />
+      <div className={cn("lab-num mt-1 font-mono text-[10px]", flowing ? "text-lab-text-dim" : "text-lab-muted")}>
+        {!up ? (
+          <span className="text-lab-danger">{link.error ? "down" : "no reply"}</span>
+        ) : rate ? (
+          <>
+            ↑ {fmtBytesRate(rate.tx)} <span className="text-lab-muted">·</span> ↓ {fmtBytesRate(rate.rx)}
+          </>
+        ) : (
+          <Nil word="Awaiting" />
         )}
-      >
-        <span className="h-[5px] w-[5px] shrink-0 rotate-45 border border-current" />
-        <span
-          className={cn(
-            "h-[2px] flex-1",
-            ok ? "lab-fabric-line" : "bg-current opacity-45",
-          )}
-        />
-        <span
-          className={cn(
-            "mx-1.5 flex h-[26px] w-[26px] shrink-0 rotate-45 items-center justify-center border",
-            ok
-              ? "border-current bg-[color:color-mix(in_srgb,var(--color-lab-ok)_14%,transparent)] shadow-[0_0_16px_color-mix(in_srgb,var(--color-lab-ok)_35%,transparent)]"
-              : "border-current bg-[color:color-mix(in_srgb,var(--color-lab-danger)_12%,transparent)]",
-          )}
-        >
-          <span className="-rotate-45 font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.1em]">
-            {ok ? "ok" : "!"}
-          </span>
-        </span>
-        <span
-          className={cn(
-            "h-[2px] flex-1",
-            ok ? "lab-fabric-line" : "bg-current opacity-45",
-          )}
-        />
-        <span className="h-[5px] w-[5px] shrink-0 rotate-45 border border-current" />
-      </div>
-
-      <div className="flex flex-col items-center gap-1 text-center">
-        <div
-          className={cn(
-            "font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase leading-none tracking-[0.16em]",
-            ok ? "text-lab-text-dim" : "text-lab-danger",
-          )}
-        >
-          {ok ? "QSFP RoCE" : "Fabric down"}
-        </div>
-        <div className="font-mono text-[10px] tabular-nums text-lab-muted">
-          {readout ?? <Nil />}
-        </div>
       </div>
     </div>
   );
 }
 
-/**
- * Load map — a flush readout bar welded to the panel head by a hairline, not a
- * nested card. Keeping it borderless is what stops the cluster reading as a
- * box-inside-a-box.
- */
-function LoadStrip({ cluster, metrics }: { cluster: ClusterStatus; metrics?: ServeMetrics | null }) {
-  const multi = cluster.summary?.multi;
-  const nodes = cluster.nodes || [];
-  const mode = multi?.mode || "none";
-  const modelShort = multi?.model_id?.split("/").pop();
-  const serving = nodes.some(ownsEndpoint);
-  const liveGen = serving ? metrics?.decode_tok_per_s : null;
-  const livePrefill = serving ? metrics?.prefill_tok_per_s : null;
-
+/** Between two cards: every rail joining them, stacked. */
+function FabricBridge({ links, byId, stale }: { links: Link[]; byId: Map<string, ClusterNode>; stale?: boolean }) {
+  const ok = links.length > 0 && links.every((l) => l.ok);
   return (
     <div
-      className={cn(
-        "border-b border-lab-border-subtle px-3.5 py-2.5 transition-shadow duration-300 sm:px-4",
-        mode === "multi_aligned" && "lab-strip-live",
-      )}
+      className="flex flex-col justify-center gap-3 px-1 py-3 lg:w-[176px]"
+      role="group"
+      aria-label={ok ? `QSFP RoCE fabric up, ${links.length} rail${links.length === 1 ? "" : "s"}` : "Fabric problem"}
     >
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className="animus-eyebrow shrink-0">Load map</span>
-          <Tick />
-          <Badge tone={multiTone(mode)} dot>
-            {multiLabel(mode)}
-          </Badge>
-          {modelShort && (
-            <span
-              className="truncate font-mono text-[11px] text-lab-text-dim"
-              title={multi?.model_id || undefined}
-            >
-              {modelShort}
-            </span>
-          )}
-          {multi?.tensor_parallel_hint != null && (
-            <span className="shrink-0 font-mono text-[10px] tabular-nums text-lab-line-bright">
-              TP={multi.tensor_parallel_hint}
-            </span>
-          )}
-          {(liveGen != null || livePrefill != null) && (
-            <span
-              className="shrink-0 font-mono text-[10px] tabular-nums text-lab-text-dim"
-              title="Endpoint rate (once per serve): per-stream decode · prefill of requests that just finished"
-            >
-              {liveGen != null ? `${fmtRate(liveGen)} tok/s` : null}
-              {liveGen != null && livePrefill != null ? " · " : null}
-              {livePrefill != null ? `${fmtRate(livePrefill)} prefill` : null}
-            </span>
-          )}
-        </div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="animus-eyebrow">Fabric</span>
+        <span className={cn("animus-eyebrow", ok ? "text-lab-ok!" : "text-lab-danger!")}>{ok ? "RoCE up" : links.length ? "check" : "no link"}</span>
+      </div>
+      {links.map((l, i) => (
+        <RailLine key={`${l.from}-${l.to}-${l.iface ?? i}`} link={l} rate={linkRate(l, byId)} stale={stale} />
+      ))}
+    </div>
+  );
+}
 
+/** Three or more nodes: every link as a row (head ↔ worker, worker ↔ worker). */
+function FabricLinks({ links, byId, stale }: { links: Link[]; byId: Map<string, ClusterNode>; stale?: boolean }) {
+  return (
+    <div className="mt-3 border-t border-lab-border-subtle pt-3">
+      <Eyebrow>Fabric · {links.length} link{links.length === 1 ? "" : "s"}</Eyebrow>
+      <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {links.map((l, i) => (
+          <div key={`${l.from}-${l.to}-${l.iface ?? i}`} className="min-w-0">
+            <div className="mb-1 font-[family-name:var(--font-display)] text-[11px] font-semibold uppercase tracking-[0.14em] text-lab-text-dim">
+              {l.from} → {l.to}
+            </div>
+            <RailLine link={l} rate={linkRate(l, byId)} stale={stale} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** How the served model is placed across the nodes — one line, no rates (those live above). */
+function PlacementStrip({ cluster }: { cluster: ClusterStatus }) {
+  const multi = cluster.summary?.multi;
+  const mode = multi?.mode || "none";
+  const nodes = cluster.nodes || [];
+  return (
+    <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+          <Badge tone={placementTone(mode)} dot>
+            {placementLabel(mode)}
+          </Badge>
+          {multi?.tensor_parallel_hint != null && mode !== "none" && (
+            <span className="shrink-0 font-mono text-[10px] tabular-nums text-lab-line-bright">TP={multi.tensor_parallel_hint}</span>
+          )}
+          {multi?.message && <span className="min-w-0 text-[11px] leading-snug text-lab-muted">{multi.message}</span>}
+        </div>
         <div className="flex items-center gap-2">
           {nodes.map((n) => {
             const filled = n.state === "serving" || n.state === "serving_worker";
-            const loading = n.state === "loading";
-            const down = n.state === "offline" || n.state === "unreachable";
             return (
-              <div key={n.id} className="flex items-center gap-1.5">
+              <div key={n.id} className="flex items-center gap-1.5" title={`${n.id}: ${stateLabel(n)}`}>
                 <div
                   className={cn(
-                    "h-2 w-10 border transition-colors",
-                    filled &&
-                      "border-lab-ok bg-lab-ok shadow-[0_0_12px_color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)]",
-                    loading && "animate-pulse border-lab-warn bg-lab-warn/70",
-                    !filled &&
-                      !loading &&
-                      n.state === "idle" &&
-                      "border-lab-border bg-lab-hover",
+                    "h-2 w-8 border",
+                    filled && "border-lab-ok bg-lab-ok",
+                    n.state === "loading" && "border-lab-warn bg-lab-warn/70",
                     n.state === "stray" && "border-lab-warn bg-lab-hover",
-                    down &&
+                    n.state === "idle" && "border-lab-border bg-lab-hover",
+                    isDown(n) &&
                       "border-[color:color-mix(in_srgb,var(--color-lab-danger)_50%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_20%,transparent)]",
                   )}
-                  title={`${n.id}: ${n.state === "serving_worker" ? "TP worker (headless)" : n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
                 />
                 <Eyebrow className="tracking-[0.14em]">{n.id}</Eyebrow>
               </div>
@@ -617,10 +430,24 @@ function LoadStrip({ cluster, metrics }: { cluster: ClusterStatus; metrics?: Ser
           })}
         </div>
       </div>
-      {multi?.message && (
-        <p className="mt-1.5 text-[11px] leading-snug text-lab-muted">{multi.message}</p>
-      )}
     </div>
+  );
+}
+
+function ProbingPanel({ note }: { note: string }) {
+  return (
+    <Panel title="Sparks" action={<Badge tone="muted">{note}</Badge>} className="overflow-hidden">
+      <div aria-busy="true" aria-label="Probing the cluster">
+        <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
+          <Skeleton className="h-3.5 w-44" />
+        </div>
+        <div className="grid grid-cols-1 gap-3 p-3.5 sm:p-4 lg:grid-cols-[1fr_auto_1fr]">
+          <Skeleton className="min-h-[220px]" />
+          <Skeleton className="hidden min-h-[220px] w-[176px] lg:block" />
+          <Skeleton className="min-h-[220px]" />
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -628,45 +455,25 @@ export function ClusterPanel({
   cluster,
   loading,
   samples,
-  engine,
-  metrics,
+  serverNow,
+  stale,
 }: {
   cluster: ClusterStatus | null | undefined;
   loading?: boolean;
-  /** per-node 60 s ring buffer from the lab-status store */
+  /** per-node 60 s series from the lab-status store */
   samples?: Record<string, NodeSample[]>;
-  /** engine telemetry (KV %, capacity) — C2 contract, optional */
-  engine?: EngineStatus | null;
-  /** the endpoint's live rates (serve.metrics) */
-  metrics?: ServeMetrics | null;
+  /** the serve-engine host's clock now (ms): node ages and the sparkline window */
+  serverNow?: number | null;
+  /** the whole snapshot stopped updating: dim, and never animate */
+  stale?: boolean;
 }) {
-  if (loading) {
-    return (
-      <Panel
-        title="Cluster"
-        action={<Badge tone="muted">probing…</Badge>}
-        className="overflow-hidden"
-      >
-        <div aria-busy="true" aria-label="Loading cluster">
-          <div className="border-b border-lab-border-subtle px-3.5 py-2.5 sm:px-4">
-            <div className="flex items-center justify-between gap-3">
-              <Skeleton className="h-3.5 w-44" />
-              <Skeleton className="h-2.5 w-28" />
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-3 p-3.5 sm:p-4 lg:grid-cols-[1fr_auto_1fr]">
-            <Skeleton className="min-h-[220px]" />
-            <Skeleton className="hidden min-h-[220px] w-[172px] lg:block" />
-            <Skeleton className="min-h-[220px]" />
-          </div>
-        </div>
-      </Panel>
-    );
-  }
+  if (loading) return <ProbingPanel note="connecting…" />;
+  // serve-engine just started: the first inventory (ssh to every node) is still running.
+  if (cluster?.pending) return <ProbingPanel note="probing the Sparks…" />;
 
   if (!cluster) {
     return (
-      <Panel title="Cluster" padded>
+      <Panel title="Sparks" padded>
         <EmptyState title="Cluster probe unavailable">
           Serve-engine didn’t return cluster topology. Check that the engine is up on :8765.
         </EmptyState>
@@ -676,7 +483,7 @@ export function ClusterPanel({
 
   if (cluster.error) {
     return (
-      <Panel title="Cluster" padded>
+      <Panel title="Sparks" padded>
         <EmptyState title="Cluster probe failed">
           <span className="text-lab-danger">{cluster.error}</span>
         </EmptyState>
@@ -686,48 +493,47 @@ export function ClusterPanel({
 
   const nodes = cluster.nodes || [];
   const summary = cluster.summary;
-  const healthy = !!summary?.healthy;
+  const online = summary?.nodes_online ?? nodes.filter((n) => !isDown(n)).length;
+  const total = summary?.nodes_total ?? nodes.length;
+  const links = cluster.fabric?.links ?? [];
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const pair = nodes.length === 2;
+  const card = (n: ClusterNode) => (
+    <NodeCard key={n.id} node={n} samples={samples?.[n.id]} serverNow={serverNow} stale={stale} />
+  );
 
   return (
     <Panel
       className="overflow-hidden"
-      title="Cluster"
+      title="Sparks"
       action={
         <span className="flex shrink-0 items-center gap-2">
-          <SyncRing
-            state={healthy ? "serving" : "offline"}
-            label={healthy ? "Cluster healthy" : "Cluster issue"}
-          />
-          <Eyebrow className={cn("lab-num", healthy ? "text-lab-ok" : "text-lab-danger")}>
-            {summary?.nodes_online ?? 0}/{summary?.nodes_total ?? nodes.length} online
-            {summary?.nodes_serving ? ` · ${summary.nodes_serving} serving` : ""}
+          <Eyebrow className={cn("lab-num", online === total ? "text-lab-ok" : "text-lab-danger")}>
+            {online}/{total} online
           </Eyebrow>
+          {summary?.nodes_serving ? (
+            <>
+              <Tick />
+              <Eyebrow className="lab-num">{summary.nodes_serving} serving</Eyebrow>
+            </>
+          ) : null}
         </span>
       }
     >
-      <LoadStrip cluster={cluster} metrics={metrics} />
+      <PlacementStrip cluster={cluster} />
 
       <div className="p-3.5 sm:p-4">
-        <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-[1fr_auto_1fr]">
-          {nodes[0] ? <NodeCard node={nodes[0]} samples={samples?.[nodes[0].id]} engine={engine} metrics={metrics} /> : <div />}
-          {nodes.length >= 2 ? (
-            <FabricBridge cluster={cluster} />
-          ) : (
-            <div className="hidden lg:block" />
-          )}
-          {nodes[1] ? (
-            <NodeCard node={nodes[1]} samples={samples?.[nodes[1].id]} engine={engine} metrics={metrics} />
-          ) : nodes.length < 2 ? null : (
-            <div />
-          )}
-        </div>
-
-        {nodes.length > 2 && (
-          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {nodes.slice(2).map((n) => (
-              <NodeCard key={n.id} node={n} samples={samples?.[n.id]} engine={engine} metrics={metrics} />
-            ))}
+        {pair ? (
+          <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+            {card(nodes[0])}
+            <FabricBridge links={links} byId={byId} stale={stale} />
+            {card(nodes[1])}
           </div>
+        ) : (
+          <>
+            <div className={cn("grid gap-3", nodes.length > 1 && "sm:grid-cols-2 xl:grid-cols-3")}>{nodes.map(card)}</div>
+            {links.length > 0 && <FabricLinks links={links} byId={byId} stale={stale} />}
+          </>
         )}
       </div>
     </Panel>

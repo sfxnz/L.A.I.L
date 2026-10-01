@@ -5,7 +5,8 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { api } from "@/lib/api";
 import { isUnauthorizedError } from "@/lib/auth-token";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { useShallow } from "zustand/react/shallow";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import type { StreamPack, StreamRunRow } from "@/lib/stream-run-types";
 import { copyText, downloadText } from "@/lib/streams/clipboard";
 import { exportStem, jsonSnapshot, markdownSummary, type RunControls } from "@/lib/streams/export";
@@ -77,7 +78,16 @@ function StreamsRoom() {
   const wall = search.get("wall") === "1";
   const urlRun = search.get("run");
 
-  const { status, loading, needToken, unreachable, error: statusError } = useLabStatus();
+  // Narrow selectors: this page re-renders for the run, not for every 1 s lab sample.
+  const { loading, needToken, unreachable, statusError, anyUp } = useLabStatusStore(
+    useShallow((s) => ({
+      loading: s.loading,
+      needToken: s.needToken,
+      unreachable: s.unreachable,
+      statusError: s.error,
+      anyUp: serveHealthy(s.status) || Object.values(s.status?.backends ?? {}).some((b) => b.ok),
+    })),
+  );
   const [packs, setPacks] = useState<StreamPack[]>([]);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [controls, setControls] = useState<StreamControls>(DEFAULT_CONTROLS);
@@ -101,7 +111,6 @@ function StreamsRoom() {
   const strands = state.strands;
   const nowAt = Math.max(tickAt, state.clock?.at ?? 0);
 
-  const anyUp = serveHealthy(status) || Object.values(status?.backends ?? {}).some((b) => b.ok);
   const canRun = anyUp && !needToken && !unreachable && !!controls.base_url;
   const runDisabledReason = needToken
     ? "LAIL_TOKEN required — paste it in the banner"

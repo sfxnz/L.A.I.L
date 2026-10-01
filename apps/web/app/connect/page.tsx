@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
+import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import { Badge, Btn, Callout, Metric, Panel } from "@/components/ui";
 
 export default function ConnectPage() {
-  const { status } = useLabStatus();
+  const status = useLabStatusStore((s) => s.status);
   const [copied, setCopied] = useState<string | null>(null);
   // The page host is browser-only state. Reading window.location during render
   // made the server emit "127.0.0.1" while the client rendered the Tailscale

@@ -22,6 +22,8 @@ from app.bind import (  # noqa: E402
     allow_query_token,
     assert_safe_bind,
     cors_origins,
+    is_cross_site_write,
+    is_untrusted_host,
     token_from_headers,
 )
 from app.config import APP_ROOT  # noqa: E402
@@ -85,6 +87,20 @@ async def _token_guard(request: Request, call_next):
         {"error": "unauthorized", "message": "LAIL_TOKEN required"},
         status_code=401,
     )
+
+
+# Registered after the token guard, so it runs first: the serve-engine listens on loopback
+# without a token in the default setup, and any page the operator opens can POST to it.
+@app.middleware("http")
+async def _browser_guard(request: Request, call_next):
+    if not _LAIL_TOKEN and is_untrusted_host(request.headers, _CORS_ORIGINS):
+        return JSONResponse({"error": "untrusted_host", "message": "Host not allowed"}, status_code=403)
+    if is_cross_site_write(request.method, request.headers, _CORS_ORIGINS):
+        return JSONResponse(
+            {"error": "cross_site_write", "message": "Cross-site write refused (send Content-Type: application/json)"},
+            status_code=403,
+        )
+    return await call_next(request)
 
 
 app.include_router(router, prefix="/api")

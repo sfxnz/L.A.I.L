@@ -7,7 +7,7 @@ import { proxyOpenAI } from "./controller/llm-proxy";
 import { streamsEngine } from "./streams/engine";
 import { createStreamsRoutes } from "./streams/routes";
 import { config } from "./config";
-import { allowQueryToken, isCrossSiteWrite, isPublicUnauthedPath, resolveCorsOrigin, tokenMatches } from "./bind";
+import { allowQueryToken, isCrossSiteWrite, isPublicUnauthedPath, isUntrustedHost, resolveCorsOrigin, tokenMatches } from "./bind";
 import {
   compareLabRuns,
   getLabRun,
@@ -41,6 +41,13 @@ export function createApp() {
       allowHeaders: ["Content-Type", "Authorization", "X-Lail-Token"],
     }),
   );
+
+  // Without a token, a DNS-rebinding page would be same-origin with the lab: refuse
+  // requests addressed to a host name the lab does not answer to.
+  app.use("*", async (c, next) => {
+    if (config.token || !isUntrustedHost(c.req.raw, corsAllow)) return next();
+    return c.json({ error: "untrusted_host", message: "Host not allowed (set LAIL_CORS_ORIGINS or LAIL_TOKEN)" }, 403);
+  });
 
   app.use("*", async (c, next) => {
     if (!isCrossSiteWrite(c.req.raw, corsAllow)) return next();

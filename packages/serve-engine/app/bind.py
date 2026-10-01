@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from typing import Mapping
+from urllib.parse import urlsplit
 
 _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:3000",
@@ -64,3 +65,55 @@ def cors_origins(extra: str | None = None) -> list[str]:
 def allow_query_token(path: str) -> bool:
     """Query-string tokens are only for EventSource job logs."""
     return bool(_JOB_LOGS.match(path or ""))
+
+
+def is_cross_site_write(method: str, headers: Mapping[str, str], allow: list[str]) -> bool:
+    """Cross-site write guard, independent of LAIL_TOKEN (same rule as the controller).
+
+    A browser page on another origin can still *reach* a handler with a CORS "simple"
+    request (no body, text/plain or a form) although it cannot read the reply — enough
+    for POST /api/serve/stop. Such a write is refused unless it is JSON, which forces a
+    preflight only the configured origins pass. The controller's proxy, curl and other
+    non-browser clients send no Origin and are unaffected.
+    """
+    if method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    lower = {str(k).lower(): str(v) for k, v in headers.items()}
+    origin = lower.get("origin")
+    if not origin:
+        return False
+    if lower.get("sec-fetch-site") == "same-origin" or origin in allow:
+        return False
+    ct = (lower.get("content-type") or "").split(";")[0].strip().lower()
+    return ct != "application/json"
+
+
+_IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _hostname(value: str) -> str:
+    h = value.strip().lower()
+    if h.startswith("["):
+        end = h.find("]")
+        return h[1:end] if end > 0 else h[1:]
+    return re.sub(r":\d+$", "", h)
+
+
+def is_untrusted_host(headers: Mapping[str, str], allow: list[str]) -> bool:
+    """DNS-rebinding guard for the token-less setup (same rule as the controller).
+
+    Allowed: IP literals, localhost / *.localhost, single-label names (docker service
+    names, `spark1` — no public DNS name rebinds to them) and the configured origins'
+    hosts. Any other dotted name is a page that rebound its own domain to loopback.
+    """
+    lower = {str(k).lower(): str(v) for k, v in headers.items()}
+    trusted = {(urlsplit(o).hostname or "").lower() for o in allow}
+    for key in ("host", "x-forwarded-host"):
+        for part in (lower.get(key) or "").split(","):
+            name = _hostname(part)
+            if not name or name in trusted or name == "localhost" or name.endswith(".localhost"):
+                continue
+            if "." not in name or ":" in name or _IPV4.match(name):
+                continue
+            return True
+    return False

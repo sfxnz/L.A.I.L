@@ -6,6 +6,7 @@ import {
   isLoopbackHost,
   isCrossSiteWrite,
   isPublicUnauthedPath,
+  isUntrustedHost,
   resolveCorsOrigin,
   tokenMatches,
 } from "./bind";
@@ -99,5 +100,21 @@ describe("allowQueryToken / public paths / CORS", () => {
     expect(isCrossSiteWrite(r("PUT", { origin: "null", "sec-fetch-site": "cross-site" }), allow)).toBe(true);
     // reads are never blocked here
     expect(isCrossSiteWrite(r("GET", { origin: "https://evil.example" }), allow)).toBe(false);
+  });
+});
+
+describe("DNS-rebinding host guard", () => {
+  const allow = ["http://127.0.0.1:3000", "http://spark1.tail1a9513.ts.net:3000"];
+  const r = (h: Record<string, string>) => new Request("http://127.0.0.1:8787/api/configure", { headers: h });
+  test("loopback, IP literals, single-label and configured hosts pass", () => {
+    for (const host of ["127.0.0.1:8787", "localhost:3000", "[::1]:8787", "10.20.20.48:3000", "spark1:3000", "lail-backend:8787", "app.localhost", "spark1.tail1a9513.ts.net:3000"]) {
+      expect(isUntrustedHost(r({ host }), allow)).toBe(false);
+    }
+    expect(isUntrustedHost(r({}), allow)).toBe(false);
+  });
+  test("a rebinding domain is refused, directly or through Next's rewrite", () => {
+    expect(isUntrustedHost(r({ host: "evil.example:8787" }), allow)).toBe(true);
+    expect(isUntrustedHost(r({ host: "127.0.0.1:8787", "x-forwarded-host": "evil.example:3000" }), allow)).toBe(true);
+    expect(isUntrustedHost(r({ host: "127.0.0.1:8787", "x-forwarded-host": "localhost:3000" }), allow)).toBe(false);
   });
 });

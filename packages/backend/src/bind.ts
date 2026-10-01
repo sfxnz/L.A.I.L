@@ -95,3 +95,42 @@ export function isCrossSiteWrite(req: Request, allow: string[]): boolean {
   const ct = (req.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
   return ct !== "application/json";
 }
+
+/** Hostname of a Host / X-Forwarded-Host value: port stripped, IPv6 brackets kept off. */
+function hostnameOf(host: string): string {
+  const h = host.trim().toLowerCase();
+  if (h.startsWith("[")) return h.slice(1, h.indexOf("]") > 0 ? h.indexOf("]") : undefined);
+  return h.replace(/:\d+$/, "");
+}
+
+/**
+ * DNS-rebinding guard for the token-less (loopback) setup. A rebinding page talks to
+ * the lab under its own domain name, so the browser treats it as same-origin; only the
+ * Host it sends gives it away. Allowed: IP literals, localhost / *.localhost, single-label
+ * names (no public DNS name rebinds to them — docker service names, `spark1`) and the
+ * hosts of the configured web origins. With LAIL_TOKEN set the token is the gate.
+ * Every Host-like header is checked (Next's rewrite forwards the browser's Host as
+ * X-Forwarded-Host).
+ */
+export function isUntrustedHost(req: Request, allow: string[]): boolean {
+  const trusted = new Set(
+    allow.flatMap((o) => {
+      try {
+        return [new URL(o).hostname.replace(/^\[|\]$/g, "").toLowerCase()];
+      } catch {
+        return [];
+      }
+    }),
+  );
+  for (const value of [req.headers.get("host"), req.headers.get("x-forwarded-host")]) {
+    if (!value) continue;
+    for (const part of value.split(",")) {
+      const name = hostnameOf(part);
+      if (!name) continue;
+      if (trusted.has(name) || name === "localhost" || name.endsWith(".localhost")) continue;
+      if (!name.includes(".") || /^\d{1,3}(\.\d{1,3}){3}$/.test(name) || name.includes(":")) continue;
+      return true;
+    }
+  }
+  return false;
+}

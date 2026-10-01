@@ -1,11 +1,11 @@
 """GPU probe parse and Spark node payload — shipped helpers only."""
 from __future__ import annotations
 
-from app.services import cluster, metadata, node_probe
+from app.services import cluster, node_probe
 
 
 def test_parse_gpu_telemetry_reads_temp_usage_power():
-    tel = metadata.parse_gpu_telemetry(
+    tel = node_probe.parse_gpu_telemetry(
         "NVIDIA GB10, 47, 83, 32.1, [N/A], [N/A]\n"
     )
     assert tel["gpu_sku"] == "NVIDIA GB10"
@@ -17,7 +17,7 @@ def test_parse_gpu_telemetry_reads_temp_usage_power():
 
 
 def test_parse_gpu_telemetry_blank_is_nil_not_zero():
-    tel = metadata.parse_gpu_telemetry("")
+    tel = node_probe.parse_gpu_telemetry("")
     assert tel["gpu_sku"] is None
     assert tel["temperature_c"] is None
     assert tel["gpu_util_pct"] is None
@@ -26,7 +26,7 @@ def test_parse_gpu_telemetry_blank_is_nil_not_zero():
 
 
 def test_parse_gpu_telemetry_na_fields_stay_none():
-    tel = metadata.parse_gpu_telemetry("NVIDIA GB10, [N/A], [N/A], [N/A], [N/A], [N/A]")
+    tel = node_probe.parse_gpu_telemetry("NVIDIA GB10, [N/A], [N/A], [N/A], [N/A], [N/A]")
     assert tel["gpu_sku"] == "NVIDIA GB10"
     assert tel["temperature_c"] is None
     assert tel["gpu_util_pct"] is None
@@ -34,7 +34,7 @@ def test_parse_gpu_telemetry_na_fields_stay_none():
 
 
 def test_node_payload_includes_temperature_and_usage_from_smi():
-    tel = metadata.parse_gpu_telemetry("NVIDIA GB10, 41.0, 7, 18.5, [N/A], [N/A]")
+    tel = node_probe.parse_gpu_telemetry("NVIDIA GB10, 41.0, 7, 18.5, [N/A], [N/A]")
     node = cluster.apply_gpu_telemetry({}, tel)
     assert node["temperature_c"] == 41.0
     assert node["gpu_util_pct"] == 7
@@ -45,7 +45,7 @@ def test_node_payload_includes_temperature_and_usage_from_smi():
 
 
 def test_node_payload_gpu_memory_in_gib_when_smi_reports_it():
-    tel = metadata.parse_gpu_telemetry("NVIDIA RTX 6000, 50, 30, 120.0, 20480, 49140")
+    tel = node_probe.parse_gpu_telemetry("NVIDIA RTX 6000, 50, 30, 120.0, 20480, 49140")
     node = cluster.apply_gpu_telemetry({}, tel)
     assert node["memory_used_mib"] == 20480
     assert node["gpu_mem_used_gib"] == 20.0
@@ -53,7 +53,7 @@ def test_node_payload_gpu_memory_in_gib_when_smi_reports_it():
 
 
 def test_node_payload_nil_when_smi_returns_nothing():
-    node = cluster.apply_gpu_telemetry({"id": "spark1"}, metadata.parse_gpu_telemetry(""))
+    node = cluster.apply_gpu_telemetry({"id": "spark1"}, node_probe.parse_gpu_telemetry(""))
     assert node["temperature_c"] is None
     assert node["gpu_util_pct"] is None
     assert node["power_w"] is None

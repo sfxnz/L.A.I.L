@@ -2979,7 +2979,6 @@ def test_unavailable_topology_probes_local_hardware(monkeypatch):
         "app.services.metadata.collect_hardware",
         lambda: {
             "ram_gib": 64.0,
-            "memory_capacity_gib": 64.0,
             "gpu_sku": "NVIDIA GeForce RTX 4090",
             "hostname": "devbox",
         },

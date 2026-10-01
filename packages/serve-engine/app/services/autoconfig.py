@@ -1298,11 +1298,9 @@ def _resolved_node_ram_gib(value: Any = None) -> float:
     """Explicit ram_gib → live MemTotal → conservative laptop-scale. Never 121.7."""
     if isinstance(value, (int, float)) and value > 0:
         return float(value)
-    hw = _probed_local_hardware()
-    for key in ("ram_gib", "memory_capacity_gib"):
-        ram = hw.get(key)
-        if isinstance(ram, (int, float)) and ram > 0:
-            return float(ram)
+    ram = _probed_local_hardware().get("ram_gib")
+    if isinstance(ram, (int, float)) and ram > 0:
+        return float(ram)
     return _CONSERVATIVE_NODE_RAM_GIB
 
 
@@ -1315,8 +1313,6 @@ def _local_hw_fallback_node() -> dict[str, Any]:
     """Single local node from collect_hardware() when cluster topology is unavailable."""
     hw = _probed_local_hardware()
     ram = hw.get("ram_gib")
-    if not (isinstance(ram, (int, float)) and ram > 0):
-        ram = hw.get("memory_capacity_gib")
     if not (isinstance(ram, (int, float)) and ram > 0):
         ram = None
     sku = hw.get("gpu_sku")

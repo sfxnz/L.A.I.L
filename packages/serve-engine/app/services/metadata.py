@@ -40,13 +40,6 @@ def available_gib() -> float | None:
     return node_probe.parse_meminfo(node_probe._read("/proc/meminfo"))["available_gib"]
 
 
-# GPU parsing lives with the probe that runs on every node; re-exported for callers.
-GPU_SMI_QUERY = node_probe.GPU_SMI_QUERY
-GPU_TELEMETRY_FIELDS = node_probe.GPU_TELEMETRY_FIELDS
-parse_gpu_telemetry = node_probe.parse_gpu_telemetry
-is_serve_container = node_probe.is_serve_container
-
-
 @functools.lru_cache(maxsize=1)
 def _host_facts() -> dict[str, Any]:
     """Static host facts, read once: real CPU model (lscpu), hostname, platform."""

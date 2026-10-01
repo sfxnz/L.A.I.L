@@ -698,3 +698,19 @@ def test_serve_examples_route_carries_the_static_presets(monkeypatch):
     monkeypatch.setattr(main_mod, "_LAIL_TOKEN", "")
     body = TestClient(main_mod.app).get("/api/serve/examples").json()
     assert body == {"examples": SERVE_EXAMPLES, "presets": list(MODEL_PRESETS.keys())}
+
+
+def test_published_models_drop_per_call_noise(monkeypatch):
+    calls: Counter = Counter()
+    _fake_collectors(monkeypatch, calls)
+
+    async def noisy_probe(base_url, timeout=5.0, **kw):
+        p = _probe(base_url)
+        p["models"] = [{"id": "org/m", "max_model_len": 8192, "created": time.time(), "permission": [{"id": "x"}]}]
+        return p
+
+    monkeypatch.setattr(metadata, "probe_endpoint", noisy_probe)
+    s = StatusSampler("http://127.0.0.1:8000")
+    snap = asyncio.run(s.sample())
+    assert snap["models"] == [{"id": "org/m", "max_model_len": 8192}]
+    assert s.probe()["models"][0]["permission"]  # envelopes still get the full probe

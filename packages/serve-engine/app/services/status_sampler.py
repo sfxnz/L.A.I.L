@@ -313,7 +313,13 @@ class StatusSampler:
             "healthy": probe.get("healthy"),
             "base_url": self.base_url,
             "model_id": model_id,
-            "models": probe.get("models"),
+            # /v1/models minus the per-call noise (vLLM stamps `created` and a fresh
+            # permission id on every answer): what is served, and its context window.
+            "models": [
+                {"id": m.get("id"), "max_model_len": m.get("max_model_len")}
+                for m in probe.get("models") or []
+                if isinstance(m, dict)
+            ],
             "version": probe.get("version"),
             "metrics": probe.get("metrics"),
             "engine": metadata.build_engine(probe, self._inspect),

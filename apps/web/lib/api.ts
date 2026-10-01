@@ -127,6 +127,8 @@ export type ClusterNode = {
  * optional/nullable — the UI renders <Nil/> when a value is absent.
  */
 export type EngineStatus = {
+  /** Engine detected on the endpoint (owned_by / metrics prefix): vllm | sglang | llamacpp | tensorfold. */
+  name?: string | null;
   kv_usage_pct?: number | null;
   requests_running?: number | null;
   requests_waiting?: number | null;
@@ -154,6 +156,10 @@ export type ServeMetrics = {
   /** computed prompt tok/s of requests that finished in the window */
   prefill_tok_per_s?: number | null;
   ttft_s?: number | null;
+  /** window percentiles from the engine's TTFT / inter-token latency histograms (s) */
+  ttft_p50_s?: number | null;
+  itl_p50_s?: number | null;
+  itl_p95_s?: number | null;
   spec_accept_rate?: number | null;
   spec_tokens_per_step?: number | null;
   spec_accept_rate_lifetime?: number | null;
@@ -226,7 +232,7 @@ export type LabStatus = {
     /** Age of the serve-engine sampler snapshot (s). */
     stale_s?: number | null;
     models?: Array<{ id: string }>;
-    /** vLLM /version, as sampled today. */
+    /** The serving engine's version (vLLM /version, SGLang /server_info, llama.cpp /props). */
     version?: { version?: string | null } | null;
     /** The endpoint block: /metrics counters and live window rates from the serve-engine sampler. */
     metrics?: ServeMetrics | null;
@@ -343,6 +349,20 @@ export type LabArtifactRun = {
   siblings?: LabArtifactRun[];
 };
 
+/** An engine Serve can launch (GET /api/serve/engines). */
+export type ServeEngine = {
+  name: string;
+  label: string;
+  default_port: number;
+  default_image: string;
+  image_env: string;
+  /** Most TP ranks it runs here (null = one per node, no cap). */
+  max_tp: number | null;
+  /** Serve fields this engine translates into its own flags. */
+  fields: string[];
+  notes: string;
+};
+
 export type ServeRecommend = {
   model: string;
   mode: string;
@@ -373,6 +393,9 @@ export type ServeRecommend = {
     overlay?: string | null;
   };
   sources?: Array<{ kind: string; ref: string; notes?: string }>;
+  /** Non-vLLM engines: the exact command line per process (rank null = single node). */
+  argv?: string;
+  processes?: Array<{ rank: number | null; node?: string; argv: string }>;
   card_recipes?: Array<{
     score: number;
     section?: string;
@@ -396,9 +419,10 @@ export const api = {
   serveExamples: () =>
     req<{ examples: Record<string, ServeExample>; presets: string[] }>("/api/serve/examples"),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
-  recommendServe: (model: string, fetchRemote = true) =>
+  serveEngines: () => req<{ engines: ServeEngine[] }>("/api/serve/engines"),
+  recommendServe: (model: string, fetchRemote = true, engine = "vllm") =>
     req<ServeRecommend>(
-      `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}`,
+      `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}&backend=${encodeURIComponent(engine)}`,
     ),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
   cancelJob: (id: string) =>

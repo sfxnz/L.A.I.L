@@ -5,7 +5,8 @@ import { memo, useEffect, useState } from "react";
 import type { LabStatus } from "@/lib/api";
 import type { EndpointSample } from "@/lib/lab-status-store";
 import { fmtKvPct, fmtTokensK, forecastLine, kvForecast } from "@/lib/status/forecast";
-import { engineLabel, fmtAgo, fmtRate, fmtUptime } from "@/lib/status/format";
+import { engineLabel } from "@/lib/engines";
+import { fmtAgo, fmtRate, fmtUptime } from "@/lib/status/format";
 import { parseQuant } from "@/lib/status/quant";
 import { Badge, CopyButton, Eyebrow, Nil, Panel, Sparkline, Stat, useCopy } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -20,7 +21,8 @@ import { cn } from "@/lib/utils";
                  never shown as live.
     throughput   all streams together per wall-clock second, with its last 60 s
                  on a real time axis (idle reads 0, a gap is a missed sample).
-    TTFT · prefill · requests · spec acceptance · KV — each with its own idle rule.
+    TTFT · ITL (step latency under spec decoding) p50/p95 · prefill · requests · spec
+                 acceptance · KV — each with its own idle rule.
 */
 
 const WINDOW_MS = 60_000;
@@ -60,13 +62,11 @@ const Unit = ({ children }: { children: React.ReactNode }) => (
 
 export const EndpointHero = memo(function EndpointHero({
   serve,
-  defaultBackend,
   endpoint,
   serverNow,
   stale,
 }: {
   serve: Serve;
-  defaultBackend?: string;
   /** the endpoint's 60 s rate series from the store */
   endpoint: readonly EndpointSample[];
   serverNow: number | null;
@@ -81,6 +81,8 @@ export const EndpointHero = memo(function EndpointHero({
   const engine = serve.engine ?? {};
   const modelId = serve.model_id || null;
   const version = engine.version ?? serve.version?.version ?? null;
+  // What is actually serving (owned_by / metrics prefix), not the configured default backend.
+  const engineName = engineLabel(engine.name);
   const cluster = serve.cluster;
   const tp = cluster?.summary?.multi?.tensor_parallel_hint ?? cluster?.nodes?.find((n) => n.tensor_parallel_size != null)?.tensor_parallel_size ?? null;
   const quant = parseQuant(modelId);
@@ -99,6 +101,9 @@ export const EndpointHero = memo(function EndpointHero({
   const lastTtft = m.ttft_s == null ? m.last_ttft : null;
   const lastTtftAge = lastTtft && serverNow != null ? (serverNow - lastTtft.at) / 1000 : null;
   const busy = (running ?? 0) > 0;
+  // Speculative decoding this second: the latency histogram is per engine step (vLLM) or
+  // per streamed chunk (SGLang), each carrying several tokens — not a per-token interval.
+  const perStep = m.spec_tokens_per_step != null;
   const domain = serverNow != null ? ([serverNow - WINDOW_MS, serverNow] as const) : undefined;
   const throughputPts = endpoint.map((s) => ({ t: s.t, v: s.throughput }));
   const bases = hermesBases(serve.base_url, pageHost);
@@ -111,7 +116,7 @@ export const EndpointHero = memo(function EndpointHero({
       action={
         <span className="flex items-center gap-2">
           {flash && <Eyebrow className="text-lab-ok">{flash}</Eyebrow>}
-          <Badge tone="ok">{engineLabel(defaultBackend || "vllm")}</Badge>
+          {engineName ? <Badge tone="ok">{engineName}</Badge> : <Nil word="Awaiting" />}
           {version && <span className="lab-num font-mono text-[10px] text-lab-muted">v{version}</span>}
         </span>
       }
@@ -209,6 +214,23 @@ export const EndpointHero = memo(function EndpointHero({
                   last {msOrS(lastTtft.s)}
                   {lastTtftAge != null ? ` · ${fmtAgo(lastTtftAge)}` : ""}
                 </span>
+              ) : (
+                <Nil word={busy ? "None" : "Idle"} />
+              )}
+            </Row>
+            <Row
+              label={perStep ? "Step p50 · p95" : "ITL p50 · p95"}
+              title={
+                perStep
+                  ? `Latency per decode step over the last second. With speculative decoding the engine records one latency per step, and a step emits ~${m.spec_tokens_per_step?.toFixed(1)} tokens — this is not the time between tokens (resolution: its bucket edges)`
+                  : "Inter-token latency over the last second, from the engine's histogram (resolution: its bucket edges)"
+              }
+            >
+              {m.itl_p50_s != null ? (
+                <>
+                  {Math.round(m.itl_p50_s * 1000)}
+                  {m.itl_p95_s != null && <span className="text-lab-muted"> · {Math.round(m.itl_p95_s * 1000)}</span>} ms
+                </>
               ) : (
                 <Nil word={busy ? "None" : "Idle"} />
               )}

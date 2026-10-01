@@ -1,6 +1,6 @@
 # L.A.I.L — Local AI Lab
 
-**Serve & eval console** — paste a Hugging Face id, auto-configure, start/stop vLLM (or llama.cpp), run smoke/perf evals, and copy an OpenAI-compatible endpoint for **Hermes** (or any client). All on your own hardware.
+**Serve & eval console** — paste a Hugging Face id, auto-configure, start/stop vLLM, SGLang, llama.cpp or TensorFold, run smoke/perf evals, and copy an OpenAI-compatible endpoint for **Hermes** (or any client). All on your own hardware.
 
 Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to the live `:8000` endpoint.
 
@@ -8,8 +8,8 @@ Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to 
 |-------|--------|
 | UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
 | Controller | Bun + Hono · live status stream, configure, usage, lab gallery, proxy to serve-engine |
-| Serve-engine | Python FastAPI · vLLM auto-configure, smoke, benches, run history |
-| Models | **vLLM** and **llama.cpp** (no Ollama) |
+| Serve-engine | Python FastAPI · auto-configure, launch / stop / live metrics per engine, smoke, benches, run history |
+| Engines | **vLLM**, **SGLang**, **llama.cpp**, **TensorFold** (no Ollama) |
 
 ## Product surface
 
@@ -41,7 +41,8 @@ Top nav (`apps/web/lib/ide-chrome.ts`); Connect (`/connect`) is linked from Stat
 └──────────────┬─────────────────────────────┬─────────────────┘
                │                             │
                ▼                             ▼
-     vLLM / llama.cpp                  packages/serve-engine
+     vLLM / SGLang / llama.cpp /       packages/serve-engine
+     TensorFold
      (OpenAI /v1)                      (Python: docker serve,
                                         smoke, perf, history)
                │
@@ -61,7 +62,7 @@ time axis and stale data is dimmed with its age, never shown as live.
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
+One **LabController** is the public API. The Python **serve-engine** owns the serve path for every engine (auto-configure, start, stop, live metrics, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
 
 ### Model resolution
 
@@ -172,10 +173,30 @@ OPENAI_MODEL=<served-model-id>
 
 ## Serve (vLLM serve & evals)
 
-- Auto-configure + start · stop (two clicks) · live job logs
+- Auto-configure + start · stop (two clicks) · live job logs — vLLM, SGLang, llama.cpp, TensorFold
 - Bench (decode / prefill) on `/bench`; smoke, golden tools and tool-eval-bench on `/evals`
 
-Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first**, then bench.
+Benches (and the controller's `/v1` proxy) hit the endpoint the serve-engine detects serving — whichever engine and port — else the configured default backend. **Serve first**, then bench.
+
+## Engines
+
+Serve → **Engine** picks one; `packages/serve-engine/app/services/engines/` holds one small
+adapter per engine (image, port, CLI from the placement result, readiness, `/metrics`
+mapping). Status shows the engine actually answering (`/v1/models` owned_by, else the
+metrics prefix), not the configured default.
+
+| Engine | Default image (env override) | Port | TP across Sparks | Live metrics |
+|--------|------------------------------|------|------------------|--------------|
+| vLLM | `vllm/vllm-openai:v0.27.1` (`LAB_VLLM_IMAGE_MAX`) | 8000 | yes (`--nnodes`, workers `--headless`) | per step |
+| SGLang | `lmsysorg/sglang:v0.5.20-cu130` (`LAIL_SGLANG_IMAGE`) | 30000 | yes (`--nnodes/--node-rank/--dist-init-addr`) | per-stream decode from the inter-token histogram, throughput from the scheduler's `gen_throughput`; `--enable-metrics` always on |
+| llama.cpp | `ghcr.io/ggml-org/llama.cpp:server-cuda13` (`LAIL_LLAMACPP_IMAGE`) | 8080 | no (single node) | when a request ends (shown as "last"), `--metrics` always on |
+| TensorFold | `nvcr.io/nvidia/pytorch:26.07-py3` + `pip install` of the verified commit at start (`LAIL_TENSORFOLD_IMAGE`, `LAIL_TENSORFOLD_PIP`); pip and kernel-build caches persist in `~/.cache/lail-tensorfold` (`LAIL_TENSORFOLD_CACHE`) | **8090** (upstream 8080 is llama.cpp's) | 2 ranks max (`--tp 2 --rank R`) | decode from `/health` running totals; no KV pool % (its ratio is per-stream context fill) |
+
+Every container L.A.I.L launches carries `--label lail.engine=<name>`; Stop removes those
+(any state) plus any other serve container that is running, judged by its command or
+image on every node — never by a model word in its name. The API binds `127.0.0.1` on
+single-node and multi-node serves alike. Recipes in `data/serve_overlays.json` may carry
+`"engine": "sglang" | "llamacpp" | "tensorfold"` to apply only to that engine.
 
 ## Models & Usage
 
@@ -188,9 +209,11 @@ See [`.env.example`](./.env.example).
 
 | Variable | Role |
 |----------|------|
-| `LAIL_DEFAULT_BACKEND` | `vllm` or `llamacpp` |
+| `LAIL_DEFAULT_BACKEND` | `vllm`, `sglang`, `llamacpp` or `tensorfold` |
 | `LAIL_VLLM_URL` | Default `http://127.0.0.1:8000` |
+| `LAIL_SGLANG_URL` | Default `http://127.0.0.1:30000` |
 | `LAIL_LLAMACPP_URL` | Default `http://127.0.0.1:8080` |
+| `LAIL_TENSORFOLD_URL` | Default `http://127.0.0.1:8090` (TensorFold's own default 8080 collides with llama.cpp; L.A.I.L launches it on 8090) |
 | `LAIL_DEFAULT_MODEL` | Served model id, or `auto` |
 | `LAIL_API_PORT` / `LAIL_WEB_PORT` / `LAIL_SERVE_ENGINE_PORT` | Ports |
 | `LAIL_DATA_DIR` | Data root (sqlite, lab runs) |

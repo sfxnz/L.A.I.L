@@ -14,6 +14,7 @@ import {
 import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { setClientToken } from "@/lib/auth-token";
+import { engineLabel } from "@/lib/engines";
 import { fmtKvPct } from "@/lib/status/forecast";
 import { fmtRate } from "@/lib/status/format";
 import { serveHealthy, tightestNode, useLabStatusStore, useStale } from "@/lib/lab-status-store";
@@ -66,6 +67,8 @@ function HeaderReadout() {
   const tokS = liveTokS ?? lastBurst;
   const rateSource = liveTokS != null ? "decode" : lastBurst != null ? "last" : "idle";
   const engine = serve?.engine;
+  const engineName = engineLabel(engine?.name);
+  const engineVersion = engine?.version ?? serve?.version?.version ?? null;
   const running = engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
   const waiting = engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
   const kvPct = engine?.kv_usage_pct ?? null;
@@ -98,7 +101,8 @@ function HeaderReadout() {
         : stale
           ? "stale"
           : healthy
-            ? "serving"
+            ? // The ring already says "serving"; the word names what is serving (detected).
+              (engineName ?? "serving")
             : "idle";
   const probeNote = needToken
     ? TOKEN_COPY
@@ -134,7 +138,10 @@ function HeaderReadout() {
           <>
             {/* only where it fits whole: at 1440 the strip squeezed it to "Qwen…" */}
             <Tick className="hidden 2xl:block" />
-            <span className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim 2xl:inline" title={model}>
+            <span
+              className="hidden max-w-[160px] truncate font-mono text-[10px] text-lab-text-dim 2xl:inline"
+              title={[model, engineName, engineVersion && `v${engineVersion}`].filter(Boolean).join(" · ")}
+            >
               {model.split("/").pop()}
             </span>
           </>

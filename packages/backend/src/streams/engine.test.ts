@@ -5,7 +5,7 @@ import { config } from "../config";
 import { RATE_WINDOW_MS, StreamsEngine, Subscriber, arrivalDelays, strandWindowRate } from "./engine";
 import { createStreamsRoutes } from "./routes";
 import { assignPrompts, getPack, listPacks, strandSystemPrompt } from "./packs";
-import { parseMetrics, serverDelta } from "./probes";
+import { parseMetrics, serverDelta, serverLoad } from "./probes";
 import { SseParser } from "./sse-parser";
 
 // ── Mock OpenAI server: reasoning + content deltas, finish_reason, trailing usage frame ──
@@ -32,6 +32,8 @@ type MockState = {
   leaseMode: "ok" | "busy" | "down";
   leases: string[];
   statusCalls: number;
+  /** The serve-engine reports this mock as the endpoint it detected serving. */
+  serving: boolean;
 };
 const state: MockState = {
   requests: [],
@@ -48,6 +50,7 @@ const state: MockState = {
   leaseMode: "ok",
   leases: [],
   statusCalls: 0,
+  serving: false,
 };
 const isWarmup = (r: Record<string, unknown>) => String((r.messages as Array<{ content: string }>)[0].content).startsWith("Warmup");
 const measured = () => state.requests.filter((r) => !isWarmup(r));
@@ -159,6 +162,8 @@ const server = Bun.serve({
       state.statusCalls++;
       return Response.json({
         sampled_at: `2026-10-01T00:00:${String(state.statusCalls).padStart(2, "0")}Z`,
+        healthy: state.serving,
+        base_url: `http://127.0.0.1:${url.port}`,
         engine: { flags_fingerprint: "fp-mock" },
         // every node carries its own fresh reading and `sampled_at`; a down peer has none
         cluster: {
@@ -458,6 +463,19 @@ describe("load run", () => {
     expect(text).toBe(engine.snapshot(run_id)!.strands[0].text);
     const toks = text.trim().split(/\s+/);
     expect(new Set(toks).size).toBe(toks.length); // tok0 … tok119, each exactly once
+  });
+
+  test("no base_url: the run measures the endpoint the serve-engine detected serving", async () => {
+    state.serving = true;
+    try {
+      // The configured default backend (:8000) is not this mock; the detected one is.
+      const run_id = await engine.createRun({ mode: "load", pack: "prose", n: 1, max_tokens: 3 });
+      expect(engine.snapshot(run_id)!.hello.base_url).toBe(BASE);
+      engine.stop(run_id);
+      while (engine.snapshot(run_id)!.status === "running") await Bun.sleep(5);
+    } finally {
+      state.serving = false;
+    }
   });
 
   test("a load run nobody ever subscribes to is aborted too", async () => {
@@ -808,7 +826,7 @@ describe("live rates and fan-out", () => {
           `vllm:num_preemptions_total{engine="0",model_name="m"} 0.0`,
         ].join("\n"),
       );
-    expect(m(0, 2)["vllm:num_requests_running"]).toBe(3); // summed over label sets
+    expect(m(0, 2).running).toBe(3); // summed over label sets
     expect(serverDelta(m(0, 0), m(100, 0))).toEqual({
       spec_acceptance: 0.667,
       spec_tokens_per_step: 3,
@@ -817,6 +835,22 @@ describe("live rates and fan-out", () => {
       preemptions: 0,
     });
     expect(serverDelta(null, m(1, 0))).toBeNull();
+  });
+
+  test("SGLang, llama.cpp and TensorFold /metrics map onto the same bench keys", () => {
+    const sgl = parseMetrics(
+      [
+        'sglang:num_running_reqs{model_name="m",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 2.0',
+        'sglang:num_queue_reqs{model_name="m",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 1.0',
+        'sglang:time_to_first_token_seconds_sum{model_name="m",engine_type="unified",is_streaming="true"} 2.0',
+        'sglang:time_to_first_token_seconds_count{model_name="m",engine_type="unified",is_streaming="true"} 8.0',
+        'sglang:time_to_first_token_seconds_count{model_name="m",engine_type="unified",is_streaming="false"} 2.0',
+      ].join("\n"),
+    );
+    expect(serverLoad(sgl)).toBe(3); // foreign load is detected on SGLang too
+    expect(sgl.ttft_count).toBe(10); // summed across is_streaming
+    expect(serverLoad(parseMetrics("llamacpp:requests_processing 1\nllamacpp:requests_deferred 2\n"))).toBe(3);
+    expect(serverLoad(parseMetrics("tensorfold:requests_running 1\ntensorfold:requests_waiting 0\n"))).toBe(1);
   });
 
   test("energy is integrated only when every node's power was re-read during the run", async () => {

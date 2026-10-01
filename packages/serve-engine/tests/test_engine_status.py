@@ -8,7 +8,7 @@ from app.services import metadata
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vllm_metrics_qwen38_flash_next.prom"
 ENGINE_KEYS = {
-    "kv_usage_pct", "requests_running", "requests_waiting", "block_size", "num_gpu_blocks",
+    "name", "kv_usage_pct", "requests_running", "requests_waiting", "block_size", "num_gpu_blocks",
     "kv_capacity_tokens", "max_model_len", "version", "prefix_cache_hit_rate",
     "preemptions_total", "sleep_state", "uptime_s", "flags_fingerprint", "flags",
 }

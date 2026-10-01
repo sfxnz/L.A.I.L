@@ -1,6 +1,6 @@
 export * from "./stats";
 
-export type BackendKind = "vllm" | "llamacpp";
+export type BackendKind = "vllm" | "sglang" | "llamacpp" | "tensorfold";
 
 export type LabSettings = {
   defaultBackend: BackendKind;

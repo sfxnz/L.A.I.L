@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import { engineLabel } from "@/lib/engines";
 import { Badge, Callout, EmptyState, Panel, PageSkeleton, btnClass } from "@/components/ui";
 import { Absent, Cell, CornerTicks, ScoreGauge, Section, scoreTone } from "@/components/evals/parts";
 import { cn } from "@/lib/utils";
@@ -138,7 +139,7 @@ export default function ToolEvalRunDetailPage() {
             {envelope ? (
               <>
                 {modelId}
-                {engine.version ? ` · vLLM ${String(engine.version)}` : ""}
+                {engine.version ? ` · ${engineLabel(engine.name ? String(engine.name) : null) ?? "engine"} ${String(engine.version)}` : ""}
                 {runId ? ` · ${runId}` : ""}
               </>
             ) : (
@@ -305,7 +306,7 @@ export default function ToolEvalRunDetailPage() {
 
                   <Cell label="Stack" className="bg-lab-panel">
                     <span className="font-[family-name:var(--font-display)] text-[13px] font-semibold uppercase tracking-[0.08em]">
-                      {String(engine.name || "vllm")} {String(engine.version || "")}
+                      {engineLabel(engine.name ? String(engine.name) : null) ?? "Unknown engine"} {String(engine.version || "")}
                     </span>
                   </Cell>
                   <Cell label="Image" className="bg-lab-panel">

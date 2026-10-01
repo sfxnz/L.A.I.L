@@ -56,12 +56,3 @@ export function fmtAgo(s: number | null | undefined): string {
   const age = fmtAge(s);
   return age === "now" ? "just now" : age ? `${age} ago` : "";
 }
-
-/** Display name of an engine / backend key. */
-export function engineLabel(key: string | null | undefined): string {
-  const k = (key || "").toLowerCase();
-  if (k === "vllm") return "vLLM";
-  if (k === "llamacpp") return "llama.cpp";
-  if (k === "sglang") return "SGLang";
-  return key || "";
-}

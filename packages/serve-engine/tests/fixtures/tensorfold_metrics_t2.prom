@@ -1,0 +1,25 @@
+# Synthesised (not a live scrape) from the exact metric names/labels in upstream source; see tests/test_engines.py.
+# HELP tensorfold:requests_running Requests in prefill or decode.
+# TYPE tensorfold:requests_running gauge
+tensorfold:requests_running 0
+# TYPE tensorfold:requests_waiting gauge
+tensorfold:requests_waiting 0
+# TYPE tensorfold:prompt_tokens_total counter
+tensorfold:prompt_tokens_total 5800
+# TYPE tensorfold:generation_tokens_total counter
+tensorfold:generation_tokens_total 1100
+# TYPE tensorfold:kv_cache_usage_ratio gauge
+tensorfold:kv_cache_usage_ratio{pool="0"} 0
+# TYPE tensorfold:mtp_drafted_total counter
+tensorfold:mtp_drafted_total 900
+# TYPE tensorfold:mtp_accepted_total counter
+tensorfold:mtp_accepted_total 600
+# TYPE tensorfold:time_to_first_token_seconds histogram
+tensorfold:time_to_first_token_seconds_bucket{le="0.5"} 11
+tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 11
+tensorfold:time_to_first_token_seconds_sum 2.75
+tensorfold:time_to_first_token_seconds_count 11
+# TYPE tensorfold:request_latency_seconds histogram
+tensorfold:request_latency_seconds_bucket{le="+Inf"} 11
+tensorfold:request_latency_seconds_sum 22.0
+tensorfold:request_latency_seconds_count 11

@@ -150,7 +150,6 @@ export default function StatusPage() {
               {healthy && serve ? (
                 <EndpointHero
                   serve={serve}
-                  defaultBackend={status?.defaultBackend}
                   endpoint={samples.endpoint}
                   serverNow={now}
                   stale={stale}

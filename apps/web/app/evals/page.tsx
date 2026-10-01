@@ -108,7 +108,7 @@ export default function EvalsPage() {
       {!loading && !healthy && hasStatus && (
         <Callout
           tone="warn"
-          title="vLLM isn’t healthy"
+          title="No healthy serve endpoint"
           action={
             <Link href="/server" className={btnClass("secondary", "sm")}>
               Open Serve

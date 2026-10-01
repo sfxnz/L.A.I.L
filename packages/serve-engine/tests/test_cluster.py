@@ -11,8 +11,10 @@ from app.services.autoconfig import plan_placement
 
 
 def test_glm_flash_container_counts_as_a_serve():
-    # one container filter for local and remote (the remote runs node_probe itself)
-    assert node_probe.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
+    # one container filter for local and remote (the remote runs node_probe itself):
+    # a custom image is a serve by the command it runs, not by a model word in its name
+    assert node_probe.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11", '"vllm serve zai-org/GLM-5.3"')
+    assert not node_probe.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11", '"/entrypoint.sh"')
     assert node_probe.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
     assert not node_probe.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
     assert cluster._container_serve_family("glm53-flash-nvfp4") == "glm53-flash-nvfp4"
@@ -634,7 +636,6 @@ def test_stop_all_default_does_not_ssh(isolated_cluster, monkeypatch):
 
     monkeypatch.setattr(serve.subprocess, "run", fake_run)
     monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/no/such/multinode_serve.json"))
-    monkeypatch.setattr(serve, "SPARK_LAB", type(serve.SPARK_LAB)("/no/such/spark_lab.sh"))
     monkeypatch.setattr(serve, "list_vllm_containers", lambda: [])
     result = serve.stop_all()
     assert result["ok"] is True

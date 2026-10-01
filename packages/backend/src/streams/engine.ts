@@ -471,8 +471,18 @@ export class StreamsEngine {
 
   // ── Lifecycle ───────────────────────────────────────────────────
 
+  /**
+   * No base_url (the Bench page sends none): measure what is actually serving — the endpoint
+   * the serve-engine detected, whichever engine and port — before the configured default.
+   */
+  private async withServingBase(body: unknown): Promise<unknown> {
+    if (!body || typeof body !== "object" || (body as { base_url?: unknown }).base_url) return body;
+    const serving = (await readServeStatus())?.serving_base;
+    return serving ? { ...body, base_url: serving } : body;
+  }
+
   async createRun(body: unknown): Promise<string> {
-    const req = this.parseRequest(body);
+    const req = this.parseRequest(await this.withServingBase(body));
     const conflict = () => {
       const active = this.activeFor(req.base_url);
       if (active) {
@@ -816,6 +826,11 @@ export class StreamsEngine {
       stream: true,
       // continuous_usage_stats: vLLM puts the cumulative `usage` on every chunk, so every
       // chunk's exact token count is known (MTP chunks carry 1–4 tokens).
+      // One body for every engine (checked upstream): SGLang accepts continuous_usage_stats,
+      // min_tokens, ignore_eos and chat_template_kwargs (openai/protocol.py @ b51d4a04);
+      // llama.cpp and TensorFold honour ignore_eos + chat_template_kwargs and ignore the
+      // rest, reporting usage once at the end: until it arrives those strands count 1 token
+      // per chunk (not exact), so their live tok/s is a chunk rate; the final usage corrects the total.
       stream_options: { include_usage: true, continuous_usage_stats: true },
     };
     if (run.fill_to_max) {

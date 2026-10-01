@@ -316,38 +316,74 @@ def cpu_model() -> str:
 
 # ─── inventory ────────────────────────────────────────────────────────────────
 
-_SERVE_CONTAINER_RE = re.compile(
-    r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark|glm",
-    re.I,
+# Serve containers are recognised by WHAT they run, not by a model word in the name:
+# the `lail.engine` label on every container L.A.I.L launches, else an engine's serve
+# command (docker ps --no-trunc shows ENTRYPOINT + CMD), else an engine image.
+ENGINE_LABEL = "lail.engine"
+_ENGINE_COMMAND_RE = (
+    ("vllm", re.compile(r"\bvllm\s+serve\b|vllm\.entrypoints", re.I)),
+    ("sglang", re.compile(r"sglang\.launch_server|\bsglang\s+serve\b", re.I)),
+    ("llamacpp", re.compile(r"llama-server\b", re.I)),
+    ("tensorfold", re.compile(r"\btensorfold\s+serve\b", re.I)),
 )
-DEFAULT_VLLM_PORTS = (8000, 8888)
+_ENGINE_IMAGE_RE = (
+    ("vllm", re.compile(r"vllm|dspark", re.I)),
+    ("sglang", re.compile(r"sglang", re.I)),
+    ("llamacpp", re.compile(r"llama[.-]?cpp", re.I)),
+    ("tensorfold", re.compile(r"tensorfold", re.I)),
+)
+# Every port an engine serves on by default (vLLM, Anemll vLLM, SGLang, TensorFold as
+# launched by L.A.I.L, llama.cpp). Kept in step with app/services/engines (tested).
+DEFAULT_SERVE_PORTS = (8000, 8888, 30000, 8090, 8080)
+# `docker ps -a --no-trunc` columns (all nodes, local and over ssh).
+DOCKER_PS_FORMAT = "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.ID}}\t{{.Label \"lail.engine\"}}\t{{.Command}}"
 
 
-def is_serve_container(name: str, image: str = "") -> bool:
-    """True for a lab vLLM/llama.cpp-style serve container, including GLM image names."""
-    if _SERVE_CONTAINER_RE.search(f"{name} {image}"):
-        return True
-    img = image.lower()
-    return "vllm" in img or "dspark" in img or "ray" in img
+def engine_of(image: str = "", command: str = "", label: str = "") -> str | None:
+    """vllm | sglang | llamacpp | tensorfold from the label, the serve command, or the image."""
+    if label:
+        return label.strip().lower()
+    for name, rx in _ENGINE_COMMAND_RE:
+        if rx.search(command or ""):
+            return name
+    for name, rx in _ENGINE_IMAGE_RE:
+        if rx.search(image or ""):
+            return name
+    return None
+
+
+def is_serve_container(name: str, image: str = "", command: str = "", label: str = "") -> bool:
+    """True for a model-serving container (any engine). Unrelated containers whose name or
+    image merely contains a model word (ollama, xray, open-webui-llama) are not."""
+    return engine_of(image, command, label) is not None
 
 
 def parse_docker_ps(text: str | None) -> list[dict[str, Any]]:
+    """Serve containers from DOCKER_PS_FORMAT lines (older 4-column lines still parse)."""
     out: list[dict[str, Any]] = []
     for line in (text or "").splitlines():
         parts = line.split("\t")
         if len(parts) < 3 or not parts[0].strip():
             continue
         name, status, image = parts[0], parts[1], parts[2]
-        if not is_serve_container(name, image):
+        label = parts[4].strip() if len(parts) > 4 else ""
+        command = "\t".join(parts[5:]) if len(parts) > 5 else ""
+        if not is_serve_container(name, image, command, label):
             continue
-        out.append({"name": name, "status": status, "image": image, "id": parts[3] if len(parts) > 3 else ""})
+        out.append({
+            "name": name,
+            "status": status,
+            "image": image,
+            "id": parts[3] if len(parts) > 3 else "",
+            "engine": engine_of(image, command, label),
+            # Ours (labelled) vs. a serve someone launched by hand: Stop treats them differently.
+            "lail": bool(label),
+        })
     return out
 
 
 def list_serve_containers() -> list[dict[str, Any]]:
-    return parse_docker_ps(
-        run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.ID}}"])
-    )
+    return parse_docker_ps(run(["docker", "ps", "-a", "--no-trunc", "--format", DOCKER_PS_FORMAT]))
 
 
 def ports_from_bindings(obj: Any) -> list[int]:
@@ -398,7 +434,8 @@ def cmd_blob(cfg: dict[str, Any], args: Any) -> str:
 
 
 def node_rank_from(blob: str, env: list[Any] | None) -> int | None:
-    m = re.search(r"--node-rank[=\s]+(\d+)", blob or "")
+    # vLLM / SGLang `--node-rank N`, TensorFold `--rank N`.
+    m = re.search(r"(?<![\w-])--(?:node-)?rank[=\s]+(\d+)", blob or "")
     if m:
         return int(m.group(1))
     for e in env or []:
@@ -410,12 +447,15 @@ def node_rank_from(blob: str, env: list[Any] | None) -> int | None:
     return None
 
 
-_OFFICIAL_VLLM_NAME_RE = re.compile(r"^spark-vllm-n(\d+)$")
+# Rank containers L.A.I.L launches: spark-vllm-nN (vLLM) and lail-<engine>-nN (the others).
+_OFFICIAL_VLLM_NAME_RE = re.compile(r"^(?:spark-vllm|lail-[a-z]+)-n(\d+)$")
+# Engines whose rank ≥ 1 never opens an HTTP server (vLLM marks it with --headless).
+_HEADLESS_RANK_ENGINES = ("sglang", "tensorfold")
 _DSPARK_VLLM_NAME_RE = re.compile(r"(?i)^(?:.+[-_])?vllm[-_]dspark[-_](\d+)$")
 
 
 def rank_from_container_name(name: str) -> int | None:
-    """Rank in a known multi-node name: spark-vllm-nN, or …-vllm-dspark-N (vllm token required)."""
+    """Rank in a known multi-node name: spark-vllm-nN / lail-<engine>-nN, or …-vllm-dspark-N."""
     n = (name or "").strip()
     m = _OFFICIAL_VLLM_NAME_RE.match(n) or _DSPARK_VLLM_NAME_RE.match(n)
     return int(m.group(1)) if m else None
@@ -444,8 +484,10 @@ def enrich_containers(containers: list[dict[str, Any]], inspect_json: str | None
         )
         rank = node_rank_from(blob, cfg.get("Env"))
         c["node_rank"] = rank if rank is not None else rank_from_container_name(c["name"])
-        c["headless"] = bool(re.search(r"--headless\b", blob))
-        m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", blob)
+        c["headless"] = bool(re.search(r"--headless\b", blob)) or (
+            c.get("engine") in _HEADLESS_RANK_ENGINES and (c["node_rank"] or 0) >= 1
+        )
+        m = re.search(r"(?<![\w-])--(?:tensor-parallel-size|tp-size|tp)[=\s]+(\d+)", blob)
         if m:
             c["tensor_parallel_size"] = int(m.group(1))
         c["started_at"] = (d.get("State") or {}).get("StartedAt")
@@ -459,7 +501,7 @@ def candidate_ports(configured_url: str | None, containers: list[dict[str, Any]]
     if m:
         configured.append(int(m.group(1)))
     discovered = [p for c in containers for p in (c.get("ports") or [])]
-    return uniq_ports(discovered, configured, list(DEFAULT_VLLM_PORTS))
+    return uniq_ports(discovered, configured, list(DEFAULT_SERVE_PORTS))
 
 
 def probe_models(ports: list[int], fallback_url: str | None = None) -> dict[str, Any]:

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { config } from "../config";
-import { getSettings } from "./settings";
+import { getSettings, openAiBase } from "./settings";
 import { proxyOpenAI } from "./llm-proxy";
 
 const origFetch = globalThis.fetch;
@@ -12,9 +12,10 @@ afterEach(() => {
 
 type Seen = { url: string; headers: Headers; body: string | undefined };
 
-function fakeBackend(served: string[]): Seen[] {
+function fakeBackend(served: string[], status: Record<string, unknown> = {}): Seen[] {
   const seen: Seen[] = [];
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    if (String(url).startsWith(`${config.serveEngineUrl}/api/status`)) return Response.json(status);
     if (String(url).endsWith("/models")) return Response.json({ data: served.map((id) => ({ id })) });
     seen.push({ url: String(url), headers: new Headers(init?.headers), body: init?.body as string | undefined });
     return Response.json({ ok: true });
@@ -58,6 +59,17 @@ describe("/v1 proxy", () => {
     expect(JSON.parse(seen[0].body!).model).toBe("org/live");
     expect(JSON.parse(seen[1].body!).model).toBe("org/typo");
     expect(getSettings().defaultModel).toBe(before); // no settings write on the hot path
+  });
+
+  test("follows the endpoint the serve-engine detected, else the configured default", async () => {
+    let seen = fakeBackend(["org/live"], { healthy: true, base_url: "http://127.0.0.1:30000" });
+    await proxyOpenAI(chat("auto"), "/chat/completions");
+    expect(seen[0].url).toBe("http://127.0.0.1:30000/v1/chat/completions");
+    expect(JSON.parse(seen[0].body!).model).toBe("org/live");
+
+    seen = fakeBackend(["org/live"], { healthy: false, base_url: "http://127.0.0.1:30000" });
+    await proxyOpenAI(chat("org/live"), "/chat/completions");
+    expect(seen[0].url).toBe(`${openAiBase()}/chat/completions`);
   });
 
   test("backend down → 502 JSON, not a bare 500", async () => {

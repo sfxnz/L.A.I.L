@@ -324,7 +324,6 @@ describe("Served model panel", () => {
     renderToStaticMarkup(
       createElement(EndpointHero, {
         serve: { ...base, metrics, ...extra } as never,
-        defaultBackend: "vllm",
         endpoint: [],
         serverNow: NOW,
       }),

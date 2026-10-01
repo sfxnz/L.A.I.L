@@ -1,0 +1,50 @@
+{
+  "t0": {
+    "ok": true,
+    "backend": "tensorfold",
+    "busy": true,
+    "requests_running": 1,
+    "requests_total": 10,
+    "prompt_tokens_total": 5000,
+    "completion_tokens_total": 1000,
+    "prefill_seconds_total": 1.0,
+    "decode_seconds_total": 20.0,
+    "cached_tokens_total": 1000,
+    "rounds_total": 300,
+    "drafted_total": 900,
+    "accepted_total": 600,
+    "context_length": 131072
+  },
+  "t1": {
+    "ok": true,
+    "backend": "tensorfold",
+    "busy": true,
+    "requests_running": 1,
+    "requests_total": 10,
+    "prompt_tokens_total": 5000,
+    "completion_tokens_total": 1060,
+    "prefill_seconds_total": 1.0,
+    "decode_seconds_total": 20.0,
+    "cached_tokens_total": 1000,
+    "rounds_total": 300,
+    "drafted_total": 900,
+    "accepted_total": 600,
+    "context_length": 131072
+  },
+  "t2": {
+    "ok": true,
+    "backend": "tensorfold",
+    "busy": false,
+    "requests_running": 0,
+    "requests_total": 11,
+    "prompt_tokens_total": 5800,
+    "completion_tokens_total": 1100,
+    "prefill_seconds_total": 1.2,
+    "decode_seconds_total": 21.6,
+    "cached_tokens_total": 1000,
+    "rounds_total": 355,
+    "drafted_total": 960,
+    "accepted_total": 645,
+    "context_length": 131072
+  }
+}

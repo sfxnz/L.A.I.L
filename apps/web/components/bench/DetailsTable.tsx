@@ -45,7 +45,7 @@ export function DecodeDetails({ arms, className }: { arms: DecodeArm[]; classNam
             <th scope="col" title="Shown from 5 strands up">p95</th>
             <th scope="col" title="Shown from 5 strands up">p99</th>
             <th scope="col">TPOT</th>
-            <th scope="col" title="vLLM: accepted ÷ drafted speculative tokens over the level">Spec accept</th>
+            <th scope="col" title="Engine counters: accepted ÷ drafted speculative tokens over the level (vLLM, llama.cpp, TensorFold)">Spec accept</th>
             <th scope="col">Waves</th>
             <th scope="col">Strands</th>
             <th scope="col">Errors</th>
@@ -107,7 +107,7 @@ export function PrefillDetails({ arms, className }: { arms: PrefillArm[]; classN
             <th scope="col">Context</th>
             <th scope="col">Prompt tokens</th>
             <th scope="col" title="prompt tokens ÷ TTFT, median over requests (min–max)">Prefill</th>
-            <th scope="col" title="vLLM: computed prefill tokens ÷ prefill time (no queueing, no cache hits)">Server prefill</th>
+            <th scope="col" title="Engine counters: computed prefill tokens ÷ prefill time (no queueing, no cache hits; vLLM, llama.cpp)">Server prefill</th>
             <th scope="col">TTFT</th>
             <th scope="col">Requests</th>
             <th scope="col">Notes</th>

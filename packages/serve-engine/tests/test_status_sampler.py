@@ -242,7 +242,11 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
         "probe": 1, "version": 1, "hw": 1, "containers": 1, "cluster": 1, "cluster_reused_ps": 0,
         "inspect": 1,
     }
-    assert s.probe() == _probe()
+    # the probe handed to envelopes carries the sample it was taken with (missed-3)
+    ctx = s.probe()
+    assert {k: v for k, v in ctx.items() if k not in ("containers", "inspect", "hardware")} == _probe()
+    assert ctx["containers"] == snap["containers"] and ctx["hardware"] == snap["hardware"]
+    assert ctx["inspect"]["cmd"] == ["--port", "8000"]
 
 
 def test_docker_inspect_runs_once_per_slow_interval_and_on_container_change(monkeypatch):
@@ -606,6 +610,39 @@ def test_version_is_fetched_once_and_again_after_the_container_changes(monkeypat
 
     asyncio.run(go())
     assert calls["version"] == 2
+
+
+def test_version_route_follows_the_detected_engine_not_the_guess(monkeypatch):
+    """An unlabelled container guesses vLLM; once SGLang is detected, its own version route
+    is asked — the guessed route's answer is never shown."""
+    calls: Counter = Counter()
+    _fake_collectors(monkeypatch, calls)
+    monkeypatch.setattr(
+        metadata, "list_vllm_containers",
+        lambda: [{"name": "custom", "status": "Up 2 hours", "image": "my/image:1", "id": "c"}],
+    )
+    asked: list[tuple[str | None, bool]] = []
+
+    async def probe(base_url, timeout=5.0, *, client=None, version=True, engine=None):
+        asked.append((engine, version))
+        v = None
+        if version:
+            v = {"version": "0.5.20"} if engine == "sglang" else {"version": "not-sglang"}
+        return {"base_url": base_url, "healthy": True, "engine": "sglang", "models": [{"id": "m"}],
+                "version": v, "metrics": {}, "error": None}
+
+    monkeypatch.setattr(metadata, "probe_endpoint", probe)
+    s = StatusSampler("http://127.0.0.1:30000", slow_s=1000.0)
+
+    async def go():
+        first = await s.sample()
+        assert first["version"] is None  # the vLLM-route answer is not SGLang's version
+        second = await s.sample()
+        assert second["version"] == {"version": "0.5.20"}
+        await s.sample()
+
+    asyncio.run(go())
+    assert asked == [(None, True), ("sglang", True), ("sglang", False)]
 
 
 def test_a_missed_metrics_scrape_keeps_the_last_gauges_but_no_live_rate(monkeypatch):

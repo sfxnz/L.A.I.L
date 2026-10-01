@@ -1,4 +1,5 @@
 import { config } from "../config";
+import { readServeStatus } from "../streams/probes";
 import { isPlaceholderModel, listServedModelIds, openAiBase, resolveModelId } from "./settings";
 
 const SERVED_TTL_MS = 5000;
@@ -8,9 +9,19 @@ const servedCache = new Map<string, { at: number; ids: string[] }>();
 async function servedIds(base: string): Promise<string[]> {
   const hit = servedCache.get(base);
   if (hit && Date.now() - hit.at < SERVED_TTL_MS) return hit.ids;
-  const ids = await listServedModelIds();
+  const ids = await listServedModelIds(undefined, base);
   servedCache.set(base, { at: Date.now(), ids });
   return ids;
+}
+
+/**
+ * Where /v1 goes: the endpoint the serve-engine detected answering (SGLang on :30000,
+ * llama.cpp on :8080, …), else the configured default backend. The serve-engine answers
+ * from its sampler's cached snapshot, so this is one loopback read per request.
+ */
+async function targetBase(): Promise<string> {
+  const serving = (await readServeStatus())?.serving_base;
+  return serving ? `${serving}/v1` : openAiBase();
 }
 
 /**
@@ -28,8 +39,8 @@ function upstreamHeaders(req: Request): Headers {
 }
 
 export async function proxyOpenAI(req: Request, path: string): Promise<Response> {
-  const targetBase = openAiBase();
-  const url = `${targetBase}${path.startsWith("/") ? path : `/${path}`}${new URL(req.url).search}`;
+  const base = await targetBase();
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}${new URL(req.url).search}`;
 
   // The client's disconnect aborts the upstream request, so vLLM stops generating.
   const init: RequestInit = { method: req.method, headers: upstreamHeaders(req), signal: req.signal };
@@ -43,7 +54,7 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
       try {
         const body = JSON.parse(bodyText) as { model?: string; [k: string]: unknown };
         if (isPlaceholderModel(body.model)) {
-          body.model = await resolveModelId(undefined, await servedIds(targetBase));
+          body.model = await resolveModelId(undefined, await servedIds(base));
           bodyText = JSON.stringify(body);
         }
       } catch {
@@ -61,7 +72,7 @@ export async function proxyOpenAI(req: Request, path: string): Promise<Response>
       {
         error: "backend_unreachable",
         message: e instanceof Error ? e.message : String(e),
-        backend: targetBase,
+        backend: base,
       },
       { status: 502 },
     );

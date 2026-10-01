@@ -1,11 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { serveHealthy, useLabStatusStore } from "@/lib/lab-status-store";
 import { Badge, Btn, Callout, Metric, Panel } from "@/components/ui";
 
 export default function ConnectPage() {
-  const status = useLabStatusStore((s) => s.status);
+  const { healthy, modelId, baseUrl } = useLabStatusStore(
+    useShallow((s) => ({ healthy: serveHealthy(s.status), modelId: s.status?.serve?.model_id ?? null, baseUrl: s.status?.serve?.base_url ?? null })),
+  );
   const [copied, setCopied] = useState<string | null>(null);
   // The page host is browser-only state. Reading window.location during render
   // made the server emit "127.0.0.1" while the client rendered the Tailscale
@@ -16,12 +19,8 @@ export default function ConnectPage() {
     setHost(window.location.hostname || "127.0.0.1");
   }, []);
 
-  const serve = status?.serve;
-  const healthy = serveHealthy(status);
-  const model = serve?.model_id || "auto";
-  const port =
-    (serve?.base_url || "").match(/:(\d+)/)?.[1] ||
-    "8000";
+  const model = modelId || "auto";
+  const port = (baseUrl || "").match(/:(\d+)/)?.[1] || "8000";
 
   const snippets = useMemo(() => {
     const localBase = `http://127.0.0.1:${port}/v1`;
@@ -61,7 +60,7 @@ export default function ConnectPage() {
           <Metric
             label="Status"
             value={healthy ? "Healthy" : "Down"}
-            sub={serve?.base_url || "—"}
+            sub={baseUrl || "—"}
             tone={healthy ? "ok" : "danger"}
           />
         </div>
@@ -73,22 +72,7 @@ export default function ConnectPage() {
           />
         </div>
         <div className="bento-span-4">
-          <Metric
-            label="Headroom"
-            value={
-              serve?.hardware?.available_gib != null
-                ? `${serve.hardware.available_gib} GiB`
-                : "—"
-            }
-            sub={serve?.headroom ? `headroom: ${serve.headroom}` : "MemAvailable (/proc/meminfo) via serve-engine"}
-            tone={
-              serve?.headroom === "critical"
-                ? "danger"
-                : serve?.headroom === "tight"
-                  ? "warn"
-                  : undefined
-            }
-          />
+          <Metric label="Port" value={port} sub="the port the served endpoint answers on" />
         </div>
       </div>
 

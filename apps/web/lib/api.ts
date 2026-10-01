@@ -394,7 +394,6 @@ export const api = {
   serveExamples: () =>
     req<{ examples: Record<string, ServeExample>; presets: string[] }>("/api/serve/examples"),
   stopServe: () => req<{ job_id: string }>("/api/serve/stop", { method: "POST" }),
-  agentRestore: () => req<{ job_id: string }>("/api/serve/agent-restore", { method: "POST" }),
   recommendServe: (model: string, fetchRemote = true) =>
     req<ServeRecommend>(
       `/api/serve/recommend?model=${encodeURIComponent(model)}&fetch_remote=${fetchRemote}`,

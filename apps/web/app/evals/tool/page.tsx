@@ -114,8 +114,8 @@ export default function ToolEvalBoardPage() {
           <Btn variant="secondary" size="sm" onClick={refresh} loading={loading && rows.length > 0}>
             Refresh
           </Btn>
-          <Link href="/server" className={btnClass("secondary", "sm")}>
-            Run on Serve
+          <Link href="/evals#agentic" className={btnClass("secondary", "sm")}>
+            Run a suite
           </Link>
           <Btn
             size="sm"
@@ -307,12 +307,12 @@ export default function ToolEvalBoardPage() {
                 />
               }
               action={
-                <Link href="/server" className={btnClass("primary", "sm")}>
-                  Open Serve → Agentic
+                <Link href="/evals#agentic" className={btnClass("primary", "sm")}>
+                  Run tool-eval-bench
                 </Link>
               }
             >
-              Run tool-eval-bench from Serve when a model is healthy. Results land here score-first.
+              Run tool-eval-bench from Evals when a model is serving. Results land here score-first.
             </EmptyState>
           </Panel>
         </Section>
@@ -718,7 +718,7 @@ export default function ToolEvalBoardPage() {
           <span className="font-[family-name:var(--font-display)] text-[10px] font-semibold uppercase leading-none tracking-[0.16em] tabular-nums text-lab-muted">
             {selectedRows.length < 2
               ? "select 1 more"
-              : `${selectedRows.length} armed · hit compare`}
+              : `${selectedRows.length} selected · compare`}
           </span>
         </div>
       )}

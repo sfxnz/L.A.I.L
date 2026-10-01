@@ -19,6 +19,7 @@ import {
   eyebrowClass,
 } from "@/components/ui";
 import { Absent, Cell, CornerTicks, ScoreGauge, Section, scoreTone } from "@/components/evals/parts";
+import { AgenticPanel } from "@/components/evals/AgenticPanel";
 
 export default function EvalsPage() {
   const { healthy, hasStatus, statusLoading } = useLabStatusStore(
@@ -91,16 +92,12 @@ export default function EvalsPage() {
     <div className="lab-fade-in space-y-6">
       <div className="page-header">
         <div className="min-w-0">
-          <div className="animus-eyebrow mb-1.5 flex items-center gap-2">
-            <span aria-hidden className="h-3 w-px bg-lab-accent" />
-            Bench control
-          </div>
           <h1 className="page-title">Evals</h1>
-          <p className="page-sub">Smoke and tool-eval quality vs the live serve; throughput and latency live on Bench</p>
+          <p className="page-sub">Smoke and tool-calling quality against the live serve; throughput and latency live on Bench</p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing}>
-            Refresh
+          <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing} title="Reload the run log">
+            Reload runs
           </Btn>
           <Link href="/evals/tool" className={btnClass("primary", "sm")}>
             Tool Eval board
@@ -191,7 +188,7 @@ export default function EvalsPage() {
                     <ScoreGauge pct={null} label="Tool-eval score" />
                   </div>
                   <p className="mt-3 text-[12px] leading-snug text-lab-muted">
-                    Run tool-eval from Serve — the verdict lands here score-first.
+                    Run tool-eval-bench below — the verdict lands here score-first.
                   </p>
                 </>
               )}
@@ -252,7 +249,7 @@ export default function EvalsPage() {
           label="Instruments"
           meta={
             <Eyebrow className="tracking-[0.18em]">
-              {healthy ? "armed" : "locked · start a model"}
+              {healthy ? "ready" : "start a model first"}
             </Eyebrow>
           }>
 
@@ -306,6 +303,11 @@ export default function EvalsPage() {
             </div>
           </Panel>
         </div>
+      </Section>
+
+      {/* ── Tool calling ─────────────────────────────────────────────────── */}
+      <Section id="agentic" className="lab-rise lab-rise-2 scroll-mt-4 space-y-3" label="Tool calling">
+        <AgenticPanel healthy={healthy} onFinished={() => void loadRuns()} />
       </Section>
 
       {/* ── Run log ──────────────────────────────────────────────────────── */}

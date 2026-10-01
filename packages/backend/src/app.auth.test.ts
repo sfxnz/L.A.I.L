@@ -10,9 +10,9 @@ describe("LAIL_TOKEN middleware", () => {
       const app = createApp();
       const health = await app.request("/api/health");
       expect(health.status).toBe(200);
-      const denied = await app.request("/api/bootstrap");
+      const denied = await app.request("/api/configure");
       expect(denied.status).toBe(401);
-      const ok = await app.request("/api/bootstrap", {
+      const ok = await app.request("/api/configure", {
         headers: { "x-lail-token": "secret" },
       });
       expect(ok.status).toBe(200);
@@ -26,7 +26,7 @@ describe("LAIL_TOKEN middleware", () => {
     config.token = "secret";
     try {
       const app = createApp();
-      const viaQuery = await app.request("/api/bootstrap?token=secret");
+      const viaQuery = await app.request("/api/configure?token=secret");
       expect(viaQuery.status).toBe(401);
     } finally {
       config.token = prev;

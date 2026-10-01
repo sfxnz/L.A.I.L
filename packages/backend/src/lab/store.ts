@@ -493,24 +493,3 @@ function mimeFor(path: string): string {
   };
   return map[e] || "application/octet-stream";
 }
-
-/** Seed gallery from demo HTML if empty */
-export function ensureDemoLabRuns(): void {
-  if (listLabRuns(1).length > 0) return;
-  const demo = join(config.workspacesDir, "demo", "geometry-dash-like.html");
-  if (!existsSync(demo)) return;
-  try {
-    importLabRun({
-      title: "Geometry Dash–like runner",
-      task_type: "html-game",
-      model_id: "demo/seed",
-      from: demo,
-      tags: ["html", "game", "self-contained", "seed"],
-      brief:
-        "Self-contained HTML game (seed). Replace with Hermes-built runs via lail_lab_publish.",
-      hermes: { source: "seed" },
-    });
-  } catch {
-    /* ignore seed failures */
-  }
-}

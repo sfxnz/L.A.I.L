@@ -60,7 +60,7 @@ describe("allowQueryToken / public paths / CORS", () => {
     expect(allowQueryToken("/api/streams/runs/abc/stop")).toBe(false);
     expect(allowQueryToken("/api/streams/runs")).toBe(false);
     expect(allowQueryToken("/api/serve/start")).toBe(false);
-    expect(allowQueryToken("/api/bootstrap")).toBe(false);
+    expect(allowQueryToken("/api/configure")).toBe(false);
   });
 
   test("public share GETs are unauthed", () => {

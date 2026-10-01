@@ -27,6 +27,14 @@ const nextConfig: NextConfig = {
   // the same URL fine. Next has no per-route compression switch, so turn the
   // dev proxy's compression off; the controller never gzips these itself.
   compress: false,
+  // Retired pages: keep old bookmarks landing somewhere live.
+  async redirects() {
+    return [
+      { source: "/workbench", destination: "/status", permanent: false },
+      { source: "/integrations", destination: "/connect", permanent: false },
+      { source: "/models", destination: "/server", permanent: false },
+    ];
+  },
   async rewrites() {
     return [
       { source: "/api/:path*", destination: `${api}/api/:path*` },

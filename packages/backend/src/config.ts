@@ -17,7 +17,6 @@ export const config = {
   serveEngineUrl: process.env.LAIL_SERVE_ENGINE_URL || `http://127.0.0.1:${process.env.LAIL_SERVE_ENGINE_PORT || 8765}`,
   root,
   dataDir: resolve(process.env.LAIL_DATA_DIR || join(root, "data")),
-  workspacesDir: resolve(process.env.LAIL_WORKSPACES_DIR || join(root, "workspaces")),
   dbPath: resolve(
     process.env.LAIL_DB_PATH ||
       join(process.env.LAIL_DATA_DIR || join(root, "data"), "lail.sqlite"),
@@ -36,7 +35,6 @@ export const config = {
       label: "llama.cpp",
     },
   },
-  hfToken: process.env.HF_TOKEN || "",
   /** Internet Funnel origin (legacy) — prefer shareSiteBase for X */
   sharePublicBase: (process.env.LAIL_SHARE_PUBLIC_BASE || "").replace(/\/$/, ""),
   /** GitHub Pages / static site origin, e.g. https://user.github.io/dgx-lab */

@@ -23,10 +23,8 @@ services:
       LAIL_VLLM_URL: http://host.docker.internal:8000
       LAIL_LLAMACPP_URL: http://host.docker.internal:8080
       LAIL_DATA_DIR: /data
-      LAIL_WORKSPACES_DIR: /workspaces
     volumes:
       - lail-data:/data
-      - ./workspaces:/workspaces
     depends_on:
       - serve-engine
     extra_hosts:
@@ -64,7 +62,6 @@ services:
     environment:
       LAIL_API_URL: http://api:8787
       NEXT_PUBLIC_LAIL_API: http://localhost:8787
-      NEXT_PUBLIC_LAIL_WS: ws://localhost:8787/ws
     depends_on:
       - api
 

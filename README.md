@@ -19,12 +19,11 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 |------|------|------|
 | **Status** | `/status` | Health, headroom, containers, recent runs |
 | **Serve** | `/server` | Manual flags, auto-config, start/stop, job logs |
-| **Models** | `/models` | Hugging Face search + local `/v1/models` |
 | **Evals** | `/evals` | Smoke + perf jobs + run history |
 | **Connect** | `/connect` | Hermes / OpenAI base URL snippets |
 | **Configure** | `/configure` | Default backend / model |
 
-`/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench` is a retirement notice — Hermes is the agent. `/integrations` is not shipped.
+`/` redirects to **Status** (`apps/web/app/page.tsx`). `/workbench`, `/integrations` and `/models` are retired and redirect to live pages — Hermes is the agent; Serve’s “Download weights first” fetches into the HF cache.
 
 ## Architecture
 
@@ -96,7 +95,6 @@ Open http://127.0.0.1:3000 — **`/` redirects to Status**.
 | Web (Status) | http://127.0.0.1:3000 |
 | Controller | http://127.0.0.1:8787 |
 | Serve-engine | http://127.0.0.1:8765 |
-| WebSocket | derived from the page host (controller `/ws`) |
 
 ### Linux + NVIDIA / DGX Spark
 
@@ -170,7 +168,7 @@ See [`.env.example`](./.env.example).
 | `LAIL_LLAMACPP_URL` | Default `http://127.0.0.1:8080` |
 | `LAIL_DEFAULT_MODEL` | Served model id, or `auto` |
 | `LAIL_API_PORT` / `LAIL_WEB_PORT` / `LAIL_SERVE_ENGINE_PORT` | Ports |
-| `LAIL_DATA_DIR` / `LAIL_WORKSPACES_DIR` | Data + project roots |
+| `LAIL_DATA_DIR` | Data root (sqlite, lab runs) |
 | `HF_TOKEN` | Optional gated HF access |
 | `LAIL_CLUSTER_JSON` | Optional pin. Unset = this host + live RoCE peers. See `.env.example` |
 | `LAIL_HOST` | Bind address. Default `127.0.0.1`. Off-loopback requires `LAIL_TOKEN` |
@@ -180,18 +178,18 @@ See [`.env.example`](./.env.example).
 
 ## Retired: Workbench
 
-`/workbench` is not the landing page. It shows a retirement notice pointing at Hermes. Plan / Ask / Agent live in Hermes against the served `:8000` endpoint, not in this console.
+`/workbench` redirects to Status; its controller backend (workspaces, sessions, agent runs, patches) is gone. Plan / Ask / Agent live in Hermes against the served `:8000` endpoint, not in this console.
 
 ## Monorepo layout
 
 ```text
 lail/
   apps/web/                 Next.js UI (Status, Serve, Evals, Connect, …)
-    lib/ide-chrome.ts       Top-nav + stream chrome contract (tested)
-  packages/backend/         Bun LabController + agent + proxy
+    lib/ide-chrome.ts       Top-nav contract (tested)
+  packages/backend/         Bun LabController + proxies + streams
   packages/serve-engine/    Python vLLM serve/bench API (install from pyproject.toml)
   packages/shared/          Shared TS types
-  workspaces/demo/          Default workspace root
+  workspaces/demo/          Example artifacts (lab gallery import sample)
   data/                     sqlite, runs/, models/ (gitignored runtime state)
   scripts/dev.ts            One-command: serve-engine + API + web
   docker-compose.yml

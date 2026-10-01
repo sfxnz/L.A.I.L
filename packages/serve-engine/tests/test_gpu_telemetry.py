@@ -1,7 +1,7 @@
 """GPU probe parse and Spark node payload — shipped helpers only."""
 from __future__ import annotations
 
-from app.services import cluster, metadata
+from app.services import cluster, metadata, node_probe
 
 
 def test_parse_gpu_telemetry_reads_temp_usage_power():
@@ -61,89 +61,108 @@ def test_node_payload_nil_when_smi_returns_nothing():
     assert 0 not in (node["temperature_c"], node["gpu_util_pct"], node["power_w"])
 
 
-def test_attach_live_rates_only_on_in_use_sparks():
-    info = {
-        "nodes": [
-            {"id": "a", "state": "serving"},
-            {"id": "b", "state": "serving_worker"},
-            {"id": "c", "state": "idle"},
-        ]
+def test_apply_telemetry_copies_the_whole_live_set_including_nulls():
+    node = {"id": "spark2", "power_w": 7.0, "available_gib": 18.0, "sampled_at": 1}
+    cluster.apply_telemetry(node, {"power_w": 13.3, "soc_temp_c": 44.7, "sampled_at": 2})
+    assert node["power_w"] == 13.3 and node["soc_temp_c"] == 44.7 and node["sampled_at"] == 2
+    # a field the new sample lacks is cleared, not left over from an older reading
+    assert node["available_gib"] is None
+    assert set(cluster.TELEMETRY_FIELDS) <= set(node)
+
+
+# ─── node_probe: the one probe that runs locally and on every remote ──────────
+
+_MEMINFO = """\
+MemTotal:       127600752 kB
+MemFree:         6291456 kB
+MemAvailable:   13945856 kB
+SwapTotal:      16777212 kB
+SwapFree:        8290872 kB
+"""
+
+
+def test_meminfo_is_kb_precise_not_floored_like_free_g():
+    m = node_probe.parse_meminfo(_MEMINFO)
+    # `free -g` said 13 for this box; MemAvailable is 13.30 GiB
+    assert m["available_gib"] == 13.3
+    assert m["ram_gib"] == 121.7  # one decimal: placement input, unchanged
+    assert m["swap_total_gib"] == 16.0
+    assert m["swap_used_gib"] == 8.09
+    assert node_probe.parse_meminfo("") == {
+        "ram_gib": None, "available_gib": None, "swap_total_gib": None, "swap_used_gib": None,
     }
-    cluster.attach_live_rates(
-        info, {"gen_tok_per_s": 41.2, "prompt_tok_per_s": 210.0}
+
+
+def test_engine_reservation_from_compute_apps():
+    # GB10: memory.used is [N/A] but the vLLM process reservation is reported per process
+    assert node_probe.parse_compute_apps("1090685, 94103\n") == 91.9
+    assert node_probe.parse_compute_apps("1, 1024\n2, 2048\n") == 3.0
+    assert node_probe.parse_compute_apps("") == 0.0  # GPU present, nothing running
+    assert node_probe.parse_compute_apps(None) is None  # nvidia-smi failed
+
+
+def test_cpu_util_from_proc_stat_deltas():
+    a = node_probe.parse_cpu_times("cpu  100 0 100 700 100 0 0 0 0 0\ncpu0 1 2 3 4\n")
+    b = node_probe.parse_cpu_times("cpu  200 0 200 800 100 0 0 0 0 0\n")
+    assert a == (200.0, 1000.0)
+    assert node_probe.cpu_util_pct(a, b) == 66.7  # 200 busy of 300 jiffies
+    assert node_probe.cpu_util_pct(None, b) is None
+    assert node_probe.cpu_util_pct(b, b) is None
+
+
+def test_psi_full_avg10():
+    text = "some avg10=0.40 avg60=0.04 avg300=0.03 total=1\nfull avg10=0.25 avg60=0.04 avg300=0.03 total=1\n"
+    assert node_probe.parse_psi_full_avg10(text) == 0.25
+    assert node_probe.parse_psi_full_avg10(None) is None
+
+
+def test_hwmon_temps_soc_nvme_nic(tmp_path):
+    def mk(name, temps, labels=None):
+        d = tmp_path / f"hwmon{len(list(tmp_path.iterdir()))}"
+        d.mkdir()
+        (d / "name").write_text(name + "\n")
+        for i, t in enumerate(temps, 1):
+            (d / f"temp{i}_input").write_text(f"{t}\n")
+            if labels:
+                (d / f"temp{i}_label").write_text(labels[i - 1] + "\n")
+
+    mk("acpitz", [46800, 44200, 47800])
+    mk("nvme", [43850, 60850], ["Composite", "Sensor 1"])
+    mk("mlx5", [51000])
+    mk("mlx5", [52000])
+    mk("mt7925_phy0", [43000])
+    assert node_probe.read_temps(str(tmp_path)) == {"soc_temp_c": 47.8, "nvme_temp_c": 43.9, "nic_temp_c": 52.0}
+    assert node_probe.read_temps(str(tmp_path / "missing")) == {
+        "soc_temp_c": None, "nvme_temp_c": None, "nic_temp_c": None,
+    }
+
+
+def test_cpu_model_from_lscpu_big_little():
+    text = (
+        "Architecture: aarch64\nModel name: Cortex-X925\nCore(s) per socket: 10\nSocket(s): 1\n"
+        "Model name: Cortex-A725\nCore(s) per socket: 10\nSocket(s): 1\n"
     )
-    assert info["nodes"][0]["gen_tok_per_s"] == 41.2
-    assert info["nodes"][0]["prompt_tok_per_s"] == 210.0
-    assert info["nodes"][1]["gen_tok_per_s"] == 41.2
-    assert info["nodes"][2]["gen_tok_per_s"] is None
-    assert info["nodes"][2]["prompt_tok_per_s"] is None
+    assert node_probe.parse_lscpu(text) == "10× Cortex-X925 + 10× Cortex-A725"
+    assert node_probe.parse_lscpu("Model name: AMD EPYC 9654\nCore(s) per socket: 96\n") == "AMD EPYC 9654"
+    assert node_probe.parse_lscpu("") is None
 
 
-def test_attach_live_rates_missing_metrics_are_nil_not_zero():
-    info = {"nodes": [{"id": "a", "state": "serving"}]}
-    cluster.attach_live_rates(info, {})
-    assert info["nodes"][0]["gen_tok_per_s"] is None
-    assert info["nodes"][0]["prompt_tok_per_s"] is None
-
-
-def test_remote_probe_script_emits_temp_and_usage(monkeypatch):
-    import io
-    import urllib.request
-
-    def fake_check_output(cmd, text=True, stderr=None, timeout=8):
-        if cmd[0] == "nvidia-smi":
-            return "NVIDIA GB10, 52, 91, 44.2, 1024, [N/A]\n"
-        if cmd[:2] == ["docker", "ps"]:
-            return ""
-        if cmd[0] == "free":
-            return (
-                "              total        used        free      shared  buff/cache   available\n"
-                "Mem:            120          10          20           0          90          80\n"
-            )
-        return ""
-
-    class FakeResp:
-        def __init__(self, body: bytes):
-            self._body = body
-
-        def read(self):
-            return self._body
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def fake_urlopen(url, timeout=2.5):
-        return FakeResp(b'{"data": []}')
-
-    monkeypatch.setattr(cluster.subprocess, "check_output", fake_check_output)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    real_open = open
-
-    def fake_open(path, *a, **kw):
-        p = str(path)
-        if p == "/proc/meminfo":
-            return io.StringIO("MemTotal:       126000000 kB\n")
-        if "/sys/class/net/" in p:
-            raise FileNotFoundError(p)
-        return real_open(path, *a, **kw)
-
-    monkeypatch.setattr("builtins.open", fake_open)
-    script = cluster._remote_probe_script(
-        {"qsfp_if": "", "vllm_url": "http://127.0.0.1:8000"}
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr("sys.stdout", buf)
-    exec(compile(script, "<remote-probe>", "exec"), {})
-    import json
-
-    data = json.loads(buf.getvalue().strip().splitlines()[-1])
-    node = cluster.apply_gpu_telemetry({}, data)
-    assert node["temperature_c"] == 52
-    assert node["gpu_util_pct"] == 91
-    assert node["power_w"] == 44.2
-    # remote probe now ships memory.used/total too; N/A stays null
-    assert node["gpu_mem_used_gib"] == 1.0
-    assert node["gpu_mem_total_gib"] is None
+def test_telemetry_sample_shape(monkeypatch):
+    outputs = {
+        "--query-gpu": "NVIDIA GB10, 43, 7, 9.08, [N/A], [N/A]\n",
+        "--query-compute-apps": "1090685, 94103\n",
+    }
+    monkeypatch.setattr(node_probe, "run", lambda cmd, timeout=8: next(v for k, v in outputs.items() if cmd[1].startswith(k)))
+    files = {"/proc/meminfo": _MEMINFO, "/proc/stat": "cpu  1 0 1 8 0 0 0 0\n", "/proc/pressure/memory": "full avg10=0.00 x\n"}
+    monkeypatch.setattr(node_probe, "_read", lambda p: files.get(p))
+    monkeypatch.setattr(node_probe, "read_temps", lambda: {"soc_temp_c": 46.8, "nvme_temp_c": 43.9, "nic_temp_c": 51.0})
+    tel = node_probe.Telemetry()
+    first = tel.sample()
+    files["/proc/stat"] = "cpu  6 0 1 13 0 0 0 0\n"
+    second = tel.sample()
+    assert first["cpu_util_pct"] is None and second["cpu_util_pct"] == 50.0
+    assert second["gpu_sku"] == "NVIDIA GB10" and second["power_w"] == 9.08 and second["memory_used_mib"] is None
+    assert second["engine_reserved_gib"] == 91.9
+    assert second["available_gib"] == 13.3 and second["swap_used_gib"] == 8.09
+    assert second["soc_temp_c"] == 46.8 and isinstance(second["sampled_at"], int)
+    assert set(cluster.TELEMETRY_FIELDS) <= set(second)

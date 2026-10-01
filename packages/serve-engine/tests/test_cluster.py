@@ -6,7 +6,7 @@ import json
 import pytest
 
 from app.services import autoconfig as ac
-from app.services import cluster, metadata
+from app.services import cluster, metadata, node_probe
 from app.services.autoconfig import plan_placement
 
 
@@ -14,7 +14,8 @@ def test_glm_flash_container_counts_as_a_serve():
     assert metadata.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
     assert metadata.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
     assert not metadata.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
-    assert "glm" in cluster._REMOTE_PROBE_PY
+    # one container filter for local and remote (the remote runs node_probe itself)
+    assert metadata.is_serve_container is node_probe.is_serve_container
     assert cluster._container_serve_family("glm53-flash-nvfp4") == "glm53-flash-nvfp4"
     head = {
         "tensor_parallel_size": 2,
@@ -108,7 +109,7 @@ def _install_probes(monkeypatch, *, remote_online: bool = False):
     def fake_local(node, base_url=None):
         return _probed(node, local=True, online=True)
 
-    def fake_remote(node):
+    def fake_remote(node, ping_targets=None):
         remote_calls.append(node)
         return _probed(node, local=False, online=remote_online)
 
@@ -345,9 +346,10 @@ def test_unrelated_up_container_is_not_serving_worker():
         "containers": [{"name": "backup-dspark-1", "status": "Up 2 days"}],
     }
     assert cluster._multinode_worker_rank(leftover) is None
-    assert cluster._node_state(leftover) == "loading"
+    # Up for days with no endpoint and no TP role: a stray, not "loading" forever
+    assert cluster._node_state(leftover) == "stray"
     summary = cluster._summarize([head, leftover], {"ok": True})
-    assert leftover["state"] == "loading"
+    assert leftover["state"] == "stray"
     assert leftover.get("model_id") is None
     assert summary["nodes_serving"] == 1
     assert summary["multi"]["mode"] == "multi_partial" or summary["multi"]["mode"] == "single"
@@ -378,62 +380,62 @@ def test_leftover_higher_dspark_rank_not_attributed():
 
 
 def test_candidate_vllm_ports_prefers_discovered_over_configured_8000():
-    ports = cluster._candidate_vllm_ports(
+    ports = node_probe.candidate_ports(
         "http://127.0.0.1:8000",
         [{"ports": [8888]}],
     )
     assert ports[0] == 8888
     assert 8000 in ports
     # Official path: discovered 8000 stays first.
-    ports_official = cluster._candidate_vllm_ports(
+    ports_official = node_probe.candidate_ports(
         "http://127.0.0.1:8000",
         [{"ports": [8000]}],
     )
     assert ports_official[0] == 8000
-    ports2 = cluster._candidate_vllm_ports(None, [{"ports": [8888]}])
+    ports2 = node_probe.candidate_ports(None, [{"ports": [8888]}])
     assert ports2[0] == 8888
     assert 8000 in ports2
+
+
+class _FakeResp:
+    def __init__(self, body: dict):
+        self._body = json.dumps(body).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_urlopen(monkeypatch, served: dict[int, str], calls: list[str] | None = None):
+    import urllib.error
+    import urllib.request
+
+    def urlopen(url, timeout=2.5):
+        if calls is not None:
+            calls.append(str(url))
+        for port, model in served.items():
+            if str(url).startswith(f"http://127.0.0.1:{port}/"):
+                return _FakeResp({"data": [{"id": model}]})
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
 
 
 def test_live_8888_beats_stale_healthy_8000(monkeypatch):
     """Discovered :8888 must win even when a leftover :8000 also returns /v1/models."""
     calls: list[str] = []
-
-    class FakeResp:
-        def __init__(self, code, body):
-            self.status_code = code
-            self._body = body
-
-        def json(self):
-            return self._body
-
-    class FakeClient:
-        def __init__(self, timeout=2.5):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def get(self, url):
-            calls.append(url)
-            if url.endswith(":8888/v1/models"):
-                return FakeResp(200, {"data": [{"id": "org/live-on-8888"}]})
-            if url.endswith(":8000/v1/models"):
-                return FakeResp(200, {"data": [{"id": "org/stale-on-8000"}]})
-            raise ConnectionError("refused")
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    ports = cluster._candidate_vllm_ports(
+    _fake_urlopen(monkeypatch, {8888: "org/live-on-8888", 8000: "org/stale-on-8000"}, calls)
+    ports = node_probe.candidate_ports(
         "http://127.0.0.1:8000",
         [{"name": "deepseek-v4-flash-vllm-dspark-0", "ports": [8888]}],
     )
     assert ports[0] == 8888
-    out = cluster._probe_models_on_ports(ports, fallback_url="http://127.0.0.1:8000")
+    out = node_probe.probe_models(ports, fallback_url="http://127.0.0.1:8000")
     assert out["healthy"] is True
     assert out["model_id"] == "org/live-on-8888"
     assert out["vllm_url"] == "http://127.0.0.1:8888"
@@ -441,37 +443,12 @@ def test_live_8888_beats_stale_healthy_8000(monkeypatch):
 
 
 def test_official_spark_vllm_8000_still_selected(monkeypatch):
-    class FakeResp:
-        def __init__(self, code, body):
-            self.status_code = code
-            self._body = body
-
-        def json(self):
-            return self._body
-
-    class FakeClient:
-        def __init__(self, timeout=2.5):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def get(self, url):
-            if url.endswith(":8000/v1/models"):
-                return FakeResp(200, {"data": [{"id": "org/official"}]})
-            raise ConnectionError("refused")
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    ports = cluster._candidate_vllm_ports(
+    _fake_urlopen(monkeypatch, {8000: "org/official"})
+    ports = node_probe.candidate_ports(
         "http://127.0.0.1:8000",
         [{"name": "spark-vllm-n0", "ports": [8000]}],
     )
-    out = cluster._probe_models_on_ports(ports)
+    out = node_probe.probe_models(ports)
     assert out["model_id"] == "org/official"
     assert out["vllm_url"] == "http://127.0.0.1:8000"
 
@@ -537,95 +514,74 @@ def test_official_and_dspark_status_summaries_both_serving():
     assert s2["multi"]["model_id"] == "org/dspark"
 
 
-def test_remote_probe_script_exec_prefers_discovered_8888(monkeypatch):
-    """Execute _REMOTE_PROBE_PY so the embedded port loop cannot drift from local order."""
-    import io
-    import urllib.error
-    import urllib.request
+_INSPECT_DSPARK = json.dumps(
+    [
+        {
+            "Name": "/deepseek-v4-flash-vllm-dspark-0",
+            "Config": {
+                "Cmd": ["vllm", "serve", "m", "--port", "8888", "--host", "0.0.0.0", "--tensor-parallel-size", "2"],
+                "Env": ["NODE_RANK=0", "HF_TOKEN=hf_secret"],
+            },
+            "Args": [],
+            "State": {"StartedAt": "2026-09-30T23:10:33.062542994Z"},
+            "NetworkSettings": {"Ports": {"8888/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8888"}]}},
+            "HostConfig": {"PortBindings": {}, "NetworkMode": "bridge"},
+        }
+    ]
+)
 
-    inspect_json = json.dumps(
-        [
-            {
-                "Config": {
-                    "Cmd": ["vllm", "serve", "m", "--port", "8888", "--host", "0.0.0.0"],
-                    "Env": ["NODE_RANK=0"],
-                    "Args": [],
-                },
-                "Args": [],
-                "NetworkSettings": {
-                    "Ports": {"8888/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8888"}]}
-                },
-                "HostConfig": {"PortBindings": {}, "NetworkMode": "bridge"},
-            }
-        ]
-    )
 
-    def fake_check_output(cmd, text=True, stderr=None, timeout=8):
+def test_inventory_prefers_discovered_8888_and_ships_a_lean_container(monkeypatch):
+    """The same inventory runs locally and (piped over ssh) on every remote node."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, timeout=8):
+        calls.append(cmd)
         if cmd[:2] == ["docker", "ps"]:
-            return "deepseek-v4-flash-vllm-dspark-0\tUp 5 minutes\tghcr.io/anemll/dspark-vllm-gx10:0.1.1\n"
+            return (
+                "deepseek-v4-flash-vllm-dspark-0\tUp 5 minutes\tghcr.io/anemll/dspark-vllm-gx10:0.1.1\tabc\n"
+                "conduit\tUp 11 days\tmatrixconduit/matrix-conduit:latest\tdef\n"
+            )
         if cmd[:2] == ["docker", "inspect"]:
-            return inspect_json
-        if cmd[0] == "nvidia-smi":
-            return "NVIDIA GB10, 128288 MiB\n"
-        if cmd[0] == "free":
-            return "              total        used        free      shared  buff/cache   available\nMem:            120          10          20           0          90          80\n"
+            return _INSPECT_DSPARK
+        if cmd[0] == "ip":
+            return (
+                "2: eno1    inet 192.168.10.4/24 brd 192.168.10.255 scope global eno1\n"
+                "4: roce0    inet 192.0.2.1/24 brd 192.0.2.255 scope global roce0\n"
+                "6: roce1    inet 198.51.100.1/24 brd 198.51.100.255 scope global roce1\n"
+            )
         if cmd[0] == "ibdev2netdev":
-            return ""
-        if cmd[0] == "tailscale":
-            return ""
-        return ""
+            return "r0 port 1 ==> roce0 (Up)\nr1 port 1 ==> roce1 (Up)\nr2 port 1 ==> roce2 (Down)\n"
+        if cmd[0] == "lscpu":
+            return "Model name: Cortex-X925\n"
+        return None
 
     probed: list[str] = []
+    _fake_urlopen(monkeypatch, {8888: "org/live-8888", 8000: "org/stale-8000"}, probed)
+    monkeypatch.setattr(node_probe, "run", fake_run)
+    monkeypatch.setattr(node_probe, "_sys_int", lambda iface, key: {"carrier": 1, "speed": 200000}[key])
+    monkeypatch.setattr(node_probe, "ping", lambda ip, timeout_s=1.0: {"ok": ip == "192.0.2.8", "rtt_ms": 0.4, "error": None})
 
-    class FakeResp:
-        def __init__(self, body: bytes):
-            self._body = body
-
-        def read(self):
-            return self._body
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def fake_urlopen(url, timeout=2.5):
-        probed.append(str(url))
-        if str(url).startswith("http://127.0.0.1:8888/"):
-            return FakeResp(json.dumps({"data": [{"id": "org/live-8888"}]}).encode())
-        if str(url).startswith("http://127.0.0.1:8000/"):
-            return FakeResp(json.dumps({"data": [{"id": "org/stale-8000"}]}).encode())
-        raise urllib.error.URLError("refused")
-
-    monkeypatch.setattr(cluster.subprocess, "check_output", fake_check_output)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    # meminfo / carrier opens inside the script — tolerate missing paths.
-    real_open = open
-
-    def fake_open(path, *a, **kw):
-        p = str(path)
-        if p == "/proc/meminfo":
-            return io.StringIO("MemTotal:       126000000 kB\n")
-        if "/sys/class/net/" in p:
-            raise FileNotFoundError(p)
-        return real_open(path, *a, **kw)
-
-    monkeypatch.setattr("builtins.open", fake_open)
-
-    script = cluster._remote_probe_script(
-        {"qsfp_if": "", "vllm_url": "http://127.0.0.1:8000"}
-    )
-    buf = io.StringIO()
-    monkeypatch.setattr("sys.stdout", buf)
-    exec(compile(script, "<remote-probe>", "exec"), {})
-    data = json.loads(buf.getvalue().strip().splitlines()[-1])
+    node_probe.cpu_model.cache_clear()
+    data = node_probe.inventory("", "http://127.0.0.1:8000", ["192.0.2.8", "192.0.2.9"])
     assert data["endpoint_healthy"] is True
     assert data["model_id"] == "org/live-8888"
     assert data["vllm_url"] == "http://127.0.0.1:8888"
     assert probed[0].startswith("http://127.0.0.1:8888/")
-    assert data["containers"][0]["ports"] == [8888]
+    assert [c["name"] for c in data["containers"]] == ["deepseek-v4-flash-vllm-dspark-0"]
+    c = data["containers"][0]
+    assert c["ports"] == [8888] and c["node_rank"] == 0 and c["headless"] is False
+    assert c["tensor_parallel_size"] == 2 and data["tensor_parallel_size"] == 2
+    assert "cmd_blob" not in c and "hf_secret" not in json.dumps(data)
+    # ONE docker inspect for all serve containers, not one per container
+    assert sum(1 for cmd in calls if cmd[:2] == ["docker", "inspect"]) == 1
+    # both RoCE rails, with addresses; the LAN is the non-rail interface
+    assert [(r["if"], r["ip"]) for r in data["rails"]] == [("roce0", "192.0.2.1"), ("roce1", "198.51.100.1")]
+    assert data["qsfp_if"] == "roce0" and data["qsfp_ip"] == "192.0.2.1"
+    assert data["lan_ip"] == "192.168.10.4"
+    assert data["pings"]["192.0.2.8"]["ok"] is True and data["pings"]["192.0.2.9"]["ok"] is False
+    assert data["cpu"] == "Cortex-X925"
+    node_probe.cpu_model.cache_clear()
 
 
 def test_invalid_cluster_json_falls_back_to_local(isolated_cluster, monkeypatch):
@@ -716,25 +672,26 @@ _NEIGH_SAMPLE = """\
 
 
 def test_parse_live_net_from_proc_text():
-    addrs = cluster._parse_ip_addrs(_ADDR_SAMPLE)
-    assert ("eno1", "192.168.10.4") in addrs
-    assert ("roce0", "192.0.2.1") in addrs
-    assert ("lo", "127.0.0.1") in addrs
-    assert cluster._parse_roce_up(_IB_SAMPLE) == ["roce0"]
+    addrs = node_probe.parse_ip_cidrs(_ADDR_SAMPLE)
+    assert ("eno1", "192.168.10.4", 24) in addrs
+    assert ("roce0", "192.0.2.1", 24) in addrs
+    assert ("lo", "127.0.0.1", 8) in addrs
+    assert node_probe.parse_roce_up(_IB_SAMPLE) == ["roce0"]
     assert cluster._parse_neigh(_NEIGH_SAMPLE) == ["192.0.2.8"]
 
 
 def test_detect_local_net_uses_roce_and_lan(monkeypatch):
-    def fake_run(cmd, timeout=12):
-        if cmd[:3] == ["ip", "-4", "-o"] or (len(cmd) >= 3 and cmd[0] == "ip" and "-o" in cmd):
-            return 0, _ADDR_SAMPLE, ""
+    def fake_run(cmd, timeout=8):
+        if cmd[0] == "ip" and "-o" in cmd:
+            return _ADDR_SAMPLE
         if cmd[0] == "ibdev2netdev":
-            return 0, _IB_SAMPLE, ""
+            return _IB_SAMPLE
         if cmd[0] == "tailscale":
-            return 0, "100.64.0.5\n", ""
-        return 1, "", "no"
+            return "100.64.0.5\n"
+        return None
 
-    monkeypatch.setattr(cluster, "_run", fake_run)
+    monkeypatch.setattr(node_probe, "run", fake_run)
+    monkeypatch.setattr(node_probe, "_sys_int", lambda iface, key: None)
     net = cluster._detect_local_net()
     assert net["lan_ip"] == "192.168.10.4"
     assert net["qsfp_if"] == "roce0"
@@ -843,3 +800,233 @@ def test_default_cluster_is_probed_host_plus_roce_peer(monkeypatch, tmp_path):
     blob = json.dumps(cfg).lower()
     for bad in _BANNED_DEFAULTS:
         assert bad.lower() not in blob
+
+
+# ─── states: offline vs unreachable, loading vs stray, TP role ────────────────
+
+
+def test_down_host_is_offline_but_a_pinging_host_with_broken_ssh_is_unreachable():
+    down = {"id": "w", "online": False, "ping": {"via": "qsfp_ip", "ip": "192.0.2.8", "ok": False}}
+    broken_ssh = {"id": "w", "online": False, "ping": {"via": "qsfp_ip", "ip": "192.0.2.8", "ok": True}}
+    assert cluster._node_state(down) == "offline"
+    assert cluster._node_state(broken_ssh) == "unreachable"
+    assert cluster._node_state({"id": "w", "online": False}) == "offline"
+    head = {"id": "h", "local": True, "online": True}
+    summary = cluster._summarize([head, broken_ssh], {"ok": True, "links": []})
+    assert summary["nodes_online"] == 1 and summary["cluster_reachable"] is False
+
+
+@pytest.mark.parametrize(
+    "status,age",
+    [
+        ("Up 5 seconds", 5),
+        ("Up Less than a second", 0.5),
+        ("Up About a minute", 60),
+        ("Up 12 minutes", 720),
+        ("Up About an hour", 3600),
+        ("Up 9 hours (healthy)", 32400),
+        ("Up 2 days", 172800),
+        ("Up", None),
+        ("Exited (137) 8 days ago", None),
+    ],
+)
+def test_container_age_from_docker_status(status, age):
+    assert cluster._container_age_s(status) == age
+
+
+def test_young_container_is_loading_old_one_is_stray():
+    young = {"id": "w", "online": True, "containers": [{"name": "spark-vllm", "status": "Up 3 minutes"}]}
+    old = {"id": "w", "online": True, "containers": [{"name": "spark-vllm", "status": "Up 2 hours"}]}
+    unknown = {"id": "w", "online": True, "containers": [{"name": "spark-vllm", "status": "Up"}]}
+    assert cluster._node_state(young) == "loading"
+    assert cluster._node_state(old) == "stray"
+    assert cluster._node_state(unknown) == "loading"
+
+
+def test_tp_role_replaces_the_copied_endpoint_rate():
+    head = {
+        "id": "spark1", "local": True, "online": True, "endpoint_healthy": True, "model_id": "org/m",
+        "containers": [{"name": "spark-vllm-n0", "status": "Up 3 minutes"}], "tensor_parallel_size": 2,
+    }
+    worker = {"id": "spark2", "online": True, "containers": [{"name": "spark-vllm-n1", "status": "Up 3 minutes"}]}
+    idle = {"id": "spark3", "online": True, "containers": []}
+    cluster._summarize([head, worker, idle], {"ok": True})
+    assert (head["tp_rank"], worker["tp_rank"], idle["tp_rank"]) == (0, 1, None)
+    for n in (head, worker, idle):
+        assert "gen_tok_per_s" not in n
+
+
+# ─── fabric: every rail, reachability ping reused, remote ↔ remote ────────────
+
+
+def _rails(*ips: str) -> list[dict]:
+    return [
+        {"if": f"roce{i}", "ip": ip, "prefix": 24, "carrier": 1, "speed_mbps": 200000}
+        for i, ip in enumerate(ips)
+    ]
+
+
+def test_fabric_has_one_link_per_rail_and_reuses_the_reachability_ping(monkeypatch):
+    pinged: list[str] = []
+
+    def fake_ping(ip, timeout_s=1.0):
+        pinged.append(ip)
+        return {"ok": ip != "198.51.100.2", "rtt_ms": 0.3, "error": None if ip != "198.51.100.2" else "down"}
+
+    monkeypatch.setattr(cluster, "_ping_ok", fake_ping)
+    head = {"id": "h", "local": True, "rails": _rails("192.0.2.1", "198.51.100.1")}
+    worker = {
+        "id": "w", "local": False, "qsfp_ip": "192.0.2.2", "rails": _rails("192.0.2.2", "198.51.100.2"),
+        "ping": {"via": "qsfp_ip", "ip": "192.0.2.2", "ok": True, "rtt_ms": 0.8, "error": None},
+    }
+    links = cluster._fabric_links([head, worker])
+    assert [(lnk["iface"], lnk["target_ip"], lnk["ok"]) for lnk in links] == [
+        ("roce0", "192.0.2.2", True),
+        ("roce1", "198.51.100.2", False),
+    ]
+    assert pinged == ["198.51.100.2"]  # rail 1's IP was already pinged for reachability
+    assert links[0]["rtt_ms"] == 0.8 and links[1]["from_speed_mbps"] == 200000
+
+
+def test_fabric_falls_back_to_the_configured_qsfp_ip_without_rail_data(monkeypatch):
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True, "rtt_ms": 0.2})
+    links = cluster._fabric_links([
+        {"id": "h", "local": True, "qsfp_if": "roce0", "qsfp_carrier": 1},
+        {"id": "w", "local": False, "qsfp_ip": "192.0.2.2", "online": False},
+    ])
+    assert [(lnk["iface"], lnk["target_ip"], lnk["ok"]) for lnk in links] == [("roce0", "192.0.2.2", True)]
+
+
+def test_remote_to_remote_links_come_from_the_remote_pings(monkeypatch):
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True, "rtt_ms": 0.2})
+    head = {"id": "h", "local": True, "rails": _rails("192.0.2.1")}
+    w1 = {"id": "w1", "local": False, "rails": _rails("192.0.2.2"),
+          "pings": {"192.0.2.3": {"ok": False, "rtt_ms": None, "error": "100% loss"}}}
+    w2 = {"id": "w2", "local": False, "rails": _rails("192.0.2.3"), "pings": {}}
+    links = cluster._fabric_links([head, w1, w2])
+    pair = [lnk for lnk in links if lnk["from"] == "w1"]
+    assert [(lnk["to"], lnk["ok"]) for lnk in pair] == [("w2", False)]
+
+
+# ─── collect_cluster: parallel, lean payload, peers persist ───────────────────
+
+
+def test_collect_cluster_probes_nodes_in_parallel_and_ships_a_lean_payload(isolated_cluster, monkeypatch):
+    import time as _time
+
+    cfg = _two_node_cfg()
+    cfg["nodes"].append({**cfg["nodes"][1], "id": "worker2", "ssh_host": "worker2.invalid"})
+    monkeypatch.setenv("LAIL_CLUSTER_JSON", json.dumps(cfg))
+    seen_targets: dict[str, list] = {}
+
+    def slow_remote(node, ping_targets=None):
+        _time.sleep(0.3)
+        seen_targets[node["id"]] = ping_targets
+        return _probed(node, local=False, online=True, pings={}, rails=[])
+
+    monkeypatch.setattr(cluster, "_probe_local", lambda node, tel=None: _probed(node, local=True, online=True, net={"x": 1}))
+    monkeypatch.setattr(cluster, "_probe_remote_ssh", slow_remote)
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True})
+    t0 = _time.monotonic()
+    data = cluster.collect_cluster()
+    assert _time.monotonic() - t0 < 0.55  # two 0.3 s remotes, probed concurrently
+    for n in data["nodes"]:
+        assert "pings" not in n and "net" not in n
+    assert seen_targets == {"worker": [], "worker2": []}  # no qsfp_ip configured → nothing to ping
+
+
+def test_discovered_peer_that_goes_down_stays_listed(monkeypatch):
+    cluster._clear_peer_cache()
+    local = {"id": "testhost", "qsfp_if": "roce0", "qsfp_ip": "192.0.2.1"}
+    alive = {"ok": True}
+
+    def fake_run(cmd, timeout=12):
+        if cmd[0] == "ip" and "neigh" in cmd:
+            return 0, "192.0.2.8 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n", ""
+        if cmd[0] == "getent":
+            return 0, "192.0.2.8 workerbox\n", ""
+        return 1, "", ""
+
+    monkeypatch.setattr(cluster, "_run", fake_run)
+    monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: dict(alive))
+    assert [p["id"] for p in cluster._discover_fabric_peers(local)] == ["workerbox"]
+    alive["ok"] = False
+    cluster._PEER_CACHE.clear()  # cache expired; the peer no longer answers
+    assert [p["id"] for p in cluster._discover_fabric_peers(local)] == ["workerbox"]
+    cluster._clear_peer_cache()
+
+
+def test_cluster_topology_uses_the_sampler_cache_without_reprobing(monkeypatch):
+    from app.services import status_sampler
+
+    s = status_sampler.StatusSampler()
+    s._cluster = s._published_cluster = {
+        "nodes": [
+            {"id": "h", "local": True, "online": True, "state": "serving", "ram_gib": 121.7},
+            {"id": "w", "local": False, "online": True, "state": "serving_worker", "ram_gib": 121.7},
+        ],
+        "fabric": {"ok": True},
+    }
+    import time as _time
+
+    s._cluster_mono = _time.monotonic()
+    monkeypatch.setattr(status_sampler, "SAMPLER", s)
+    monkeypatch.setattr(cluster, "collect_cluster", lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-probed")))
+    topo = ac._cluster_topology()
+    assert topo["nodes"] == 2 and topo["fabric_ok"] is True
+    assert plan_placement(21.0, topo, mode="lab_safe", overlay=None)["nodes_available"] == 2
+
+
+# ─── ssh plumbing ─────────────────────────────────────────────────────────────
+
+
+def test_ssh_cmd_multiplexes_and_quotes_the_request():
+    cmd = cluster._ssh_cmd("spark2", {"mode": "inventory", "vllm_url": "http://127.0.0.1:8000"})
+    assert cmd[0] == "ssh" and "BatchMode=yes" in cmd and "ServerAliveInterval=5" in cmd
+    assert any(o.startswith("ControlPath=") for o in cmd) and "ControlMaster=auto" in cmd
+    assert cmd[-5:-1] == ["spark2", "python3", "-u", "-"]
+    # the remote shell sees one quoted JSON word
+    assert json.loads(__import__("shlex").split(cmd[-1])[0])["mode"] == "inventory"
+
+
+def test_peer_stream_runs_the_probe_and_reads_lines(monkeypatch):
+    """Run the stream end to end with the remote side replaced by a local python3."""
+    import sys
+    import time as _time
+
+    monkeypatch.setattr(
+        cluster, "_ssh_cmd", lambda host, req: [sys.executable, "-u", "-", json.dumps(req)]
+    )
+    s = cluster.PeerStream("fake", interval_s=0.2)
+    s.start()
+    try:
+        deadline = _time.monotonic() + 10
+        first = None
+        while _time.monotonic() < deadline:
+            first = first or s.reading()
+            r = s.reading()
+            if first and r and r["sampled_at"] > first["sampled_at"]:
+                break
+            _time.sleep(0.05)
+    finally:
+        s.stop()
+    assert r and r["sampled_at"] > first["sampled_at"], s.error
+    assert set(cluster.TELEMETRY_FIELDS) <= set(r)
+    assert s.error is None and not s._thread.is_alive()
+
+
+def test_peer_stream_reports_why_it_is_down(monkeypatch):
+    import sys
+    import time as _time
+
+    monkeypatch.setattr(
+        cluster, "_ssh_cmd", lambda host, req: [sys.executable, "-c", "print('ssh: connect to host w: No route to host'); raise SystemExit(255)"]
+    )
+    s = cluster.PeerStream("w", interval_s=0.2)
+    s.start()
+    deadline = _time.monotonic() + 5
+    while s.error is None and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    s.stop()
+    assert "No route to host" in (s.error or "")
+    assert s.reading() is None

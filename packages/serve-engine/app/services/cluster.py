@@ -1,15 +1,18 @@
 """Cluster health for L.A.I.L Status (source of truth).
 
 Default topology is this machine as probed (hostname, LAN, Tailscale, RoCE)
-plus any RoCE peers that answer ping (ARP table, or a /24-or-tighter QSFP
-scan when the table is cold after reboot). LAIL_CLUSTER_JSON or
-gitignored data/cluster.json still override.
+plus every RoCE peer that has ever answered ping (ARP table, or a /24-or-tighter
+QSFP scan when the table is cold after reboot) — a peer that goes down stays
+listed as offline. LAIL_CLUSTER_JSON or gitignored data/cluster.json override.
 
-Probes:
-  - local node via metadata + live NICs
-  - remote nodes via passwordless SSH + a small JSON collector
-  - QSFP fabric reachability between discovered interconnect IPs
-  - whether a model is loaded on each node and whether multi-node looks aligned
+Two cadences:
+  - inventory (`collect_cluster`, slow tick): containers, endpoint, RoCE rails,
+    addresses, reachability and fabric pings. Nodes are probed in parallel; the
+    local node in-process and remotes over one multiplexed ssh call each, both
+    running the SAME `node_probe` code.
+  - telemetry (`PeerStream`, ~1 s): one long-lived `ssh host python3 -u -` per
+    remote node streaming memory / temps / GPU / CPU lines. The local node's
+    telemetry comes from the status sampler's fast tick.
 """
 from __future__ import annotations
 
@@ -19,12 +22,15 @@ import logging
 import os
 import platform
 import re
+import shlex
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
-from . import metadata
+from . import metadata, node_probe
 
 log = logging.getLogger(__name__)
 
@@ -42,243 +48,29 @@ _FALLBACK_CLUSTER = {
     ],
 }
 
-_SKIP_IFACES = {"lo", "docker0", "tailscale0"}
-_SKIP_IFACE_PREFIXES = ("br-", "veth", "virbr", "cni", "flannel", "wg")
+# Container naming / rank parsing is shared with the probe that runs on every node.
+_rank_from_container_name = node_probe.rank_from_container_name
+_node_rank_from_blob_and_env = node_probe.node_rank_from
 
-# Official LAIL multi-node name, plus community/Anemll/Mia DSpark-style ranks.
-# DSpark must include the vllm-dspark token — bare "…-dspark-N" is not enough.
-_OFFICIAL_VLLM_NAME_RE = re.compile(r"^spark-vllm-n(\d+)$")
-_DSPARK_VLLM_NAME_RE = re.compile(r"(?i)^(?:.+[-_])?vllm[-_]dspark[-_](\d+)$")
-_DEFAULT_VLLM_PORTS = (8000, 8888)
-
-_REMOTE_PROBE_PY = r"""
-import json, platform, re, subprocess, urllib.request
-
-def run(cmd, t=8):
-    try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=t)
-    except Exception:
-        return ""
-
-def avail():
-    out = run(["free", "-g"])
-    for line in out.splitlines():
-        if line.startswith("Mem:"):
-            p = line.split()
-            if len(p) >= 7:
-                try: return float(p[6])
-                except: return None
-    return None
-
-def mem_total():
-    try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemTotal:"):
-                return round(int(line.split()[1]) / 1024 / 1024, 1)
-    except Exception:
-        return None
-    return None
-
-def ports_from_bindings(obj):
-    out = []
-    if not isinstance(obj, dict):
-        return out
-    for _k, bindings in obj.items():
-        if not bindings:
-            continue
-        for b in bindings:
-            if not isinstance(b, dict):
-                continue
-            hp = b.get("HostPort")
-            if hp and str(hp).isdigit():
-                out.append(int(hp))
-    return out
-
-def enrich(c):
-    raw = run(["docker", "inspect", c["name"]], t=8)
-    if not raw.strip():
-        return
-    try:
-        data = json.loads(raw)[0]
-    except Exception:
-        return
-    cfg = data.get("Config") or {}
-    cmd = cfg.get("Cmd") or []
-    args = data.get("Args") or []
-    env = cfg.get("Env") or []
-    joined = " ".join(
-        [*(cmd if isinstance(cmd, list) else [str(cmd)]),
-         *(args if isinstance(args, list) else [str(args)]),
-         *(e for e in env if isinstance(e, str) and ("RANK" in e or e.startswith("VLLM_") or e.startswith("--")))]
-    )
-    c["cmd_blob"] = joined
-    ports = []
-    for m in re.finditer(r"--port[=\s]+(\d+)", joined):
-        ports.append(int(m.group(1)))
-    ns = data.get("NetworkSettings") or {}
-    hc = data.get("HostConfig") or {}
-    ports += ports_from_bindings(ns.get("Ports") or {})
-    ports += ports_from_bindings(hc.get("PortBindings") or {})
-    # uniq preserve order
-    seen = set()
-    uniq = []
-    for p in ports:
-        if p not in seen and 1 <= p <= 65535:
-            seen.add(p)
-            uniq.append(p)
-    c["ports"] = uniq
-    rank = None
-    m = re.search(r"--node-rank[=\s]+(\d+)", joined)
-    if m:
-        rank = int(m.group(1))
-    else:
-        for e in env:
-            if isinstance(e, str) and e.startswith("NODE_RANK="):
-                try:
-                    rank = int(e.split("=", 1)[1].strip())
-                except Exception:
-                    pass
-    c["node_rank"] = rank
-    c["headless"] = bool(re.search(r"--headless\b", joined))
-    m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", joined)
-    if m:
-        c["tensor_parallel_size"] = int(m.group(1))
-
-gpu = "unknown"
-temperature_c = None
-gpu_util_pct = None
-power_w = None
-memory_used_mib = None
-memory_total_mib = None
-smi = run(["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total", "--format=csv,noheader,nounits"])
-if smi.strip():
-    parts = [p.strip() for p in smi.strip().split("\n")[0].split(",")]
-    if parts and parts[0]:
-        gpu = parts[0]
-    def _num(x):
-        s = (x or "").strip().lower()
-        if s in ("[n/a]", "n/a", "na", ""):
-            return None
-        try:
-            return float(s)
-        except Exception:
-            return None
-    if len(parts) >= 4:
-        temperature_c = _num(parts[1])
-        gpu_util_pct = _num(parts[2])
-        power_w = _num(parts[3])
-    if len(parts) >= 6:
-        memory_used_mib = _num(parts[4])
-        memory_total_mib = _num(parts[5])
-
-containers = []
-dout = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])
-for line in dout.splitlines():
-    if not line.strip():
-        continue
-    parts = line.split("\t")
-    if len(parts) < 3:
-        continue
-    name, status, image = parts[0], parts[1], parts[2]
-    if re.search(r"vllm|spark-vllm|ray|deepseek|qwen|brain|llama|dspark|glm", name, re.I) or "vllm" in image.lower() or "ray" in image.lower() or "dspark" in image.lower() or "glm" in image.lower():
-        rec = {"name": name, "status": status, "image": image}
-        enrich(rec)
-        containers.append(rec)
-
-# Candidate OpenAI ports: published/--port from containers first, then configured URL, then defaults.
-# Discovered ports must beat a stale configured :8000 when Anemll serves on :8888.
-port_candidates = []
-def add_port(p):
-    try:
-        p = int(p)
-    except Exception:
-        return
-    if 1 <= p <= 65535 and p not in port_candidates:
-        port_candidates.append(p)
-
-for c in containers:
-    for p in c.get("ports") or []:
-        add_port(p)
-m = re.search(r":(\d+)(?:/|$)", str(vllm_url or ""))
-if m:
-    add_port(m.group(1))
-for p in (8000, 8888):
-    add_port(p)
-
-model_id = None
-healthy = False
-models = []
-live_url = str(vllm_url or "http://127.0.0.1:8000")
-for port in port_candidates:
-    url = "http://127.0.0.1:%d" % port
-    try:
-        with urllib.request.urlopen(url.rstrip("/") + "/v1/models", timeout=2.5) as r:
-            body = json.loads(r.read().decode())
-            models = body.get("data") or []
-            if models:
-                model_id = models[0].get("id")
-                healthy = True
-                live_url = url
-                break
-    except Exception:
-        continue
-
-# detect TP from running container cmd
-tp = None
-ray_like = False
-for c in containers:
-    if "ray" in c["name"].lower() or "ray" in c["image"].lower():
-        ray_like = True
-    if c.get("tensor_parallel_size") is not None:
-        tp = c["tensor_parallel_size"]
-
-# fabric carrier/speed for the node-configured iface (injected as qsfp_if)
-carrier = None
-speed = None
-try:
-    if qsfp_if:
-        carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
-except Exception:
-    pass
-try:
-    if qsfp_if:
-        speed = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
-except Exception:
-    pass
-
-ib = run(["ibdev2netdev"])
-up_ifs = []
-for line in ib.splitlines():
-    if "(Up)" in line:
-        parts = line.split()
-        if len(parts) >= 5:
-            up_ifs.append(parts[4].strip("()"))
-
-print(json.dumps({
-    "hostname": platform.node(),
-    "reachable": True,
-    "gpu_sku": gpu,
-    "temperature_c": temperature_c,
-    "gpu_util_pct": gpu_util_pct,
-    "power_w": power_w,
-    "memory_used_mib": memory_used_mib,
-    "memory_total_mib": memory_total_mib,
-    "ram_gib": mem_total(),
-    "available_gib": avail(),
-    "model_id": model_id,
-    "endpoint_healthy": healthy,
-    "models": [{"id": m.get("id")} for m in models[:5]],
-    "containers": containers,
-    "tensor_parallel_size": tp,
-    "ray_hint": ray_like,
-    "qsfp_if": qsfp_if,
-    "qsfp_carrier": carrier,
-    "qsfp_speed_mbps": speed if speed and speed > 0 else None,
-    "roce_up_ifs": up_ifs,
-    "vllm_url": live_url,
-    "tailscale_ip": run(["tailscale", "ip", "-4"]).strip().split("\n")[0] if run(["tailscale", "ip", "-4"]).strip() else None,
-}))
-"""
+# Per-node live readings (fast tick / peer stream). Copied onto node dicts as a set.
+TELEMETRY_FIELDS = (
+    "sampled_at",
+    "temperature_c",
+    "gpu_util_pct",
+    "power_w",
+    "memory_used_mib",
+    "memory_total_mib",
+    "engine_reserved_gib",
+    "ram_gib",
+    "available_gib",
+    "swap_total_gib",
+    "swap_used_gib",
+    "mem_psi_full_avg10",
+    "cpu_util_pct",
+    "soc_temp_c",
+    "nvme_temp_c",
+    "nic_temp_c",
+)
 
 
 def apply_gpu_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dict[str, Any]:
@@ -296,22 +88,12 @@ def apply_gpu_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dic
     return node
 
 
-def attach_live_rates(
-    cluster_info: dict[str, Any], metrics: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Map endpoint-wide vLLM tok/s onto in-use Sparks. Idle nodes stay None."""
-    metrics = metrics or {}
-    gen = metrics.get("gen_tok_per_s")
-    prompt = metrics.get("prompt_tok_per_s")
-    if gen is not None and gen <= 0:
-        gen = None
-    if prompt is not None and prompt <= 0:
-        prompt = None
-    for node in cluster_info.get("nodes") or []:
-        serving = node.get("state") in ("serving", "serving_worker")
-        node["gen_tok_per_s"] = gen if serving else None
-        node["prompt_tok_per_s"] = prompt if serving else None
-    return cluster_info
+def apply_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dict[str, Any]:
+    """Overwrite a node's live readings (and their `sampled_at`, epoch ms) from one sample."""
+    tel = tel or {}
+    for key in TELEMETRY_FIELDS:
+        node[key] = tel.get(key)
+    return apply_gpu_telemetry(node, tel)
 
 
 def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
@@ -329,34 +111,17 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
-def _rank_from_container_name(name: str) -> int | None:
-    """Worker/head rank encoded in a known vLLM container name, if any.
-
-    Official LAIL: spark-vllm-nN. Community/Anemll/Mia: …-vllm-dspark-N (vllm token required).
-    """
-    n = (name or "").strip()
-    if not n:
-        return None
-    m = _OFFICIAL_VLLM_NAME_RE.match(n)
-    if m:
-        return int(m.group(1))
-    m = _DSPARK_VLLM_NAME_RE.match(n)
-    if m:
-        return int(m.group(1))
-    return None
-
-
 def _container_serve_family(name: str) -> str | None:
     """Stable serve-family key for pairing head/worker containers."""
     n = (name or "").strip()
     if not n:
         return None
-    if _OFFICIAL_VLLM_NAME_RE.match(n):
+    if node_probe._OFFICIAL_VLLM_NAME_RE.match(n):
         return "spark-vllm"
-    m = _DSPARK_VLLM_NAME_RE.match(n)
+    m = node_probe._DSPARK_VLLM_NAME_RE.match(n)
     if m:
         return re.sub(r"[-_]\d+$", "", n).lower()
-    if metadata.is_serve_container(n):
+    if node_probe.is_serve_container(n):
         return n.lower()
     return None
 
@@ -369,188 +134,6 @@ def _node_serve_families(n: dict[str, Any]) -> set[str]:
         fam = _container_serve_family(str(c.get("name", "")))
         if fam:
             out.add(fam)
-    return out
-
-
-def _ports_from_host_bindings(obj: Any) -> list[int]:
-    out: list[int] = []
-    if not isinstance(obj, dict):
-        return out
-    for _k, bindings in obj.items():
-        if not bindings:
-            continue
-        for b in bindings:
-            if not isinstance(b, dict):
-                continue
-            hp = b.get("HostPort")
-            if hp is None:
-                continue
-            try:
-                port = int(hp)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= port <= 65535:
-                out.append(port)
-    return out
-
-
-def _cmd_blob_from_inspect(insp: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for key in ("cmd", "args"):
-        val = insp.get(key)
-        if isinstance(val, list):
-            parts.extend(str(x) for x in val)
-        elif val:
-            parts.append(str(val))
-    for e in insp.get("env") or []:
-        if not isinstance(e, str):
-            continue
-        if e.startswith("NODE_RANK=") or "RANK=" in e or e.startswith("VLLM_") or e.startswith("--"):
-            parts.append(e)
-    return " ".join(parts)
-
-
-def _ports_from_cmd_blob(blob: str) -> list[int]:
-    return [int(m.group(1)) for m in re.finditer(r"--port[=\s]+(\d+)", blob or "")]
-
-
-def _node_rank_from_blob_and_env(blob: str, env: list[Any] | None) -> int | None:
-    m = re.search(r"--node-rank[=\s]+(\d+)", blob or "")
-    if m:
-        return int(m.group(1))
-    for e in env or []:
-        if isinstance(e, str) and e.startswith("NODE_RANK="):
-            try:
-                return int(e.split("=", 1)[1].strip())
-            except ValueError:
-                return None
-    return None
-
-
-def _uniq_ports(*groups: list[int]) -> list[int]:
-    seen: set[int] = set()
-    out: list[int] = []
-    for group in groups:
-        for p in group:
-            try:
-                port = int(p)
-            except (TypeError, ValueError):
-                continue
-            if port in seen or not (1 <= port <= 65535):
-                continue
-            seen.add(port)
-            out.append(port)
-    return out
-
-
-def _candidate_vllm_ports(configured_url: str | None, containers: list[dict[str, Any]]) -> list[int]:
-    """Ports to probe for /v1/models.
-
-    Order: published/--port from running containers, then configured URL, then defaults.
-    Discovered ports must win over a stale configured :8000 when the live serve is elsewhere.
-    """
-    configured: list[int] = []
-    if configured_url:
-        m = re.search(r":(\d+)(?:/|$)", str(configured_url))
-        if m:
-            configured.append(int(m.group(1)))
-    discovered: list[int] = []
-    for c in containers:
-        for p in c.get("ports") or []:
-            try:
-                discovered.append(int(p))
-            except (TypeError, ValueError):
-                continue
-    return _uniq_ports(discovered, configured, list(_DEFAULT_VLLM_PORTS))
-
-
-def _enrich_local_container(c: dict[str, Any]) -> None:
-    """Attach ports / node_rank / headless / TP from docker inspect onto a container dict."""
-    name = c.get("name") or ""
-    if not name:
-        return
-    insp = metadata.docker_inspect_flags(name)
-    if not insp:
-        # Name-only fallback still helps worker detection for known layouts.
-        rank = _rank_from_container_name(name)
-        if rank is not None:
-            c["node_rank"] = rank
-        return
-    blob = _cmd_blob_from_inspect(insp)
-    c["cmd_blob"] = blob
-    ports = _uniq_ports(
-        _ports_from_cmd_blob(blob),
-        list(insp.get("ports") or []),
-    )
-    c["ports"] = ports
-    rank = _node_rank_from_blob_and_env(blob, insp.get("env"))
-    if rank is None:
-        rank = _rank_from_container_name(name)
-    c["node_rank"] = rank
-    c["headless"] = bool(re.search(r"--headless\b", blob))
-    m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", blob)
-    if m:
-        c["tensor_parallel_size"] = int(m.group(1))
-
-
-def _probe_models_on_ports(ports: list[int], *, fallback_url: str | None = None) -> dict[str, Any]:
-    """Try /v1/models on each candidate port in order; return first healthy hit.
-
-    Callers must pass ports already ordered (discovered before configured/defaults).
-    """
-    import httpx
-
-    urls: list[str] = []
-    for port in ports:
-        u = f"http://127.0.0.1:{int(port)}"
-        if u not in urls:
-            urls.append(u)
-
-    last_error: str | None = None
-    with httpx.Client(timeout=2.5) as client:
-        for url in urls:
-            try:
-                m = client.get(f"{url.rstrip('/')}/v1/models")
-                if m.status_code != 200:
-                    continue
-                body = m.json()
-                models = body.get("data") or []
-                if not models:
-                    continue
-                return {
-                    "healthy": True,
-                    "models": models,
-                    "model_id": models[0].get("id") if isinstance(models[0], dict) else None,
-                    "vllm_url": url,
-                    "error": None,
-                }
-            except Exception as e:
-                last_error = str(e)
-                continue
-    return {
-        "healthy": False,
-        "models": [],
-        "model_id": None,
-        "vllm_url": (fallback_url or f"http://127.0.0.1:{ports[0] if ports else 8000}").rstrip("/"),
-        "error": last_error,
-    }
-
-
-def _parse_ip_addrs(text: str) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for line in (text or "").splitlines():
-        m = re.match(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/", line)
-        if m:
-            out.append((m.group(1), m.group(2)))
-    return out
-
-
-def _parse_ip_cidrs(text: str) -> list[tuple[str, str, int]]:
-    out: list[tuple[str, str, int]] = []
-    for line in (text or "").splitlines():
-        m = re.match(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)", line)
-        if m:
-            out.append((m.group(1), m.group(2), int(m.group(3))))
     return out
 
 
@@ -568,23 +151,18 @@ def _subnet_hosts(ip: str, prefix: int) -> list[str]:
 
 _PEER_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _PEER_CACHE_SEC = 90.0
+# Every peer ever discovered, per local fabric key — a peer that stops answering stays
+# listed (and probes as offline) instead of vanishing and leaving the cluster "healthy".
+_KNOWN_PEERS: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _clear_peer_cache() -> None:
     _PEER_CACHE.clear()
+    _KNOWN_PEERS.clear()
 
 
 def _peer_cache_key(local: dict[str, Any]) -> str:
     return f"{local.get('qsfp_if')}|{local.get('qsfp_ip')}"
-
-
-def _parse_roce_up(text: str) -> list[str]:
-    up: list[str] = []
-    for line in (text or "").splitlines():
-        m = re.search(r"==>\s+(\S+)\s+\(Up\)", line)
-        if m:
-            up.append(m.group(1))
-    return up
 
 
 def _parse_neigh(text: str) -> list[str]:
@@ -605,45 +183,17 @@ def _parse_neigh(text: str) -> list[str]:
     return ips
 
 
-def _iface_skipped(name: str) -> bool:
-    n = (name or "").strip()
-    if n in _SKIP_IFACES:
-        return True
-    return any(n.startswith(p) for p in _SKIP_IFACE_PREFIXES)
-
-
 def _detect_local_net() -> dict[str, Any]:
-    """LAN / Tailscale / RoCE from this host. No baked lab addresses."""
-    code, addr_txt, _ = _run(["ip", "-4", "-o", "addr"], timeout=4)
-    addrs = _parse_ip_addrs(addr_txt) if code == 0 else []
-    code, ib_txt, _ = _run(["ibdev2netdev"], timeout=4)
-    roce_up = _parse_roce_up(ib_txt) if code == 0 else []
-
-    by_iface: dict[str, str] = {}
-    for iface, ip in addrs:
-        by_iface.setdefault(iface, ip)
-
-    qsfp_if = next((i for i in roce_up if i in by_iface), None)
-    qsfp_ip = by_iface.get(qsfp_if) if qsfp_if else None
-
-    lan_ip = None
-    for iface, ip in addrs:
-        if _iface_skipped(iface) or iface == qsfp_if:
-            continue
-        lan_ip = ip
-        break
-
-    ts_ip = by_iface.get("tailscale0")
-    if not ts_ip:
-        code, ts_out, _ = _run(["tailscale", "ip", "-4"], timeout=4)
-        if code == 0 and ts_out.strip():
-            ts_ip = ts_out.strip().splitlines()[0]
-
+    """LAN / Tailscale / RoCE rails from this host (one probe). No baked lab addresses."""
+    net = node_probe.net_info()
+    rail = net["rails"][0] if net["rails"] else None
     return {
-        "lan_ip": lan_ip,
-        "tailscale_ip": ts_ip,
-        "qsfp_if": qsfp_if,
-        "qsfp_ip": qsfp_ip,
+        "lan_ip": net["lan_ip"],
+        "tailscale_ip": net["tailscale_ip"],
+        "qsfp_if": rail["if"] if rail else None,
+        "qsfp_ip": rail["ip"] if rail else None,
+        "rails": net["rails"],
+        "roce_up_ifs": net["roce_up_ifs"],
     }
 
 
@@ -698,7 +248,7 @@ def _candidate_qsfp_ips(qsfp_if: str, self_ip: str | None, neigh_txt: str) -> li
     code, addr_txt, _ = _run(["ip", "-4", "-o", "addr", "show", "dev", str(qsfp_if)], timeout=4)
     if code != 0:
         return []
-    for iface, ip, prefix in _parse_ip_cidrs(addr_txt):
+    for iface, ip, prefix in node_probe.parse_ip_cidrs(addr_txt):
         if iface != qsfp_if:
             continue
         for host in _subnet_hosts(ip, prefix):
@@ -728,7 +278,7 @@ def _peer_from_ip(local: dict[str, Any], ip: str) -> dict[str, Any] | None:
 
 
 def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
-    """RoCE peers that answer ping become remote nodes.
+    """RoCE peers become remote nodes once they answer ping, and stay known after.
 
     `ip neigh` is empty after a reboot until something talks on the link, so
     when the table is cold we ping the QSFP prefix (/24 or tighter) in parallel.
@@ -744,7 +294,8 @@ def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
 
     code, neigh_txt, _ = _run(["ip", "neigh", "show", "dev", str(qsfp_if)], timeout=4)
     candidates = _candidate_qsfp_ips(str(qsfp_if), str(self_ip) if self_ip else None, neigh_txt if code == 0 else "")
-    peers: list[dict[str, Any]] = []
+    known = _KNOWN_PEERS.setdefault(key, {})
+    candidates = [ip for ip in candidates if ip not in known]
     if candidates:
         with ThreadPoolExecutor(max_workers=min(64, max(4, len(candidates)))) as pool:
             results = list(pool.map(lambda ip: (ip, _ping_ok(ip, 1.0)), candidates))
@@ -753,10 +304,10 @@ def _discover_fabric_peers(local: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             peer = _peer_from_ip(local, ip)
             if peer:
-                peers.append(peer)
-
+                known[ip] = peer
+    peers = [known[ip] for ip in sorted(known, key=ipaddress.ip_address)]
     _PEER_CACHE[key] = (time.monotonic(), [dict(p) for p in peers])
-    return peers
+    return [dict(p) for p in peers]
 
 
 def _default_cluster() -> dict[str, Any]:
@@ -772,6 +323,8 @@ def _default_cluster() -> dict[str, Any]:
     for k, v in net.items():
         if v:
             local[k] = v
+    # The local probe reuses this detection instead of running ip/ibdev2netdev/tailscale again.
+    local["net"] = {k: net.get(k) for k in ("lan_ip", "tailscale_ip", "rails", "roce_up_ifs")}
     nodes = [local]
     try:
         for peer in _discover_fabric_peers(local):
@@ -829,108 +382,56 @@ def _node_is_local(node: dict[str, Any], n_cfg: int) -> bool:
     return n_cfg == 1 and not node.get("ssh_host")
 
 
-def _remote_probe_script(node: dict[str, Any]) -> str:
-    prefix = (
-        f"qsfp_if = {json.dumps(str(node.get('qsfp_if') or ''))}\n"
-        f"vllm_url = {json.dumps(str(node.get('vllm_url') or 'http://127.0.0.1:8000'))}\n"
-    )
-    return prefix + _REMOTE_PROBE_PY
-
-
 def _ping_ok(ip: str, timeout_s: float = 1.0) -> dict[str, Any]:
-    if not ip:
-        return {"ok": False, "error": "no_ip"}
-    code, out, err = _run(["ping", "-c", "1", "-W", str(max(1, int(timeout_s))), ip], timeout=timeout_s + 2)
-    rtt = None
-    m = re.search(r"time[=<]([\d.]+)\s*ms", out)
-    if m:
-        try:
-            rtt = float(m.group(1))
-        except ValueError:
-            rtt = None
-    return {"ok": code == 0, "rtt_ms": rtt, "error": None if code == 0 else (err or out[-200:] or f"exit {code}")}
+    return node_probe.ping(ip, timeout_s)
 
 
-def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str, Any]:
-    configured_url = base_url or node.get("vllm_url") or "http://127.0.0.1:8000"
-    hw = metadata.collect_hardware()
-    containers = metadata.list_vllm_containers()
-    # also catch ray / dspark containers the name filter might miss
-    code, dout, _ = _run(
-        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
-        timeout=8,
-    )
-    if code == 0:
-        seen = {c["name"] for c in containers}
-        for line in dout.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            name, status, image = parts[0], parts[1], parts[2]
-            if name in seen:
-                continue
-            if metadata.is_serve_container(name, image) or re.search(r"ray", name + image, re.I):
-                containers.append({"name": name, "status": status, "image": image})
+# ─── probes ───────────────────────────────────────────────────────────────────
 
-    for c in containers:
-        _enrich_local_container(c)
 
-    ports = _candidate_vllm_ports(configured_url, containers)
-    probe = _probe_models_on_ports(ports, fallback_url=configured_url)
-    url = probe.get("vllm_url") or configured_url
+def _probe_source() -> str:
+    return Path(node_probe.__file__).read_text()
 
-    model_id = probe.get("model_id")
-    models = probe.get("models") or []
 
-    tp = None
-    ray_hint = False
-    for c in containers:
-        blob = f"{c.get('name','')} {c.get('image','')}"
-        if "ray" in blob.lower():
-            ray_hint = True
-        if c.get("tensor_parallel_size") is not None:
-            tp = c["tensor_parallel_size"]
-            continue
-        # Fallback if enrich missed TP (older inspect path).
-        insp = metadata.docker_inspect_flags(c.get("name") or "")
-        cmd = insp.get("cmd") or []
-        joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-        m = re.search(r"--tensor-parallel-size[=\s]+(\d+)", joined)
-        if m:
-            tp = int(m.group(1))
+def _ssh_control_dir() -> str | None:
+    """Private dir for ssh ControlMaster sockets (short path: unix sockets cap at ~104 bytes)."""
+    path = f"/tmp/lail-ssh-{os.getuid()}"
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None
+    return path
 
-    net = _detect_local_net()
-    qsfp_if = node.get("qsfp_if") or net.get("qsfp_if") or None
-    lan_ip = node.get("lan_ip") or net.get("lan_ip")
-    qsfp_ip = node.get("qsfp_ip") or net.get("qsfp_ip")
-    carrier = None
-    speed = None
-    if qsfp_if:
-        try:
-            carrier = int(open(f"/sys/class/net/{qsfp_if}/carrier").read().strip())
-        except Exception:
-            pass
-        try:
-            sp = int(open(f"/sys/class/net/{qsfp_if}/speed").read().strip())
-            if sp > 0:
-                speed = sp
-        except Exception:
-            pass
 
-    code, ib, _ = _run(["ibdev2netdev"], timeout=5)
-    up_ifs: list[str] = []
-    if code == 0:
-        for line in ib.splitlines():
-            if "(Up)" in line:
-                parts = line.split()
-                if len(parts) >= 5:
-                    up_ifs.append(parts[4].strip("()"))
+def _ssh_cmd(host: str, req: dict[str, Any]) -> list[str]:
+    """`ssh host python3 -u - '<req>'` — the probe source goes on stdin.
 
-    ts_ip = None
-    code, ts_out, _ = _run(["tailscale", "ip", "-4"], timeout=4)
-    if code == 0 and ts_out.strip():
-        ts_ip = ts_out.strip().splitlines()[0]
+    ControlMaster multiplexes every call to a host over one connection (the peer
+    stream keeps it open), so an inventory call costs ~20 ms, not a handshake.
+    """
+    opts = [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "StrictHostKeyChecking=accept-new",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=2",
+    ]
+    ctl = _ssh_control_dir()
+    if ctl:
+        opts += ["ControlMaster=auto", f"ControlPath={ctl}/%C", "ControlPersist=60"]
+    cmd = ["ssh"]
+    for o in opts:
+        cmd += ["-o", o]
+    return [*cmd, host, "python3", "-u", "-", shlex.quote(json.dumps(req))]
 
+
+def _probe_local(node: dict[str, Any], telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """This host's inventory in-process; telemetry from the sampler's fast tick when given."""
+    configured_url = node.get("vllm_url") or "http://127.0.0.1:8000"
+    inv = node_probe.inventory(node.get("qsfp_if"), configured_url, net=node.get("net"))
     out = {
         "id": node["id"],
         "label": node.get("label") or node["id"],
@@ -938,32 +439,31 @@ def _probe_local(node: dict[str, Any], base_url: str | None = None) -> dict[str,
         "local": True,
         "online": True,
         "probe_error": None,
-        "hostname": hw.get("hostname") or platform.node(),
-        "lan_ip": lan_ip,
-        "tailscale_ip": ts_ip or node.get("tailscale_ip") or net.get("tailscale_ip"),
-        "qsfp_ip": qsfp_ip,
-        "gpu_sku": hw.get("gpu_sku"),
-        "ram_gib": hw.get("ram_gib"),
-        "available_gib": hw.get("available_gib"),
-        "endpoint_healthy": bool(probe.get("healthy")),
-        "model_id": model_id,
-        "models": [{"id": m.get("id")} for m in (models or [])[:5] if isinstance(m, dict)],
-        "containers": containers,
-        "tensor_parallel_size": tp,
-        "ray_hint": ray_hint,
-        "qsfp_if": qsfp_if,
-        "qsfp_carrier": carrier,
-        "qsfp_speed_mbps": speed,
-        "roce_up_ifs": up_ifs,
-        "vllm_url": url,
+        "hostname": inv["hostname"],
+        "cpu": inv["cpu"],
+        "lan_ip": node.get("lan_ip") or inv["lan_ip"],
+        "tailscale_ip": inv["tailscale_ip"] or node.get("tailscale_ip"),
+        "qsfp_ip": node.get("qsfp_ip") or inv["qsfp_ip"],
+        "endpoint_healthy": inv["endpoint_healthy"],
+        "model_id": inv["model_id"],
+        "models": inv["models"],
+        "containers": inv["containers"],
+        "tensor_parallel_size": inv["tensor_parallel_size"],
+        "ray_hint": inv["ray_hint"],
+        "qsfp_if": inv["qsfp_if"],
+        "qsfp_carrier": inv["qsfp_carrier"],
+        "qsfp_speed_mbps": inv["qsfp_speed_mbps"],
+        "rails": inv["rails"],
+        "roce_up_ifs": inv["roce_up_ifs"],
+        "vllm_url": inv["vllm_url"],
+        "inventory_at": int(time.time() * 1000),
     }
-    apply_gpu_telemetry(out, hw)
-    return out
+    return apply_telemetry(out, telemetry or node_probe.Telemetry().sample())
 
 
-def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
+def _probe_remote_ssh(node: dict[str, Any], ping_targets: list[str] | None = None) -> dict[str, Any]:
     host = node.get("ssh_host") or node.get("id")
-    base = {
+    base: dict[str, Any] = {
         "id": node["id"],
         "label": node.get("label") or node["id"],
         "role": node.get("role") or "node",
@@ -971,15 +471,11 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
         "online": False,
         "probe_error": None,
         "hostname": None,
+        "cpu": None,
         "lan_ip": node.get("lan_ip"),
         "tailscale_ip": node.get("tailscale_ip"),
         "qsfp_ip": node.get("qsfp_ip"),
         "gpu_sku": None,
-        "temperature_c": None,
-        "gpu_util_pct": None,
-        "power_w": None,
-        "ram_gib": None,
-        "available_gib": None,
         "endpoint_healthy": False,
         "model_id": None,
         "models": [],
@@ -989,40 +485,34 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
         "qsfp_if": node.get("qsfp_if"),
         "qsfp_carrier": None,
         "qsfp_speed_mbps": None,
+        "rails": [],
         "roce_up_ifs": [],
         "vllm_url": node.get("vllm_url"),
         "ssh_host": host,
+        "ping": None,
+        "pings": {},
+        "inventory_at": int(time.time() * 1000),
     }
+    apply_telemetry(base, None)
 
-    # Prefer QSFP then Tailscale then SSH hostname for reachability ping
-    for ip_key in ("qsfp_ip", "tailscale_ip", "lan_ip"):
-        ip = node.get(ip_key)
-        if not ip:
-            continue
-        p = _ping_ok(ip, 1.0)
-        base[f"ping_{ip_key}"] = p
-        if p.get("ok"):
-            break
+    # Reachability: ping every known address at once; first answer in QSFP → Tailscale → LAN
+    # order wins. Kept separate from ssh so "host down" and "ssh broken" read differently.
+    addrs = [(k, node[k]) for k in ("qsfp_ip", "tailscale_ip", "lan_ip") if node.get(k)]
+    if addrs:
+        with ThreadPoolExecutor(max_workers=len(addrs)) as pool:
+            results = list(pool.map(lambda a: _ping_ok(a[1], 1.0), addrs))
+        hit = next(((a, r) for a, r in zip(addrs, results) if r.get("ok")), (addrs[0], results[0]))
+        base["ping"] = {"via": hit[0][0], "ip": hit[0][1], **hit[1]}
 
-    cmd = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        host,
-        "python3",
-        "-",
-    ]
+    req = {
+        "mode": "inventory",
+        "qsfp_if": node.get("qsfp_if") or "",
+        "vllm_url": node.get("vllm_url") or "http://127.0.0.1:8000",
+        "ping_targets": list(ping_targets or []),
+    }
     try:
         p = subprocess.run(
-            cmd,
-            input=_remote_probe_script(node),
-            text=True,
-            capture_output=True,
-            timeout=18,
+            _ssh_cmd(host, req), input=_probe_source(), text=True, capture_output=True, timeout=15
         )
         code, out, err = p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired:
@@ -1042,9 +532,7 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
         {
             "online": True,
             "hostname": data.get("hostname"),
-            "gpu_sku": data.get("gpu_sku"),
-            "ram_gib": data.get("ram_gib"),
-            "available_gib": data.get("available_gib"),
+            "cpu": data.get("cpu"),
             "endpoint_healthy": bool(data.get("endpoint_healthy")),
             "model_id": data.get("model_id"),
             "models": data.get("models") or [],
@@ -1054,13 +542,92 @@ def _probe_remote_ssh(node: dict[str, Any]) -> dict[str, Any]:
             "qsfp_if": data.get("qsfp_if") or node.get("qsfp_if"),
             "qsfp_carrier": data.get("qsfp_carrier"),
             "qsfp_speed_mbps": data.get("qsfp_speed_mbps"),
+            "rails": data.get("rails") or [],
             "roce_up_ifs": data.get("roce_up_ifs") or [],
             "tailscale_ip": data.get("tailscale_ip") or node.get("tailscale_ip"),
             "vllm_url": data.get("vllm_url") or node.get("vllm_url"),
+            "pings": data.get("pings") or {},
         }
     )
-    apply_gpu_telemetry(base, data)
-    return base
+    return apply_telemetry(base, data.get("telemetry"))
+
+
+class PeerStream:
+    """One persistent `ssh host python3 -u -` printing a telemetry JSON line per interval.
+
+    A reader thread keeps the latest line, stamped with THIS server's receive time
+    (epoch ms) so remote clock skew never shows up as staleness. The stream is
+    restarted with exponential backoff (1 → 30 s) when ssh or the host drops.
+    """
+
+    def __init__(self, host: str, interval_s: float = 1.0) -> None:
+        self.host = host
+        self.interval_s = interval_s
+        self.error: str | None = None
+        self._latest: tuple[dict[str, Any], int] | None = None
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen[str] | None = None
+        self._thread = threading.Thread(target=self._run, name=f"peer-stream-{host}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._kill()
+        self._thread.join(timeout=3)
+
+    def _kill(self) -> None:
+        p = self._proc
+        if p is not None and p.poll() is None:
+            p.terminate()
+
+    def reading(self) -> dict[str, Any] | None:
+        latest = self._latest
+        if latest is None:
+            return None
+        return {**latest[0], "sampled_at": latest[1]}
+
+    def _run(self) -> None:
+        backoff = 1.0
+        source = _probe_source()
+        cmd = _ssh_cmd(self.host, {"mode": "stream", "interval_s": self.interval_s})
+        while not self._stop.is_set():
+            try:
+                p = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                )
+            except OSError as e:
+                self.error = str(e)
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            self._proc = p
+            try:
+                assert p.stdin is not None and p.stdout is not None
+                p.stdin.write(source)
+                p.stdin.close()
+                for line in p.stdout:
+                    try:
+                        data = json.loads(line)
+                    except ValueError:
+                        if line.strip():
+                            self.error = line.strip()[-300:]
+                        continue
+                    self._latest = (data, int(time.time() * 1000))
+                    self.error = None
+                    backoff = 1.0
+            except (OSError, ValueError) as e:
+                self.error = str(e)
+            p.wait()
+            if self._stop.is_set():
+                break
+            self.error = self.error or f"telemetry stream exited ({p.returncode})"
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+# ─── state & summary ──────────────────────────────────────────────────────────
 
 
 def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
@@ -1114,29 +681,57 @@ def _worker_aligned_with_head(worker: dict[str, Any], head: dict[str, Any], rank
     return bool(hk & wk)
 
 
+# A serve container Up for longer than this without an endpoint (or a TP role) is not
+# "loading" any more — vLLM multi-node readiness gives up after 30 min.
+LOADING_MAX_S = 45 * 60
+_AGE_UNITS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800, "month": 2592000}
+
+
+def _container_age_s(status: str) -> float | None:
+    """Seconds from a docker status like 'Up 12 minutes' / 'Up About an hour'; None if unknown."""
+    m = re.search(r"\bUp\s+(Less than a|About an?|\d+)\s+(second|minute|hour|day|week|month)s?\b", status or "")
+    if not m:
+        return None
+    n = m.group(1)
+    count = 0.5 if n.startswith("Less") else 1.0 if n.startswith("About") else float(n)
+    return count * _AGE_UNITS[m.group(2)]
+
+
+def _up_containers(n: dict[str, Any]) -> list[dict[str, Any]]:
+    return [c for c in n.get("containers") or [] if "up" in str(c.get("status", "")).lower()]
+
+
+def _loading_or_stray(n: dict[str, Any]) -> str:
+    """A young (or age-unknown) serve container is still loading; an old one is a stray."""
+    for c in _up_containers(n):
+        age = _container_age_s(str(c.get("status", "")))
+        if age is None or age < LOADING_MAX_S:
+            return "loading"
+    return "stray"
+
+
 def _node_state(n: dict[str, Any]) -> str:
     if not n.get("online") and not n.get("local"):
-        return "offline"
+        # Ping answered but ssh failed → the host is up; keys/sshd are the problem.
+        return "unreachable" if (n.get("ping") or {}).get("ok") else "offline"
     if n.get("endpoint_healthy") and n.get("model_id"):
         return "serving"
     # Headless TP worker: container up, no endpoint by design → still serving.
     if _multinode_worker_rank(n) is not None:
         return "serving_worker"
-    if n.get("containers"):
-        # container present but endpoint not healthy yet
-        up = any("up" in str(c.get("status", "")).lower() for c in n.get("containers") or [])
-        if up:
-            return "loading"
-    if n.get("online") or n.get("local"):
-        return "idle"
-    return "offline"
+    if _up_containers(n):
+        return _loading_or_stray(n)
+    return "idle"
+
+
+_DOWN_STATES = ("offline", "unreachable")
 
 
 def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str, Any]:
     for n in nodes:
         n["state"] = _node_state(n)
 
-    online = sum(1 for n in nodes if n.get("state") != "offline")
+    online = sum(1 for n in nodes if n.get("state") not in _DOWN_STATES)
     head_serving = [n for n in nodes if n.get("state") == "serving"]
     # Drop workers that do not share a serve family with a live head (or exceed TP).
     workers_serving: list[dict[str, Any]] = []
@@ -1145,7 +740,7 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
             continue
         rank = _multinode_worker_rank(w)
         if rank is None:
-            w["state"] = "loading"
+            w["state"] = _loading_or_stray(w)
             continue
         if not head_serving:
             workers_serving.append(w)
@@ -1154,8 +749,7 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
             workers_serving.append(w)
             continue
         # Leftover / unrelated Up container — do not paint as TP worker.
-        up = any("up" in str(c.get("status", "")).lower() for c in w.get("containers") or [])
-        w["state"] = "loading" if up else "idle"
+        w["state"] = _loading_or_stray(w) if _up_containers(w) else "idle"
 
     # A headless worker serves the head's model — attribute only when aligned.
     if head_serving and workers_serving:
@@ -1170,6 +764,13 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
                 w["model_id"] = head_model
             w["headless_worker"] = True
     serving = head_serving + workers_serving
+    # TP role per node (the endpoint rate lives on the serve, not on each rank).
+    for n in nodes:
+        n["tp_rank"] = None
+    if head_serving and workers_serving:
+        head_serving[0]["tp_rank"] = 0
+        for w in workers_serving:
+            w["tp_rank"] = _multinode_worker_rank(w)
     models = [n.get("model_id") for n in serving if n.get("model_id")]
     unique_models = sorted({m for m in models if m})
 
@@ -1246,19 +847,71 @@ def _summarize(nodes: list[dict[str, Any]], fabric: dict[str, Any]) -> dict[str,
     }
 
 
-def _fabric_link(a: dict[str, Any], b: dict[str, Any], target: str) -> dict[str, Any]:
-    link = {
+def _same_subnet(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    try:
+        return ipaddress.ip_interface(f"{a['ip']}/{a['prefix']}").network == ipaddress.ip_interface(
+            f"{b['ip']}/{b['prefix']}"
+        ).network
+    except (KeyError, ValueError):
+        return False
+
+
+def _link(a: dict[str, Any], b: dict[str, Any], target: str, iface: str | None, ping: dict[str, Any]) -> dict[str, Any]:
+    ra = next((r for r in a.get("rails") or [] if r.get("if") == iface), None)
+    rb = next((r for r in b.get("rails") or [] if r.get("ip") == target), None)
+    return {
         "from": a["id"],
         "to": b["id"],
         "via": "qsfp",
+        "iface": iface,
         "target_ip": target,
-        **_ping_ok(target, 1.0),
+        "ok": bool(ping.get("ok")),
+        "rtt_ms": ping.get("rtt_ms"),
+        "error": ping.get("error"),
+        "from_carrier": ra["carrier"] if ra else a.get("qsfp_carrier"),
+        "to_carrier": rb["carrier"] if rb else b.get("qsfp_carrier"),
+        "from_speed_mbps": ra["speed_mbps"] if ra else a.get("qsfp_speed_mbps"),
+        "to_speed_mbps": rb["speed_mbps"] if rb else b.get("qsfp_speed_mbps"),
     }
-    link["from_carrier"] = a.get("qsfp_carrier")
-    link["to_carrier"] = b.get("qsfp_carrier")
-    link["from_speed_mbps"] = a.get("qsfp_speed_mbps")
-    link["to_speed_mbps"] = b.get("qsfp_speed_mbps")
-    return link
+
+
+def _rail_targets(a: dict[str, Any], b: dict[str, Any]) -> list[tuple[str | None, str]]:
+    """(a's iface, b's IP) for every RoCE rail the two share; b's configured qsfp_ip otherwise."""
+    pairs = [
+        (ra.get("if"), rb["ip"])
+        for ra in a.get("rails") or []
+        for rb in b.get("rails") or []
+        if _same_subnet(ra, rb)
+    ]
+    if not pairs and b.get("qsfp_ip"):
+        pairs = [(a.get("qsfp_if"), str(b["qsfp_ip"]))]
+    return pairs
+
+
+def _fabric_links(probed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One link per RoCE rail: head → each remote (pinged here), remote ↔ remote (pinged there)."""
+    local_nodes = [n for n in probed if n.get("local")]
+    remote_nodes = [n for n in probed if not n.get("local")]
+    pairs = [(a, b) for a in local_nodes for b in remote_nodes]
+    plan = [(a, b, iface, ip) for a, b in pairs for iface, ip in _rail_targets(a, b)]
+    # A reachability ping that already hit this exact IP is reused, not repeated.
+    reused = {
+        (b["id"], b["ping"]["ip"]): b["ping"]
+        for _a, b in pairs
+        if (b.get("ping") or {}).get("ok")
+    }
+    todo = sorted({ip for _a, b, _i, ip in plan if (b["id"], ip) not in reused})
+    pings: dict[str, dict[str, Any]] = {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            pings = dict(zip(todo, pool.map(lambda ip: _ping_ok(ip, 1.0), todo)))
+    links = [_link(a, b, ip, iface, reused.get((b["id"], ip)) or pings[ip]) for a, b, iface, ip in plan]
+    for i, a in enumerate(remote_nodes):
+        for b in remote_nodes[i + 1:]:
+            for iface, ip in _rail_targets(a, b):
+                if ip in (a.get("pings") or {}):
+                    links.append(_link(a, b, ip, iface, a["pings"][ip]))
+    return links
 
 
 def _fabric_note(fabric_links: list[dict[str, Any]], probed: list[dict[str, Any]]) -> str:
@@ -1281,48 +934,40 @@ def _fabric_note(fabric_links: list[dict[str, Any]], probed: list[dict[str, Any]
     return "configured interconnect"
 
 
-def collect_cluster() -> dict[str, Any]:
+_PAYLOAD_DROP = ("net", "pings")
+
+
+def collect_cluster(local_telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Inventory every node in parallel, then fabric + states.
+
+    `local_telemetry` is the sampler's latest fast-tick sample; without it the local
+    node samples once. A dead remote only delays its own slot (ssh timeouts), never
+    the local node.
+    """
     cfg = _load_cluster_config()
     nodes_cfg = [n for n in (cfg.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
-    probed: list[dict[str, Any]] = []
     n_cfg = len(nodes_cfg)
+    remotes_cfg = [n for n in nodes_cfg if not _node_is_local(n, n_cfg)]
 
-    for node in nodes_cfg:
+    def probe(node: dict[str, Any]) -> dict[str, Any]:
         if _node_is_local(node, n_cfg):
-            probed.append(_probe_local(node))
-        else:
-            probed.append(_probe_remote_ssh(node))
+            return _probe_local(node, local_telemetry)
+        peers = [str(o["qsfp_ip"]) for o in remotes_cfg if o is not node and o.get("qsfp_ip")]
+        return _probe_remote_ssh(node, peers)
 
-    # Fabric: ping configured remote qsfp IPs only — never invent lab interconnects.
-    fabric_links: list[dict[str, Any]] = []
-    local_nodes = [n for n in probed if n.get("local")]
-    remote_nodes = [n for n in probed if not n.get("local")]
-    fabric_ok = True
-    if local_nodes and remote_nodes:
-        for a in local_nodes:
-            for b in remote_nodes:
-                target = b.get("qsfp_ip")
-                if not target:
-                    continue
-                link = _fabric_link(a, b, str(target))
-                fabric_links.append(link)
-                if not link.get("ok"):
-                    fabric_ok = False
-    elif len(probed) >= 2:
-        a, b = probed[0], probed[1]
-        target = b.get("qsfp_ip")
-        if target:
-            link = _fabric_link(a, b, str(target))
-            fabric_links.append(link)
-            fabric_ok = bool(link.get("ok"))
+    with ThreadPoolExecutor(max_workers=max(1, n_cfg)) as pool:
+        probed = list(pool.map(probe, nodes_cfg))
 
+    links = _fabric_links(probed)
     fabric = {
-        "ok": fabric_ok,
-        "links": fabric_links,
-        "note": _fabric_note(fabric_links, probed),
+        "ok": all(lnk.get("ok") for lnk in links),
+        "links": links,
+        "note": _fabric_note(links, probed),
     }
-
     summary = _summarize(probed, fabric)
+    for n in probed:
+        for key in _PAYLOAD_DROP:
+            n.pop(key, None)
 
     return {
         "name": cfg.get("name") or "lab-cluster",

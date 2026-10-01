@@ -837,8 +837,11 @@ def _cluster_topology() -> dict[str, Any]:
 
     try:
         from . import cluster as _cluster
+        from . import status_sampler as _sampler
 
-        data = _cluster.collect_cluster()
+        # The sampler's slow tick already probed every node (≤ 2 ticks old); only
+        # re-probe over ssh when it has no fresh cluster (startup, scripts, tests).
+        data = _sampler.SAMPLER.cluster(max_age_s=2 * _sampler.SLOW_INTERVAL_S + 5) or _cluster.collect_cluster()
         nodes = data.get("nodes") or []
         online = [n for n in nodes if n.get("state") != "offline" and (n.get("online") or n.get("local"))]
         if not online:

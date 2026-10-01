@@ -33,6 +33,10 @@ SAFE_MIN_AVAIL_GIB = 60
 WORKFLOW_UTIL = 0.85
 WORKFLOW_MAX_LEN = 262144
 
+# Memory floor (GiB) an OOM guard acts on: a serve is in danger only when BOTH
+# MemAvailable and SwapFree approach it (status `headroom` / node `mem_pressure`).
+MEM_FLOOR_GIB = float(os.environ.get("LAIL_MEM_FLOOR_GIB", "2"))
+
 CONTAINER_SAFE = "spark-vllm"
 CONTAINER_MAX = "spark-vllm-max"
 

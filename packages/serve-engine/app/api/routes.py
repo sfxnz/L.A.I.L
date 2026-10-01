@@ -33,16 +33,23 @@ async def status() -> dict[str, Any]:
 
 @router.get("/cluster")
 async def cluster_status() -> dict[str, Any]:
-    """Cluster fabric + per-node serve health (L.A.I.L cluster SoT)."""
+    """Cluster fabric + per-node serve health (L.A.I.L cluster SoT).
+
+    The sampler's cached cluster (with live telemetry); probes off the loop only
+    while the sampler has not produced one yet.
+    """
+    cached = status_sampler.SAMPLER.cluster()
+    if cached is not None:
+        return cached
     try:
-        return cluster.collect_cluster()
+        return await asyncio.to_thread(cluster.collect_cluster)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/hardware")
 async def hardware() -> dict[str, Any]:
-    return metadata.collect_hardware()
+    return status_sampler.SAMPLER.hardware() or await asyncio.to_thread(metadata.collect_hardware)
 
 
 # ─── Serve ────────────────────────────────────────────────────────────────────
@@ -123,7 +130,7 @@ async def serve_examples() -> dict[str, Any]:
 
 
 @router.get("/serve/recommend")
-async def serve_recommend(
+def serve_recommend(
     model: str = Query(..., description="HF model id or local path"),
     mode: Optional[str] = Query(
         None,
@@ -141,6 +148,8 @@ async def serve_recommend(
     """Recommend vLLM, llama.cpp, or SGLang flags from the card plus vendor recipes.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
+    Plain `def`: card/HF fetches and topology run in FastAPI's threadpool, never on
+    the event loop that serves /api/status.
     """
     try:
         rec = autoconfig.recommend(
@@ -510,7 +519,7 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
 
 @router.get("/bench/tool-eval-status")
 async def tool_eval_status() -> dict[str, Any]:
-    return agentic.tool_eval_available()
+    return await asyncio.to_thread(agentic.tool_eval_available)
 
 
 # ─── Runs / compare ───────────────────────────────────────────────────────────

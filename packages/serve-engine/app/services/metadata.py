@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import platform
@@ -14,6 +15,7 @@ from typing import Any
 import httpx
 
 from ..config import DEFAULT_BASE_URL, MODEL_PRESETS
+from . import node_probe
 
 
 def utc_now() -> str:
@@ -34,176 +36,32 @@ def _run(cmd: list[str], timeout: float = 10) -> str:
 
 
 def available_gib() -> float | None:
-    out = _run(["free", "-g"])
-    for line in out.splitlines():
-        if line.startswith("Mem:"):
-            parts = line.split()
-            if len(parts) >= 7:
-                try:
-                    return float(parts[6])
-                except ValueError:
-                    return None
-    return None
+    """MemAvailable in GiB from /proc/meminfo (0.01 GiB precision)."""
+    return node_probe.parse_meminfo(node_probe._read("/proc/meminfo"))["available_gib"]
 
 
-def free_h() -> str:
-    return _run(["free", "-h"]).strip()
+# GPU parsing lives with the probe that runs on every node; re-exported for callers.
+GPU_SMI_QUERY = node_probe.GPU_SMI_QUERY
+GPU_TELEMETRY_FIELDS = node_probe.GPU_TELEMETRY_FIELDS
+parse_gpu_telemetry = node_probe.parse_gpu_telemetry
+is_serve_container = node_probe.is_serve_container
 
 
-GPU_SMI_QUERY = (
-    "name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total"
-)
-_GPU_NA = {"[n/a]", "n/a", "na", ""}
-GPU_TELEMETRY_FIELDS = (
-    "temperature_c",
-    "gpu_util_pct",
-    "power_w",
-    "memory_used_mib",
-    "memory_total_mib",
-)
+@functools.lru_cache(maxsize=1)
+def _host_facts() -> dict[str, Any]:
+    """Static host facts, read once: real CPU model (lscpu), hostname, platform."""
+    return {"cpu": node_probe.cpu_model(), "hostname": platform.node(), "platform": platform.platform()}
 
 
-def _smi_num(raw: str) -> float | None:
-    s = (raw or "").strip().lower()
-    if s in _GPU_NA:
-        return None
-    for suffix in (" mib", "°c", "w", "%", "c"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)].strip()
-            break
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def parse_gpu_telemetry(csv_text: str) -> dict[str, Any]:
-    """Parse one nvidia-smi csv line. Missing and N/A fields stay None, never 0."""
-    empty: dict[str, Any] = {
-        "gpu_sku": None,
-        "temperature_c": None,
-        "gpu_util_pct": None,
-        "power_w": None,
-        "memory_used_mib": None,
-        "memory_total_mib": None,
-    }
-    lines = (csv_text or "").strip().splitlines()
-    if not lines:
-        return empty
-    parts = [p.strip() for p in lines[0].split(",")]
-    sku = parts[0] or None
-    if len(parts) >= 6:
-        return {
-            "gpu_sku": sku,
-            "temperature_c": _smi_num(parts[1]),
-            "gpu_util_pct": _smi_num(parts[2]),
-            "power_w": _smi_num(parts[3]),
-            "memory_used_mib": _smi_num(parts[4]),
-            "memory_total_mib": _smi_num(parts[5]),
-        }
-    if len(parts) == 2:
-        empty["gpu_sku"] = sku
-        empty["memory_total_mib"] = _smi_num(parts[1])
-        return empty
-    empty["gpu_sku"] = sku
-    return empty
-
-
-def collect_gpu_telemetry() -> dict[str, Any]:
-    raw = _run(
-        [
-            "nvidia-smi",
-            f"--query-gpu={GPU_SMI_QUERY}",
-            "--format=csv,noheader,nounits",
-        ]
-    )
-    return parse_gpu_telemetry(raw)
-
-
-def collect_hardware() -> dict[str, Any]:
-    tel = collect_gpu_telemetry()
-    gpu = tel.get("gpu_sku") or "unknown"
-    cpu = platform.processor() or platform.machine()
-    # better CPU model on Linux
-    try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("model name"):
-                cpu = line.split(":", 1)[1].strip()
-                break
-    except Exception:
-        pass
-    mem_total = None
-    try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemTotal:"):
-                kb = int(line.split()[1])
-                mem_total = round(kb / 1024 / 1024, 1)
-                break
-    except Exception:
-        pass
-    return {
-        "gpu_sku": gpu,
-        "temperature_c": tel.get("temperature_c"),
-        "gpu_util_pct": tel.get("gpu_util_pct"),
-        "power_w": tel.get("power_w"),
-        "memory_used_mib": tel.get("memory_used_mib"),
-        "memory_total_mib": tel.get("memory_total_mib"),
-        "memory_capacity_gib": mem_total,
-        "bandwidth": "UMA" if "GB10" in str(gpu) or "Spark" in str(gpu) else "unknown",
-        "interconnect": "n/a",
-        "cpu": cpu,
-        "ram_gib": mem_total,
-        "available_gib": available_gib(),
-        "free_h": free_h(),
-        "hostname": platform.node(),
-        "platform": platform.platform(),
-    }
-
-
-_SERVE_CONTAINER_RE = re.compile(
-    r"vllm|spark-vllm|qwen|brain|nemotron|deepseek|llama|dspark|glm",
-    re.I,
-)
-
-
-def is_serve_container(name: str, image: str = "") -> bool:
-    """True for a lab vLLM/llama.cpp-style serve container, including GLM image names."""
-    blob = f"{name} {image}"
-    if _SERVE_CONTAINER_RE.search(blob):
-        return True
-    img = image.lower()
-    return "vllm" in img or "dspark" in img or "ray" in img
+def collect_hardware(tel: node_probe.Telemetry | None = None) -> dict[str, Any]:
+    """This host's telemetry + static facts. Pass the sampler's `Telemetry` so CPU % has a
+    previous /proc/stat sample to diff against; a one-shot call reports cpu_util_pct None."""
+    sample = (tel or node_probe.Telemetry()).sample()
+    return {**sample, "gpu_sku": sample.get("gpu_sku") or "unknown", **_host_facts()}
 
 
 def list_vllm_containers() -> list[dict[str, Any]]:
-    out = _run(
-        [
-            "docker",
-            "ps",
-            "-a",
-            "--format",
-            "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.ID}}",
-        ]
-    )
-    containers = []
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        name, status, image = parts[0], parts[1], parts[2]
-        if not is_serve_container(name, image):
-            continue
-        containers.append(
-            {
-                "name": name,
-                "status": status,
-                "image": image,
-                "id": parts[3] if len(parts) > 3 else "",
-            }
-        )
-    return containers
+    return node_probe.list_serve_containers()
 
 
 def docker_inspect_flags(name: str) -> dict[str, Any]:
@@ -217,29 +75,7 @@ def docker_inspect_flags(name: str) -> dict[str, Any]:
     cfg = data.get("Config") or {}
     ns = data.get("NetworkSettings") or {}
     hc = data.get("HostConfig") or {}
-
-    def _host_ports(obj: Any) -> list[int]:
-        out: list[int] = []
-        if not isinstance(obj, dict):
-            return out
-        for _k, bindings in obj.items():
-            if not bindings:
-                continue
-            for b in bindings:
-                if not isinstance(b, dict):
-                    continue
-                hp = b.get("HostPort")
-                if hp is None:
-                    continue
-                try:
-                    port = int(hp)
-                except (TypeError, ValueError):
-                    continue
-                if 1 <= port <= 65535:
-                    out.append(port)
-        return out
-
-    ports = sorted({*_host_ports(ns.get("Ports") or {}), *_host_ports(hc.get("PortBindings") or {})})
+    ports = sorted({*node_probe.ports_from_bindings(ns.get("Ports")), *node_probe.ports_from_bindings(hc.get("PortBindings"))})
     return {
         "image": cfg.get("Image"),
         "cmd": cfg.get("Cmd") or [],

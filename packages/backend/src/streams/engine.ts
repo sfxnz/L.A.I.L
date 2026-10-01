@@ -259,7 +259,8 @@ type Run = {
   /** Bench: serve fingerprint at start; status-snapshot node readings over the run. */
   fingerprint: string | null;
   hardware: BenchHardware["series"];
-  hardwareSampledAt: string | null;
+  /** Bench: each node's last recorded `sampled_at` — a reading is recorded once. */
+  hardwareAt: Map<string, number>;
   /** Bench: each level's measured span [from, to] (ms since t0) — what energy is integrated over. */
   levelWindows: Array<[number, number]>;
   /** Bench: holds the serve-engine bench lease (null when the serve-engine was unreachable). */
@@ -572,7 +573,7 @@ export class StreamsEngine {
       aggSeries: [],
       fingerprint: status?.fingerprint ?? null,
       hardware: [],
-      hardwareSampledAt: null,
+      hardwareAt: new Map(),
       levelWindows: [],
       lease,
       summary: null,
@@ -600,10 +601,13 @@ export class StreamsEngine {
   }
 
   private recordHardware(run: Run, st: StatusReading | null) {
-    if (!st || run.status !== "running" || (st.sampled_at !== null && st.sampled_at === run.hardwareSampledAt)) return;
-    run.hardwareSampledAt = st.sampled_at;
+    if (!st || run.status !== "running") return;
     const t = Math.round(now() - run.t0);
-    for (const n of st.nodes) run.hardware.push([t, n.id, n.temp, n.power, n.avail]);
+    for (const n of st.nodes) {
+      if (n.at === null || n.at === run.hardwareAt.get(n.id)) continue;
+      run.hardwareAt.set(n.id, n.at);
+      run.hardware.push([t, n.id, n.temp, n.power, n.avail]);
+    }
   }
 
   private evict() {

@@ -94,7 +94,8 @@ function seHeaders(): Record<string, string> {
   return h;
 }
 
-export type NodeReading = { id: string; temp: number | null; power: number | null; avail: number | null };
+/** One node's live reading; `at` is its own `sampled_at` (epoch ms), null when the node has no current reading. */
+export type NodeReading = { id: string; at: number | null; temp: number | null; power: number | null; avail: number | null };
 export type StatusReading = { sampled_at: string | null; fingerprint: string | null; nodes: NodeReading[] };
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -110,21 +111,17 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
     const j = (await r.json()) as {
       sampled_at?: string;
       engine?: { flags_fingerprint?: string | null };
-      hardware?: Record<string, unknown>;
       cluster?: { nodes?: Array<Record<string, unknown>> };
     };
-    // Cluster node telemetry refreshes on the sampler's slow (10 s) tick; the head's own
-    // `hardware` block on every fast (2 s) tick — prefer it for the node it describes.
-    const local = j.hardware && typeof j.hardware.hostname === "string" ? j.hardware : null;
-    const nodes = (j.cluster?.nodes ?? []).map((n) => {
-      const src = local && (n.hostname === local.hostname || n.id === local.hostname) ? local : n;
-      return {
-        id: String(n.id ?? n.hostname ?? "node"),
-        temp: num(src.temperature_c),
-        power: num(src.power_w),
-        avail: num(src.available_gib),
-      };
-    });
+    // Every cluster node carries its freshest telemetry (the head from the fast tick, peers
+    // from their streams) with its own `sampled_at`; a down node has none.
+    const nodes = (j.cluster?.nodes ?? []).map((n) => ({
+      id: String(n.id ?? n.hostname ?? "node"),
+      at: num(n.sampled_at),
+      temp: num(n.temperature_c),
+      power: num(n.power_w),
+      avail: num(n.available_gib),
+    }));
     return { sampled_at: j.sampled_at ?? null, fingerprint: j.engine?.flags_fingerprint ?? null, nodes };
   } catch {
     return null;
@@ -159,10 +156,10 @@ function energyOver(pw: Array<[number, number]>, windows: Array<[number, number]
  * Per node over the run, plus energy: Σ over nodes of ∫ power dt over the measured
  * `windows` only (the level spans — not the warmup or the idle-drain waits), so energy and
  * `tokens` cover the same time; per token over `tokens` (null = not a per-token quantity,
- * e.g. the prefill bench's 1-token answers). Energy is reported only when every node's
- * power was actually re-read during the run (≥ 2 distinct readings): a run shorter than the
- * telemetry cadence sees one stale reading repeated, and integrating that would report
- * idle power as the run's.
+ * e.g. the prefill bench's 1-token answers). `series` holds only new readings (a node's
+ * `sampled_at` moved). Energy is reported only when every node's power was re-read during
+ * the run (≥ 2 readings): integrating one reading held flat would report the power from
+ * before the run as the run's.
  */
 export function summarizeHardware(
   series: BenchHardware["series"],
@@ -193,7 +190,7 @@ export function summarizeHardware(
       available_min_gib: avails.length ? Math.min(...avails) : null,
     });
     const pw = rows.filter((r) => r[3] !== null).map((r): [number, number] => [r[0], r[3] as number]);
-    if (new Set(pw.map((r) => r[1])).size < 2) stale = true;
+    if (pw.length < 2) stale = true;
     else energy += energyOver(pw, windows);
   }
   const measured = windows.some(([a, b]) => b > a);

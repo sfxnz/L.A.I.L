@@ -160,12 +160,12 @@ const server = Bun.serve({
       return Response.json({
         sampled_at: `2026-10-01T00:00:${String(state.statusCalls).padStart(2, "0")}Z`,
         engine: { flags_fingerprint: "fp-mock" },
-        // the head's own fast-tick reading wins over its (slower) cluster-node row
-        hardware: { hostname: "spark1", temperature_c: 50 + state.statusCalls, power_w: 100 + state.statusCalls, available_gib: 20 },
+        // every node carries its own fresh reading and `sampled_at`; a down peer has none
         cluster: {
           nodes: [
-            { id: "spark1", hostname: "spark1", temperature_c: 49, power_w: 1, available_gib: 1 },
-            { id: "spark2", temperature_c: 45, power_w: 60 + (state.statusCalls % 2) * 10, available_gib: 30 },
+            { id: "spark1", hostname: "spark1", sampled_at: 1000 * state.statusCalls, temperature_c: 50 + state.statusCalls, power_w: 100 + state.statusCalls, available_gib: 20 },
+            { id: "spark2", sampled_at: 1000 * state.statusCalls, temperature_c: 45, power_w: 60 + (state.statusCalls % 2) * 10, available_gib: 30 },
+            { id: "spark3", online: false, state: "offline", sampled_at: null, temperature_c: null, power_w: null, available_gib: null },
           ],
         },
       });
@@ -832,13 +832,12 @@ describe("live rates and fan-out", () => {
     );
     expect(fresh).toMatchObject({ energy_j: 350, energy_j_per_token: 3.5 });
     expect(fresh.nodes[0]).toMatchObject({ id: "spark1", temp_max_c: 52, power_mean_w: 110, available_min_gib: 19 });
-    // a run shorter than the telemetry cadence repeats one stale reading: no energy
+    // spark2's reading was never refreshed during the run (one reading): no energy
     const stale = summarizeHardware(
       [
         [0, "spark1", 50, 100, 20],
         [0, "spark2", 45, 60, 30],
         [2000, "spark1", 52, 120, 19],
-        [2000, "spark2", 45, 60, 30],
       ],
       [[0, 2000]],
       100,

@@ -151,10 +151,12 @@ const server = Bun.serve({
       return Response.json({
         sampled_at: `2026-10-01T00:00:${String(state.statusCalls).padStart(2, "0")}Z`,
         engine: { flags_fingerprint: "fp-mock" },
+        // the head's own fast-tick reading wins over its (slower) cluster-node row
+        hardware: { hostname: "spark1", temperature_c: 50 + state.statusCalls, power_w: 100 + state.statusCalls, available_gib: 20 },
         cluster: {
           nodes: [
-            { id: "spark1", temperature_c: 50 + state.statusCalls, power_w: 100, available_gib: 20 },
-            { id: "spark2", temperature_c: 45, power_w: 60, available_gib: 30 },
+            { id: "spark1", hostname: "spark1", temperature_c: 49, power_w: 1, available_gib: 1 },
+            { id: "spark2", temperature_c: 45, power_w: 60 + (state.statusCalls % 2) * 10, available_gib: 30 },
           ],
         },
       });
@@ -537,7 +539,8 @@ describe("bench runs", () => {
     const hw = env.metrics.hardware;
     expect(hw.nodes.map((n: { id: string }) => n.id).sort()).toEqual(["spark1", "spark2"]);
     expect(hw.series.length).toBeGreaterThanOrEqual(4);
-    expect(hw.nodes.find((n: { id: string }) => n.id === "spark2")).toMatchObject({ power_mean_w: 60, available_min_gib: 30, temp_max_c: 45 });
+    expect(hw.nodes.find((n: { id: string }) => n.id === "spark2")).toMatchObject({ available_min_gib: 30, temp_max_c: 45 });
+    expect(hw.nodes.find((n: { id: string }) => n.id === "spark1").available_min_gib).toBe(20);
     expect(hw.energy_j).toBeGreaterThanOrEqual(0);
   });
 
@@ -769,5 +772,33 @@ describe("live rates and fan-out", () => {
       preemptions: 0,
     });
     expect(serverDelta(null, m(1, 0))).toBeNull();
+  });
+
+  test("energy is integrated only when every node's power was re-read during the run", async () => {
+    const { summarizeHardware } = await import("./probes");
+    // spark1 at 100 W then 120 W over 2 s, spark2 at 60 → 70 W: (110 + 65) × 2 = 350 J over 100 tokens
+    const fresh = summarizeHardware(
+      [
+        [0, "spark1", 50, 100, 20],
+        [0, "spark2", 45, 60, 30],
+        [2000, "spark1", 52, 120, 19],
+        [2000, "spark2", 46, 70, 30],
+      ],
+      100,
+    );
+    expect(fresh).toMatchObject({ energy_j: 350, energy_j_per_token: 3.5 });
+    expect(fresh.nodes[0]).toMatchObject({ id: "spark1", temp_max_c: 52, power_mean_w: 110, available_min_gib: 19 });
+    // a run shorter than the telemetry cadence repeats one stale reading: no energy
+    const stale = summarizeHardware(
+      [
+        [0, "spark1", 50, 100, 20],
+        [0, "spark2", 45, 60, 30],
+        [2000, "spark1", 52, 120, 19],
+        [2000, "spark2", 45, 60, 30],
+      ],
+      100,
+    );
+    expect(stale.energy_j).toBeNull();
+    expect(stale.energy_j_per_token).toBeNull();
   });
 });

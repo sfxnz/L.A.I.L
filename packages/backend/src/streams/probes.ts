@@ -110,14 +110,21 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
     const j = (await r.json()) as {
       sampled_at?: string;
       engine?: { flags_fingerprint?: string | null };
+      hardware?: Record<string, unknown>;
       cluster?: { nodes?: Array<Record<string, unknown>> };
     };
-    const nodes = (j.cluster?.nodes ?? []).map((n) => ({
-      id: String(n.id ?? n.hostname ?? "node"),
-      temp: num(n.temperature_c),
-      power: num(n.power_w),
-      avail: num(n.available_gib),
-    }));
+    // Cluster node telemetry refreshes on the sampler's slow (10 s) tick; the head's own
+    // `hardware` block on every fast (2 s) tick — prefer it for the node it describes.
+    const local = j.hardware && typeof j.hardware.hostname === "string" ? j.hardware : null;
+    const nodes = (j.cluster?.nodes ?? []).map((n) => {
+      const src = local && (n.hostname === local.hostname || n.id === local.hostname) ? local : n;
+      return {
+        id: String(n.id ?? n.hostname ?? "node"),
+        temp: num(src.temperature_c),
+        power: num(src.power_w),
+        avail: num(src.available_gib),
+      };
+    });
     return { sampled_at: j.sampled_at ?? null, fingerprint: j.engine?.flags_fingerprint ?? null, nodes };
   } catch {
     return null;
@@ -126,7 +133,10 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
 
 /**
  * Per node over the run, plus energy: Σ over nodes of the trapezoid ∫ power dt between
- * that node's consecutive power samples; per token over `tokens`.
+ * that node's consecutive power samples; per token over `tokens`. Energy is reported only
+ * when every node's power was actually re-read during the run (≥ 2 distinct readings): a
+ * run shorter than the telemetry cadence sees one stale reading repeated, and integrating
+ * that would report idle power as the run's.
  */
 export function summarizeHardware(series: BenchHardware["series"], tokens: number): BenchHardware {
   const byNode = new Map<string, BenchHardware["series"]>();
@@ -140,6 +150,7 @@ export function summarizeHardware(series: BenchHardware["series"], tokens: numbe
   const nodes: BenchHardwareNode[] = [];
   let energy = 0;
   let integrated = false;
+  let stale = false;
   for (const [id, rows] of byNode) {
     const temps = rows.map((r) => r[2]).filter((v): v is number => v !== null);
     const powers = rows.map((r) => r[3]).filter((v): v is number => v !== null);
@@ -153,12 +164,13 @@ export function summarizeHardware(series: BenchHardware["series"], tokens: numbe
       available_min_gib: avails.length ? Math.min(...avails) : null,
     });
     const pw = rows.filter((r) => r[3] !== null);
+    if (pw.length && new Set(pw.map((r) => r[3])).size < 2) stale = true;
     for (let k = 1; k < pw.length; k++) {
       energy += (((pw[k - 1][3] as number) + (pw[k][3] as number)) / 2) * ((pw[k][0] - pw[k - 1][0]) / 1000);
       integrated = true;
     }
   }
-  const energy_j = integrated ? Math.round(energy) : null;
+  const energy_j = integrated && !stale ? Math.round(energy) : null;
   return {
     series,
     nodes,

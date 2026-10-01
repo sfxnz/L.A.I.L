@@ -176,7 +176,7 @@ OPENAI_MODEL=<served-model-id>
 - Auto-configure + start · stop (two clicks) · live job logs — vLLM, SGLang, llama.cpp, TensorFold
 - Bench (decode / prefill) on `/bench`; smoke, golden tools and tool-eval-bench on `/evals`
 
-Benches hit whatever is on the serving engine's URL — **serve first**, then bench.
+Benches (and the controller's `/v1` proxy) hit the endpoint the serve-engine detects serving — whichever engine and port — else the configured default backend. **Serve first**, then bench.
 
 ## Engines
 
@@ -188,9 +188,9 @@ metrics prefix), not the configured default.
 | Engine | Default image (env override) | Port | TP across Sparks | Live metrics |
 |--------|------------------------------|------|------------------|--------------|
 | vLLM | `vllm/vllm-openai:v0.27.1` (`LAB_VLLM_IMAGE_MAX`) | 8000 | yes (`--nnodes`, workers `--headless`) | per step |
-| SGLang | `lmsysorg/sglang:v0.5.20-cu130` (`LAIL_SGLANG_IMAGE`) | 30000 | yes (`--nnodes/--node-rank/--dist-init-addr`) | per step (TTFT / inter-token histograms), `--enable-metrics` always on |
+| SGLang | `lmsysorg/sglang:v0.5.20-cu130` (`LAIL_SGLANG_IMAGE`) | 30000 | yes (`--nnodes/--node-rank/--dist-init-addr`) | per-stream decode from the inter-token histogram, throughput from the scheduler's `gen_throughput`; `--enable-metrics` always on |
 | llama.cpp | `ghcr.io/ggml-org/llama.cpp:server-cuda13` (`LAIL_LLAMACPP_IMAGE`) | 8080 | no (single node) | when a request ends (shown as "last"), `--metrics` always on |
-| TensorFold | `nvcr.io/nvidia/pytorch:26.07-py3` + `pip install` from GitHub at start (`LAIL_TENSORFOLD_IMAGE`, `LAIL_TENSORFOLD_PIP`) | **8090** (upstream 8080 is llama.cpp's) | 2 ranks max (`--tp 2 --rank R`) | decode from `/health` running totals; no KV pool % (its ratio is per-stream context fill) |
+| TensorFold | `nvcr.io/nvidia/pytorch:26.07-py3` + `pip install` of the verified commit at start (`LAIL_TENSORFOLD_IMAGE`, `LAIL_TENSORFOLD_PIP`); pip and kernel-build caches persist in `~/.cache/lail-tensorfold` (`LAIL_TENSORFOLD_CACHE`) | **8090** (upstream 8080 is llama.cpp's) | 2 ranks max (`--tp 2 --rank R`) | decode from `/health` running totals; no KV pool % (its ratio is per-stream context fill) |
 
 Every container L.A.I.L launches carries `--label lail.engine=<name>`; Stop removes those
 (any state) plus any other serve container that is running, judged by its command or

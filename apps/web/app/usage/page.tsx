@@ -110,7 +110,7 @@ export default function UsagePage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Usage</h1>
-          <p className="page-sub">Every request the engine served (Hermes, proxy, benches) · from vLLM counters</p>
+          <p className="page-sub">Every request the engine served (Hermes, proxy, benches) · from the engine&apos;s /metrics counters (vLLM; SGLang with --enable-metrics; llama-server with --metrics)</p>
         </div>
       </div>
 

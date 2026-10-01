@@ -7,11 +7,14 @@ import { getSettings } from "./settings";
  * other client talk to :8000 directly, so only the engine sees all traffic; the
  * controller never counts requests itself.
  *
- * Each sample diffs vllm:{prompt,generation}_tokens_total and
- * vllm:request_success_total (summed over engines / finish reasons, per model)
- * against the last reading persisted for that backend + model, and adds the delta
- * to a per-minute bucket. A new engine process (process_start_time_seconds changed,
- * or any counter went backwards) starts from zero, so its whole counter is the delta.
+ * Each sample diffs the prompt / generation token counters and the finished-request
+ * counter (summed over engines / finish reasons, per model) against the last reading
+ * persisted for that backend + model, and adds the delta to a per-minute bucket. A
+ * new engine process (process_start_time_seconds changed, or any counter went
+ * backwards) starts from zero, so its whole counter is the delta.
+ *
+ * vLLM always exports these; SGLang needs --enable-metrics and llama-server needs
+ * --metrics (llama.cpp has no request counter, so its calls stay 0).
  */
 
 export type Totals = { prompt: number; completion: number; requests: number };
@@ -22,11 +25,17 @@ const SERIES: Record<string, keyof Totals> = {
   "vllm:prompt_tokens_total": "prompt",
   "vllm:generation_tokens_total": "completion",
   "vllm:request_success_total": "requests",
+  "sglang:prompt_tokens_total": "prompt",
+  "sglang:generation_tokens_total": "completion",
+  "sglang:num_requests_total": "requests",
+  "llamacpp:prompt_tokens_total": "prompt",
+  "llamacpp:tokens_predicted_total": "completion",
 };
 
 export const USAGE_SAMPLE_MS = 15_000;
 
-export function parseVllmCounters(text: string): EngineCounters {
+/** `unlabeled` names the model for series without a model_name label (llama.cpp). */
+export function parseEngineCounters(text: string, unlabeled = "unknown"): EngineCounters {
   const models = new Map<string, Totals>();
   let startTime: number | null = null;
   for (const line of text.split("\n")) {
@@ -41,7 +50,7 @@ export function parseVllmCounters(text: string): EngineCounters {
     }
     const field = SERIES[m[1]];
     if (!field) continue;
-    const model = /model_name="([^"]*)"/.exec(m[2] || "")?.[1] || "unknown";
+    const model = /model_name="([^"]*)"/.exec(m[2] || "")?.[1] || unlabeled;
     const t = models.get(model) ?? { prompt: 0, completion: 0, requests: 0 };
     t[field] += value;
     models.set(model, t);
@@ -71,6 +80,14 @@ export function recordCounters(backend: string, counters: EngineCounters, now = 
   const readPrev = db.query(
     "SELECT prompt, completion, requests, start_time AS startTime FROM usage_counters WHERE backend = ? AND model = ?",
   );
+  // The same process reached under another URL (Configure edited 127.0.0.1 →
+  // localhost, a LAN IP…): same model and start time. Its reading moves to the new
+  // URL instead of the whole lifetime counter being counted again.
+  const readSameProcess = db.query(
+    `SELECT backend, prompt, completion, requests, start_time AS startTime FROM usage_counters
+     WHERE model = ? AND start_time = ? AND backend != ?`,
+  );
+  const dropPrev = db.query("DELETE FROM usage_counters WHERE backend = ? AND model = ?");
   const writePrev = db.query(
     `INSERT INTO usage_counters (backend, model, prompt, completion, requests, start_time)
      VALUES (?, ?, ?, ?, ?, ?)
@@ -87,7 +104,16 @@ export function recordCounters(backend: string, counters: EngineCounters, now = 
   );
   db.transaction(() => {
     for (const [model, cur] of counters.models) {
-      const prev = readPrev.get(backend, model) as LastReading | null;
+      let prev = readPrev.get(backend, model) as LastReading | null;
+      if (counters.startTime !== null && prev?.startTime !== counters.startTime) {
+        const moved = readSameProcess.get(model, counters.startTime, backend) as
+          | (LastReading & { backend: string })
+          | null;
+        if (moved) {
+          prev = moved;
+          dropPrev.run(moved.backend, model);
+        }
+      }
       const d = counterDelta(prev, cur, counters.startTime);
       if (d.prompt > 0 || d.completion > 0 || d.requests > 0) {
         addMinute.run(minute, model, Math.round(d.prompt), Math.round(d.completion), Math.round(d.requests));
@@ -97,15 +123,28 @@ export function recordCounters(backend: string, counters: EngineCounters, now = 
   })();
 }
 
-/** One pass over every enabled backend's /metrics. Unreachable or non-vLLM backends are skipped. */
+/** The first id an OpenAI-compatible server lists, for engines whose counters carry no model label. */
+async function servedModelId(base: string): Promise<string | null> {
+  try {
+    const r = await fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(3000) });
+    const body = (await r.json()) as { data?: Array<{ id?: string }> };
+    return body.data?.[0]?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+/** One pass over every enabled backend's /metrics. Unreachable or unmetered backends are skipped. */
 export async function sampleUsage(): Promise<void> {
-  for (const b of Object.values(getSettings().backends)) {
+  for (const [kind, b] of Object.entries(getSettings().backends)) {
     if (!b.enabled) continue;
     const base = b.url.replace(/\/$/, "").replace(/\/v1$/, "");
     try {
       const r = await fetch(`${base}/metrics`, { signal: AbortSignal.timeout(3000) });
       if (!r.ok) continue;
-      const counters = parseVllmCounters(await r.text());
+      const text = await r.text();
+      const unlabeled = text.includes("llamacpp:") ? ((await servedModelId(base)) ?? kind) : kind;
+      const counters = parseEngineCounters(text, unlabeled);
       if (counters.models.size) recordCounters(base, counters);
     } catch {
       /* backend down: nothing served, nothing to meter */

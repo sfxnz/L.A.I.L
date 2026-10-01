@@ -4,7 +4,7 @@ import { getSettings } from "./settings";
 import {
   counterDelta,
   getUsageSummary,
-  parseVllmCounters,
+  parseEngineCounters,
   recordCounters,
   sampleUsage,
   type EngineCounters,
@@ -33,24 +33,52 @@ beforeEach(() => {
   getDb().exec("DELETE FROM usage_minutes; DELETE FROM usage_counters;");
 });
 
-describe("parseVllmCounters", () => {
+describe("parseEngineCounters", () => {
   test("sums the token and request counters per model and reads the process start", () => {
-    const c = parseVllmCounters(METRICS);
+    const c = parseEngineCounters(METRICS);
     expect(c.startTime).toBe(1790809832.95);
     expect(c.models.get(M)).toEqual({ prompt: 1397, completion: 4829, requests: 36 });
     expect(c.models.size).toBe(1);
   });
 
   test("sums across data-parallel engines", () => {
-    const c = parseVllmCounters(
+    const c = parseEngineCounters(
       'vllm:generation_tokens_total{engine="0",model_name="m"} 10\nvllm:generation_tokens_total{engine="1",model_name="m"} 5\n',
     );
     expect(c.models.get("m")?.completion).toBe(15);
   });
 
-  test("a non-vLLM page yields nothing", () => {
-    expect(parseVllmCounters("llamacpp:tokens_predicted_total 9\n").models.size).toBe(0);
-    expect(parseVllmCounters("").models.size).toBe(0);
+  test("SGLang (--enable-metrics) counters, per model", () => {
+    const c = parseEngineCounters(`# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="Qwen/Qwen3-8B",tp_rank="0"} 812.0
+sglang:generation_tokens_total{model_name="Qwen/Qwen3-8B",tp_rank="0"} 2048.0
+sglang:num_requests_total{model_name="Qwen/Qwen3-8B",tp_rank="0"} 7.0
+sglang:cached_tokens_total{model_name="Qwen/Qwen3-8B",tp_rank="0"} 300.0
+sglang:num_running_reqs{model_name="Qwen/Qwen3-8B",tp_rank="0"} 1.0
+`);
+    expect(c.models.get("Qwen/Qwen3-8B")).toEqual({ prompt: 812, completion: 2048, requests: 7 });
+    expect(c.startTime).toBeNull();
+  });
+
+  test("llama.cpp (--metrics) counters carry no model label: the caller names it", () => {
+    const c = parseEngineCounters(
+      `# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 120
+llamacpp:tokens_predicted_total 345
+llamacpp:prompt_seconds_total 1.5
+llamacpp:n_decode_total 345
+llamacpp:requests_processing 0
+`,
+      "qwen3-8b-q4_k_m.gguf",
+    );
+    expect(c.models.get("qwen3-8b-q4_k_m.gguf")).toEqual({ prompt: 120, completion: 345, requests: 0 });
+    expect(c.models.size).toBe(1);
+  });
+
+  test("a page without engine counters yields nothing", () => {
+    expect(parseEngineCounters("process_cpu_seconds_total 9\nhttp_requests_total 3\n").models.size).toBe(0);
+    expect(parseEngineCounters("").models.size).toBe(0);
   });
 });
 
@@ -110,6 +138,29 @@ describe("recordCounters → getUsageSummary", () => {
   });
 });
 
+describe("recordCounters keyed by process, not by URL", () => {
+  test("the same engine reached under an edited backend URL is not counted again", () => {
+    recordCounters("http://127.0.0.1:8000", counters(100, 400, 4), new Date("2026-10-01T10:00:00Z"));
+    // Configure: 127.0.0.1 → localhost; same process (same start time).
+    recordCounters("http://localhost:8000", counters(100, 400, 4), new Date("2026-10-01T10:00:15Z"));
+    recordCounters("http://localhost:8000", counters(110, 420, 5), new Date("2026-10-01T10:00:30Z"));
+    // …and back again.
+    recordCounters("http://127.0.0.1:8000", counters(130, 450, 6), new Date("2026-10-01T10:00:45Z"));
+    const u = getUsageSummary();
+    expect(u.lifetimePrompt).toBe(130);
+    expect(u.lifetimeCompletion).toBe(450);
+    expect(u.topModels).toEqual([{ model: M, tokens: 580, calls: 6 }]);
+    const rows = getDb().query("SELECT COUNT(*) AS n FROM usage_counters").get() as { n: number };
+    expect(rows.n).toBe(1);
+  });
+
+  test("a new process at a new URL still counts from zero", () => {
+    recordCounters("http://127.0.0.1:8000", counters(100, 400, 4, 100), new Date("2026-10-01T10:00:00Z"));
+    recordCounters("http://localhost:8000", counters(5, 9, 1, 200), new Date("2026-10-01T10:00:15Z"));
+    expect(getUsageSummary().lifetimePrompt).toBe(105);
+  });
+});
+
 describe("sampleUsage", () => {
   const origFetch = globalThis.fetch;
   afterEach(() => {
@@ -128,5 +179,18 @@ describe("sampleUsage", () => {
     await sampleUsage();
     expect(seen).toEqual([vllmMetrics, `${llamacpp.url.replace(/\/$/, "")}/metrics`]);
     expect(getUsageSummary().lifetimeCompletion).toBe(4829);
+  });
+
+  test("llama.cpp usage is attributed to the model llama-server lists", async () => {
+    const { vllm, llamacpp } = getSettings().backends;
+    const lc = llamacpp.url.replace(/\/$/, "").replace(/\/v1$/, "");
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u === `${lc}/metrics`) return new Response("llamacpp:prompt_tokens_total 10\nllamacpp:tokens_predicted_total 32\n");
+      if (u === `${lc}/v1/models`) return Response.json({ object: "list", data: [{ id: "gemma-3-4b-q8.gguf" }] });
+      throw new Error(`ECONNREFUSED ${u} (vllm at ${vllm.url})`);
+    }) as unknown as typeof fetch;
+    await sampleUsage();
+    expect(getUsageSummary().topModels).toEqual([{ model: "gemma-3-4b-q8.gguf", tokens: 42, calls: 0 }]);
   });
 });

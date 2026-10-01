@@ -48,7 +48,7 @@ const snap = (at: number, nodeT: Record<string, number | null>, metricsT: number
 });
 
 afterEach(() => {
-  useLabStatusStore.setState({ status: null, receivedAt: null, samples: EMPTY_SAMPLES, liveRun: null, loading: true, transport: null });
+  useLabStatusStore.setState({ status: null, receivedAt: null, samples: EMPTY_SAMPLES, liveRun: null, loading: true, transport: null, engineError: null });
 });
 
 describe("samples keyed by the server's sampled_at", () => {
@@ -126,6 +126,29 @@ describe("stream merge and ordering", () => {
     ingestStatus(st(1000), "poll");
     expect(useLabStatusStore.getState().status?.serve?.sampled_at_ms).toBe(2000);
     expect(useLabStatusStore.getState().transport).toBe("stream");
+  });
+});
+
+describe("serve-engine failures", () => {
+  test("a failure keeps the last real snapshot (aging into stale) instead of blanking it", () => {
+    const ok = mergeTick(null, { serve: snap(2000, { spark1: 1995 }) });
+    ingestStatus(ok, "stream");
+    const t0 = useLabStatusStore.getState().receivedAt;
+    ingestStatus(mergeTick(null, { serve: { error: "The operation timed out.", unreachable: true } }), "poll");
+    const s = useLabStatusStore.getState();
+    expect(s.status?.serve?.sampled_at_ms).toBe(2000); // last real reading kept
+    expect(s.receivedAt).toBe(t0); // so its age keeps growing
+    expect(s.engineError).toBe("The operation timed out.");
+    expect(s.unreachable).toBe(false); // the controller answered
+    ingestStatus(mergeTick(null, { serve: snap(3000, { spark1: 2995 }) }), "stream");
+    expect(useLabStatusStore.getState().engineError).toBeNull();
+  });
+
+  test("with nothing to keep, the failure itself is shown", () => {
+    ingestStatus(mergeTick(null, { serve: { error: "status sampler warming up", sampled_at_ms: null } }), "stream");
+    const s = useLabStatusStore.getState();
+    expect(s.engineError).toBe("status sampler warming up");
+    expect(s.status?.serve?.error).toBe("status sampler warming up");
   });
 });
 

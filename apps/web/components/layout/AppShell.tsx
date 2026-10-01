@@ -96,9 +96,11 @@ function HeaderReadout() {
       ? "unreachable"
       : loading
         ? "…"
-        : healthy
-          ? "serving"
-          : "idle";
+        : stale
+          ? "stale"
+          : healthy
+            ? "serving"
+            : "idle";
   const probeNote = needToken
     ? TOKEN_COPY
     : unreachable

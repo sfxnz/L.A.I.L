@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { api, type RunRow } from "@/lib/api";
-import { serveHealthy, serverNow, useLabStatusStore, useStale } from "@/lib/lab-status-store";
+import { serveHealthy, serverNow, useLabStatusStore, useNow, useStale } from "@/lib/lab-status-store";
 import { ClusterPanel } from "@/components/ClusterPanel";
 import { LastSyncCard } from "@/components/bench/LastSyncCard";
 import { EndpointHero } from "@/components/status/EndpointHero";
@@ -34,13 +34,14 @@ function Band({ index, label, meta }: { index: string; label: string; meta?: Rea
 }
 
 export default function StatusPage() {
-  const { status, loading, needToken, unreachable, error, receivedAt, runLive, refresh } = useLabStatusStore(
+  const { status, loading, needToken, unreachable, error, engineError, receivedAt, runLive, refresh } = useLabStatusStore(
     useShallow((s) => ({
       status: s.status,
       loading: s.loading,
       needToken: s.needToken,
       unreachable: s.unreachable,
       error: s.error,
+      engineError: s.engineError,
       receivedAt: s.receivedAt,
       runLive: !!s.liveRun,
       refresh: s.refresh,
@@ -48,6 +49,8 @@ export default function StatusPage() {
   );
   const samples = useLabStatusStore((s) => s.samples);
   const stale = useStale();
+  // Samples move the page every second; while none arrive, ages must still count up.
+  useNow(stale ? 1000 : 3_600_000);
   const [decodeRuns, setDecodeRuns] = useState<RunRow[]>([]);
   const [runsLoading, setRunsLoading] = useState(true);
   const [retrying, setRetrying] = useState(false);
@@ -86,7 +89,6 @@ export default function StatusPage() {
   const healthy = serveHealthy(status);
   const now = serverNow({ status, receivedAt });
   const nodeCount = cluster?.nodes?.length ?? 0;
-  const engineDown = !!serve?.unreachable;
 
   return (
     <div className="lab-fade-in space-y-4">
@@ -135,10 +137,11 @@ export default function StatusPage() {
         </Callout>
       )}
 
-      {!unreachable && engineDown && (
-        <Callout tone="danger" title="Serve-engine unreachable">
-          The controller answers but serve-engine does not{serve?.error ? ` (${serve.error})` : ""}. Live readings resume
-          when it is back on :8765.
+      {!unreachable && engineError && (
+        <Callout tone="danger" title="Serve-engine not answering">
+          The controller answers but serve-engine does not ({engineError}).{" "}
+          {serve?.sampled_at_ms != null ? "The readings below are the last ones it sent. " : ""}They resume when it is
+          back on :8765.
         </Callout>
       )}
 

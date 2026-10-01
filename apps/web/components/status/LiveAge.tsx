@@ -21,7 +21,7 @@ export function LiveAge({ className, quiet }: { className?: string; /** say noth
   if (quiet && !stale && s.transport !== "poll") return null;
   return (
     <Eyebrow
-      className={cn("lab-num", stale ? "text-lab-warn" : "text-lab-muted", className)}
+      className={cn("lab-num shrink-0 whitespace-nowrap", stale ? "text-lab-warn" : "text-lab-muted", className)}
       title={`Newest sample ${age.toFixed(1)} s old${s.transport === "poll" ? " · stream unavailable, polling every 2 s" : ""}`}
     >
       {stale ? `not updating · ${fmtAge(age)}` : s.transport === "poll" ? "polling" : "live"}

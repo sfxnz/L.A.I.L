@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { create } from "zustand";
-import { api, type ClusterNode, type LabStatus } from "./api";
+import { ApiError, api, type ClusterNode, type LabStatus } from "./api";
 import { isUnauthorizedError } from "./auth-token";
 
 /**
@@ -89,6 +89,12 @@ type LabStatusStore = {
   receivedAt: number | null;
   /** how status is arriving: the live stream, or the polling fallback */
   transport: "stream" | "poll" | null;
+  /**
+   * The controller answers but serve-engine does not (or is warming up). `status`
+   * then keeps the last real snapshot, which ages into "stale" — never replaced by
+   * an empty one that would read as "no model serving".
+   */
+  engineError: string | null;
   samples: Samples;
   liveRun: LiveRun | null;
   /** last `meta` event of the stream (merged into every tick) */
@@ -236,6 +242,7 @@ export const useLabStatusStore = create<LabStatusStore>((set, get) => ({
   error: null,
   receivedAt: null,
   transport: null,
+  engineError: null,
   samples: EMPTY_SAMPLES,
   liveRun: null,
   meta: null,
@@ -262,18 +269,31 @@ export const useLabStatusStore = create<LabStatusStore>((set, get) => ({
   },
 }));
 
-/** Show one snapshot (from either transport). An older one than shown is dropped. */
+/** A status whose serve block is serve-engine's failure (or warm-up), not a snapshot. */
+export function engineFailure(status: LabStatus): string | null {
+  const serve = status.serve;
+  if (serve && num(serve.sampled_at_ms) != null) return null;
+  return serve?.error || (serve ? null : "serve-engine did not answer");
+}
+
+/**
+ * Show one snapshot (from either transport). An older one than shown is dropped.
+ * A serve-engine failure keeps the last real snapshot on screen, aging (and so
+ * dimmed as stale) with the failure noted, rather than blanking the instruments.
+ */
 export function ingestStatus(status: LabStatus, transport: "stream" | "poll"): void {
   const s = useLabStatusStore.getState();
   if (isOlder(s.status, status)) return;
+  const engineError = engineFailure(status);
+  const base = { loading: false, needToken: false, unreachable: false, error: null, transport, engineError };
+  if (engineError && num(s.status?.serve?.sampled_at_ms) != null) {
+    useLabStatusStore.setState(base);
+    return;
+  }
   useLabStatusStore.setState({
+    ...base,
     status,
-    loading: false,
-    needToken: false,
-    unreachable: false,
-    error: null,
     receivedAt: Date.now(),
-    transport,
     samples: pushSamples(s.samples, status.serve),
   });
 }
@@ -287,11 +307,13 @@ export function ingestHistory(entries: Array<{ serve?: Partial<Serve> }>): void 
 
 export function ingestFailure(e: unknown): void {
   const unauthorized = isUnauthorizedError(e);
+  // The web server's proxy answers a bare 5xx page when the controller is down.
+  const proxied = e instanceof ApiError && !e.json && e.status >= 500;
   useLabStatusStore.setState({
     loading: false,
     needToken: unauthorized,
     unreachable: !unauthorized,
-    error: unauthorized ? null : String((e as Error)?.message || e),
+    error: unauthorized ? null : proxied ? `no answer from the controller (HTTP ${(e as ApiError).status})` : String((e as Error)?.message || e),
   });
 }
 

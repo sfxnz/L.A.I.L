@@ -1224,8 +1224,13 @@ export default function ServerPage() {
  * costs the operator half an hour.
  */
 function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked: boolean }) {
-  const { loading, healthy, serve } = useLabStatusStore(
-    useShallow((s) => ({ loading: s.loading, healthy: serveHealthy(s.status), serve: s.status?.serve ?? null })),
+  const { loading, healthy, serve, engineError } = useLabStatusStore(
+    useShallow((s) => ({
+      loading: s.loading,
+      healthy: serveHealthy(s.status),
+      serve: s.status?.serve ?? null,
+      engineError: s.engineError,
+    })),
   );
   const [confirming, setConfirming] = useState(false);
   useEffect(() => {
@@ -1253,8 +1258,8 @@ function LiveEndpoint({ onStop, stopBlocked }: { onStop: () => void; stopBlocked
           label="Live endpoint"
           action={
             <SyncRing
-              state={loading ? null : healthy ? "serving" : serve?.unreachable ? "offline" : "idle"}
-              label={loading ? "Checking endpoint" : healthy ? "Endpoint healthy" : serve?.unreachable ? "Engine down" : "Endpoint idle"}
+              state={loading ? null : engineError ? "offline" : healthy ? "serving" : "idle"}
+              label={loading ? "Checking endpoint" : engineError ? `Serve-engine not answering (${engineError})` : healthy ? "Endpoint healthy" : "Endpoint idle"}
             />
           }
         />

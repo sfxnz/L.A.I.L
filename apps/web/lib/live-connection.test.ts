@@ -19,6 +19,7 @@ afterEach(() => {
     error: null,
     receivedAt: null,
     transport: null,
+    engineError: null,
     samples: EMPTY_SAMPLES,
   });
 });
@@ -120,6 +121,14 @@ describe("startLive", () => {
     }
     expect(useLabStatusStore.getState().unreachable).toBe(false);
     expect(useLabStatusStore.getState().status?.serve?.sampled_at_ms).toBeGreaterThan(1000);
+  });
+
+  test("the web proxy's bare 500 (controller down) reads as no answer, not as a server bug", async () => {
+    globalThis.fetch = (async () => new Response("Internal Server Error", { status: 500 })) as unknown as typeof fetch;
+    const stop = startLive(async () => new Response("Internal Server Error", { status: 500 }));
+    await until(() => useLabStatusStore.getState().unreachable);
+    stop();
+    expect(useLabStatusStore.getState().error).toBe("no answer from the controller (HTTP 500)");
   });
 
   test("nothing answers → unreachable, with the error", async () => {

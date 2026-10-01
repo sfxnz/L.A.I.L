@@ -100,7 +100,7 @@ export function DecodeConfigPanel({
           <span className="lab-num font-mono text-[10px] text-lab-muted">{cfg.levels.map((l) => `×${l}`).join(" → ")}</span>
         </div>
         <LevelGrid selected={selected} disabled={locked} onToggle={(n) => onChange({ ...cfg, levels: sortConcurrencies(toggleLevel(selected, n)) })} />
-        <p className="mt-1.5 text-[10px] leading-snug text-lab-muted">Keys 1–6 toggle ×1 ×2 ×4 ×8 ×16 ×32. Levels run ascending, one wave each.</p>
+        <p className="mt-1.5 text-[10px] leading-snug text-lab-muted">Keys 1–6 toggle ×1 ×2 ×4 ×8 ×16 ×32. Levels run ascending after one warmup request, each with at least 3 strands (×1 three waves, ×2 two, ×4+ one); numbers are medians with min–max.</p>
       </section>
 
       <section>
@@ -197,7 +197,7 @@ export function PrefillConfigPanel({
           ))}
         </div>
         <p className="mt-1.5 text-[10px] leading-snug text-lab-muted">
-          One stream per size, unique-prefix prompt, max_tokens 1. Sizes over max-model-len are reported skipped — never dropped.
+          Two requests per size after one warmup, each with its own unique-prefix prompt (no prefix-cache hits), max_tokens 1; the rate is the median. Sizes over max-model-len are reported skipped — never dropped.
         </p>
       </section>
       <RunStop running={running} canRun={canRun} reason={reason} onRun={onRun} onStop={onStop} starting={starting} />

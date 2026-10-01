@@ -64,7 +64,12 @@ def argv(spec: ServeSpec, rank: Rank | None) -> list[str]:
 
 
 def container_args(image: str, cmd: list[str], multi: bool) -> list[str]:
-    prelude = f"command -v tensorfold >/dev/null 2>&1 || pip install {shlex.quote(PIP_SOURCE)} || exit 1"
+    # The install resolves TensorFold's PyPI dependencies at run time: run it without the
+    # HF token the container carries for `tensorfold serve`, so a bad dependency cannot read it.
+    prelude = (
+        "command -v tensorfold >/dev/null 2>&1 || "
+        f"env -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN pip install {shlex.quote(PIP_SOURCE)} || exit 1"
+    )
     return bash_wrap(image, cmd, prelude=prelude)
 
 

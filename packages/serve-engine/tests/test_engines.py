@@ -110,6 +110,7 @@ def test_single_node_commands_bind_loopback_label_and_enable_metrics():
     assert f"{engines.tensorfold.CACHE_DIR}:/root/.cache" in cmd  # pip + kernel builds survive Stop
     i = cmd.index(tf.image())
     assert cmd[i + 1] == "-lc" and "pip install" in cmd[i + 2] and "command -v tensorfold" in cmd[i + 2]
+    assert "env -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN pip install" in cmd[i + 2]  # the install never sees the token
     assert "TensorFold.git@c4646171139ee8a3c38103eaa1699dad226ec12b" in cmd[i + 2]  # the verified commit
     argv = cmd[cmd.index("--") + 1:]
     assert argv[:3] == ["tensorfold", "serve", "zai-org/GLM-5.3-Flash"]

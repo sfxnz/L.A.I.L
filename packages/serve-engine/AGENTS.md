@@ -1,10 +1,11 @@
 # AGENTS.md — `packages/serve-engine`
 
-Python FastAPI: vLLM auto-configure, smoke, benches, run history.
+Python FastAPI: auto-configure, serve (vLLM, SGLang, llama.cpp, TensorFold), smoke, benches, run history.
 
 ## Placement
 
 - Flags are generated in `app/services/autoconfig.py`. Do not hardcode model recipes in Python.
+- Engine-specific CLI, readiness and `/metrics` mapping live in `app/services/engines/` (one adapter per engine: vLLM, SGLang, llama.cpp, TensorFold). The placement result stays engine-neutral; an adapter translates it.
 - Add future model recipes to repo-root `data/serve_overlays.json`.
 - Corpus tests live in `tests/corpus/` and `tests/fixtures/`. A placement change without a corpus or unit test is incomplete.
 

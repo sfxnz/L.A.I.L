@@ -242,7 +242,11 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
         "probe": 1, "version": 1, "hw": 1, "containers": 1, "cluster": 1, "cluster_reused_ps": 0,
         "inspect": 1,
     }
-    assert s.probe() == _probe()
+    # the probe handed to envelopes carries the sample it was taken with (missed-3)
+    ctx = s.probe()
+    assert {k: v for k, v in ctx.items() if k not in ("containers", "inspect", "hardware")} == _probe()
+    assert ctx["containers"] == snap["containers"] and ctx["hardware"] == snap["hardware"]
+    assert ctx["inspect"]["cmd"] == ["--port", "8000"]
 
 
 def test_docker_inspect_runs_once_per_slow_interval_and_on_container_change(monkeypatch):

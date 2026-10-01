@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from ..config import DEFAULT_BASE_URL, MODEL_PRESETS
-from . import node_probe
+from . import engines, node_probe
 
 
 def utc_now() -> str:
@@ -153,10 +153,11 @@ def build_engine(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """`serve.engine` for /api/status: vLLM gauges, KV geometry, container flags.
+    """`serve.engine` for /api/status: the engine serving (detected), its gauges, KV
+    geometry, container flags.
 
-    Every value is None when its source is absent (llama.cpp has no vllm:* metrics,
-    a bare process has no container) — nothing is fabricated.
+    Every value is None when its source is absent (llama.cpp and TensorFold publish no
+    KV pool fraction, a bare process has no container) — nothing is fabricated.
     """
     probe = probe or {}
     metrics = probe.get("metrics") or {}
@@ -171,11 +172,14 @@ def build_engine(
         capacity = block_size * num_blocks
     models = probe.get("models") or []
     max_len = models[0].get("max_model_len") if models and isinstance(models[0], dict) else None
+    if max_len is None:
+        max_len = metrics.get("context_length")  # TensorFold /health
     version = probe.get("version")
     if isinstance(version, dict):
         version = version.get("version")
     flags = redact_flags(inspect.get("cmd") or [])
     return {
+        "name": probe.get("engine"),
         "kv_usage_pct": None if kv is None else round(kv * 100, 2),
         "requests_running": _int_or_none(metrics.get("requests_running")),
         "requests_waiting": _int_or_none(metrics.get("requests_waiting")),
@@ -204,18 +208,25 @@ async def probe_endpoint(
     *,
     client: httpx.AsyncClient | None = None,
     version: bool = True,
+    engine: str | None = None,
 ) -> dict[str, Any]:
-    """Probe /health, /v1/models, /version (when asked), /metrics concurrently.
+    """Probe /health, /v1/models, the version route (when asked), /metrics concurrently.
+
+    `engine` is the best guess before this probe (the last detection, or the serving
+    container's engine): it picks the version route. The engine is then detected from
+    what answered (owned_by, metrics prefix) and its adapter parses /metrics (+ /health
+    for TensorFold) into the shared contract.
 
     Parsing /metrics feeds the live tok/s counter deltas (`_LIVE_RATE`), so this
     must have one caller at a fixed cadence: the status sampler. Bench threads
     read the sampler's cached probe instead of calling this. The sampler passes
-    its long-lived `client` and skips /version until the serving container changes.
+    its long-lived `client` and skips the version route until the serving container changes.
     """
     base = base_url.rstrip("/")
     result: dict[str, Any] = {
         "base_url": base,
         "healthy": False,
+        "engine": None,
         "models": [],
         "version": None,
         "metrics": {},
@@ -223,6 +234,8 @@ async def probe_endpoint(
     }
     health_ok = False
     errors: dict[str, str] = {}
+    raw: dict[str, Any] = {"metrics": None, "health": None}
+    version_route = engines.get(engine).version if engine in engines.ENGINES else engines.VLLM.version
 
     async def run(c: httpx.AsyncClient) -> None:
         async def health() -> None:
@@ -230,6 +243,8 @@ async def probe_endpoint(
             try:
                 h = await c.get(f"{base}/health", timeout=timeout)
                 health_ok = h.status_code == 200
+                if health_ok and "application/json" in h.headers.get("content-type", ""):
+                    raw["health"] = h.json()
             except Exception as e:
                 errors["health"] = f"health: {e}"
 
@@ -244,10 +259,19 @@ async def probe_endpoint(
                 errors["models"] = f" models: {e}"
 
         async def version_() -> None:
+            if version_route is None:
+                return
+            path, key = version_route
             try:
-                v = await c.get(f"{base}/version", timeout=timeout)
-                if v.status_code == 200:
-                    result["version"] = v.json() if "application/json" in v.headers.get("content-type", "") else v.text
+                v = await c.get(f"{base}{path}", timeout=timeout)
+                if v.status_code != 200:
+                    return
+                if "application/json" not in v.headers.get("content-type", ""):
+                    result["version"] = {"version": v.text.strip()}
+                    return
+                body = v.json()
+                if isinstance(body, dict) and body.get(key):
+                    result["version"] = {"version": str(body[key])}
             except Exception:
                 pass
 
@@ -255,11 +279,8 @@ async def probe_endpoint(
             try:
                 met = await c.get(f"{base}/metrics", timeout=timeout)
                 if met.status_code == 200:
-                    mono, wall_ms = time.monotonic(), int(time.time() * 1000)
-                    # ~70 KB of text: parse off the event loop. One writer → rate state is safe.
-                    parsed = await asyncio.to_thread(parse_prometheus, met.text, mono)
-                    parsed["sampled_at"] = wall_ms
-                    result["metrics"] = parsed
+                    raw["metrics"] = met.text
+                    raw["mono"], raw["wall_ms"] = time.monotonic(), int(time.time() * 1000)
             except Exception:
                 pass
 
@@ -271,47 +292,34 @@ async def probe_endpoint(
         async with httpx.AsyncClient(timeout=timeout) as c:
             await run(c)
     result["healthy"] = result["healthy"] or health_ok
+    result["engine"] = engines.detect(result["models"], raw["metrics"], hint=engine)
+    if raw["metrics"] is not None:
+        # ~70 KB of text: parse off the event loop. One writer → rate state is safe.
+        parsed = await asyncio.to_thread(
+            parse_prometheus, raw["metrics"], raw["mono"], engine=result["engine"] or "vllm", health=raw["health"]
+        )
+        parsed["sampled_at"] = raw["wall_ms"]
+        result["metrics"] = parsed
     if errors:
         result["error"] = errors.get("health", "") + errors.get("models", "")
     return result
 
 
-# Prometheus name → normalized key. Series of one name that differ only by labels
-# (engine="0", engine="1", … under data parallel) are SUMMED; when several names map
-# to one key (old and new vLLM spellings) the first name present wins.
-_PROM_KEYS: tuple[tuple[str, str], ...] = (
-    ("vllm:kv_cache_usage_perc", "gpu_kv_cache_usage"),
-    ("vllm:gpu_cache_usage_perc", "gpu_kv_cache_usage"),
-    # vLLM ≥ 0.10 exposes the counters with the Prometheus `_total` suffix.
-    ("vllm:prefix_cache_hits_total", "prefix_cache_hits"),
-    ("vllm:prefix_cache_hits", "prefix_cache_hits"),
-    ("vllm:prefix_cache_queries_total", "prefix_cache_queries"),
-    ("vllm:prefix_cache_queries", "prefix_cache_queries"),
-    ("vllm:num_preemptions_total", "preemptions_total"),
-    ("vllm:num_requests_running", "requests_running"),
-    ("vllm:num_requests_waiting", "requests_waiting"),
-    ("vllm:prompt_tokens_total", "prompt_tokens_total"),
-    ("vllm:generation_tokens_total", "generation_tokens_total"),
-    ("vllm:time_to_first_token_seconds_sum", "ttft_sum"),
-    ("vllm:time_to_first_token_seconds_count", "ttft_count"),
-    # Recorded once per engine step per running request: Σ is the busy decode time.
-    ("vllm:inter_token_latency_seconds_sum", "itl_sum"),
-    # Recorded when a request FINISHES (not at first token).
-    ("vllm:request_prefill_time_seconds_sum", "prefill_time_s_sum"),
-    ("vllm:request_prefill_time_seconds_count", "prefill_time_s_count"),
-    ("vllm:request_prefill_kv_computed_tokens_sum", "prefill_tokens_sum"),
-    ("vllm:spec_decode_num_drafts_total", "spec_drafts"),
-    ("vllm:spec_decode_num_draft_tokens_total", "spec_draft_tokens"),
-    ("vllm:spec_decode_num_accepted_tokens_total", "spec_accepted"),
-)
-_PROM_NAMES = {name for name, _ in _PROM_KEYS}
-# A pool fraction per engine: summing engines would exceed 1 — report the fullest one.
-_PROM_MAX_KEYS = {"gpu_kv_cache_usage"}
 _PROM_LINE_RE = re.compile(r"^([a-zA-Z0-9_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+|NaN)")
 
 
-def parse_prometheus(text: str, now: float | None = None) -> dict[str, Any]:
-    """Extract the vLLM gauges/counters LAIL uses, then the live window rates."""
+def parse_prometheus(
+    text: str,
+    now: float | None = None,
+    *,
+    engine: str = "vllm",
+    health: Any = None,
+) -> dict[str, Any]:
+    """Map one engine's /metrics (and TensorFold's /health) onto the shared keys, then the
+    live window rates. Series of one name that differ only by labels are SUMMED (vLLM
+    data-parallel engines, SGLang is_streaming); the adapter's max-keys take the fullest."""
+    eng = engines.get(engine)
+    names = {name for name, _ in eng.prom_keys}
     by_name: dict[str, list[float]] = {}
     out: dict[str, Any] = {}
     for line in text.splitlines():
@@ -330,19 +338,24 @@ def parse_prometheus(text: str, now: float | None = None) -> dict[str, Any]:
                 out["sleep_state"] = sm.group(1)
             continue
         m = _PROM_LINE_RE.match(line)
-        if not m or m.group(1) not in _PROM_NAMES:
+        if not m or m.group(1) not in names:
             continue
         val = float(m.group(2))
         if val == val:  # drop NaN
             by_name.setdefault(m.group(1), []).append(val)
-    for name, key in _PROM_KEYS:
+    for name, key in eng.prom_keys:
         if key in out or name not in by_name:
             continue
         vals = by_name[name]
-        out[key] = max(vals) if key in _PROM_MAX_KEYS else sum(vals)
+        out[key] = max(vals) if key in eng.prom_max_keys else sum(vals)
     if out.get("prefix_cache_queries"):
         out["prefix_cache_hit_rate"] = out.get("prefix_cache_hits", 0.0) / out["prefix_cache_queries"]
-    return live_token_rates(out, now=now)
+    if eng.derive is not None:
+        out = eng.derive(out, health)
+    out = live_token_rates(out, now=now, mode=eng.rate_mode)
+    if eng.live_gauges is not None:
+        out = eng.live_gauges(out)
+    return out
 
 
 # Counters whose window deltas drive the live rates.
@@ -390,7 +403,7 @@ def _ratio(num: float | None, den: float | None, digits: int = 2) -> float | Non
     return round(num / den, digits)
 
 
-def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+def live_token_rates(metrics: dict[str, Any], *, now: float | None = None, mode: str = "step") -> dict[str, Any]:
     """Live rates from counter deltas over the window since the previous scrape.
 
     decode_tok_per_s      per-stream decode speed over BUSY time: tokens after each
@@ -412,6 +425,14 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
                           `ended_at` epoch ms. Closed at the first scrape with no request
                           running, so ended_at is at most one window after the last token.
                           Both "last" values are labelled, never live.
+
+    `mode` is how the engine's counters move (its adapter's `rate_mode`):
+      step    tokens + busy time advance every step (vLLM; SGLang via its histograms)
+      wall    tokens advance live, busy time lands when a request ends (TensorFold):
+              live decode = Δtokens ÷ Δwall ÷ streams decoding; last_burst is exact
+      finish  everything lands when a request ends (llama.cpp): no live decode or
+              throughput (a finished request's tokens would read as a spike) — the
+              finished requests' exact rate shows as last_burst
 
     Never a lifetime average; a counter that goes backwards (engine restart) re-baselines.
     """
@@ -442,11 +463,15 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     first = d.get("ttft_count") or 0.0
     itl = d.get("itl_sum") or 0.0
     out["rate_window_s"] = round(dt, 2)
-    if gen is not None:
+    if gen is not None and mode != "finish":
         out["throughput_tok_per_s"] = round(gen / dt, 2)
-    if running and gen is not None:
-        out["decode_tok_per_s"] = round(max(0.0, gen - first) / itl, 2) if itl > 0 else 0.0
-    if d.get("prefill_time_s_count"):
+    if mode == "step":
+        if running and gen is not None:
+            out["decode_tok_per_s"] = round(max(0.0, gen - first) / itl, 2) if itl > 0 else 0.0
+    elif mode == "wall" and running and gen is not None:
+        streams = max(1.0, float(metrics.get("decode_streams") or metrics.get("requests_running") or 1))
+        out["decode_tok_per_s"] = round(gen / dt / streams, 2)
+    if d.get("prefill_time_s_sum"):
         out["prefill_tok_per_s"] = _ratio(d.get("prefill_tokens_sum"), d.get("prefill_time_s_sum"))
         if out["prefill_tok_per_s"] is not None:
             _LIVE_RATE["last_prefill"] = out["last_prefill"] = {
@@ -463,19 +488,24 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     out["prefix_cache_hit_rate_live"] = _ratio(d.get("prefix_cache_hits"), d.get("prefix_cache_queries"), 4)
 
     burst = _LIVE_RATE["burst"]
-    if running or gen or d.get("prefill_time_s_count"):
+    active = bool(running or gen or d.get("prefill_time_s_sum"))
+    if active:
         burst = burst or {"tokens": 0.0, "decode_tokens": 0.0, "itl": 0.0}
         burst["tokens"] += gen or 0.0
-        burst["decode_tokens"] += max(0.0, (gen or 0.0) - first) if itl > 0 else 0.0
+        # step: tokens and busy time arrive together; wall/finish: busy time lands later.
+        burst["decode_tokens"] += max(0.0, (gen or 0.0) - first) if (itl > 0 or mode != "step") else 0.0
         burst["itl"] += itl
+        burst["last_active_ms"] = int(time.time() * 1000)
         _LIVE_RATE["burst"] = burst
-    if burst and not running:
-        # Nothing runs at this scrape: the burst ended inside this window (its last tokens,
-        # if any, were just added). Keep it, labelled as such — never shown as live.
+    # step: nothing runs at this scrape, so the burst ended inside this window (its last
+    # tokens, if any, were just added). wall/finish: the busy time can land a window after
+    # the last request ends — wait for a fully idle window. Either way ended_at is the last
+    # scrape that saw activity. Kept, labelled as such — never shown as live.
+    if burst and not running and (mode == "step" or not active):
         _LIVE_RATE["last_burst"] = out["last_burst"] = {
             "decode_tok_per_s": _ratio(burst["decode_tokens"], burst["itl"]),
             "tokens": int(burst["tokens"]),
-            "ended_at": int(time.time() * 1000),
+            "ended_at": burst.get("last_active_ms") or int(time.time() * 1000),
         }
         _LIVE_RATE["burst"] = None
     return out
@@ -544,12 +574,16 @@ def build_envelope(
     elif isinstance(version, str):
         eng_ver = version
 
-    containers = list_vllm_containers()
+    # The status sampler's probe carries the sample it was taken with (containers, the
+    # serving container's inspect, telemetry): the envelope then describes the same
+    # moment as the Status page, without re-running docker / nvidia-smi.
+    sample = probe or {}
+    containers = sample["containers"] if "containers" in sample else list_vllm_containers()
     running = [c for c in containers if "Up" in c.get("status", "")]
     image = running[0]["image"] if running else None
     cmd_flags: list[str] = list(flags or [])
     if running and not cmd_flags:
-        insp = docker_inspect_flags(running[0]["name"])
+        insp = sample.get("inspect") or docker_inspect_flags(running[0]["name"])
         cmd_flags = [str(x) for x in (insp.get("cmd") or [])]
         image = insp.get("image") or image
 
@@ -568,7 +602,8 @@ def build_envelope(
         },
         "weights": preset.get("weights") or {},
         "engine": {
-            "name": "vllm",
+            # What answered (owned_by / metrics prefix), never assumed.
+            "name": sample.get("engine"),
             "version": eng_ver,
             "commit": eng_commit,
             "image": image,
@@ -578,7 +613,7 @@ def build_envelope(
             "metrics_snapshot": (probe or {}).get("metrics") or {},
             **(engine_extra or {}),
         },
-        "hardware": collect_hardware(),
+        "hardware": sample.get("hardware") or collect_hardware(),
         "workload": workload or {},
         "metrics": metrics or {},
         "agentic": agentic or {},

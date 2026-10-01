@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from app.services import autoconfig as ac
+from app.services.engines import vllm as vllm_adapter
 
 FIX = Path(__file__).resolve().parent / "fixtures"
 UNSLOTH = "unsloth/Qwen3.6-35B-A3B-NVFP4"
@@ -601,7 +602,7 @@ def test_build_vllm_args_mtp_emits_spark_moe_keys():
     """Structured MTP emit must carry Spark MoE keys (not just method + token count)."""
     from app.services import serve as sv
 
-    argv = sv._build_vllm_args(
+    argv = vllm_adapter.build_args(
         util=0.4,
         max_model_len=65536,
         port=8000,
@@ -626,7 +627,7 @@ def test_build_vllm_args_mtp_merges_spark_moe_from_extra_spec():
     """Leftover playbook --speculative-config extras must fold into the structured emit."""
     from app.services import serve as sv
 
-    argv = sv._build_vllm_args(
+    argv = vllm_adapter.build_args(
         util=0.4,
         max_model_len=65536,
         port=8000,
@@ -1189,7 +1190,7 @@ def test_recommend_dsv4_two_sparks_end_to_end(monkeypatch):
 def test_serve_build_args_passes_tp_through():
     from app.services import serve
 
-    args = serve._build_vllm_args(
+    args = vllm_adapter.build_args(
         util=0.8,
         max_model_len=1048576,
         port=8000,
@@ -1300,18 +1301,24 @@ def test_placement_future_4node_minimal_and_full():
 
 def test_multi_node_launch_head_worker_split():
     from app.services import serve
+    from app.services.engines import VLLM, ServeSpec
 
     launch = serve.build_multi_node_launch(
-        image="img", model="m",
-        vllm_args=["--host", "0.0.0.0", "--port", "8000", "--tensor-parallel-size", "2", "--kv-cache-dtype", "nvfp4_ds_mla", "--nnodes", "2"],
+        engine=VLLM,
+        spec=ServeSpec(
+            model="m", port=8000, tensor_parallel_size=2, kv_cache_dtype="nvfp4_ds_mla",
+            extra_flags="--host 0.0.0.0 --port 8000 --tensor-parallel-size 2 --nnodes 2",
+        ),
+        image="img",
         env_list=["VLLM_HOST_IP=10.100.8.1", "WORKER_VLLM_HOST_IP=10.100.8.2", "NCCL_SOCKET_IFNAME=enp1s0f1np1"],
         head={"id": "spark1", "qsfp_ip": "10.100.8.1"},
         workers=[{"id": "spark2", "qsfp_ip": "10.100.8.2", "ssh_host": "spark2"}],
-        nnodes=2, port=8000,
     )
     head = " ".join(launch["head"]["cmd"])
     worker = " ".join(launch["workers"][0]["cmd"])
-    assert "--node-rank 0" in head and "--host 0.0.0.0" in head and "--headless" not in head
+    # The head's OpenAI API binds loopback like a single-node serve (host network).
+    assert "--node-rank 0" in head and "--host 127.0.0.1" in head and "--headless" not in head
+    assert "0.0.0.0" not in head
     assert "--node-rank 1" in worker and "--headless" in worker and "--host" not in worker
     assert head.count("--tensor-parallel-size") == 1  # structured flag deduped
     assert "VLLM_HOST_IP=10.100.8.2" in worker
@@ -1324,13 +1331,15 @@ def test_multi_node_launch_clears_image_entrypoint():
     ('unrecognized arguments'). Verified live on spark1/spark2 2026-08-07."""
     from app.services import serve
 
+    from app.services.engines import VLLM, ServeSpec
+
     launch = serve.build_multi_node_launch(
-        image="ghcr.io/anemll/dspark-vllm-gx10:0.1.1", model="m",
-        vllm_args=["--kv-cache-dtype", "nvfp4_ds_mla"],
+        engine=VLLM,
+        spec=ServeSpec(model="m", port=8000, tensor_parallel_size=2, kv_cache_dtype="nvfp4_ds_mla"),
+        image="ghcr.io/anemll/dspark-vllm-gx10:0.1.1",
         env_list=[],
         head={"id": "spark1", "qsfp_ip": "10.100.8.1"},
         workers=[{"id": "spark2", "qsfp_ip": "10.100.8.2", "ssh_host": "spark2"}],
-        nnodes=2, port=8000,
     )
     for cmd in (launch["head"]["cmd"], launch["workers"][0]["cmd"]):
         assert "--entrypoint" in cmd, "must clear the image ENTRYPOINT"
@@ -1352,15 +1361,15 @@ def test_single_node_anemll_hf_home_and_entrypoint_parity():
     from app.services import serve
     from pathlib import Path
 
+    from app.services.engines import VLLM, ServeSpec
+
     image = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
-    args = serve._build_vllm_args(util=0.4, max_model_len=8192, port=8000, tensor_parallel_size=1)
     cmd = serve.build_single_node_docker_cmd(
+        engine=VLLM,
+        spec=ServeSpec(model="nvidia/NVIDIA-Nemotron-Nano-9B-v2", port=8000, util=0.4, max_model_len=8192),
         image=image,
-        model="nvidia/NVIDIA-Nemotron-Nano-9B-v2",
-        vllm_args=args,
         env_list=["NCCL_DEBUG=WARN"],
         container="vllm-lab-safe",
-        port=8000,
         hf_token=None,
     )
     joined = " ".join(cmd)
@@ -1383,15 +1392,15 @@ def test_single_node_stock_vllm_openai_no_entrypoint_override():
     from app.services import serve
     from pathlib import Path
 
+    from app.services.engines import VLLM, ServeSpec
+
     image = "vllm/vllm-openai:v0.27.1"
-    args = serve._build_vllm_args(util=0.4, max_model_len=4096, port=8000)
     cmd = serve.build_single_node_docker_cmd(
+        engine=VLLM,
+        spec=ServeSpec(model="Qwen/Qwen2.5-0.5B-Instruct", port=8000, util=0.4, max_model_len=4096),
         image=image,
-        model="Qwen/Qwen2.5-0.5B-Instruct",
-        vllm_args=args,
         env_list=[],
         container="vllm-lab-safe",
-        port=8000,
     )
     joined = " ".join(cmd)
     host_hf = str(Path.home() / ".cache" / "huggingface")
@@ -1400,6 +1409,8 @@ def test_single_node_stock_vllm_openai_no_entrypoint_override():
     assert "--entrypoint" not in cmd
     # Stock: image then model (ENTRYPOINT already vllm serve).
     assert cmd[cmd.index(image) + 1] == "Qwen/Qwen2.5-0.5B-Instruct"
+    # Published on loopback only; labelled so Stop/discovery find it by what it is.
+    assert "127.0.0.1:8000:8000" in cmd and "lail.engine=vllm" in cmd
 
 
 def test_worker_docker_pull_quotes_image(monkeypatch):
@@ -1425,20 +1436,19 @@ def test_worker_docker_pull_quotes_image(monkeypatch):
         "image": image,
         "model": "m",
         "port": 8000,
-        "head": {"rank": 0, "cmd": ["echo", "head"]},
+        "head": {"rank": 0, "container": "spark-vllm-n0", "cmd": ["echo", "head"]},
         "workers": [
             {
                 "node": "spark2",
                 "ssh_host": "spark2",
                 "rank": 1,
+                "container": "spark-vllm-n1",
                 "cmd": ["echo", "worker"],
             }
         ],
     }
-    # Short-circuit readiness wait by making urlopen succeed immediately.
-    monkeypatch.setattr(serve.urllib.request, "urlopen", lambda *a, **k: True)
-    # Avoid writing multinode state under data/
-    monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/tmp/lail-test-mn-state.json"))
+    # Short-circuit the readiness wait.
+    monkeypatch.setattr(serve, "wait_ready", lambda *a, **k: None)
     # _ensure_image_present first: image inspect fails → pull on head
     calls_n = {"n": 0}
     real_fake = fake_run
@@ -1456,7 +1466,7 @@ def test_worker_docker_pull_quotes_image(monkeypatch):
         return real_fake(cmd, **kwargs)
 
     monkeypatch.setattr(serve.subprocess, "run", sequenced)
-    serve._launch_multi_node(launch, port=8000)
+    serve._launch_multi_node(launch)
 
     ssh_pulls = [
         c for c in captured
@@ -1488,16 +1498,25 @@ def test_stop_all_kills_remote_worker_without_state_file(monkeypatch):
         ),
     )
     monkeypatch.setattr(serve, "_MULTINODE_STATE", type(serve._MULTINODE_STATE)("/no/such/multinode_serve.json"))
-    monkeypatch.setattr(serve, "SPARK_LAB", type(serve.SPARK_LAB)("/no/such/spark_lab.sh"))
     monkeypatch.setattr(serve, "list_vllm_containers", lambda: [])
 
+    # spark2 as `docker ps -a --no-trunc --format DOCKER_PS_FORMAT` prints it.
+    remote_ps = (
+        "spark-vllm-n1\tExited (1) 2 minutes ago\tvllm/vllm-openai:v0.27.1\tid1\tvllm\t\"bash -lc …\"\n"
+        # SE-05: a hand-launched TP worker whose NAME lacks "vllm" (the live serve on 2026-10-01).
+        "qwen38-flash-next-nvfp4\tUp 10 hours\tvllm/vllm-openai:v0.30.0-aarch64\tid2\t\t"
+        "\"vllm serve /cache/huggingface/hub/m --node-rank 1 --headless\"\n"
+        "conduit\tUp 11 days\tmatrixconduit/matrix-conduit:latest\tid3\t\t\"/bin/tini -- conduit\"\n"
+        # Not ours and not running: left alone.
+        "old-vllm\tExited (0) 3 days ago\tvllm/vllm-openai:latest\tid4\t\t\"vllm serve m\"\n"
+    )
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         class R:
             returncode = 0
-            stdout = "spark-vllm-n1\nother\n" if "docker ps" in " ".join(cmd) else ""
+            stdout = remote_ps if "docker ps" in " ".join(cmd) else ""
             stderr = ""
         return R()
 
@@ -1505,11 +1524,12 @@ def test_stop_all_kills_remote_worker_without_state_file(monkeypatch):
 
     result = serve.stop_all()
     assert result["ok"] is True
-    assert "spark2:spark-vllm-n1" in result["stopped"]
+    assert sorted(result["stopped"]) == ["spark2:qwen38-flash-next-nvfp4", "spark2:spark-vllm-n1"]
     # list + rm over ssh to spark2
     joined = [" ".join(c) for c in calls]
-    assert any("ssh" in j and "spark2" in j and "docker ps" in j for j in joined)
+    assert any("ssh" in j and "spark2" in j and "docker ps -a --no-trunc" in j for j in joined)
     assert any("ssh" in j and "spark2" in j and "docker rm -f spark-vllm-n1" in j for j in joined)
+    assert not any("conduit" in j or "old-vllm" in j for j in joined if "docker rm" in j)
 
 
 def test_overlay_file_extends_builtins(monkeypatch, tmp_path):
@@ -1700,7 +1720,7 @@ def test_recommend_nvidia_qwen36_35b_emits_playbook_mtp_moe(monkeypatch):
     assert cfg.get("mtp_num_tokens") == 3
     assert cfg.get("mtp_moe_backend") == "triton"
     assert "--max-num-batched-tokens 8192" in (cfg.get("extra_flags") or "")
-    argv = sv._build_vllm_args(
+    argv = vllm_adapter.build_args(
         util=float(cfg.get("util") or 0.4),
         max_model_len=int(cfg.get("max_model_len") or 65536),
         port=8000,
@@ -3354,16 +3374,6 @@ def test_multinode_weight_estimate_uses_hf_config(monkeypatch):
     assert all(c == cfg for c in seen["cfgs"]), f"hf_config skipped on a call; got {seen['cfgs']!r}"
 
 
-def test_lab_safe_headroom_abort_only_on_large_uma():
-    from app.services import serve as sv
-
-    assert sv._lab_safe_headroom_abort(avail=20.0, ram_total=32.0) is None
-    assert sv._lab_safe_headroom_abort(avail=20.0, ram_total=None) is None
-    msg = sv._lab_safe_headroom_abort(avail=20.0, ram_total=121.7)
-    assert msg is not None and "ABORT" in msg and "60" in msg
-    assert sv._lab_safe_headroom_abort(avail=80.0, ram_total=121.7) is None
-
-
 # ─── Active vendor research (card-silent) + Qwen3.8-27B-NVFP4 ─────────────────
 
 UNSLOTH_QWEN38 = "unsloth/Qwen3.8-27B-NVFP4"
@@ -4364,7 +4374,7 @@ def test_recommend_diffusiongemma_playbook(monkeypatch):
     from app.services import serve as sv
 
     cmd = "vllm serve " + rec["model"] + " " + " ".join(
-        sv._build_vllm_args(
+        vllm_adapter.build_args(
             util=float(cfg.get("util") or 0.4),
             max_model_len=int(cfg.get("max_model_len") or 65536),
             port=8000,
@@ -4626,9 +4636,10 @@ def test_recommend_sglang_unsloth35b_corpus_card(monkeypatch):
     assert rec["engine"] == "sglang"
     assert rec["serve_blocked"] is False
     argv = rec["argv"]
-    assert argv.startswith("python -m sglang.launch_server")
+    assert argv.startswith("python3 -m sglang.launch_server")
     assert "NEXTN" in argv
-    assert "--speculative-algo NEXTN" in argv
+    # The launch argv spells the flag as SGLang declares it (the card's alias is not one).
+    assert "--speculative-algorithm NEXTN" in argv
     assert rec["config"]["model_path"] == case["model"]
     assert int(rec["config"]["tp_size"]) == 1
     assert int(rec["config"]["port"]) == 30000
@@ -4666,7 +4677,7 @@ def test_recommend_sglang_from_vendor_doc(monkeypatch):
     assert rec["engine"] == "sglang"
     assert rec["serve_blocked"] is False
     argv = rec["argv"]
-    assert argv.startswith("python -m sglang.launch_server")
+    assert argv.startswith("python3 -m sglang.launch_server")
     assert "vllm serve" not in argv
     assert "--model-path" in argv
     assert "unsloth/Qwen3.8-27B-NVFP4" in argv
@@ -4762,7 +4773,7 @@ def test_recommend_three_engines_same_public_entry(monkeypatch):
     assert vllm["engine"] == "vllm"
     assert "quantization" in vllm["config"] or vllm["config"].get("max_model_len")
     assert sgl["engine"] == "sglang"
-    assert sgl["argv"].startswith("python -m sglang.launch_server")
+    assert sgl["argv"].startswith("python3 -m sglang.launch_server")
     assert llama["engine"] == "llamacpp"
     assert "-ngl 99" in llama["argv"]
     for rec in (vllm, sgl, llama):

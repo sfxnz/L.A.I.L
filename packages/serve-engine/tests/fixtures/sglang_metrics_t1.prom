@@ -1,0 +1,39 @@
+# Synthesised (not a live scrape) from the exact metric names/labels in upstream source; see tests/test_engines.py.
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 2.0
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 1.0
+# TYPE sglang:gen_throughput gauge
+sglang:gen_throughput{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 176.4
+# TYPE sglang:cache_hit_rate gauge
+sglang:cache_hit_rate{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.31
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.12
+# TYPE sglang:kv_used_tokens gauge
+sglang:kv_used_tokens{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 12000.0
+# TYPE sglang:kv_available_tokens gauge
+sglang:kv_available_tokens{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 88000.0
+# TYPE sglang:spec_accept_rate gauge
+sglang:spec_accept_rate{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 0.71
+# TYPE sglang:spec_accept_length gauge
+sglang:spec_accept_length{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 3.13
+# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true"} 4100.0
+sglang:prompt_tokens_total{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="false"} 900.0
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true"} 1000.0
+sglang:generation_tokens_total{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="false"} 0.0
+# TYPE sglang:num_requests_total counter
+sglang:num_requests_total{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true"} 8.0
+# TYPE sglang:time_to_first_token_seconds histogram
+sglang:time_to_first_token_seconds_bucket{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true",le="0.5"} 10.0
+sglang:time_to_first_token_seconds_bucket{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true",le="+Inf"} 10.0
+sglang:time_to_first_token_seconds_sum{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true"} 2.5
+sglang:time_to_first_token_seconds_count{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",is_streaming="true"} 10.0
+# TYPE sglang:inter_token_latency_seconds histogram
+sglang:inter_token_latency_seconds_bucket{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",le="0.02"} 1170.0
+sglang:inter_token_latency_seconds_bucket{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified",le="+Inf"} 1170.0
+sglang:inter_token_latency_seconds_sum{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified"} 22.0
+sglang:inter_token_latency_seconds_count{model_name="unsloth/Qwen3.6-35B-A3B-NVFP4",engine_type="unified"} 1170.0

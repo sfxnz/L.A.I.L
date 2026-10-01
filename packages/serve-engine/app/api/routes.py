@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .. import db
 from ..config import DEFAULT_BASE_URL, MODEL_PRESETS, RUNS_DIR, SERVE_EXAMPLES
-from ..services import agentic, autoconfig, cluster, jobs, metadata, serve, status_sampler
+from ..services import agentic, autoconfig, cluster, engines, jobs, metadata, serve, status_sampler
 
 router = APIRouter()
 
@@ -68,10 +68,12 @@ class ServeRequest(BaseModel):
     """Fully explicit serve config — hardware envelope is chosen by autoconfig."""
 
     model: str
+    # vllm | sglang | llamacpp | tensorfold — the adapter translates the fields below.
+    engine: str = "vllm"
     mode: Optional[str] = None  # ignored; kept so old clients do not 422
     util: Optional[float] = None
     max_model_len: Optional[int] = None
-    port: int = 8000
+    port: Optional[int] = None  # None: the engine's default port
     image: Optional[str] = None
     docker_env: list[str] = Field(default_factory=list)
     quantization: str = ""
@@ -96,12 +98,18 @@ class ServeRequest(BaseModel):
 
 @router.post("/serve/start")
 async def serve_start(body: ServeRequest) -> dict[str, str]:
-    def work(log, progress, **kw):
+    try:
+        engines.get(body.engine)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+    def work(log, progress, cancel, **kw):
         if body.download:
             progress(0.02, "downloading…")
             serve.download_model(model=body.model, log=log, progress=progress)
         return serve.serve_model(
             model=body.model,
+            engine=body.engine,
             mode=body.mode,
             util=body.util,
             max_model_len=body.max_model_len,
@@ -127,10 +135,17 @@ async def serve_start(body: ServeRequest) -> dict[str, str]:
             stop_first=body.stop_first,
             log=log,
             progress=progress,
+            cancel=cancel,
         )
 
     job_id = await jobs.start_job("serve", work)
     return {"job_id": job_id}
+
+
+@router.get("/serve/engines")
+async def serve_engines() -> dict[str, Any]:
+    """Engines Serve can launch, with their defaults and the fields each one translates."""
+    return {"engines": [e.describe() for e in engines.ENGINES.values()]}
 
 
 @router.get("/serve/examples")
@@ -152,10 +167,11 @@ def serve_recommend(
     ),
     backend: Optional[str] = Query(
         None,
-        description="vllm (default), llamacpp, or sglang. GGUF ids should use llamacpp.",
+        description="vllm (default), sglang, llamacpp, or tensorfold. GGUF ids should use llamacpp.",
     ),
 ) -> dict[str, Any]:
-    """Recommend vLLM, llama.cpp, or SGLang flags from the card plus vendor recipes.
+    """Recommend vLLM, SGLang, llama.cpp, or TensorFold flags from the card, vendor recipes
+    and the placement engine.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
     Plain `def`: card/HF fetches and topology run in FastAPI's threadpool, never on
@@ -208,7 +224,8 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 
     Sets the job's cancel flag; the runner writes `cancelled` at its next check (before
     each golden case; tool-eval's subprocess group is terminated by a watcher within
-    ~0.5 s; serve jobs do not honour cancel yet), so `status` here is usually still
+    ~0.5 s; a serve job stops polling within one readiness poll and removes the
+    containers it started), so `status` here is usually still
     `running`. A job with no runner in this process (orphaned by a restart) is marked
     `cancelled` immediately. Already-terminal jobs are returned unchanged.
     """
@@ -386,8 +403,9 @@ async def chat(body: ChatRequest):
     )
 
 @router.post("/smoke")
-async def smoke(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
-    base = base_url.rstrip("/")
+async def smoke(base_url: Optional[str] = None) -> dict[str, Any]:
+    # Default: the endpoint the sampler follows (whichever engine/port is serving).
+    base = (base_url or status_sampler.SAMPLER.base_url).rstrip("/")
     async with httpx.AsyncClient(timeout=180.0) as client:
         m = await client.get(f"{base}/v1/models")
         m.raise_for_status()
@@ -423,7 +441,7 @@ async def smoke(base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
 
 
 class AgenticRequest(BaseModel):
-    base_url: str = DEFAULT_BASE_URL
+    base_url: Optional[str] = None  # default: the endpoint the sampler follows
     model: Optional[str] = None
     intent: str = "attach"
     suite: Literal["golden", "tool_eval"] = "golden"
@@ -438,7 +456,7 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
 
         def work(log, progress, cancel, **kw):
             return agentic.run_golden_tools(
-                base_url=body.base_url,
+                base_url=body.base_url or status_sampler.SAMPLER.base_url,
                 model=body.model,
                 intent=body.intent,
                 log=log,
@@ -451,7 +469,7 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
 
         def work(log, progress, cancel, **kw):
             return agentic.run_tool_eval_bench(
-                base_url=body.base_url,
+                base_url=body.base_url or status_sampler.SAMPLER.base_url,
                 model=body.model,
                 preset=body.preset,
                 intent=body.intent,

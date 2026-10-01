@@ -4,7 +4,8 @@ Requests only read the cache; all blocking work runs via `asyncio.to_thread`.
 Two fixed-rate asyncio loops (started from the app lifespan; no drift — the next
 tick is scheduled from the previous deadline, not from when work finished):
 
-  fast (1 s)  endpoint probe (/metrics → live rates, /health, /v1/models),
+  fast (1 s)  endpoint probe (/metrics → live rates, /health, /v1/models; the engine
+              — vLLM, SGLang, llama.cpp, TensorFold — detected from what answers),
               this host's telemetry, docker ps (+ docker inspect of the serving
               container when it changes, or once per slow interval)
   slow (10 s) cluster inventory (all nodes in parallel); keeps one persistent
@@ -143,6 +144,9 @@ class StatusSampler:
         self._inspect_mono: float | None = None
         # /version only changes with the engine: fetched on the first tick and after a change.
         self._need_version = True
+        # Engine detected on the endpoint (owned_by / metrics prefix) — picks the version
+        # route and the metrics adapter for the next probe.
+        self._engine: str | None = None
         self._cluster: dict[str, Any] = _cluster_pending()
         self._cluster_mono: float | None = None
         self._published_cluster: dict[str, Any] = self._cluster
@@ -209,14 +213,29 @@ class StatusSampler:
             log.info("status sampler: endpoint moved %s → %s", self.base_url, self._pending_url)
             self.base_url, self._pending_url = self._pending_url, None
             self._need_version = True
+            self._engine = None
             metadata.reset_live_rate_state()
+        hint = self._engine or next(
+            (c.get("engine") for c in self._containers if "Up" in str(c.get("status", "")) and c.get("engine")),
+            None,
+        )
         probe, hardware, containers = await asyncio.gather(
             metadata.probe_endpoint(
-                self.base_url, ENDPOINT_TIMEOUT_S, client=self._client, version=self._need_version
+                self.base_url, ENDPOINT_TIMEOUT_S, client=self._client, version=self._need_version, engine=hint
             ),
             asyncio.to_thread(metadata.collect_hardware, self._telemetry),
             asyncio.to_thread(metadata.list_vllm_containers),
         )
+        if self._engine is not None and probe.get("engine") not in (None, self._engine):
+            # Another engine answers on the same URL: its counters and version are not the
+            # old one's — this window's deltas mixed the two, so it shows no rate.
+            metadata.reset_live_rate_state()
+            self._need_version, moved = True, True
+            if probe.get("metrics"):
+                probe["metrics"] = {
+                    **probe["metrics"], **dict.fromkeys(metadata.LIVE_RATE_KEYS), "last_burst": None, "last_prefill": None
+                }
+        self._engine = probe.get("engine") or self._engine
         prev = {} if moved else (self._probe or {})  # the old endpoint's scrape is not this one's
         if not self._need_version:
             probe["version"] = prev.get("version")
@@ -293,6 +312,7 @@ class StatusSampler:
                 # Another engine: its counters and version are not the old one's.
                 metadata.reset_live_rate_state()
                 self._need_version = True
+                self._engine = None
         self._inspect_name = name
         if not name:
             return
@@ -342,8 +362,12 @@ class StatusSampler:
     # ── readers ──────────────────────────────────────────────────────────────
 
     def probe(self) -> dict[str, Any] | None:
-        """Latest endpoint probe, for envelopes built off the loop (bench threads, import)."""
-        return self._probe
+        """Latest endpoint probe plus the sample it was taken with (containers, the serving
+        container's inspect, this host's telemetry), for envelopes built off the loop
+        (bench threads, import) — they describe the moment the Status page shows."""
+        if self._probe is None:
+            return None
+        return {**self._probe, "containers": self._containers, "inspect": self._inspect, "hardware": self._hardware}
 
     def hardware(self) -> dict[str, Any]:
         """Latest fast-tick telemetry of this host ({} before the first tick)."""

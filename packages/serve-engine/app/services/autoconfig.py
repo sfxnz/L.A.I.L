@@ -25,12 +25,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from . import engines
 from ..config import (
     DEFAULT_IMAGE_MAX,
     DEFAULT_IMAGE_SAFE,
     HOME,
-    SAFE_MAX_LEN,
-    SAFE_UTIL,
     WORKFLOW_MAX_LEN,
     WORKFLOW_UTIL,
 )
@@ -699,6 +698,8 @@ DSPARK_IMAGE = "ghcr.io/anemll/dspark-vllm-gx10:0.1.1"
 #
 # Add future models WITHOUT touching code: drop entries into data/serve_overlays.json
 # (same shape as a list entry). File entries override built-ins on key collision.
+# An entry may carry "engine": "sglang" | "llamacpp" | "tensorfold" — it then applies
+# only when recommending for that engine (default "vllm").
 _BUILTIN_OVERLAYS: list[dict[str, Any]] = [
     {
         "match": {"all": ["deepseek"], "any": ["v4", "dspark"]},
@@ -782,15 +783,18 @@ def _overlay_gap_only(overlay: Optional[dict[str, Any]]) -> bool:
     return bool(overlay.get("gap_only")) or overlay.get("family_key") == "qwen38_nvfp4"
 
 
-def _family_overlay(model: str, detected: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _family_overlay(model: str, detected: dict[str, Any], engine: str = "vllm") -> Optional[dict[str, Any]]:
     """Match a model id (+ optional detected family) against the overlay registry.
 
     Returns None when the card is authoritative (normal models). Data-driven so
     future models need no code change — drop entries into data/serve_overlays.json.
+    Only overlays for `engine` match (an entry without "engine" is a vLLM recipe).
     """
     mid = (model or "").lower()
     fam = str((detected or {}).get("family") or "").lower()
     for ov in _load_overlays():
+        if str(ov.get("engine") or "vllm").lower() != engine:
+            continue
         m = ov.get("match") or {}
         all_terms = [str(t).lower() for t in (m.get("all") or [])]
         any_terms = [str(t).lower() for t in (m.get("any") or [])]
@@ -1546,6 +1550,33 @@ def _apply_topology(
         env.append(f"VLLM_HOST_IP={head_ip}")
     if worker_ips:
         env.append(f"WORKER_VLLM_HOST_IP={','.join(worker_ips)}")
+    env += _nccl_env(head_if, warnings, rationale)
+    cfg["docker_env"] = _dedupe_env(env)
+
+    wtxt = f"~{weights_gib} GiB weights" if weights_gib else "weights unknown"
+    rationale.append(
+        f"Placement: {wtxt} over {plan['node_ram_gib']:.0f} GiB nodes → needs {n} node(s); "
+        f"TP={tp} across QSFP RoCE ({head_if or 'interface not discovered'})"
+        + (f"; head={head_ip}" if head_ip else "")
+        + (f", workers={','.join(worker_ips)}" if worker_ips else "")
+    )
+    if not fabric_ok:
+        warnings.append(
+            "Multi-node serve planned but the QSFP RoCE fabric check did not pass. "
+            f"Verify {head_if or 'RoCE interface'} carrier + {prefix_hint or 'RoCE IP'} "
+            "reachability on all nodes before Start."
+        )
+    if not head_ip or len(worker_ips) < (n - 1):
+        warnings.append(
+            "RoCE IPs not fully discovered — VLLM_HOST_IP / WORKER_VLLM_HOST_IP may need "
+            f"manual entry ({prefix_hint + ' on this lab' if prefix_hint else 'RoCE IPs on the QSFP interface'})."
+        )
+    cfg["topology_plan"] = plan
+
+
+def _nccl_env(head_if: Optional[str], warnings: list[str], rationale: list[str]) -> list[str]:
+    """NCCL / Gloo env for TP over the QSFP RoCE fabric (every engine uses NCCL)."""
+    env: list[str] = []
     if head_if:
         env += [
             f"NCCL_SOCKET_IFNAME={head_if}",
@@ -1574,27 +1605,62 @@ def _apply_topology(
             f"Could not resolve the RoCE HCA for {head_if}. If NCCL fails with "
             "'unhandled system error', set NCCL_IB_HCA manually in docker env."
         )
-    cfg["docker_env"] = _dedupe_env(env)
+    return env
 
-    wtxt = f"~{weights_gib} GiB weights" if weights_gib else "weights unknown"
-    rationale.append(
-        f"Placement: {wtxt} over {plan['node_ram_gib']:.0f} GiB nodes → needs {n} node(s); "
-        f"TP={tp} across QSFP RoCE ({head_if or 'interface not discovered'})"
-        + (f"; head={head_ip}" if head_ip else "")
-        + (f", workers={','.join(worker_ips)}" if worker_ips else "")
+
+def _engine_form(
+    eng: "engines.Engine",
+    form: dict[str, Any],
+    *,
+    plan: dict[str, Any],
+    overlay: Optional[dict[str, Any]],
+    warnings: list[str],
+    rationale: list[str],
+) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+    """Finish a non-vLLM recommendation: overlay for this engine, fabric env for TP,
+    and the exact per-process command lines the launcher will run (one per rank).
+
+    `form` holds the engine-neutral Serve fields (util, max_model_len, TP, parsers,
+    extra_flags…) — the same ones Start sends back. Returns (form, argv text, ranks).
+    """
+    if overlay:
+        for k, v in (overlay.get("config") or {}).items():
+            if k == "extra_flags":
+                form["extra_flags"] = _merge_extra_flags(form.get("extra_flags") or "", v or "")
+            elif k == "docker_env":
+                form["docker_env"] = _dedupe_env([*(form.get("docker_env") or []), *(v or [])])
+            elif v not in (None, ""):
+                form[k] = v
+        rationale.append(f"Overlay «{overlay.get('label') or overlay.get('family_key')}» for {eng.label}")
+        rationale.extend(overlay.get("rationale") or [])
+    tp = int(form.get("tensor_parallel_size") or 1)
+    ranks = None
+    head = plan.get("head") or {}
+    if tp >= 2:
+        head_if = head.get("qsfp_if") or _discovered_roce().get("qsfp_if")
+        form["docker_env"] = _dedupe_env([*(form.get("docker_env") or []), *_nccl_env(head_if, warnings, rationale)])
+        master = head.get("qsfp_ip") or "HEAD_ROCE_IP"
+        ranks = [
+            engines.Rank(rank=r, nnodes=tp, master_addr=master, master_port=int(eng.master_port or 0))
+            for r in range(tp)
+        ]
+    else:
+        form.pop("tensor_parallel_size", None)
+    form.setdefault("image", eng.image())
+    spec = engines.ServeSpec(
+        **{k: form[k] for k in engines.ServeSpec.__dataclass_fields__ if form.get(k) is not None and k != "tensor_parallel_size"},
+        tensor_parallel_size=tp,
     )
-    if not fabric_ok:
-        warnings.append(
-            "Multi-node serve planned but the QSFP RoCE fabric check did not pass. "
-            f"Verify {head_if or 'RoCE interface'} carrier + {prefix_hint or 'RoCE IP'} "
-            "reachability on all nodes before Start."
-        )
-    if not head_ip or len(worker_ips) < (n - 1):
-        warnings.append(
-            "RoCE IPs not fully discovered — VLLM_HOST_IP / WORKER_VLLM_HOST_IP may need "
-            f"manual entry ({prefix_hint + ' on this lab' if prefix_hint else 'RoCE IPs on the QSFP interface'})."
-        )
-    cfg["topology_plan"] = plan
+    procs = engines.preview(eng, spec, ranks)
+    nodes = [head, *(plan.get("workers") or [])]
+    for p in procs:
+        if p["rank"] is not None and p["rank"] < len(nodes):
+            p["node"] = (nodes[p["rank"]] or {}).get("id")
+    if len(procs) == 1:
+        argv = procs[0]["argv"]
+    else:
+        argv = "\n".join(f"# rank {p['rank']}{' on ' + p['node'] if p.get('node') else ''}\n{p['argv']}" for p in procs)
+    return form, argv, procs
 
 
 def _discovered_roce() -> dict[str, Any]:
@@ -4915,8 +4981,8 @@ def recommend(
     ``mode`` is accepted for old clients and ignored — util / max-len / VL
     come from the researched recipe + live hardware envelope.
 
-    ``backend`` is ``vllm`` (default), ``llamacpp``, or ``sglang``. GGUF ids
-    should use ``llamacpp``. None of these paths start a server.
+    ``backend`` is ``vllm`` (default), ``sglang``, ``llamacpp``, or ``tensorfold``.
+    GGUF ids should use ``llamacpp``. None of these paths start a server.
     """
     del mode  # accepted for old clients; user-facing dual envelopes are gone
     model = (model or "").strip()
@@ -4928,6 +4994,8 @@ def recommend(
         return recommend_llamacpp(model, fetch_remote=fetch_remote)
     if eng in ("sglang", "sg-lang", "sgl"):
         return recommend_sglang(model, fetch_remote=fetch_remote)
+    if eng == "tensorfold":
+        return recommend_tensorfold(model, fetch_remote=fetch_remote)
 
     rationale: list[str] = []
     warnings: list[str] = []
@@ -5449,7 +5517,7 @@ def looks_like_gguf(model: str, tags: list[str] | None = None) -> bool:
 
 
 def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, Any]:
-    """Spark-optimal llama.cpp flags. Recommend-only — does not start llama-server.
+    """Spark-optimal llama.cpp flags (single node). Recommends only; Start launches it.
 
     Pack from ggml DGX Spark benches + NVIDIA forum Spark guides:
     ``-ngl 99 --flash-attn on --no-mmap --jinja -ub 2048`` and a ctx sized
@@ -5522,21 +5590,27 @@ def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, An
         "mtp_num_tokens": mtp_n if use_mtp else 0,
         "extra_flags": "",
     }
+    launch_model = hub_id
     if spark_quant and "/" in hub_id and not hub_id.startswith("/"):
-        model_arg = f"-hf {hub_id}:{spark_quant}"
-        rationale.append(f"llama.cpp Hub ref: -hf {hub_id}:{spark_quant} (one Spark quant, not -m repo)")
-    else:
-        model_arg = f"-m {hub_id}"
-    mtp_arg = ""
+        launch_model = f"{hub_id}:{spark_quant}"
+        rationale.append(f"llama.cpp Hub ref: -hf {launch_model} (one Spark quant, not -m repo)")
+    pack = ["-ngl", "99", "--flash-attn", "on", "--no-mmap", "--jinja", "-ub", "2048"]
     if use_mtp:
-        mtp_arg = f" --spec-type draft-mtp --spec-draft-n-max {mtp_n}"
+        pack += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(mtp_n)]
         rationale.append(
             f"MTP GGUF detected → --spec-type draft-mtp --spec-draft-n-max {mtp_n}"
         )
-    argv = (
-        f"llama-server {model_arg} -ngl 99 --flash-attn on --no-mmap --jinja "
-        f"-ub 2048 -c {ctx} --host 0.0.0.0 --port 8080{mtp_arg}"
+    eng = engines.get("llamacpp")
+    # The Serve form: Start sends these back and the adapter adds --host/--port/--metrics.
+    form, argv, procs = _engine_form(
+        eng,
+        {"model": launch_model, "port": eng.default_port, "max_model_len": ctx, "extra_flags": shlex.join(pack), "docker_env": []},
+        plan=plan,
+        overlay=_family_overlay(hub_id, {}, engine="llamacpp"),
+        warnings=warnings,
+        rationale=rationale,
     )
+    cfg.update(form)
     rationale.append(
         "DGX Spark llama.cpp pack: -ngl 99, --flash-attn on, --no-mmap "
         "(GB10 mmap is slow), --jinja (tools). "
@@ -5553,10 +5627,11 @@ def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, An
         "mode": "auto",
         "confidence": "medium" if weights_gib else "low",
         "label": "llama.cpp Spark",
-        "notes": "Recommend-only. Start llama-server yourself (L.A.I.L does not spawn it yet).",
+        "notes": "Start launches llama-server in docker on this node (single node; /metrics on).",
         "serve_blocked": not fits,
         "config": cfg,
         "argv": argv,
+        "processes": procs,
         "topology": {
             "nodes": topology.get("nodes", 1),
             "weights_gib": weights_gib,
@@ -5578,7 +5653,7 @@ def recommend_llamacpp(model: str, *, fetch_remote: bool = True) -> dict[str, An
 
 
 def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]:
-    """Spark-optimal SGLang flags from the card / Unsloth docs. Recommend-only.
+    """Spark-optimal SGLang flags from the card / Unsloth docs. Recommends only; Start launches it.
 
     Unsloth NVFP4 pages publish ``python -m sglang.launch_server`` with NEXTN
     speculative decoding. Hardware envelope sets ``--tp-size`` and
@@ -5728,46 +5803,43 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
         cfg["extra_flags"] = _strip_flag_from_extra(cfg["extra_flags"], "--model")
         cfg["extra_flags"] = _scrub_unexpanded_shell_vars(cfg["extra_flags"], warnings)
 
-    parts = [
-        "python -m sglang.launch_server",
-        "--model-path",
-        str(cfg["model_path"] or model),
-        "--host",
-        str(cfg.get("host") or "0.0.0.0"),
-        "--port",
-        str(int(cfg.get("port") or 30000)),
-        "--tp-size",
-        str(int(cfg.get("tp_size") or 1)),
-        "--mem-fraction-static",
-        f"{float(cfg.get('mem_fraction_static') or mem):.2f}",
-    ]
-    if cfg.get("trust_remote_code"):
-        parts.append("--trust-remote-code")
-    if cfg.get("context_length"):
-        parts += ["--context-length", str(int(cfg["context_length"]))]
-    if cfg.get("quantization"):
-        parts += ["--quantization", str(cfg["quantization"])]
-    if cfg.get("tool_call_parser"):
-        parts += ["--tool-call-parser", str(cfg["tool_call_parser"])]
-    if cfg.get("reasoning_parser"):
-        parts += ["--reasoning-parser", str(cfg["reasoning_parser"])]
+    spec_flags: list[str] = []
     if cfg.get("spec_algorithm"):
-        # Emit the Unsloth/card spelling; --speculative-algorithm is accepted on parse.
-        parts += ["--speculative-algo", str(cfg["spec_algorithm"])]
+        spec_flags += ["--speculative-algorithm", str(cfg["spec_algorithm"])]
         if cfg.get("spec_num_steps") is not None:
-            parts += ["--speculative-num-steps", str(int(cfg["spec_num_steps"]))]
+            spec_flags += ["--speculative-num-steps", str(int(cfg["spec_num_steps"]))]
         if cfg.get("spec_eagle_topk") is not None:
-            parts += ["--speculative-eagle-topk", str(int(cfg["spec_eagle_topk"]))]
+            spec_flags += ["--speculative-eagle-topk", str(int(cfg["spec_eagle_topk"]))]
         if cfg.get("spec_draft_tokens") is not None:
-            parts += ["--speculative-num-draft-tokens", str(int(cfg["spec_draft_tokens"]))]
+            spec_flags += ["--speculative-num-draft-tokens", str(int(cfg["spec_draft_tokens"]))]
     extra = (cfg.get("extra_flags") or "").strip()
-    if extra:
-        parts.append(extra)
-    argv = " ".join(parts)
-    if "$" in argv:
-        warnings.append("Stripped leftover $ from SGLang argv")
-        argv = re.sub(r"\$\w+|\$\{\w+\}", "", argv)
-        argv = re.sub(r"\s+", " ", argv).strip()
+    if "$" in extra:
+        warnings.append("Stripped leftover $ from SGLang flags")
+        extra = re.sub(r"\s+", " ", re.sub(r"\$\w+|\$\{\w+\}", "", extra)).strip()
+    eng = engines.get("sglang")
+    # Placement → the Serve form (util = --mem-fraction-static, max_model_len =
+    # --context-length, TP across Sparks); the SGLang adapter turns it into argv per rank.
+    form, argv, procs = _engine_form(
+        eng,
+        {
+            "model": model,
+            "port": int(cfg.get("port") or eng.default_port),
+            "util": round(float(cfg.get("mem_fraction_static") or mem), 2),
+            "max_model_len": int(cfg["context_length"]) if cfg.get("context_length") else None,
+            "tensor_parallel_size": int(cfg.get("tp_size") or 1),
+            "trust_remote_code": bool(cfg.get("trust_remote_code")),
+            "quantization": str(cfg.get("quantization") or ""),
+            "tool_call_parser": str(cfg.get("tool_call_parser") or ""),
+            "reasoning_parser": str(cfg.get("reasoning_parser") or ""),
+            "extra_flags": _merge_extra_flags(shlex.join(spec_flags), extra),
+            "docker_env": [],
+        },
+        plan=plan,
+        overlay=_family_overlay(model, detected, engine="sglang"),
+        warnings=warnings,
+        rationale=rationale,
+    )
+    cfg.update(form)
 
     fits = bool(plan.get("fits", True))
     ok_load, load_msg = check_serve_loadability(
@@ -5788,7 +5860,7 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
             "you add nodes or pick a smaller checkpoint."
         )
     rationale.append(
-        "SGLang Spark pack: python -m sglang.launch_server (not vllm serve). "
+        "SGLang Spark pack: python3 -m sglang.launch_server (not vllm serve), --enable-metrics. "
         "Refs: Unsloth NVFP4 SGLang tutorial (NEXTN)."
     )
     return {
@@ -5797,10 +5869,11 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
         "mode": "auto",
         "confidence": "high" if candidates else ("medium" if hf_config else "low"),
         "label": "SGLang Spark",
-        "notes": "Recommend-only. Start sglang yourself (L.A.I.L does not spawn it yet).",
+        "notes": "Start launches SGLang in docker (TP across Sparks: one rank per node; /metrics on).",
         "serve_blocked": serve_blocked,
         "config": cfg,
         "argv": argv,
+        "processes": procs,
         "topology": {
             "nodes": topology.get("nodes", 1),
             "nodes_used": plan.get("nodes_needed", 1),
@@ -5824,4 +5897,112 @@ def recommend_sglang(model: str, *, fetch_remote: bool = True) -> dict[str, Any]
             }
             for i, c in enumerate(candidates[:8])
         ],
+    }
+
+
+# TensorFold's CUDA model table (README / RUNBOOK, v0.6.0): id substrings → ranks it needs.
+_TENSORFOLD_CUDA_FAMILIES = (
+    ("qwen3.8-27b", 1),
+    ("qwen3.8-flash-next", 1),
+    ("nemotron-3.5-lightning", 1),
+    ("glm-5.3-flash", 2),
+)
+
+
+def recommend_tensorfold(model: str, *, fetch_remote: bool = True) -> dict[str, Any]:
+    """TensorFold from the placement engine: TP from weights vs. the online Sparks (≤ 2
+    ranks), context left to TensorFold (CUDA sizes the affordable native window when
+    --context is unset). Does not start a server."""
+    model = (model or "").strip()
+    if not model:
+        raise ValueError("model is required")
+    eng = engines.get("tensorfold")
+    rationale: list[str] = []
+    warnings: list[str] = []
+    hf_config: Optional[dict] = None
+    if fetch_remote and "/" in model and not model.startswith("/") and not Path(model).is_dir():
+        remote = fetch_hf_card(model)
+        hf_config = remote.get("config")
+        for e in remote.get("errors") or []:
+            rationale.append(f"HF fetch note: {e}")
+    if hf_config is None:
+        hf_config = load_local_fallback(model).get("config")
+    detected = analyze_config(hf_config or {}, model)
+    weights_gib = estimate_weights_gib(model, hf_config)
+    topology = _cluster_topology()
+    plan = plan_placement(weights_gib, topology)
+    ram = _resolved_node_ram_gib(plan.get("node_ram_gib"))
+    tp = max(1, int(plan.get("tensor_parallel_size") or 1))
+
+    mid = model.lower()
+    family = next(((key, ranks) for key, ranks in _TENSORFOLD_CUDA_FAMILIES if key in mid), None)
+    if family is None:
+        warnings.append(
+            "TensorFold's CUDA backend lists Qwen3.8-27B, Qwen3.8 Flash Next, Nemotron 3.5 "
+            "Lightning 30B and GLM-5.3-Flash — this model may be refused at startup."
+        )
+    elif family[1] > tp:
+        tp = family[1]
+        rationale.append(f"{family[0]} runs on {family[1]} ranks on CUDA → TP={tp}")
+        # The ranks go to the online Sparks in topology order (the plan sized fewer).
+        plan = {**plan, "workers": (topology.get("workers") or [])[: tp - 1]}
+    fits = bool(plan.get("fits", True))
+    if tp > (eng.max_tp or tp):
+        fits = False
+        warnings.append(f"Weights need {tp} Sparks but TensorFold runs at most {eng.max_tp} ranks.")
+    if tp > int(plan.get("nodes_available") or 1):
+        fits = False
+        warnings.append(f"TensorFold needs {tp} ranks here but only {plan.get('nodes_available')} Spark(s) are online.")
+    ok_load, load_msg = check_serve_loadability(
+        weights_gib=weights_gib,
+        node_ram_gib=ram,
+        nodes_used=tp,
+        util=WORKFLOW_UTIL,
+        reserve_gib=float(plan.get("reserve_gib") or _UMA_RESERVE_GIB),
+    )
+    if fits and not ok_load:
+        fits = False
+        if load_msg:
+            warnings.append(load_msg)
+    if not fits:
+        warnings.append(
+            "SERVE BLOCKED: weights do not fit the online cluster — Start will refuse until "
+            "you add nodes or pick a smaller checkpoint."
+        )
+    rationale.append(
+        f"Placement: ~{weights_gib} GiB weights over {ram:.0f} GiB nodes → TP={tp}; "
+        "context left to TensorFold (affordable native window)."
+    )
+    form, argv, procs = _engine_form(
+        eng,
+        {"model": model, "port": eng.default_port, "tensor_parallel_size": tp, "docker_env": []},
+        plan=plan,
+        overlay=_family_overlay(model, detected, engine="tensorfold"),
+        warnings=warnings,
+        rationale=rationale,
+    )
+    return {
+        "model": model,
+        "engine": "tensorfold",
+        "mode": "auto",
+        "confidence": "medium" if family else "low",
+        "label": "TensorFold Spark",
+        "notes": eng.notes,
+        "serve_blocked": not fits,
+        "config": {"engine": "tensorfold", **form},
+        "argv": argv,
+        "processes": procs,
+        "topology": {
+            "nodes": topology.get("nodes", 1),
+            "nodes_used": tp,
+            "weights_gib": weights_gib,
+            "node_ram_gib": ram,
+            "fits": fits,
+            "tensor_parallel_size": tp,
+            "fabric_ok": bool(topology.get("fabric_ok")),
+        },
+        "sources": [{"kind": "vendor_doc", "ref": "https://github.com/ashhart/TensorFold", "notes": "README / RUNBOOK"}],
+        "rationale": rationale,
+        "warnings": warnings,
+        "detected": detected,
     }

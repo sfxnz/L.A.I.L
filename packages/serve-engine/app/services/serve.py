@@ -1,109 +1,113 @@
-"""Serve / stop vLLM — fully driven by explicit user config (no profiles)."""
+"""Serve / stop model engines (vLLM, SGLang, llama.cpp, TensorFold) from explicit config.
+
+Engine specifics (CLI, image, port, readiness path) live in `engines/`; this module owns
+the shared plumbing: docker run (single node, or one container per TP rank over ssh),
+readiness with dead-container checks and cancel, and Stop.
+"""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import select
 import shlex
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config import (
-    CONTAINER_MAX,
-    CONTAINER_SAFE,
-    DATA_DIR,
-    DEFAULT_IMAGE_MAX,
-    DEFAULT_IMAGE_SAFE,
-    DEFAULT_PORT,
-    SAFE_MAX_LEN,
-    SAFE_MIN_AVAIL_GIB,
-    SAFE_UTIL,
-    SERVE_EXAMPLES,
-    SPARK_LAB,
-    WORKFLOW_MAX_LEN,
-    WORKFLOW_UTIL,
-)
-from .metadata import available_gib, collect_hardware, list_vllm_containers
-
-
-# Lab Safe 60 GiB free-RAM abort is a Spark UMA contract (~128 GiB hosts).
-_LAB_SAFE_HEADROOM_MIN_RAM_GIB = 100.0
-
-
-def _lab_safe_headroom_abort(avail: float | None, ram_total: float | None) -> str | None:
-    """Return an abort message only on large-UMA hosts that can actually keep 60 GiB free."""
-    if avail is None:
-        return None
-    if ram_total is None or ram_total < _LAB_SAFE_HEADROOM_MIN_RAM_GIB:
-        return None
-    if avail < SAFE_MIN_AVAIL_GIB:
-        return (
-            f"ABORT: available {avail} GiB < {SAFE_MIN_AVAIL_GIB} GiB — container stopped"
-        )
-    return None
-
-
-# ─── Multi-node launcher ──────────────────────────────────────────────────────
+from ..config import DATA_DIR, WORKFLOW_UTIL
+from . import engines
+from .engines import Engine, Rank, ServeSpec
+from .jobs import JobCancelled
+from .metadata import available_gib, list_vllm_containers
+from .node_probe import DOCKER_PS_FORMAT, ENGINE_LABEL, parse_docker_ps
 
 # In-container HF cache path shared by single-node and multi-node launches.
 # Host ~/.cache/huggingface is bind-mounted here; HF_HOME must match.
 HF_CACHE_IN_CONTAINER = "/cache/huggingface"
+_MULTINODE_STATE = DATA_DIR / "multinode_serve.json"
+_SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+
+READY_POLL_S = 5.0
+MULTI_READY_TIMEOUT_S = 30 * 60
+# Remote ranks are checked over ssh every this many polls (30 s), the local head every poll.
+WORKER_CHECK_EVERY = 6
+_TOKEN_ENV = ("HF_TOKEN=", "HUGGING_FACE_HUB_TOKEN=")
 
 
-def _strip_structured_flags(args: list[str]) -> list[str]:
-    """Remove flags the launcher already sets explicitly, so a free-form extra_flags
-    blob can be reused verbatim for both head and worker without duplicates."""
-    drop = {
-        "--tensor-parallel-size",
-        "--pipeline-parallel-size",
-        "--nnodes",
-        "--node-rank",
-        "--master-addr",
-        "--master-port",
-        "--distributed-executor-backend",
-        "--host",
-        "--port",
-    }
-    out: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in drop:
-            if i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
-                i += 2
-            else:
-                i += 1
-            continue
-        if any(a.startswith(f + "=") for f in drop):
-            i += 1
-            continue
-        out.append(a)
-        i += 1
-    return out
+def redact_cmd(parts: list[str]) -> str:
+    """A command for LOG LINES: shell-quoted, HF tokens masked. Never execute this string."""
+    out = []
+    for c in parts:
+        if c.startswith(_TOKEN_ENV):
+            out.append(c.split("=", 1)[0] + "=***")
+        else:
+            out.append(shlex.quote(c))
+    return " ".join(out)
+
+
+def _hf_env(hf_token: str | None) -> list[str]:
+    if not hf_token:
+        return []
+    return ["-e", f"HF_TOKEN={hf_token}", "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
+
+
+def _hf_mount() -> list[str]:
+    hf = str(Path.home() / ".cache" / "huggingface")
+    return ["-v", f"{hf}:{HF_CACHE_IN_CONTAINER}"]
+
+
+def build_single_node_docker_cmd(
+    *,
+    engine: Engine,
+    spec: ServeSpec,
+    image: str,
+    env_list: list[str],
+    container: str,
+    hf_token: str | None = None,
+) -> list[str]:
+    """docker run argv for a single-node serve. Pure (no subprocess) for tests.
+
+    The API is reachable on 127.0.0.1 only: published on loopback from the bridge
+    network, or (host-network engines) bound to loopback by the engine itself. HF cache
+    mount + HF_HOME match multi-node (/cache/huggingface).
+    """
+    cmd: list[str] = [
+        "docker", "run", "-d",
+        "--name", container,
+        "--restart", "no",
+        "--label", f"{ENGINE_LABEL}={engine.name}",
+        "--gpus", "all",
+    ]
+    if engine.host_network:
+        cmd += ["--network", "host"]
+    else:
+        cmd += ["--shm-size=32g", "-p", f"127.0.0.1:{spec.port}:{spec.port}"]
+    cmd += [*engine.docker_opts, *_hf_mount(), "-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}"]
+    for e in env_list:
+        cmd += ["-e", e]
+    cmd += _hf_env(hf_token)
+    return cmd + engine.command(spec, image, None)
 
 
 def build_multi_node_launch(
     *,
+    engine: Engine,
+    spec: ServeSpec,
     image: str,
-    model: str,
-    vllm_args: list[str],
     env_list: list[str],
     head: dict[str, Any],
     workers: list[dict[str, Any]],
-    nnodes: int,
-    port: int,
-    headless: bool = True,
+    hf_token: str | None = None,
 ) -> dict[str, Any]:
-    """Build the per-node docker command set for a TP=nnodes multi-node serve.
-    Pure function (no subprocess) so it is fully testable. Returns head + worker cmds."""
-    hf = str(Path.home() / ".cache" / "huggingface")
+    """Per-rank docker commands for a TP serve across len(workers)+1 nodes, one GPU each.
+    Pure function (no subprocess) so it is fully testable. Every rank gets the HF token."""
+    nnodes = 1 + len(workers)
     master_addr = head.get("qsfp_ip") or "127.0.0.1"
-    base_args = _strip_structured_flags(vllm_args)
-
     # Environment that is identical across nodes (model/runtime knobs), minus host-IP keys.
     shared_env = [
         e
@@ -111,132 +115,45 @@ def build_multi_node_launch(
         if not e.startswith(("VLLM_HOST_IP=", "WORKER_VLLM_HOST_IP=", "NODE_RANK=", "MASTER_ADDR="))
     ]
 
-    def docker_prefix(name: str, node_ip: str | None) -> list[str]:
+    def rank_cmd(rank: int, node_ip: str | None) -> list[str]:
         cmd = [
-            "docker", "run", "-d", "--name", name, "--restart", "no",
+            "docker", "run", "-d", "--name", engine.rank_container(rank), "--restart", "no",
+            "--label", f"{ENGINE_LABEL}={engine.name}",
             "--gpus", "all", "--network", "host", "--ipc", "host", "--shm-size=32g",
             "--device", "/dev/infiniband",
             # RDMA needs locked (pinned) memory + raw verbs access; without these
             # NCCL fails at init with "unhandled system error".
             "--cap-add", "IPC_LOCK",
             "--ulimit", "memlock=-1:-1",
-            # Runtime images (e.g. Anemll dspark-vllm-gx10) ship ENTRYPOINT=vllm.
-            # Clear it so our bash wrapper runs as the command instead of being
-            # appended as arguments to vllm (=> "unrecognized arguments" exit 2).
-            "--entrypoint", "bash",
-            "-v", f"{hf}:{HF_CACHE_IN_CONTAINER}",
+            *_hf_mount(),
         ]
         for e in shared_env:
             cmd += ["-e", e]
         if node_ip:
             cmd += ["-e", f"VLLM_HOST_IP={node_ip}"]
-        cmd += ["-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}"]
-        return cmd
+        cmd += ["-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}", *_hf_env(hf_token)]
+        cmd += ["-e", f"NODE_RANK={rank}", "-e", f"MASTER_ADDR={master_addr}"]
+        where = Rank(rank=rank, nnodes=nnodes, master_addr=master_addr, master_port=int(engine.master_port or 0))
+        return cmd + engine.command(spec, image, where)
 
-    def serve_suffix(rank: int, is_head: bool) -> list[str]:
-        args = [
-            "vllm", "serve", model,
-            "--tensor-parallel-size", str(nnodes),
-            "--pipeline-parallel-size", "1",
-            "--nnodes", str(nnodes),
-            "--node-rank", str(rank),
-            "--master-addr", master_addr,
-            "--master-port", "25000",
-            "--distributed-executor-backend", "mp",
-        ]
-        if is_head:
-            args += ["--host", "0.0.0.0", "--port", str(port)]
-        elif headless:
-            args += ["--headless"]
-        args += base_args
-        return args
-
-    # --entrypoint is bash, so args start at bash's own flags (no leading "bash").
-    # `bash -lc 'exec "$@"' -- vllm serve …` makes "--" $0 and the rest "$@".
-    entry = ["-lc", 'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"', "--"]
-
-    head_cmd = docker_prefix(f"spark-vllm-n0", head.get("qsfp_ip")) + [
-        "-e", "NODE_RANK=0", "-e", f"MASTER_ADDR={master_addr}",
-        image, *entry, *serve_suffix(0, True),
-    ]
     worker_cmds = []
     for idx, wnode in enumerate(workers, start=1):
-        wc = docker_prefix(f"spark-vllm-n{idx}", wnode.get("qsfp_ip")) + [
-            "-e", f"NODE_RANK={idx}", "-e", f"MASTER_ADDR={master_addr}",
-            image, *entry, *serve_suffix(idx, False),
-        ]
-        worker_cmds.append({"node": wnode.get("id") or f"worker{idx}", "ssh_host": wnode.get("ssh_host") or wnode.get("id"), "rank": idx, "cmd": wc})
-
-    return {"head": {"rank": 0, "cmd": head_cmd}, "workers": worker_cmds, "nnodes": nnodes, "port": port, "model": model, "image": image}
-
-
-def _needs_anemll_entrypoint(image: str) -> bool:
-    """Anemll / DSpark images ship ENTRYPOINT=vllm; clear it for our bash wrapper."""
-    img_l = (image or "").lower()
-    return "anemll" in img_l or "dspark-vllm" in img_l or "gx10" in img_l
-
-
-def build_single_node_docker_cmd(
-    *,
-    image: str,
-    model: str,
-    vllm_args: list[str],
-    env_list: list[str],
-    container: str,
-    port: int,
-    hf_token: str | None = None,
-) -> list[str]:
-    """Build docker run argv for single-node serve. Pure (no subprocess) for tests.
-
-    HF cache mount + HF_HOME match multi-node (/cache/huggingface) so Anemll and
-    stock images resolve hub weights the same way on 1-node and N-node launches.
-    """
-    hf = str(Path.home() / ".cache" / "huggingface")
-    cmd: list[str] = [
-        "docker", "run", "-d",
-        "--name", container,
-        "--restart", "no",
-        "--gpus", "all",
-        "--shm-size=32g",
-        "-p", f"127.0.0.1:{port}:{port}",
-        "-v", f"{hf}:{HF_CACHE_IN_CONTAINER}",
-        "-e", f"HF_HOME={HF_CACHE_IN_CONTAINER}",
-    ]
-    for e in env_list:
-        cmd += ["-e", e]
-    if hf_token:
-        cmd += [
-            "-e", f"HF_TOKEN={hf_token}",
-            "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}",
-        ]
-    if _needs_anemll_entrypoint(image):
-        # --entrypoint bash; wrapper is bash's own flags (no second "bash" token).
-        cmd += [
-            "--entrypoint", "bash",
-            image,
-            "-lc",
-            'export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH; exec "$@"',
-            "--",
-            "vllm", "serve", model,
-            *vllm_args,
-        ]
-    else:
-        # Stock vllm-openai: image ENTRYPOINT already is vllm serve.
-        cmd += [image, model, *vllm_args]
-    return cmd
-
-
-_MULTINODE_STATE = DATA_DIR / "multinode_serve.json"
-
-
-def _redact(parts: list[str]) -> str:
-    out = []
-    for c in parts:
-        if c.startswith(("HF_TOKEN=", "HUGGING_FACE_HUB_TOKEN=")):
-            out.append(c.split("=", 1)[0] + "=***")
-        else:
-            out.append(shlex.quote(c))
-    return " ".join(out)
+        worker_cmds.append({
+            "node": wnode.get("id") or f"worker{idx}",
+            "ssh_host": wnode.get("ssh_host") or wnode.get("id"),
+            "rank": idx,
+            "container": engine.rank_container(idx),
+            "cmd": rank_cmd(idx, wnode.get("qsfp_ip")),
+        })
+    return {
+        "engine": engine.name,
+        "head": {"rank": 0, "container": engine.rank_container(0), "cmd": rank_cmd(0, head.get("qsfp_ip"))},
+        "workers": worker_cmds,
+        "nnodes": nnodes,
+        "port": spec.port,
+        "model": spec.model,
+        "image": image,
+    }
 
 
 def _ensure_image_present(
@@ -271,15 +188,162 @@ def _ensure_image_present(
     w(f"Pulled {image}", 0.18)
 
 
+# ─── readiness ────────────────────────────────────────────────────────────────
+
+
+def _container_dead(name: str, host: str | None = None) -> str | None:
+    """None while the container runs; else its docker state ("exited 1", "missing").
+    An unanswered ssh probe is not a verdict (None): the next check decides."""
+    inspect = ["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", name]
+    try:
+        if host:
+            st = subprocess.run([*_SSH, host, shlex.join(inspect)], capture_output=True, text=True, timeout=20)
+            if st.returncode == 255:  # ssh itself failed
+                return None
+        else:
+            st = subprocess.run(inspect, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return None
+    status = (st.stdout or "").strip()
+    if not status:
+        return "missing"
+    return None if status.startswith("running") else status
+
+
+def _tail_logs(name: str, n: int = 120, host: str | None = None) -> str:
+    cmd = ["docker", "logs", "--tail", str(n), name]
+    try:
+        if host:
+            return subprocess.check_output([*_SSH, host, shlex.join(cmd) + " 2>&1"], text=True, timeout=30)
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=30)
+    except Exception as e:
+        return str(e)
+
+
+def _answers(url: str) -> bool:
+    """200 from the readiness path. 503 (SGLang starting, llama.cpp loading) and a refused
+    connection (TensorFold binds only once loaded) both mean "still loading"."""
+    try:
+        urllib.request.urlopen(url, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def wait_ready(
+    engine: Engine,
+    port: int,
+    *,
+    container: str,
+    remote: list[tuple[str, str]] | tuple = (),
+    timeout_s: float,
+    log: Any = None,
+    progress: Callable | None = None,
+    cancel: threading.Event | None = None,
+) -> None:
+    """Poll the engine's readiness path until it answers 200.
+
+    Fails fast — with the container's last log lines — when the local container (every
+    poll) or a remote rank (every WORKER_CHECK_EVERY polls) is no longer running. Raises
+    JobCancelled when `cancel` is set, TimeoutError after `timeout_s`. Progress moves with
+    the elapsed time and the container's latest log line.
+    """
+    url = f"http://127.0.0.1:{port}{engine.ready_path}"
+    t0 = time.monotonic()
+    tick = 0
+    last_line = ""
+    last_report = -math.inf
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise JobCancelled("cancelled while the model was loading")
+        dead = _container_dead(container)
+        if dead is not None:
+            logs = _tail_logs(container)
+            if log:
+                log.write(f"container {container} exited early ({dead})")
+                log.write(logs)
+            raise RuntimeError(
+                f"{engine.label} container {container} exited ({dead}) before {engine.ready_path} answered.\n"
+                f"--- docker logs ---\n{logs[-4000:]}"
+            )
+        if remote and tick % WORKER_CHECK_EVERY == 0:
+            for host, name in remote:
+                dead = _container_dead(name, host)
+                if dead is not None:
+                    logs = _tail_logs(name, host=host)
+                    if log:
+                        log.write(f"worker {name} on {host} exited early ({dead})")
+                        log.write(logs)
+                    raise RuntimeError(
+                        f"{engine.label} worker {name} on {host} exited ({dead}) before the head was ready.\n"
+                        f"--- docker logs ({host}) ---\n{logs[-4000:]}"
+                    )
+        if _answers(url):
+            return
+        elapsed = time.monotonic() - t0
+        if elapsed > timeout_s:
+            logs = _tail_logs(container)
+            if log:
+                log.write(logs)
+            raise TimeoutError(
+                f"Timeout after {int(elapsed)} s waiting for {url}\n--- docker logs ---\n{logs[-4000:]}"
+            )
+        line = (_tail_logs(container, 1).strip().splitlines() or [""])[-1][:160]
+        if progress and (line != last_line or elapsed - last_report >= 30):
+            # 0.35 → ~0.95 over a typical load; the message carries the real elapsed time.
+            p = 0.35 + 0.6 * (1 - math.exp(-elapsed / 300))
+            progress(round(p, 3), f"loading · {int(elapsed)} s · {line or 'no output yet'}")
+            last_line, last_report = line, elapsed
+        tick += 1
+        if cancel is not None:
+            cancel.wait(READY_POLL_S)
+        else:
+            time.sleep(READY_POLL_S)
+
+
+# ─── multi-node ───────────────────────────────────────────────────────────────
+
+
+def _write_multinode_state(launch: dict[str, Any]) -> None:
+    _MULTINODE_STATE.write_text(
+        json.dumps(
+            {
+                "engine": launch.get("engine"),
+                "model": launch["model"],
+                "image": launch["image"],
+                "nnodes": launch["nnodes"],
+                "port": launch["port"],
+                "head": launch["head"]["container"],
+                "workers": [
+                    {"ssh_host": w["ssh_host"], "node": w["node"], "rank": w["rank"], "container": w["container"]}
+                    for w in launch["workers"]
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+def _rm_remote(host: str, name: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*_SSH, host, f"docker rm -f {shlex.quote(name)}"], capture_output=True, text=True, timeout=60
+    )
+
+
 def _launch_multi_node(
     launch: dict[str, Any],
     *,
-    port: int,
+    engine: Engine = engines.VLLM,
     log: Any = None,
     progress: Callable | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Start workers (ssh) then head, then wait for /v1/models on the head. Records a
-    state file so stop_all can tear the whole cluster down."""
+    """Start the worker ranks (ssh), then the head, then wait for the head's readiness.
+
+    The state file is written before anything starts, so Stop can always find every
+    rank; any failure (a rank that will not start or dies, timeout, cancel) tears down
+    whatever was started — a stray rank would otherwise pin its node's memory.
+    """
 
     def w(msg: str, p: float = 0.3) -> None:
         if log:
@@ -288,6 +352,7 @@ def _launch_multi_node(
             progress(p, msg)
 
     nnodes = launch["nnodes"]
+    port = launch["port"]
     image = (launch.get("image") or "").strip()
     # Ensure image on head + each worker before docker run (common DSpark failure mode).
     if image:
@@ -300,91 +365,94 @@ def _launch_multi_node(
             # Quote image so tags/repos with special shell chars are safe over SSH.
             iq = shlex.quote(image)
             probe = subprocess.run(
-                [
-                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
-                    f"docker image inspect {iq} >/dev/null 2>&1 || docker pull {iq}",
-                ],
+                [*_SSH, host, f"docker image inspect {iq} >/dev/null 2>&1 || docker pull {iq}"],
                 capture_output=True, text=True, timeout=600,
             )
             if probe.returncode != 0:
                 err = (probe.stderr or probe.stdout or "").strip()[-800:]
                 raise RuntimeError(f"Failed to pull {image} on {host}: {err}")
 
-    # 1) workers first (headless ranks), each over SSH
-    for wc in launch["workers"]:
-        host = wc["ssh_host"]
-        w(f"Starting worker rank {wc['rank']} on {wc['node']} ({host})…")
-        remote = _redact(wc["cmd"])
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, remote],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"worker {wc['node']} failed to start: {r.stderr or r.stdout}")
-        w(f"worker {wc['node']} up")
-
-    # 2) head (serves the API)
-    w("Starting head (rank 0, API)…", 0.5)
-    hr = subprocess.run(launch["head"]["cmd"], capture_output=True, text=True)
-    if hr.returncode != 0:
-        raise RuntimeError(f"head failed to start: {hr.stderr or hr.stdout}")
-
-    # 3) record state for stop_all
+    head_name = launch["head"]["container"]
     try:
-        _MULTINODE_STATE.write_text(
-            __import__("json").dumps(
-                {
-                    "model": launch["model"],
-                    "image": launch["image"],
-                    "nnodes": nnodes,
-                    "port": port,
-                    "workers": [{"ssh_host": w["ssh_host"], "node": w["node"], "rank": w["rank"]} for w in launch["workers"]],
-                },
-                indent=2,
-            )
-        )
-    except Exception:
-        pass
+        _write_multinode_state(launch)
+    except OSError as e:
+        w(f"could not record multi-node state ({e}); Stop still finds ranks by label")
+    try:
+        # Stale per-rank containers (exited ranks persist: --restart no, no --rm) would make
+        # `docker run --name` fail on a name conflict.
+        subprocess.run(["docker", "rm", "-f", head_name], capture_output=True, text=True, timeout=60)
+        for wc in launch["workers"]:
+            _rm_remote(wc["ssh_host"], wc["container"])
 
-    # 4) wait for readiness on the head endpoint
-    w("Waiting for /v1/models on head (multi-node load can take 15–30+ min)…", 0.6)
-    ready = False
-    for i in range(360):  # up to 30 min
+        # 1) worker ranks first (TensorFold requires rank 1 up before rank 0), over ssh.
+        #    The executed command carries the real token; only the log line is redacted.
+        for wc in launch["workers"]:
+            host = wc["ssh_host"]
+            w(f"Starting worker rank {wc['rank']} on {wc['node']} ({host})…")
+            if log:
+                log.write(f"$ ssh {host} {redact_cmd(wc['cmd'])}")
+            r = subprocess.run([*_SSH, host, shlex.join(wc["cmd"])], capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError(f"worker {wc['node']} failed to start: {r.stderr or r.stdout}")
+            w(f"worker {wc['node']} up")
+
+        # 2) head (rank 0 serves the API)
+        w("Starting head (rank 0, API)…", 0.5)
+        if log:
+            log.write(f"$ {redact_cmd(launch['head']['cmd'])}")
+        hr = subprocess.run(launch["head"]["cmd"], capture_output=True, text=True, timeout=120)
+        if hr.returncode != 0:
+            raise RuntimeError(f"head failed to start: {hr.stderr or hr.stdout}")
+
+        # 3) readiness on the head; ranks checked for crashes while it loads
+        w(f"Waiting for {engine.ready_path} on head (multi-node load can take 15–30+ min)…", 0.6)
+        wait_ready(
+            engine, port,
+            container=head_name,
+            remote=[(wc["ssh_host"], wc["container"]) for wc in launch["workers"]],
+            timeout_s=MULTI_READY_TIMEOUT_S,
+            log=log, progress=progress, cancel=cancel,
+        )
+    except BaseException:
+        w("Launch failed — removing every rank…", 0.9)
+        _teardown_ranks(launch)
+        raise
+    w(f"Multi-node {engine.label} serve ready on :{port} ({nnodes} nodes)", 1.0)
+    return {"ok": True, "multi_node": True, "engine": engine.name, "nnodes": nnodes, "model": launch["model"], "port": port}
+
+
+def _teardown_ranks(launch: dict[str, Any]) -> None:
+    """Best effort: remove every rank of `launch` (local head, workers over ssh) and its state."""
+    for wc in launch["workers"]:
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3)
-            ready = True
-            break
+            _rm_remote(wc["ssh_host"], wc["container"])
         except Exception:
-            time.sleep(5)
-            if i % 12 == 0:
-                w(f"still loading… ({i * 5}s)")
-    if not ready:
-        raise RuntimeError("Timeout waiting for multi-node /v1/models on head")
-    w(f"Multi-node serve ready on :{port} ({nnodes} nodes)", 1.0)
-    return {"ok": True, "multi_node": True, "nnodes": nnodes, "model": launch["model"], "port": port}
+            pass
+    subprocess.run(["docker", "rm", "-f", launch["head"]["container"]], capture_output=True, text=True, timeout=60)
+    _MULTINODE_STATE.unlink(missing_ok=True)
 
 
 def stop_multi_node(log: Any = None) -> dict[str, Any]:
     """Tear down a recorded multi-node serve across head + workers (state file)."""
     stopped: list[str] = []
     try:
-        import json as _json
-
-        st = _json.loads(_MULTINODE_STATE.read_text())
+        st = json.loads(_MULTINODE_STATE.read_text())
     except Exception:
         return {"ok": False, "reason": "no multinode state"}
     for wr in st.get("workers") or []:
         host = wr.get("ssh_host")
         if host:
-            name = f"spark-vllm-n{wr.get('rank', 1)}"
-            subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
-                 f"docker rm -f {shlex.quote(name)}"],
-                capture_output=True, text=True, timeout=60,
-            )
+            name = wr.get("container") or f"spark-vllm-n{wr.get('rank', 1)}"
+            try:
+                _rm_remote(host, name)
+            except subprocess.TimeoutExpired:
+                if log:
+                    log.write(f"{host}: docker rm -f {name} timed out")
+                continue
             stopped.append(f"{host}:{name}")
-    subprocess.run(["docker", "rm", "-f", "spark-vllm-n0"], capture_output=True, text=True)
-    stopped.append("spark-vllm-n0")
+    head = st.get("head") or "spark-vllm-n0"
+    subprocess.run(["docker", "rm", "-f", head], capture_output=True, text=True, timeout=60)
+    stopped.append(head)
     try:
         _MULTINODE_STATE.unlink(missing_ok=True)
     except Exception:
@@ -392,17 +460,21 @@ def stop_multi_node(log: Any = None) -> dict[str, Any]:
     return {"ok": True, "stopped": stopped}
 
 
-def _vllm_container_name(name: str) -> bool:
-    n = (name or "").lower()
-    return "vllm" in n or n.startswith("spark-vllm")
+# ─── stop ─────────────────────────────────────────────────────────────────────
 
 
-def stop_cluster_remote_vllm(log: Any = None) -> dict[str, Any]:
-    """Stop vLLM containers on non-local cluster nodes via SSH.
+def _stoppable(c: dict[str, Any]) -> bool:
+    """Every container L.A.I.L launched (any state); a serve launched by hand only while Up."""
+    return bool(c.get("lail")) or "up" in str(c.get("status", "")).lower()
 
-    Ground truth is live docker on each node — not multinode_serve.json.
-    That state file can be missing after engine restarts, manual launches,
-    or a prior stop that removed the file while a remote rm failed.
+
+def stop_cluster_remote(log: Any = None) -> dict[str, Any]:
+    """Stop serve containers (any engine) on the non-local cluster nodes over ssh.
+
+    Ground truth is live docker on each node, judged by the same predicate as this
+    host (`node_probe.parse_docker_ps`: label, serve command or engine image) — not the
+    container name, and not multinode_serve.json (missing after engine restarts or
+    manual launches).
     """
     from .cluster import _load_cluster_config
 
@@ -417,10 +489,7 @@ def stop_cluster_remote_vllm(log: Any = None) -> dict[str, Any]:
             continue
         try:
             listed = subprocess.run(
-                [
-                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", str(host),
-                    "docker ps -a --format '{{.Names}}'",
-                ],
+                [*_SSH, str(host), f"docker ps -a --no-trunc --format {shlex.quote(DOCKER_PS_FORMAT)}"],
                 capture_output=True, text=True, timeout=30,
             )
         except Exception as e:
@@ -429,20 +498,14 @@ def stop_cluster_remote_vllm(log: Any = None) -> dict[str, Any]:
         if listed.returncode != 0:
             errors.append(f"{host}: list exit {listed.returncode}: {(listed.stderr or '')[:200]}")
             continue
-        names = [ln.strip() for ln in listed.stdout.splitlines() if _vllm_container_name(ln.strip())]
+        names = [c["name"] for c in parse_docker_ps(listed.stdout) if _stoppable(c)]
         if not names:
             continue
         if log:
             log.write(f"Remote {host}: stopping {names}")
         for name in names:
             try:
-                rm = subprocess.run(
-                    [
-                        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", str(host),
-                        f"docker rm -f {shlex.quote(name)}",
-                    ],
-                    capture_output=True, text=True, timeout=60,
-                )
+                rm = _rm_remote(str(host), name)
             except Exception as e:
                 errors.append(f"{host}:{name}: {e}")
                 continue
@@ -451,10 +514,6 @@ def stop_cluster_remote_vllm(log: Any = None) -> dict[str, Any]:
             else:
                 errors.append(f"{host}:{name}: rm exit {rm.returncode}")
     return {"ok": not errors, "stopped": stopped, "errors": errors}
-
-
-def serve_examples() -> dict[str, dict]:
-    return SERVE_EXAMPLES
 
 
 def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dict[str, Any]:
@@ -475,11 +534,11 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
     except Exception:
         pass
 
-    # 2) Always live-discover remote workers. State file is not required.
+    # 2) Always live-discover remote ranks. State file is not required.
     try:
-        rem = stop_cluster_remote_vllm(log=log)
+        rem = stop_cluster_remote(log=log)
         if rem.get("stopped"):
-            w(f"Stopped remote vLLM: {rem.get('stopped')}")
+            w(f"Stopped remote serves: {rem.get('stopped')}")
             for item in rem["stopped"]:
                 if item not in stopped:
                     stopped.append(item)
@@ -489,31 +548,11 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
         if log:
             log.write(f"remote cluster stop failed: {e}")
 
-    # 3) Local containers (spark_lab helper if present, else docker rm).
-    if SPARK_LAB.exists():
-        w(f"Running {SPARK_LAB} stop")
-        r = subprocess.run(
-            ["bash", str(SPARK_LAB), "stop"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if log:
-            log.write(r.stdout or "")
-            log.write(r.stderr or "")
-        if progress:
-            progress(1.0, "stopped")
-        return {
-            "ok": r.returncode == 0,
-            "stopped": stopped,
-            "stdout": r.stdout,
-            "stderr": r.stderr,
-        }
-
-    names = [c["name"] for c in list_vllm_containers()]
+    # 3) This host.
+    names = [c["name"] for c in list_vllm_containers() if _stoppable(c)]
     w(f"Stopping: {names}")
     for n in names:
-        subprocess.run(["docker", "rm", "-f", n], capture_output=True, text=True)
+        subprocess.run(["docker", "rm", "-f", n], capture_output=True, text=True, timeout=60)
         if n not in stopped:
             stopped.append(n)
     if progress:
@@ -521,77 +560,7 @@ def stop_all(log: Any = None, progress: Callable | None = None, **_: Any) -> dic
     return {"ok": True, "stopped": stopped}
 
 
-def _assert_lab_safe_util(util: float) -> None:
-    if util > SAFE_UTIL + 1e-9:
-        raise ValueError(
-            f"Lab Safe mode refuses util={util} > {SAFE_UTIL}. "
-            "Switch to Workflow Max or lower util."
-        )
-
-
-def _parse_extra_flags(extra_flags: str) -> list[str]:
-    s = (extra_flags or "").strip()
-    if not s:
-        return []
-    return shlex.split(s)
-
-
-def _mtp_speculative_json(
-    *,
-    num_tokens: int,
-    moe_backend: str = "",
-    extras: list[str] | None = None,
-) -> str:
-    """Structured MTP JSON, including Spark playbook keys (e.g. moe_backend:triton)."""
-    spec: dict[str, Any] = {
-        "method": "mtp",
-        "num_speculative_tokens": int(num_tokens),
-    }
-    extra_keys: dict[str, Any] = {}
-    args = extras or []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        raw = ""
-        if a == "--speculative-config" and i + 1 < len(args):
-            raw = str(args[i + 1])
-        elif a.startswith("--speculative-config="):
-            raw = a.split("=", 1)[1]
-        if raw:
-            try:
-                obj = json.loads(raw)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                obj = None
-            if isinstance(obj, dict):
-                extra_keys.update(
-                    {k: v for k, v in obj.items() if k not in ("method", "num_speculative_tokens")}
-                )
-        i += 1
-    moe = (moe_backend or "").strip() or extra_keys.pop("moe_backend", None)
-    if moe:
-        spec["moe_backend"] = str(moe)
-    spec.update(extra_keys)
-    return json.dumps(spec, separators=(",", ":"))
-
-
-def _strip_flag(args: list[str], flag: str) -> list[str]:
-    """Drop ``flag`` (+ value) from an argv-style list."""
-    out: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == flag:
-            if i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
-                i += 2
-            else:
-                i += 1
-            continue
-        if a.startswith(flag + "="):
-            i += 1
-            continue
-        out.append(a)
-        i += 1
-    return out
+# ─── start ────────────────────────────────────────────────────────────────────
 
 
 def _resolve_hf_token_for_container() -> str:
@@ -628,109 +597,24 @@ def _normalize_docker_env(user_env: list[str] | None) -> list[str]:
     return out
 
 
-def _build_vllm_args(
-    *,
-    util: float,
-    max_model_len: int,
-    port: int,
-    quantization: str = "",
-    kv_cache_dtype: str = "",
-    moe_backend: str = "",
-    trust_remote_code: bool = False,
-    enable_auto_tool_choice: bool = False,
-    tool_call_parser: str = "",
-    reasoning_parser: str = "",
-    max_num_seqs: int | None = None,
-    mtp: bool = False,
-    mtp_num_tokens: int = 2,
-    mtp_moe_backend: str = "",
-    load_format: str = "",
-    enable_chunked_prefill: bool = False,
-    enable_prefix_caching: bool = False,
-    extra_flags: str = "",
-    tensor_parallel_size: int = 1,
-) -> list[str]:
-    """Assemble the vLLM CLI from explicit fields + free-form extras. Nothing silent."""
-    args: list[str] = [
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
-        "--tensor-parallel-size",
-        str(max(1, int(tensor_parallel_size or 1))),
-        "--gpu-memory-utilization",
-        str(util),
-        "--max-model-len",
-        str(max_model_len),
+def ignored_fields(engine: Engine, spec: ServeSpec) -> list[str]:
+    """Fields set in the request that `engine` has no translation for (reported, not dropped silently)."""
+    default = ServeSpec(model=spec.model, port=spec.port)
+    return [
+        f for f in ServeSpec.__dataclass_fields__
+        if f not in engine.fields and f not in engines.COMMON_FIELDS
+        and getattr(spec, f) != getattr(default, f)
     ]
-    if trust_remote_code:
-        args.append("--trust-remote-code")
-    if quantization.strip():
-        args += ["--quantization", quantization.strip()]
-    if kv_cache_dtype.strip():
-        args += ["--kv-cache-dtype", kv_cache_dtype.strip()]
-    if moe_backend.strip():
-        args += ["--moe-backend", moe_backend.strip()]
-    if max_num_seqs is not None and max_num_seqs > 0:
-        args += ["--max-num-seqs", str(max_num_seqs)]
-    if enable_auto_tool_choice:
-        args.append("--enable-auto-tool-choice")
-    if tool_call_parser.strip():
-        args += ["--tool-call-parser", tool_call_parser.strip()]
-    if reasoning_parser.strip():
-        args += ["--reasoning-parser", reasoning_parser.strip()]
-    if load_format.strip():
-        args += ["--load-format", load_format.strip()]
-    if enable_chunked_prefill:
-        args.append("--enable-chunked-prefill")
-    if enable_prefix_caching:
-        args.append("--enable-prefix-caching")
-    extras = _parse_extra_flags(extra_flags)
-    if mtp:
-        args += [
-            "--speculative-config",
-            _mtp_speculative_json(
-                num_tokens=mtp_num_tokens,
-                moe_backend=mtp_moe_backend,
-                extras=extras,
-            ),
-        ]
-        extras = _strip_flag(extras, "--speculative-config")
-    if quantization.strip():
-        extras = _strip_flag(extras, "--quantization")
-        extras = _strip_flag(extras, "-q")
-    if kv_cache_dtype.strip():
-        extras = _strip_flag(extras, "--kv-cache-dtype")
-    if moe_backend.strip():
-        extras = _strip_flag(extras, "--moe-backend")
-    if tool_call_parser.strip():
-        extras = _strip_flag(extras, "--tool-call-parser")
-    if reasoning_parser.strip():
-        extras = _strip_flag(extras, "--reasoning-parser")
-    if load_format.strip():
-        extras = _strip_flag(extras, "--load-format")
-    # Launcher owns the model (passed positionally) and the lab envelope owns
-    # host/port/tp/util/max-len.
-    for f in (
-        "--model",
-        "--host",
-        "--port",
-        "--tensor-parallel-size",
-        "--gpu-memory-utilization",
-        "--max-model-len",
-    ):
-        extras = _strip_flag(extras, f)
-    args += extras
-    return args
 
 
 def serve_model(
     *,
     model: str,
+    engine: str | None = None,
     mode: str | None = None,
     util: float | None = None,
     max_model_len: int | None = None,
-    port: int = DEFAULT_PORT,
+    port: int | None = None,
     image: str | None = None,
     docker_env: list[str] | None = None,
     quantization: str = "",
@@ -752,6 +636,7 @@ def serve_model(
     stop_first: bool = True,
     log: Any = None,
     progress: Callable | None = None,
+    cancel: threading.Event | None = None,
     # legacy no-ops so old clients don't crash
     profile: str | None = None,
     **_: Any,
@@ -762,17 +647,16 @@ def serve_model(
         if progress:
             progress(p, msg)
 
-    # Dual user envelopes (Lab Safe / Workflow Max) are gone. Hardware
-    # defaults + reserved UMA are the only sizing policy.
-    util = WORKFLOW_UTIL if util is None else util
-    max_model_len = WORKFLOW_MAX_LEN if max_model_len is None else max_model_len
-    image = image or DEFAULT_IMAGE_MAX or DEFAULT_IMAGE_SAFE
-    container = CONTAINER_SAFE
+    eng = engines.get(engine)
+    port = int(port or eng.default_port)
+    image = (image or "").strip() or eng.image()
 
     # Resolve TP once — fits gate and launch must use the same value (no plan
     # fallback only in the gate, which previously greenlit multi-node fit while
     # launch still ran single-node).
     tp_n = max(1, int(tensor_parallel_size or 1))
+    if eng.max_tp is not None and tp_n > eng.max_tp:
+        raise RuntimeError(f"{eng.label} supports at most TP={eng.max_tp} here (requested {tp_n}).")
 
     # Hard gate: refuse Start when weights cannot fit the online cluster (P0.3).
     # Shares check_serve_loadability with recommend() so Start and Auto-configure agree.
@@ -871,12 +755,12 @@ def serve_model(
             )
             moe_backend = ""
 
-    _ensure_image_present(image or "", log=log, progress=progress)
-
-    vllm_args = _build_vllm_args(
+    spec = ServeSpec(
+        model=model,
+        port=port,
         util=util,
         max_model_len=max_model_len,
-        port=port,
+        tensor_parallel_size=tp_n,
         quantization=quantization,
         kv_cache_dtype=kv_cache_dtype,
         moe_backend=moe_backend,
@@ -892,11 +776,23 @@ def serve_model(
         enable_chunked_prefill=enable_chunked_prefill,
         enable_prefix_caching=enable_prefix_caching,
         extra_flags=extra_flags,
-        tensor_parallel_size=tp_n,
     )
+    ignored = ignored_fields(eng, spec)
+    if ignored:
+        w(f"{eng.label} has no flag for: {', '.join(ignored)} — not passed (use extra flags)", 0.16)
 
-    # Multi-node (TP across Sparks): build per-node launch + orchestrate head/workers.
+    _ensure_image_present(image, log=log, progress=progress)
+    hf_token = _resolve_hf_token_for_container()
+    if not hf_token:
+        w(
+            "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
+            0.19,
+        )
+
+    # Multi-node (TP across Sparks): one container per rank, workers over ssh.
     if tp_n >= 2:
+        if eng.master_port is None:
+            raise RuntimeError(f"{eng.label} has no multi-node tensor parallel here — serve it on one node.")
         from .autoconfig import (
             _cluster_topology,
             estimate_weights_gib,
@@ -914,144 +810,64 @@ def serve_model(
                 "Bring the cluster up or lower tensor-parallel-size."
             )
         head = plan.get("head") or {}
-        workers = (plan.get("planned_nodes") or [])[1:]
-        # strip structured TP/nnodes from extras so the launcher can set them per rank
-        clean_args = _strip_structured_flags(vllm_args)
+        # The requested TP decides how many nodes take a rank (the plan's own
+        # planned_nodes may be fewer: a small model "needs" one node).
+        workers = (topo.get("workers") or [])[: tp_n - 1]
         launch = build_multi_node_launch(
-            image=image,
-            model=model,
-            vllm_args=clean_args,
-            env_list=env_list,
-            head=head,
-            workers=workers,
-            nnodes=tp_n,
-            port=port,
+            engine=eng, spec=spec, image=image, env_list=env_list,
+            head=head, workers=workers, hf_token=hf_token,
         )
         if stop_first:
-            w("Stopping existing vLLM containers (head + workers)…", 0.05)
+            w("Stopping existing serve containers (head + workers)…", 0.05)
             stop_multi_node(log=log)
             stop_all(log=log)
-        w(f"Multi-node launch: TP={tp_n} across {tp_n} node(s) on QSFP RoCE", 0.2)
-        return _launch_multi_node(launch, port=port, log=log, progress=progress)
+        w(f"Multi-node {eng.label} launch: TP={tp_n} across {tp_n} node(s) on QSFP RoCE", 0.2)
+        return _launch_multi_node(launch, engine=eng, log=log, progress=progress, cancel=cancel)
 
     if stop_first:
-        w("Stopping existing vLLM containers…", 0.05)
+        w("Stopping existing serve containers…", 0.05)
         stop_all(log=log)
 
-    w("Launching docker vLLM (manual config)…", 0.2)
-    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-    hf_token = _resolve_hf_token_for_container()
-    if not hf_token:
-        w(
-            "HF token missing or invalid (whoami failed) — container will fetch public models anonymously",
-            0.28,
-        )
+    container = eng.container
+    w(f"Launching {eng.label} in docker ({container})…", 0.2)
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=60)
     cmd = build_single_node_docker_cmd(
-        image=image or "",
-        model=model,
-        vllm_args=vllm_args,
-        env_list=env_list,
-        container=container,
-        port=port,
-        hf_token=hf_token,
+        engine=eng, spec=spec, image=image, env_list=env_list, container=container, hf_token=hf_token,
     )
-
-    def _redact_cmd(parts: list[str]) -> str:
-        """Never log HF tokens / secrets in job logs."""
-        out: list[str] = []
-        for c in parts:
-            if c.startswith("HF_TOKEN=") or c.startswith("HUGGING_FACE_HUB_TOKEN="):
-                k = c.split("=", 1)[0]
-                out.append(f"{k}=***")
-            else:
-                out.append(shlex.quote(c))
-        return " ".join(out)
-
     w(f"image={image}", 0.25)
     w(f"docker_env={env_list}", 0.26)
-    w(f"vllm_args={vllm_args}", 0.27)
-    w(f"$ {_redact_cmd(cmd)}", 0.3)
+    w(f"$ {redact_cmd(cmd)}", 0.3)
 
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(r.stderr or r.stdout or "docker run failed")
     if log:
         log.write((r.stdout or "").strip())
-        log.write("Waiting for /v1/models (up to 10 min)…")
-
-    def _container_dead() -> str | None:
-        """Return docker status string if container is not running."""
-        st = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", container],
-            capture_output=True,
-            text=True,
+        log.write(f"Waiting for {eng.ready_path} (up to {eng.ready_timeout_s // 60} min)…")
+    try:
+        wait_ready(
+            eng, port, container=container, timeout_s=eng.ready_timeout_s,
+            log=log, progress=progress, cancel=cancel,
         )
-        status = (st.stdout or "").strip()
-        if not status:
-            return "missing"
-        if status.startswith("running"):
-            return None
-        return status
-
-    def _tail_logs(n: int = 120) -> str:
-        try:
-            return subprocess.check_output(
-                ["docker", "logs", "--tail", str(n), container],
-                text=True,
-                stderr=subprocess.STDOUT,
-            )
-        except Exception as e:
-            return str(e)
-
-    ready = False
-    for i in range(120):
-        dead = _container_dead()
-        if dead is not None:
-            logs = _tail_logs()
-            if log:
-                log.write(f"container exited early ({dead})")
-                log.write(logs)
-            raise RuntimeError(
-                f"vLLM container exited ({dead}) before /v1/models became ready.\n"
-                f"--- docker logs ---\n{logs[-4000:]}"
-            )
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3)
-            ready = True
-            break
-        except Exception:
-            time.sleep(5)
-            if i % 6 == 0 and log:
-                log.write(f"still loading… ({i * 5}s)")
-    if not ready:
-        logs = _tail_logs()
-        if log:
-            log.write(logs)
-        raise RuntimeError(f"Timeout waiting for /v1/models\n--- docker logs ---\n{logs[-4000:]}")
+    except (JobCancelled, TimeoutError):
+        # Still loading and holding memory: remove it. An exited container is kept for `docker logs`.
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=60)
+        raise
 
     avail = available_gib()
-    ram_total = None
-    try:
-        ram_total = collect_hardware().get("ram_gib")
-    except Exception:
-        ram_total = None
-    abort = _lab_safe_headroom_abort(avail, ram_total if isinstance(ram_total, (int, float)) else None)
-    if abort:
-        # Informational only — reserved UMA is enforced at placement, not by
-        # killing a serve that already became healthy.
-        w(f"HEADROOM: {abort}", 1.0)
-    w(f"API ready. available_gib={avail}", 1.0)
+    w(f"{eng.label} API ready on :{port}. available_gib={avail}", 1.0)
     return {
         "ok": True,
-        "mode": mode,
+        "engine": eng.name,
         "model": model,
         "container": container,
+        "port": port,
         "util": util,
         "max_model_len": max_model_len,
         "available_gib": avail,
         "image": image,
         "docker_env": env_list,
-        "vllm_args": vllm_args,
+        "args": eng.command(spec, image, None),
     }
 
 

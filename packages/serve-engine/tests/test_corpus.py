@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from app.services import autoconfig as ac
-from app.services import serve as sv
+from app.services.engines import vllm as vllm_adapter
 
 CORPUS = Path(__file__).resolve().parent / "corpus"
 
@@ -122,7 +122,7 @@ def _recommend_offline(monkeypatch, case: dict) -> dict:
 
 def _final_command(model: str, cfg: dict) -> str:
     """Compose the argv the launcher would actually exec, for end-to-end checks."""
-    args = sv._build_vllm_args(
+    args = vllm_adapter.build_args(
         util=float(cfg.get("util") or 0.4),
         max_model_len=int(cfg.get("max_model_len") or 65536),
         port=8000,

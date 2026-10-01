@@ -12,28 +12,18 @@ DATA_DIR = Path(os.environ.get("LAIL_DATA_DIR", APP_ROOT / "data")).resolve()
 RUNS_DIR = DATA_DIR / "runs"
 DB_PATH = DATA_DIR / "lab.sqlite"
 
-PIPELINE = HOME / "benchmarks" / "_pipeline"
-SPARK_LAB = PIPELINE / "spark_lab.sh"
-PROFILES_DIR = PIPELINE / "profiles"
-
 DEFAULT_BASE_URL = os.environ.get("LAB_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_PORT = int(os.environ.get("LAB_PORT", "8000"))
 DEFAULT_IMAGE_SAFE = os.environ.get("SPARK_VLLM_IMAGE", "vllm/vllm-openai:v0.27.1")
 DEFAULT_IMAGE_MAX = os.environ.get("LAB_VLLM_IMAGE_MAX", "vllm/vllm-openai:v0.27.1")
 
-# Lab Safe envelope (matches spark_envelope.sh)
-SAFE_UTIL = 0.4
-SAFE_MAX_LEN = 65536
-SAFE_MIN_AVAIL_GIB = 60
+# vLLM workflow envelope: util / max-model-len when a request leaves them unset.
 WORKFLOW_UTIL = 0.85
 WORKFLOW_MAX_LEN = 262144
 
 # Memory floor (GiB) an OOM guard acts on: a serve is in danger only when BOTH
 # MemAvailable and SwapFree approach it (status `headroom` / node `mem_pressure`).
 MEM_FLOOR_GIB = float(os.environ.get("LAIL_MEM_FLOOR_GIB", "2"))
-
-CONTAINER_SAFE = "spark-vllm"
-CONTAINER_MAX = "spark-vllm-max"
 
 MODEL_PRESETS: dict[str, dict] = {
     "nvidia/Qwen3.6-27B-NVFP4": {

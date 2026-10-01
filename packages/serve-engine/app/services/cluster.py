@@ -112,18 +112,17 @@ def _run(cmd: list[str], timeout: float = 12) -> tuple[int, str, str]:
 
 
 def _container_serve_family(name: str) -> str | None:
-    """Stable serve-family key for pairing head/worker containers."""
+    """Stable serve-family key for pairing head/worker containers (node container lists
+    hold serve containers only — `node_probe.parse_docker_ps` filtered them)."""
     n = (name or "").strip()
     if not n:
         return None
     if node_probe._OFFICIAL_VLLM_NAME_RE.match(n):
-        return "spark-vllm"
+        return re.sub(r"-n\d+$", "", n)
     m = node_probe._DSPARK_VLLM_NAME_RE.match(n)
     if m:
         return re.sub(r"[-_]\d+$", "", n).lower()
-    if node_probe.is_serve_container(n):
-        return n.lower()
-    return None
+    return n.lower()
 
 
 def _node_serve_families(n: dict[str, Any]) -> set[str]:

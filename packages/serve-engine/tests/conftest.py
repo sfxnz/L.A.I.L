@@ -6,6 +6,7 @@ from app import db
 from app.api import routes
 from app.services import agentic
 from app.services import jobs
+from app.services import serve
 
 
 @pytest.fixture(autouse=True)
@@ -21,5 +22,6 @@ def isolated_data(monkeypatch, tmp_path):
     monkeypatch.setattr(routes, "RUNS_DIR", runs)
     monkeypatch.setattr(agentic, "RUNS_DIR", runs)
     monkeypatch.setattr(jobs, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(serve, "_MULTINODE_STATE", tmp_path / "multinode_serve.json")
     db.init_db()
     return tmp_path

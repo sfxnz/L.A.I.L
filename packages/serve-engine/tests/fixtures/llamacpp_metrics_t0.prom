@@ -1,0 +1,46 @@
+# Synthesised (not a live scrape) from the exact metric names/labels in upstream source; see tests/test_engines.py.
+# HELP llamacpp:prompt_tokens_total prompt_tokens_total
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 1000
+# HELP llamacpp:prompt_tokens_cached_total prompt_tokens_cached_total
+# TYPE llamacpp:prompt_tokens_cached_total counter
+llamacpp:prompt_tokens_cached_total 64
+# HELP llamacpp:prompt_seconds_total prompt_seconds_total
+# TYPE llamacpp:prompt_seconds_total counter
+llamacpp:prompt_seconds_total 2.0
+# HELP llamacpp:tokens_predicted_total tokens_predicted_total
+# TYPE llamacpp:tokens_predicted_total counter
+llamacpp:tokens_predicted_total 500
+# HELP llamacpp:tokens_predicted_seconds_total tokens_predicted_seconds_total
+# TYPE llamacpp:tokens_predicted_seconds_total counter
+llamacpp:tokens_predicted_seconds_total 10.0
+# HELP llamacpp:n_decode_total n_decode_total
+# TYPE llamacpp:n_decode_total counter
+llamacpp:n_decode_total 700
+# HELP llamacpp:n_tokens_max n_tokens_max
+# TYPE llamacpp:n_tokens_max counter
+llamacpp:n_tokens_max 4096
+# HELP llamacpp:spec_decode_num_draft_tokens_total spec_decode_num_draft_tokens_total
+# TYPE llamacpp:spec_decode_num_draft_tokens_total counter
+llamacpp:spec_decode_num_draft_tokens_total 300
+# HELP llamacpp:spec_decode_num_accepted_tokens_total spec_decode_num_accepted_tokens_total
+# TYPE llamacpp:spec_decode_num_accepted_tokens_total counter
+llamacpp:spec_decode_num_accepted_tokens_total 200
+# HELP llamacpp:spec_decode_num_drafts_total spec_decode_num_drafts_total
+# TYPE llamacpp:spec_decode_num_drafts_total counter
+llamacpp:spec_decode_num_drafts_total 100
+# HELP llamacpp:prompt_tokens_seconds prompt_tokens_seconds
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 1280.0
+# HELP llamacpp:predicted_tokens_seconds predicted_tokens_seconds
+# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 80.0
+# HELP llamacpp:requests_processing requests_processing
+# TYPE llamacpp:requests_processing gauge
+llamacpp:requests_processing 1
+# HELP llamacpp:requests_deferred requests_deferred
+# TYPE llamacpp:requests_deferred gauge
+llamacpp:requests_deferred 0
+# HELP llamacpp:n_busy_slots_per_decode n_busy_slots_per_decode
+# TYPE llamacpp:n_busy_slots_per_decode gauge
+llamacpp:n_busy_slots_per_decode 1

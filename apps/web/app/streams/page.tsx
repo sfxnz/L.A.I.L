@@ -395,13 +395,13 @@ function StreamsRoom() {
       : loading
         ? "Checking…"
         : live
-          ? "Synchronizing"
+          ? "Running"
           : finished
             ? state.done?.summary.status === "cancelled"
               ? "Sequence cancelled"
               : state.done?.summary.status === "error"
                 ? "Sequence failed"
-                : "Sequence synchronized"
+                : "Run done"
             : anyUp
               ? "Endpoint live"
               : "No model serving";
@@ -460,7 +460,7 @@ function StreamsRoom() {
               </Link>
             }
           >
-            No memory loaded. Serve a model to begin synchronization — strands need a live endpoint.
+            No model serving. Start one on Serve — streams need a live endpoint.
           </Corridor>
         </Panel>
       ) : (
@@ -553,7 +553,7 @@ function StreamsRoom() {
           ) : (
             <section aria-label="Preview" className="space-y-2">
               <div className="flex items-center gap-2.5">
-                <Eyebrow className="text-lab-text-dim">Run to synchronize {controls.n} strand{controls.n === 1 ? "" : "s"}</Eyebrow>
+                <Eyebrow className="text-lab-text-dim">Run to start {controls.n} strand{controls.n === 1 ? "" : "s"}</Eyebrow>
                 <div aria-hidden className="animus-rule min-w-6 flex-1" />
                 <Eyebrow className="lab-num">
                   {packLabel(controls.pack)} · {fmtInt(controls.max_tokens)} tok · {controls.arrival}

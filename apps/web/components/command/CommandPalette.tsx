@@ -79,7 +79,7 @@ export function CommandPalette() {
     if (open) setQuery("");
   }, [open]);
 
-  // Sequences: fetch the recent run index once per open, debounced behind the first keystroke.
+  // Runs: fetch the recent run index once per open, debounced behind the first keystroke.
   useEffect(() => {
     if (!open || runs !== null || query.trim().length < 2) return;
     const t = window.setTimeout(() => {
@@ -115,7 +115,7 @@ export function CommandPalette() {
     const rows = runs.flatMap((r) => {
       const href = runHref(r);
       return href
-        ? [{ run: r, href, label: r.run_id, hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "), group: "Sequences" }]
+        ? [{ run: r, href, label: r.run_id, hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "), group: "Runs" }]
         : [];
     });
     return filterCommands(rows, query).slice(0, 8);
@@ -165,7 +165,7 @@ export function CommandPalette() {
             </Command.Group>
           ))}
           {sequences.length > 0 && (
-            <Command.Group heading={<Eyebrow>Sequences</Eyebrow>}>
+            <Command.Group heading={<Eyebrow>Runs</Eyebrow>}>
               {sequences.map((s) => (
                 <Command.Item
                   key={s.run.run_id}

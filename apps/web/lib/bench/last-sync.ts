@@ -3,7 +3,7 @@ import { decodeConfigToQuery, defaultDecodeConfig } from "./levels";
 import { comparable, headlineFromIndex, headlineFromResult, type BenchResult, type DecodeArm } from "./result";
 
 /**
- * The Status "Last synchronization" card, as data: the newest decode run of the
+ * The Status "Last decode bench" card, as data: the newest decode run of the
  * model being served, its hero, the delta against the previous comparable run
  * (same model, pack, tokens/stream and serve fingerprint — never just "the run
  * before it"), and where its two actions go. Envelopes are optional — the index

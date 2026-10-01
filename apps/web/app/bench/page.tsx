@@ -384,7 +384,7 @@ function BenchRoom() {
       <div className="page-header">
         <div className="min-w-0">
           <h1 className="page-title">Bench</h1>
-          <p className="page-sub">Decode and prefill synchronization runs against the live endpoint, drawn as they happen.</p>
+          <p className="page-sub">Decode and prefill benches against the live endpoint, drawn as they happen.</p>
         </div>
         <SegmentedControl<Tab>
           value={tab}

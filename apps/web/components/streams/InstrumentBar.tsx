@@ -26,7 +26,7 @@ export function InstrumentBar({ state, live, className }: { state: StreamRunStat
   const sum = state.done?.summary ?? null;
   const { value, method } = aggregateMethod(state);
   const ring: SyncState | null = state.error || sum?.status === "error" ? "offline" : sum ? "serving" : live ? "loading" : latest ? "idle" : null;
-  const ringLabel = state.error ? "Run failed" : sum ? (sum.status === "cancelled" ? "Run cancelled" : "Run synchronized") : live ? "Synchronizing" : "Idle";
+  const ringLabel = state.error ? "Run failed" : sum ? (sum.status === "cancelled" ? "Run cancelled" : "Run done") : live ? "Running" : "Idle";
   const peak = sum?.peak_tok_s ?? latest?.peak_tok_s;
   const tokens = sum?.tokens ?? latest?.tokens;
   // Once the run is done its summary is the definition (a null p95 = too few samples),

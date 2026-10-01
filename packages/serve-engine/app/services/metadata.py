@@ -357,6 +357,7 @@ def build_engine(
         "version": str(version) if version else None,
         "prefix_cache_hit_rate": _num_or_none(metrics.get("prefix_cache_hit_rate_live")),
         "preemptions_total": _int_or_none(metrics.get("preemptions_total")),
+        "sleep_state": metrics.get("sleep_state"),
         "uptime_s": _uptime_s(inspect.get("started_at"), now),
         "flags_fingerprint": flags_fingerprint(flags),
         "flags": flags,
@@ -368,12 +369,19 @@ def _int_or_none(v: Any) -> int | None:
     return None if f is None else int(f)
 
 
-async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0) -> dict[str, Any]:
-    """Probe /health, /v1/models, /version, /metrics concurrently.
+async def probe_endpoint(
+    base_url: str = DEFAULT_BASE_URL,
+    timeout: float = 5.0,
+    *,
+    client: httpx.AsyncClient | None = None,
+    version: bool = True,
+) -> dict[str, Any]:
+    """Probe /health, /v1/models, /version (when asked), /metrics concurrently.
 
     Parsing /metrics feeds the live tok/s counter deltas (`_LIVE_RATE`), so this
     must have one caller at a fixed cadence: the status sampler. Bench threads
-    read the sampler's cached probe instead of calling this.
+    read the sampler's cached probe instead of calling this. The sampler passes
+    its long-lived `client` and skips /version until the serving container changes.
     """
     base = base_url.rstrip("/")
     result: dict[str, Any] = {
@@ -386,19 +394,19 @@ async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0)
     }
     health_ok = False
     errors: dict[str, str] = {}
-    async with httpx.AsyncClient(timeout=timeout) as client:
 
+    async def run(c: httpx.AsyncClient) -> None:
         async def health() -> None:
             nonlocal health_ok
             try:
-                h = await client.get(f"{base}/health")
+                h = await c.get(f"{base}/health", timeout=timeout)
                 health_ok = h.status_code == 200
             except Exception as e:
                 errors["health"] = f"health: {e}"
 
         async def models() -> None:
             try:
-                m = await client.get(f"{base}/v1/models")
+                m = await c.get(f"{base}/v1/models", timeout=timeout)
                 if m.status_code == 200:
                     body = m.json()
                     result["models"] = body.get("data") or []
@@ -406,9 +414,9 @@ async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0)
             except Exception as e:
                 errors["models"] = f" models: {e}"
 
-        async def version() -> None:
+        async def version_() -> None:
             try:
-                v = await client.get(f"{base}/version")
+                v = await c.get(f"{base}/version", timeout=timeout)
                 if v.status_code == 200:
                     result["version"] = v.json() if "application/json" in v.headers.get("content-type", "") else v.text
             except Exception:
@@ -416,42 +424,67 @@ async def probe_endpoint(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0)
 
         async def metrics() -> None:
             try:
-                met = await client.get(f"{base}/metrics")
+                met = await c.get(f"{base}/metrics", timeout=timeout)
                 if met.status_code == 200:
-                    result["metrics"] = parse_prometheus(met.text)
+                    mono, wall_ms = time.monotonic(), int(time.time() * 1000)
+                    # ~70 KB of text: parse off the event loop. One writer → rate state is safe.
+                    parsed = await asyncio.to_thread(parse_prometheus, met.text, mono)
+                    parsed["sampled_at"] = wall_ms
+                    result["metrics"] = parsed
             except Exception:
                 pass
 
-        await asyncio.gather(health(), models(), version(), metrics())
+        await asyncio.gather(health(), models(), *([version_()] if version else []), metrics())
+
+    if client is not None:
+        await run(client)
+    else:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            await run(c)
     result["healthy"] = result["healthy"] or health_ok
     if errors:
         result["error"] = errors.get("health", "") + errors.get("models", "")
     return result
 
 
-def parse_prometheus(text: str) -> dict[str, float]:
-    """Extract a few useful vLLM gauges/counters."""
-    keys = {
-        "vllm:gpu_cache_usage_perc": "gpu_kv_cache_usage",
-        "vllm:prefix_cache_hits": "prefix_cache_hits",
-        "vllm:prefix_cache_queries": "prefix_cache_queries",
-        # vLLM ≥ 0.10 exposes the counters with the Prometheus `_total` suffix.
-        "vllm:prefix_cache_hits_total": "prefix_cache_hits",
-        "vllm:prefix_cache_queries_total": "prefix_cache_queries",
-        "vllm:num_preemptions_total": "preemptions_total",
-        "vllm:num_requests_running": "requests_running",
-        "vllm:num_requests_waiting": "requests_waiting",
-        "vllm:prompt_tokens_total": "prompt_tokens_total",
-        "vllm:generation_tokens_total": "generation_tokens_total",
-        "vllm:avg_prompt_throughput_toks_per_s": "prompt_tok_per_s",
-        "vllm:avg_generation_throughput_toks_per_s": "gen_tok_per_s",
-        "vllm:kv_cache_usage_perc": "gpu_kv_cache_usage",
-        "vllm:request_decode_time_seconds_sum": "decode_time_s_sum",
-        "vllm:request_generation_tokens_sum": "generation_tokens_sum",
-        "vllm:request_prefill_time_seconds_sum": "prefill_time_s_sum",
-        "vllm:request_prefill_kv_computed_tokens_sum": "prefill_tokens_sum",
-    }
-    out: dict[str, float] = {}
+# Prometheus name → normalized key. Series of one name that differ only by labels
+# (engine="0", engine="1", … under data parallel) are SUMMED; when several names map
+# to one key (old and new vLLM spellings) the first name present wins.
+_PROM_KEYS: tuple[tuple[str, str], ...] = (
+    ("vllm:kv_cache_usage_perc", "gpu_kv_cache_usage"),
+    ("vllm:gpu_cache_usage_perc", "gpu_kv_cache_usage"),
+    # vLLM ≥ 0.10 exposes the counters with the Prometheus `_total` suffix.
+    ("vllm:prefix_cache_hits_total", "prefix_cache_hits"),
+    ("vllm:prefix_cache_hits", "prefix_cache_hits"),
+    ("vllm:prefix_cache_queries_total", "prefix_cache_queries"),
+    ("vllm:prefix_cache_queries", "prefix_cache_queries"),
+    ("vllm:num_preemptions_total", "preemptions_total"),
+    ("vllm:num_requests_running", "requests_running"),
+    ("vllm:num_requests_waiting", "requests_waiting"),
+    ("vllm:prompt_tokens_total", "prompt_tokens_total"),
+    ("vllm:generation_tokens_total", "generation_tokens_total"),
+    ("vllm:time_to_first_token_seconds_sum", "ttft_sum"),
+    ("vllm:time_to_first_token_seconds_count", "ttft_count"),
+    # Recorded once per engine step per running request: Σ is the busy decode time.
+    ("vllm:inter_token_latency_seconds_sum", "itl_sum"),
+    # Recorded when a request FINISHES (not at first token).
+    ("vllm:request_prefill_time_seconds_sum", "prefill_time_s_sum"),
+    ("vllm:request_prefill_time_seconds_count", "prefill_time_s_count"),
+    ("vllm:request_prefill_kv_computed_tokens_sum", "prefill_tokens_sum"),
+    ("vllm:spec_decode_num_drafts_total", "spec_drafts"),
+    ("vllm:spec_decode_num_draft_tokens_total", "spec_draft_tokens"),
+    ("vllm:spec_decode_num_accepted_tokens_total", "spec_accepted"),
+)
+_PROM_NAMES = {name for name, _ in _PROM_KEYS}
+# A pool fraction per engine: summing engines would exceed 1 — report the fullest one.
+_PROM_MAX_KEYS = {"gpu_kv_cache_usage"}
+_PROM_LINE_RE = re.compile(r"^([a-zA-Z0-9_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+|NaN)")
+
+
+def parse_prometheus(text: str, now: float | None = None) -> dict[str, Any]:
+    """Extract the vLLM gauges/counters LAIL uses, then the live window rates."""
+    by_name: dict[str, list[float]] = {}
+    out: dict[str, Any] = {}
     for line in text.splitlines():
         if line.startswith("#") or not line.strip():
             continue
@@ -459,122 +492,154 @@ def parse_prometheus(text: str) -> dict[str, float]:
             # KV geometry lives in the labels of this info gauge (value is always 1).
             for label in ("block_size", "num_gpu_blocks", "kv_cache_size_tokens"):
                 lm = re.search(rf'\b{label}="(\d+)"', line)
-                if lm:
+                if lm and label not in out:
                     out[label] = float(lm.group(1))
             continue
-        # metric{labels} value
-        m = re.match(r"^([a-zA-Z0-9_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)", line)
-        if not m:
+        if line.startswith("vllm:engine_sleep_state{"):
+            sm = re.search(r'sleep_state="([^"]+)"\}\s+1(?:\.0)?\s*$', line)
+            if sm:
+                out["sleep_state"] = sm.group(1)
             continue
-        name, val = m.group(1), float(m.group(2))
-        if name in keys:
-            # prefer unlabeled or sum — last wins for gauges
-            out[keys[name]] = val
-    if "prefix_cache_hits" in out and "prefix_cache_queries" in out and out["prefix_cache_queries"] > 0:
-        out["prefix_cache_hit_rate"] = out["prefix_cache_hits"] / out["prefix_cache_queries"]
-    return live_token_rates(out)
+        m = _PROM_LINE_RE.match(line)
+        if not m or m.group(1) not in _PROM_NAMES:
+            continue
+        val = float(m.group(2))
+        if val == val:  # drop NaN
+            by_name.setdefault(m.group(1), []).append(val)
+    for name, key in _PROM_KEYS:
+        if key in out or name not in by_name:
+            continue
+        vals = by_name[name]
+        out[key] = max(vals) if key in _PROM_MAX_KEYS else sum(vals)
+    if out.get("prefix_cache_queries"):
+        out["prefix_cache_hit_rate"] = out.get("prefix_cache_hits", 0.0) / out["prefix_cache_queries"]
+    return live_token_rates(out, now=now)
 
 
-_LIVE_RATE: dict[str, float | None] = {
-    "t": None,
-    "prompt": None,
-    "gen": None,
-    "last_gen_rate": None,
-    "last_prompt_rate": None,
-    "pc_hits": None,
-    "pc_queries": None,
-}
+# Counters whose window deltas drive the live rates.
+_RATE_COUNTERS = (
+    "generation_tokens_total",
+    "ttft_sum",
+    "ttft_count",
+    "itl_sum",
+    "prefill_time_s_sum",
+    "prefill_time_s_count",
+    "prefill_tokens_sum",
+    "spec_drafts",
+    "spec_draft_tokens",
+    "spec_accepted",
+    "prefix_cache_hits",
+    "prefix_cache_queries",
+)
+# Every live rate key is always present; None means "no reading this window".
+LIVE_RATE_KEYS = (
+    "decode_tok_per_s",
+    "throughput_tok_per_s",
+    "prefill_tok_per_s",
+    "ttft_s",
+    "spec_accept_rate",
+    "spec_tokens_per_step",
+    "prefix_cache_hit_rate_live",
+    "rate_window_s",
+)
+
+# Single writer (the sampler's fast tick): previous counters, the burst in progress,
+# and the last finished burst.
+_LIVE_RATE: dict[str, Any] = {"t": None, "prev": None, "burst": None, "last_burst": None, "last_prefill": None}
 
 
 def reset_live_rate_state() -> None:
-    _LIVE_RATE.update(
-        t=None, prompt=None, gen=None, last_gen_rate=None, last_prompt_rate=None,
-        pc_hits=None, pc_queries=None,
-    )
+    """Forget counters and bursts — the endpoint or serving container changed."""
+    _LIVE_RATE.update(t=None, prev=None, burst=None, last_burst=None, last_prefill=None)
 
 
-def _positive_rate(value: float | None) -> float | None:
-    if value is None or value <= 0:
+def _ratio(num: float | None, den: float | None, digits: int = 2) -> float | None:
+    if num is None or den is None or den <= 0:
         return None
-    return round(float(value), 2)
+    return round(num / den, digits)
 
 
-def _counter_delta(now_val: float | None, prev_val: float | None, dt: float) -> float | None:
-    if now_val is None or prev_val is None or dt < 0.2:
-        return None
-    return (float(now_val) - float(prev_val)) / dt
+def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    """Live rates from counter deltas over the window since the previous scrape.
 
+    decode_tok_per_s      per-stream decode speed over BUSY time: tokens after each
+                          request's first ÷ Σ inter-token latency. A short burst inside
+                          a long window is not diluted. With spec-decode one engine
+                          step emits several tokens; this is tokens per second of step
+                          time, i.e. what one stream sees. 0 while requests run but no
+                          token moved (prefill, stall); None when idle.
+    throughput_tok_per_s  aggregate Δgeneration_tokens / Δwall — all streams together.
+    prefill_tok_per_s     computed prompt tokens ÷ prefill time of requests that FINISHED
+                          in the window (vLLM records it at finish; cache hits excluded).
+    ttft_s                mean time to first token of requests that got one this window.
+    spec_accept_rate      accepted ÷ drafted tokens; spec_tokens_per_step = 1 + accepted ÷ drafts.
+    last_prefill          the latest non-null prefill_tok_per_s with its time (`at`, epoch ms).
+    last_burst            the previous busy period: per-stream decode rate and tokens,
+                          `ended_at` epoch ms. Both "last" values are labelled, never live.
 
-def live_token_rates(metrics: dict[str, float], *, now: float | None = None) -> dict[str, float]:
-    """Fill gen_tok_per_s / prompt_tok_per_s from gauges or counter deltas.
-
-    Newer vLLM drops avg_*_throughput gauges. `generation_tokens_total` and
-    `prompt_tokens_total` still move. Prefill is a burst at request start, so
-    the last positive prefill rate sticks while decode tokens (or running
-    requests) show the serve is still in use. Zero stays absent, never a fake 0.
+    Never a lifetime average; a counter that goes backwards (engine restart) re-baselines.
     """
     out = dict(metrics)
     now = time.monotonic() if now is None else now
-    prompt = out.get("prompt_tokens_total")
-    gen = out.get("generation_tokens_total")
-    prev_t = _LIVE_RATE.get("t")
-    d_gen = None
-    d_prompt = None
-    if prev_t is not None:
-        dt = now - float(prev_t)
-        d_gen = _counter_delta(gen, _LIVE_RATE.get("gen"), dt)
-        d_prompt = _counter_delta(prompt, _LIVE_RATE.get("prompt"), dt)
+    for key in LIVE_RATE_KEYS:
+        out[key] = None
+    out["spec_accept_rate_lifetime"] = _ratio(metrics.get("spec_accepted"), metrics.get("spec_draft_tokens"), 4)
 
-    if d_gen is not None and not out.get("gen_tok_per_s"):
-        out["gen_tok_per_s"] = d_gen
-    if d_prompt is not None and not out.get("prompt_tok_per_s"):
-        out["prompt_tok_per_s"] = d_prompt
+    cur = {k: metrics.get(k) for k in _RATE_COUNTERS}
+    prev, prev_t = _LIVE_RATE["prev"], _LIVE_RATE["t"]
+    _LIVE_RATE.update(t=now, prev=cur)
+    out["last_burst"] = _LIVE_RATE["last_burst"]
+    out["last_prefill"] = _LIVE_RATE["last_prefill"]
+    if prev is None or prev_t is None or now - prev_t < 0.2:
+        return out
+    d = {k: cur[k] - prev[k] for k in _RATE_COUNTERS if cur[k] is not None and prev.get(k) is not None}
+    if any(v < 0 for v in d.values()):
+        # Counters went backwards: the engine restarted. Re-baseline, show nothing stale.
+        _LIVE_RATE.update(burst=None, last_burst=None, last_prefill=None)
+        out["last_burst"] = out["last_prefill"] = None
+        return out
 
-    running = (out.get("requests_running") or 0) > 0
-    if not out.get("gen_tok_per_s") and running:
-        decode_s = out.get("decode_time_s_sum")
-        gen_sum = out.get("generation_tokens_sum")
-        if decode_s and gen_sum and decode_s > 0:
-            out["gen_tok_per_s"] = gen_sum / decode_s
-    if not out.get("prompt_tok_per_s") and running:
-        prefill_s = out.get("prefill_time_s_sum")
-        prefill_tok = out.get("prefill_tokens_sum")
-        if prefill_s and prefill_tok and prefill_s > 0:
-            out["prompt_tok_per_s"] = prefill_tok / prefill_s
+    dt = now - prev_t
+    running = (metrics.get("requests_running") or 0) > 0
+    gen = d.get("generation_tokens_total")
+    first = d.get("ttft_count") or 0.0
+    itl = d.get("itl_sum") or 0.0
+    out["rate_window_s"] = round(dt, 2)
+    if gen is not None:
+        out["throughput_tok_per_s"] = round(gen / dt, 2)
+    if gen is not None and itl > 0:
+        out["decode_tok_per_s"] = round(max(0.0, gen - first) / itl, 2)
+    elif running and gen is not None:
+        out["decode_tok_per_s"] = 0.0
+    if d.get("prefill_time_s_count"):
+        out["prefill_tok_per_s"] = _ratio(d.get("prefill_tokens_sum"), d.get("prefill_time_s_sum"))
+        if out["prefill_tok_per_s"] is not None:
+            _LIVE_RATE["last_prefill"] = out["last_prefill"] = {
+                "tok_per_s": out["prefill_tok_per_s"],
+                "at": int(time.time() * 1000),
+            }
+    if first:
+        out["ttft_s"] = _ratio(d.get("ttft_sum"), first, 3)
+    out["spec_accept_rate"] = _ratio(d.get("spec_accepted"), d.get("spec_draft_tokens"), 4)
+    if d.get("spec_drafts") and d.get("spec_accepted") is not None:
+        out["spec_tokens_per_step"] = round(1 + d["spec_accepted"] / d["spec_drafts"], 2)
+    out["prefix_cache_hit_rate_live"] = _ratio(d.get("prefix_cache_hits"), d.get("prefix_cache_queries"), 4)
 
-    gen_rate = _positive_rate(out.get("gen_tok_per_s"))
-    prompt_rate = _positive_rate(out.get("prompt_tok_per_s"))
-    in_flight = (
-        running
-        or (d_gen is not None and d_gen > 0)
-        or (d_prompt is not None and d_prompt > 0)
-    )
-    if prompt_rate is None and in_flight:
-        prompt_rate = _positive_rate(_LIVE_RATE.get("last_prompt_rate"))
-    if gen_rate is None and in_flight:
-        gen_rate = _positive_rate(_LIVE_RATE.get("last_gen_rate"))
-
-    out["gen_tok_per_s"] = gen_rate
-    out["prompt_tok_per_s"] = prompt_rate
-
-    # Prefix-cache hit rate over this window (counter deltas); absent while no queries happened.
-    hits, queries = out.get("prefix_cache_hits"), out.get("prefix_cache_queries")
-    prev_h, prev_q = _LIVE_RATE.get("pc_hits"), _LIVE_RATE.get("pc_queries")
-    if None not in (hits, queries, prev_h, prev_q) and queries > prev_q:  # type: ignore[operator]
-        out["prefix_cache_hit_rate_live"] = round((hits - prev_h) / (queries - prev_q), 4)  # type: ignore[operator]
-    _LIVE_RATE.update(
-        t=now,
-        prompt=prompt,
-        gen=gen,
-        pc_hits=hits,
-        pc_queries=queries,
-        last_gen_rate=gen_rate if gen_rate is not None else (
-            _LIVE_RATE.get("last_gen_rate") if in_flight else None
-        ),
-        last_prompt_rate=prompt_rate if prompt_rate is not None else (
-            _LIVE_RATE.get("last_prompt_rate") if in_flight else None
-        ),
-    )
+    burst = _LIVE_RATE["burst"]
+    if running or gen or d.get("prefill_time_s_count"):
+        burst = burst or {"tokens": 0.0, "decode_tokens": 0.0, "itl": 0.0}
+        burst["tokens"] += gen or 0.0
+        burst["decode_tokens"] += max(0.0, (gen or 0.0) - first) if itl > 0 else 0.0
+        burst["itl"] += itl
+        _LIVE_RATE["burst"] = burst
+    elif burst:
+        # First idle window after activity: the burst is over — keep it, labelled as such.
+        _LIVE_RATE["last_burst"] = out["last_burst"] = {
+            "decode_tok_per_s": _ratio(burst["decode_tokens"], burst["itl"]),
+            "tokens": int(burst["tokens"]),
+            "ended_at": int(time.time() * 1000),
+        }
+        _LIVE_RATE["burst"] = None
     return out
 
 

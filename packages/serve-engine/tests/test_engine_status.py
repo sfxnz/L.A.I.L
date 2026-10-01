@@ -10,7 +10,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "vllm_metrics_qwen38_flash_next.p
 ENGINE_KEYS = {
     "kv_usage_pct", "requests_running", "requests_waiting", "block_size", "num_gpu_blocks",
     "kv_capacity_tokens", "max_model_len", "version", "prefix_cache_hit_rate",
-    "preemptions_total", "uptime_s", "flags_fingerprint", "flags",
+    "preemptions_total", "sleep_state", "uptime_s", "flags_fingerprint", "flags",
 }
 
 
@@ -36,14 +36,14 @@ def test_parse_prometheus_reads_real_vllm_scrape_incl_cache_config_labels():
     # `_total`-suffixed counters map onto the historical keys
     assert m["prefix_cache_hits"] == 9.8048e06
     assert m["prefix_cache_queries"] == 1.098554e07
-    assert "prefix_cache_hit_rate_live" not in m  # first sample: no delta yet
+    assert m["prefix_cache_hit_rate_live"] is None  # first sample: no delta yet
 
 
 def test_prefix_cache_hit_rate_is_a_window_delta_not_cumulative():
     metadata.reset_live_rate_state()
     metadata.live_token_rates({"prefix_cache_hits": 900.0, "prefix_cache_queries": 1000.0}, now=1.0)
     idle = metadata.live_token_rates({"prefix_cache_hits": 900.0, "prefix_cache_queries": 1000.0}, now=3.0)
-    assert "prefix_cache_hit_rate_live" not in idle
+    assert idle["prefix_cache_hit_rate_live"] is None
     busy = metadata.live_token_rates({"prefix_cache_hits": 925.0, "prefix_cache_queries": 1100.0}, now=5.0)
     assert busy["prefix_cache_hit_rate_live"] == 0.25
 

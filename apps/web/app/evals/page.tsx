@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type RunRow } from "@/lib/api";
+import { runHref } from "@/lib/run-href";
 import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import {
   Badge,
@@ -149,13 +150,6 @@ function scoreTone(score: number | null | undefined) {
   if (score >= 75) return "accent" as const;
   if (score >= 50) return "warn" as const;
   return "danger" as const;
-}
-
-/** Bench runs open in /bench, tool-eval runs on their scorecard; other kinds have no view. */
-function runHref(r: RunRow): string | null {
-  if (r.kind === "decode" || r.kind === "prefill") return `/bench?run=${encodeURIComponent(r.run_id)}`;
-  if (r.kind === "agentic_tool_eval") return `/evals/tool/${encodeURIComponent(r.run_id)}`;
-  return null;
 }
 
 export default function EvalsPage() {

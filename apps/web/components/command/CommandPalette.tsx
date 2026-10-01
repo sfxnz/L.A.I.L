@@ -14,6 +14,7 @@ import {
   type CommandContext,
 } from "@/lib/commands";
 import { useLabStatusStore } from "@/lib/lab-status-store";
+import { runHref } from "@/lib/run-href";
 import { useCommandUi } from "@/lib/shortcuts";
 import { Eyebrow } from "@/components/ui";
 import { Keys } from "./Keys";
@@ -108,12 +109,13 @@ export function CommandPalette() {
   const groups = useMemo(() => groupCommands(filterCommands(visibleCommands(COMMANDS, ctx), query)), [ctx, query]);
   const sequences = useMemo(() => {
     if (!runs || query.trim().length < 2) return [];
-    const rows = runs.map((r) => ({
-      run: r,
-      label: r.run_id,
-      hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "),
-      group: "Sequences",
-    }));
+    // Only runs with a view to open: legacy_* and other kinds have none.
+    const rows = runs.flatMap((r) => {
+      const href = runHref(r);
+      return href
+        ? [{ run: r, href, label: r.run_id, hint: [r.kind, r.model_id?.split("/").pop()].filter(Boolean).join(" · "), group: "Sequences" }]
+        : [];
+    });
     return filterCommands(rows, query).slice(0, 8);
   }, [runs, query]);
 
@@ -169,7 +171,7 @@ export function CommandPalette() {
                   className="cmd-item"
                   onSelect={() => {
                     setPalette(false);
-                    router.push(`/bench?run=${encodeURIComponent(s.run.run_id)}`);
+                    router.push(s.href);
                   }}
                 >
                   <Row label={s.label} hint={s.hint} />

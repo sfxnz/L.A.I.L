@@ -396,7 +396,8 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
                           a long window is not diluted. With spec-decode one engine
                           step emits several tokens; this is tokens per second of step
                           time, i.e. what one stream sees. 0 while requests run but no
-                          token moved (prefill, stall); None when idle.
+                          token moved (prefill, stall); None when no request is running at
+                          the scrape — the window's last tokens are in last_burst instead.
     throughput_tok_per_s  aggregate Δgeneration_tokens / Δwall — all streams together.
     prefill_tok_per_s     computed prompt tokens ÷ prefill time of requests that FINISHED
                           in the window (vLLM records it at finish; cache hits excluded).
@@ -404,7 +405,9 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     spec_accept_rate      accepted ÷ drafted tokens; spec_tokens_per_step = 1 + accepted ÷ drafts.
     last_prefill          the latest non-null prefill_tok_per_s with its time (`at`, epoch ms).
     last_burst            the previous busy period: per-stream decode rate and tokens,
-                          `ended_at` epoch ms. Both "last" values are labelled, never live.
+                          `ended_at` epoch ms. Closed at the first scrape with no request
+                          running, so ended_at is at most one window after the last token.
+                          Both "last" values are labelled, never live.
 
     Never a lifetime average; a counter that goes backwards (engine restart) re-baselines.
     """
@@ -436,10 +439,8 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
     out["rate_window_s"] = round(dt, 2)
     if gen is not None:
         out["throughput_tok_per_s"] = round(gen / dt, 2)
-    if gen is not None and itl > 0:
-        out["decode_tok_per_s"] = round(max(0.0, gen - first) / itl, 2)
-    elif running and gen is not None:
-        out["decode_tok_per_s"] = 0.0
+    if running and gen is not None:
+        out["decode_tok_per_s"] = round(max(0.0, gen - first) / itl, 2) if itl > 0 else 0.0
     if d.get("prefill_time_s_count"):
         out["prefill_tok_per_s"] = _ratio(d.get("prefill_tokens_sum"), d.get("prefill_time_s_sum"))
         if out["prefill_tok_per_s"] is not None:
@@ -461,8 +462,9 @@ def live_token_rates(metrics: dict[str, Any], *, now: float | None = None) -> di
         burst["decode_tokens"] += max(0.0, (gen or 0.0) - first) if itl > 0 else 0.0
         burst["itl"] += itl
         _LIVE_RATE["burst"] = burst
-    elif burst:
-        # First idle window after activity: the burst is over — keep it, labelled as such.
+    if burst and not running:
+        # Nothing runs at this scrape: the burst ended inside this window (its last tokens,
+        # if any, were just added). Keep it, labelled as such — never shown as live.
         _LIVE_RATE["last_burst"] = out["last_burst"] = {
             "decode_tok_per_s": _ratio(burst["decode_tokens"], burst["itl"]),
             "tokens": int(burst["tokens"]),

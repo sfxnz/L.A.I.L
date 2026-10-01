@@ -42,10 +42,12 @@ def test_first_scrape_has_every_rate_key_and_no_value():
 
 def test_short_burst_is_not_diluted_by_the_window():
     """A 64-token reply decoded in 0.9 s inside a 2 s window: per-stream decode is the real
-    speed (busy time from Σ inter-token latency); the aggregate is the wall-clock average."""
+    speed (busy time from Σ inter-token latency); the aggregate is the wall-clock average.
+    It finished inside the window, so it reads as the last burst, not as live decode."""
     step(10.0)
     out = step(12.0, generation_tokens_total=4829.0 + 64, ttft_count=37.0, ttft_sum=6.68 + 0.08, itl_sum=67.40 + 0.9)
-    assert out["decode_tok_per_s"] == 70.0  # (64 − 1 first token) / 0.9 s
+    assert out["decode_tok_per_s"] is None  # nothing running at the scrape
+    assert out["last_burst"]["decode_tok_per_s"] == 70.0  # (64 − 1 first token) / 0.9 s
     assert out["throughput_tok_per_s"] == 32.0  # 64 / 2 s
     assert out["ttft_s"] == 0.08
     assert out["rate_window_s"] == 2.0
@@ -118,7 +120,10 @@ def test_last_burst_is_kept_after_traffic_stops_and_labelled_by_time():
         13.0, generation_tokens_total=4829.0 + 141, ttft_count=37.0, ttft_sum=6.88, itl_sum=67.40 + 2.0,
         prefill_time_s_count=37.0, prefill_time_s_sum=5.36 + 0.1, prefill_tokens_sum=1397.0 + 500,
     )
-    assert finish["last_burst"] is None  # still in the burst
+    # The last tokens landed and nothing runs any more: the burst closes in this window,
+    # its ended_at stamped now (not one idle window later), and decode is no longer live.
+    assert finish["decode_tok_per_s"] is None
+    assert finish["last_burst"]["tokens"] == 141
     idle = step(14.0, generation_tokens_total=4829.0 + 141, ttft_count=37.0, ttft_sum=6.88, itl_sum=69.40,
                 prefill_time_s_count=37.0, prefill_time_s_sum=5.46, prefill_tokens_sum=1897.0)
     burst = idle["last_burst"]
@@ -127,6 +132,7 @@ def test_last_burst_is_kept_after_traffic_stops_and_labelled_by_time():
     assert burst["tokens"] == 141
     assert idle["last_prefill"]["tok_per_s"] == 5000.0
     assert isinstance(burst["ended_at"], int)
+    assert burst == finish["last_burst"]
     later = step(16.0, generation_tokens_total=4829.0 + 141, ttft_count=37.0, ttft_sum=6.88, itl_sum=69.40,
                  prefill_time_s_count=37.0, prefill_time_s_sum=5.46, prefill_tokens_sum=1897.0)
     assert later["last_burst"] == burst

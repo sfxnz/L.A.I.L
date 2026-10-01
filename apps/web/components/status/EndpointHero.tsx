@@ -21,7 +21,8 @@ import { cn } from "@/lib/utils";
                  never shown as live.
     throughput   all streams together per wall-clock second, with its last 60 s
                  on a real time axis (idle reads 0, a gap is a missed sample).
-    TTFT · ITL p50/p95 · prefill · requests · spec acceptance · KV — each with its own idle rule.
+    TTFT · ITL (step latency under spec decoding) p50/p95 · prefill · requests · spec
+                 acceptance · KV — each with its own idle rule.
 */
 
 const WINDOW_MS = 60_000;
@@ -100,6 +101,9 @@ export const EndpointHero = memo(function EndpointHero({
   const lastTtft = m.ttft_s == null ? m.last_ttft : null;
   const lastTtftAge = lastTtft && serverNow != null ? (serverNow - lastTtft.at) / 1000 : null;
   const busy = (running ?? 0) > 0;
+  // Speculative decoding this second: the latency histogram is per engine step (vLLM) or
+  // per streamed chunk (SGLang), each carrying several tokens — not a per-token interval.
+  const perStep = m.spec_tokens_per_step != null;
   const domain = serverNow != null ? ([serverNow - WINDOW_MS, serverNow] as const) : undefined;
   const throughputPts = endpoint.map((s) => ({ t: s.t, v: s.throughput }));
   const bases = hermesBases(serve.base_url, pageHost);
@@ -215,8 +219,12 @@ export const EndpointHero = memo(function EndpointHero({
               )}
             </Row>
             <Row
-              label="ITL p50 · p95"
-              title="Inter-token latency over the last second, from the engine's histogram (resolution: its bucket edges)"
+              label={perStep ? "Step p50 · p95" : "ITL p50 · p95"}
+              title={
+                perStep
+                  ? `Latency per decode step over the last second. With speculative decoding the engine records one latency per step, and a step emits ~${m.spec_tokens_per_step?.toFixed(1)} tokens — this is not the time between tokens (resolution: its bucket edges)`
+                  : "Inter-token latency over the last second, from the engine's histogram (resolution: its bucket edges)"
+              }
             >
               {m.itl_p50_s != null ? (
                 <>

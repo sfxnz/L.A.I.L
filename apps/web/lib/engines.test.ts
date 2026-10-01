@@ -37,13 +37,16 @@ describe("engine identity", () => {
     const s = serve("vllm", "http://127.0.0.1:8000");
     s.metrics = { spec_accept_rate: 0.71, spec_tokens_per_step: 3.13, ttft_s: 0.182, itl_p50_s: 0.0413, itl_p95_s: 0.0697 };
     const live = hero(s);
-    expect(live).toContain("ITL p50 · p95");
+    // Spec decoding this second: the histogram is per engine step, so it is not labelled ITL.
+    expect(live).toContain("Step p50 · p95");
+    expect(live).not.toContain("ITL p50 · p95");
     expect(live).toContain('41<span class="text-lab-muted"> · 70</span> ms');
     expect(live).toContain("71%");
     expect(live).toContain("3.13/step");
     expect(live).toContain("182 ms");
-    s.metrics = { spec_accept_rate: null, spec_accept_rate_lifetime: 0.752, ttft_s: null };
+    s.metrics = { spec_accept_rate: null, spec_accept_rate_lifetime: 0.752, ttft_s: null, itl_p50_s: 0.02 };
     expect(hero(s)).toContain("75% lifetime");
+    expect(hero(s)).toContain("ITL p50 · p95");
   });
 
   test("an engine nothing identified shows a state word, never a guessed vLLM", () => {

@@ -526,12 +526,14 @@ def inventory(
     vllm_url: str | None = None,
     ping_targets: list[str] | None = None,
     net: dict[str, Any] | None = None,
+    containers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Slow topology facts for this node (seconds-scale cadence, not per tick).
 
-    `net` is a `net_info()` result the caller already has (skips re-running ip/ibdev2netdev).
+    `net` is a `net_info()` result the caller already has (skips re-running ip/ibdev2netdev);
+    `containers` a `list_serve_containers()` result it already has (skips `docker ps`).
     """
-    containers = list_serve_containers()
+    containers = [dict(c) for c in containers] if containers is not None else list_serve_containers()
     if containers:
         enrich_containers(containers, run(["docker", "inspect", *[c["name"] for c in containers]], timeout=15))
     endpoint = probe_models(candidate_ports(vllm_url, containers), fallback_url=vllm_url)

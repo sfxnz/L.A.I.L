@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import Counter
 
 import httpx
@@ -49,8 +50,9 @@ def _fake_collectors(monkeypatch, calls: Counter) -> None:
         calls["containers"] += 1
         return [{"name": "spark-vllm", "status": "Up 2 hours", "image": "vllm/vllm-openai:v0.27.1", "id": "abc"}]
 
-    def fake_cluster(local_telemetry=None):
+    def fake_cluster(local_telemetry=None, local_containers=None):
         calls["cluster"] += 1
+        calls["cluster_reused_ps"] += local_containers is not None
         return {
             "nodes": [
                 {"id": "a", "local": True, "state": "serving", "power_w": 9.0, "sampled_at": 1_000},
@@ -76,6 +78,10 @@ def _fake_collectors(monkeypatch, calls: Counter) -> None:
     monkeypatch.setattr(cluster, "PeerStream", FakeStream)
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 class FakeStream:
     """Stands in for the per-peer ssh telemetry stream."""
 
@@ -83,9 +89,10 @@ class FakeStream:
 
     def __init__(self, host, interval_s=1.0):
         self.host = host
+        self.interval_s = interval_s
         self.error = None
         self.stopped = False
-        self.line = {"power_w": 13.3, "available_gib": 18.5, "sampled_at": 5_000}
+        self.line = {"power_w": 13.3, "available_gib": 18.5, "sampled_at": _now_ms()}
 
     def start(self):
         FakeStream.started.append(self)
@@ -236,7 +243,10 @@ def test_sampler_publishes_snapshot_and_status_reads_the_cache(monkeypatch):
     assert snap["engine"]["flags_fingerprint"] and snap["engine"]["uptime_s"] > 0
     assert snap["engine"]["requests_waiting"] is None  # not in this probe → null, not 0
     # reads never re-run collectors
-    assert dict(calls) == {"probe": 1, "version": 1, "hw": 1, "containers": 1, "cluster": 1, "tool_eval": 1, "inspect": 1}
+    assert dict(calls) == {
+        "probe": 1, "version": 1, "hw": 1, "containers": 1, "cluster": 1, "cluster_reused_ps": 0,
+        "tool_eval": 1, "inspect": 1,
+    }
     assert s.probe() == _probe()
 
 
@@ -288,6 +298,8 @@ def test_cluster_tick_republishes_without_waiting_for_the_fast_tick(monkeypatch)
         return before, await s.status()
 
     before, after = asyncio.run(go())
+    # after a fast tick, the slow tick reuses its `docker ps` instead of running its own
+    assert calls["cluster_reused_ps"] == 1 and calls["containers"] == 1
     assert before["cluster"]["pending"] is True and before["tool_eval"] is None
     assert after["cluster"]["nodes"][0]["power_w"] == 11.5
     assert after["tool_eval"] == {"available": False}
@@ -445,11 +457,11 @@ def test_status_headroom_is_the_worst_node(monkeypatch):
     calls: Counter = Counter()
     _fake_collectors(monkeypatch, calls)
 
-    def starving_worker(local_telemetry=None):
+    def starving_worker(local_telemetry=None, local_containers=None):
         return {
             "nodes": [
                 {"id": "a", "local": True, "state": "serving"},
-                {"id": "b", "local": False, "state": "serving_worker", "available_gib": 1.5,
+                {"id": "b", "local": False, "online": True, "state": "serving_worker", "available_gib": 1.5,
                  "swap_total_gib": 16.0, "swap_used_gib": 15.0, "sampled_at": 1},
             ],
             "summary": {"healthy": True},
@@ -472,28 +484,56 @@ def test_status_headroom_is_the_worst_node(monkeypatch):
 
 
 def test_publish_overlays_fresh_telemetry_without_mutating_the_slow_tick_cluster():
+    now = _now_ms()
     info = {
         "nodes": [
-            {"id": "a", "local": True, "power_w": 9.0, "sampled_at": 1_000},
-            {"id": "b", "local": False, "power_w": 7.0, "available_gib": 18.0, "sampled_at": 1_000},
-            {"id": "c", "local": False, "power_w": 6.0, "sampled_at": 9_000},
+            {"id": "a", "local": True, "power_w": 9.0, "sampled_at": now - 9_000},
+            {"id": "b", "local": False, "online": True, "power_w": 7.0, "available_gib": 18.0, "sampled_at": now - 9_000},
+            {"id": "c", "local": False, "online": True, "power_w": 6.0, "sampled_at": now - 1_000},
         ]
     }
-    fresh_b, stale_c = FakeStream("b"), FakeStream("c")
-    stale_c.line = {"power_w": 99.0, "sampled_at": 8_000}
-    stale_c.error = "telemetry stream exited (255)"
+    fresh_b, older_c = FakeStream("b"), FakeStream("c")
+    older_c.line = {"power_w": 99.0, "sampled_at": now - 2_000}
+    older_c.error = "telemetry stream exited (255)"
     out = status_sampler._publish_cluster(
-        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": 2_000}, {"b": fresh_b, "c": stale_c}
+        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": now}, {"b": fresh_b, "c": older_c}
     )
     a, b, c = out["nodes"]
-    assert a["power_w"] == 11.0 and a["sampled_at"] == 2_000
-    assert b["power_w"] == 13.3 and b["available_gib"] == 18.5 and b["sampled_at"] == 5_000
+    assert a["power_w"] == 11.0 and a["sampled_at"] == now
+    assert b["power_w"] == 13.3 and b["available_gib"] == 18.5 and b["sampled_at"] == fresh_b.line["sampled_at"]
     # an older stream line never overwrites a newer slow-tick reading; its error is surfaced
-    assert c["power_w"] == 6.0 and c["sampled_at"] == 9_000
+    assert c["power_w"] == 6.0 and c["sampled_at"] == now - 1_000
     assert c["telemetry_error"] == "telemetry stream exited (255)"
     assert b["mem_pressure"] == "ok" and c["mem_pressure"] is None
     # the cached slow-tick dicts (and earlier snapshots built from them) are untouched
     assert info["nodes"][0]["power_w"] == 9.0 and "mem_pressure" not in info["nodes"][1]
+
+
+def test_a_dead_peer_never_shows_its_last_stream_line_as_current():
+    """Offline node + a cached line from before it died: no numbers, no pressure, no headroom vote."""
+    now = _now_ms()
+    # what _probe_remote_ssh returns when ssh fails: every live field None
+    offline = cluster.apply_telemetry({"id": "b", "local": False, "online": False, "state": "offline"}, None)
+    last = FakeStream("b")
+    last.line = {"available_gib": 3.0, "swap_total_gib": 16.0, "swap_used_gib": 15.0,
+                 "temperature_c": 71.0, "sampled_at": now}
+    b = status_sampler._publish_cluster({"nodes": [offline]}, None, {"b": last})["nodes"][0]
+    assert b["state"] == "offline"
+    assert b["available_gib"] is None and b["temperature_c"] is None and b["mem_pressure"] is None
+
+
+def test_a_wedged_stream_falls_back_to_the_slow_tick_reading():
+    """Online node whose stream stopped printing: its line ages out after 3 intervals."""
+    now = _now_ms()
+    node = {"id": "b", "local": False, "online": True, "power_w": 7.0, "available_gib": 20.0,
+            "sampled_at": now - 8_000}
+    wedged = FakeStream("b", interval_s=1.0)
+    wedged.line = {"power_w": 99.0, "available_gib": 3.0, "sampled_at": now - 4_000}
+    b = status_sampler._publish_cluster({"nodes": [node]}, None, {"b": wedged})["nodes"][0]
+    assert b["power_w"] == 7.0 and b["available_gib"] == 20.0 and b["sampled_at"] == now - 8_000
+    wedged.line["sampled_at"] = now - 500
+    b = status_sampler._publish_cluster({"nodes": [node]}, None, {"b": wedged})["nodes"][0]
+    assert b["power_w"] == 99.0
 
 
 def test_streams_follow_the_remote_topology(monkeypatch):
@@ -542,15 +582,41 @@ def test_sampler_follows_the_port_the_local_serve_answers_on(monkeypatch):
     _fake_collectors(monkeypatch, calls)
     monkeypatch.setattr(
         cluster, "collect_cluster",
-        lambda local_telemetry=None: {"nodes": [
+        lambda local_telemetry=None, local_containers=None: {"nodes": [
             {"id": "a", "local": True, "endpoint_healthy": True, "vllm_url": "http://127.0.0.1:8888"}
         ]},
     )
     s = StatusSampler("http://127.0.0.1:8000")
-    metadata._LIVE_RATE["prev"] = {"generation_tokens_total": 5.0}
-    asyncio.run(s.sample_cluster())
-    assert s.base_url == "http://127.0.0.1:8888"
-    assert metadata._LIVE_RATE["prev"] is None and s._need_version is True
+    probed: list[str] = []
+    real = metadata.probe_endpoint
+
+    async def record(base_url, timeout=5.0, **kw):
+        probed.append(base_url)
+        return await real(base_url, timeout, **kw)
+
+    monkeypatch.setattr(metadata, "probe_endpoint", record)
+
+    async def go():
+        await s.sample()
+        s._need_version = False
+        metadata._LIVE_RATE["prev"] = {"generation_tokens_total": 5.0}
+        await s.sample_cluster()
+        # the slow tick only records the move: the fast tick owns the rate state
+        assert s.base_url == "http://127.0.0.1:8000"
+        assert metadata._LIVE_RATE["prev"] == {"generation_tokens_total": 5.0}
+        reset_before_probe = []
+        monkeypatch.setattr(
+            metadata, "probe_endpoint",
+            lambda base_url, timeout=5.0, **kw: (reset_before_probe.append(metadata._LIVE_RATE["prev"]), record(base_url, timeout, **kw))[1],
+        )
+        snap = await s.sample()
+        return reset_before_probe, snap
+
+    reset_before_probe, snap = asyncio.run(go())
+    assert probed == ["http://127.0.0.1:8000", "http://127.0.0.1:8888"]
+    assert reset_before_probe == [None]
+    assert s.base_url == snap["base_url"] == "http://127.0.0.1:8888"
+    assert s._pending_url is None
 
 
 def test_version_is_fetched_once_and_again_after_the_container_changes(monkeypatch):
@@ -575,7 +641,7 @@ def test_version_is_fetched_once_and_again_after_the_container_changes(monkeypat
     assert calls["version"] == 2
 
 
-def test_a_missed_metrics_scrape_keeps_the_last_one_with_its_timestamp(monkeypatch):
+def test_a_missed_metrics_scrape_keeps_the_last_gauges_but_no_live_rate(monkeypatch):
     calls: Counter = Counter()
     _fake_collectors(monkeypatch, calls)
     s = StatusSampler("http://127.0.0.1:8000")
@@ -589,8 +655,12 @@ def test_a_missed_metrics_scrape_keeps_the_last_one_with_its_timestamp(monkeypat
         return await s.sample()
 
     snap = asyncio.run(go())
-    assert snap["metrics"]["decode_tok_per_s"] == 42.0
+    # gauges/counters of the last scrape stay (with their timestamp) …
+    assert snap["metrics"]["requests_running"] == 2.0
     assert snap["metrics"]["sampled_at"] == 1_700_000_000_000
+    # … but no window was measured, so no rate is presented as live
+    for key in metadata.LIVE_RATE_KEYS:
+        assert snap["metrics"][key] is None, key
 
 
 # ─── routes read the cache ────────────────────────────────────────────────────

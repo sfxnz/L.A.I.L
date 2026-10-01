@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import metadata, node_probe
+from . import node_probe
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +50,6 @@ _FALLBACK_CLUSTER = {
 
 # Container naming / rank parsing is shared with the probe that runs on every node.
 _rank_from_container_name = node_probe.rank_from_container_name
-_node_rank_from_blob_and_env = node_probe.node_rank_from
 
 # Per-node live readings (fast tick / peer stream). Copied onto node dicts as a set.
 TELEMETRY_FIELDS = (
@@ -79,7 +78,7 @@ def apply_gpu_telemetry(node: dict[str, Any], tel: dict[str, Any] | None) -> dic
     sku = tel.get("gpu_sku")
     if sku:
         node["gpu_sku"] = sku
-    for key in metadata.GPU_TELEMETRY_FIELDS:
+    for key in node_probe.GPU_TELEMETRY_FIELDS:
         node[key] = tel.get(key)
     # GiB view for the Status memory bar. GB10 unified memory reports [N/A] → None.
     for src, dst in (("memory_used_mib", "gpu_mem_used_gib"), ("memory_total_mib", "gpu_mem_total_gib")):
@@ -428,10 +427,15 @@ def _ssh_cmd(host: str, req: dict[str, Any]) -> list[str]:
     return [*cmd, host, "python3", "-u", "-", shlex.quote(json.dumps(req))]
 
 
-def _probe_local(node: dict[str, Any], telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
-    """This host's inventory in-process; telemetry from the sampler's fast tick when given."""
+def _probe_local(
+    node: dict[str, Any],
+    telemetry: dict[str, Any] | None = None,
+    containers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """This host's inventory in-process; telemetry and `docker ps` from the sampler's
+    fast tick when given (the slow tick then only adds one batched `docker inspect`)."""
     configured_url = node.get("vllm_url") or "http://127.0.0.1:8000"
-    inv = node_probe.inventory(node.get("qsfp_if"), configured_url, net=node.get("net"))
+    inv = node_probe.inventory(node.get("qsfp_if"), configured_url, net=node.get("net"), containers=containers)
     out = {
         "id": node["id"],
         "label": node.get("label") or node["id"],
@@ -556,8 +560,9 @@ class PeerStream:
     """One persistent `ssh host python3 -u -` printing a telemetry JSON line per interval.
 
     A reader thread keeps the latest line, stamped with THIS server's receive time
-    (epoch ms) so remote clock skew never shows up as staleness. The stream is
-    restarted with exponential backoff (1 → 30 s) when ssh or the host drops.
+    (epoch ms) so remote clock skew never shows up as staleness, and drops it when
+    the stream ends. The stream is restarted with exponential backoff (1 → 30 s)
+    when ssh or the host drops.
     """
 
     def __init__(self, host: str, interval_s: float = 1.0) -> None:
@@ -603,11 +608,16 @@ class PeerStream:
                 backoff = min(backoff * 2, 30.0)
                 continue
             self._proc = p
+            if self._stop.is_set():
+                # stop() ran between Popen and the assignment above and killed nothing.
+                p.terminate()
             try:
                 assert p.stdin is not None and p.stdout is not None
                 p.stdin.write(source)
                 p.stdin.close()
                 for line in p.stdout:
+                    if self._stop.is_set():
+                        break
                     try:
                         data = json.loads(line)
                     except ValueError:
@@ -619,7 +629,15 @@ class PeerStream:
                     backoff = 1.0
             except (OSError, ValueError) as e:
                 self.error = str(e)
-            p.wait()
+            if self._stop.is_set():
+                self._kill()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            # The stream is gone: its last line is no longer a current reading.
+            self._latest = None
             if self._stop.is_set():
                 break
             self.error = self.error or f"telemetry stream exited ({p.returncode})"
@@ -652,12 +670,7 @@ def _multinode_worker_rank(n: dict[str, Any]) -> int | None:
                 rank = int(c["node_rank"])
             except (TypeError, ValueError):
                 rank = None
-        if rank is None:
-            rank = _node_rank_from_blob_and_env(str(c.get("cmd_blob") or ""), None)
-
         headless = bool(c.get("headless"))
-        if not headless:
-            headless = bool(re.search(r"--headless\b", str(c.get("cmd_blob") or "")))
 
         # Explicit headless worker only when rank is known and >= 1.
         if headless and rank is not None and rank >= 1:
@@ -937,12 +950,15 @@ def _fabric_note(fabric_links: list[dict[str, Any]], probed: list[dict[str, Any]
 _PAYLOAD_DROP = ("net", "pings")
 
 
-def collect_cluster(local_telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
+def collect_cluster(
+    local_telemetry: dict[str, Any] | None = None,
+    local_containers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Inventory every node in parallel, then fabric + states.
 
-    `local_telemetry` is the sampler's latest fast-tick sample; without it the local
-    node samples once. A dead remote only delays its own slot (ssh timeouts), never
-    the local node.
+    `local_telemetry` / `local_containers` are the sampler's latest fast-tick sample and
+    `docker ps`; without them the local node collects its own. A dead remote only delays
+    its own slot (ssh timeouts), never the local node.
     """
     cfg = _load_cluster_config()
     nodes_cfg = [n for n in (cfg.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
@@ -951,7 +967,7 @@ def collect_cluster(local_telemetry: dict[str, Any] | None = None) -> dict[str, 
 
     def probe(node: dict[str, Any]) -> dict[str, Any]:
         if _node_is_local(node, n_cfg):
-            return _probe_local(node, local_telemetry)
+            return _probe_local(node, local_telemetry, local_containers)
         peers = [str(o["qsfp_ip"]) for o in remotes_cfg if o is not node and o.get("qsfp_ip")]
         return _probe_remote_ssh(node, peers)
 

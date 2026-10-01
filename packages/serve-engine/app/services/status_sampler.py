@@ -37,6 +37,8 @@ FIRST_SAMPLE_TIMEOUT_S = 2.0
 ENDPOINT_TIMEOUT_S = 1.5
 
 _PRESSURE_ORDER = {"ok": 0, "tight": 1, "critical": 2}
+# A peer-stream line older than this many stream intervals is not shown as current.
+STREAM_STALE_INTERVALS = 3
 
 
 def headroom_for(tel: dict[str, Any] | None, floor_gib: float = MEM_FLOOR_GIB) -> str:
@@ -76,8 +78,12 @@ def _publish_cluster(
 ) -> dict[str, Any]:
     """Copy of the slow-tick cluster with the freshest telemetry overlaid per node.
 
+    A remote node takes its stream's line only while the node is online and the
+    line is fresh (≤ STREAM_STALE_INTERVALS stream intervals old): a dead peer or a
+    wedged stream never keeps its last numbers on screen as if they were current.
     Never mutates `info` — earlier snapshots keep the numbers they were served with.
     """
+    now_ms = int(time.time() * 1000)
     nodes = []
     for raw in info.get("nodes") or []:
         node = dict(raw)
@@ -87,10 +93,18 @@ def _publish_cluster(
         else:
             stream = streams.get(node.get("id"))
             reading = stream.reading() if stream else None
-            if reading and (reading.get("sampled_at") or 0) >= (node.get("sampled_at") or 0):
+            at = (reading or {}).get("sampled_at") or 0
+            if (
+                reading
+                and node.get("online")
+                and now_ms - at <= STREAM_STALE_INTERVALS * stream.interval_s * 1000
+                and at >= (node.get("sampled_at") or 0)
+            ):
                 cluster.apply_telemetry(node, reading)
             node["telemetry_error"] = stream.error if stream else None
-        node["mem_pressure"] = headroom_for(node) if node.get("available_gib") is not None else None
+        # A down node has no current memory reading, so it never drives serve.headroom.
+        live = node.get("local") or node.get("online")
+        node["mem_pressure"] = headroom_for(node) if live and node.get("available_gib") is not None else None
         nodes.append(node)
     return {**info, "nodes": nodes}
 
@@ -104,6 +118,8 @@ class StatusSampler:
         slow_s: float = SLOW_INTERVAL_S,
     ) -> None:
         self.base_url = base_url
+        # Set by the slow tick, applied by the fast tick: the live-rate state has one writer.
+        self._pending_url: str | None = None
         self.fast_s = fast_s
         self.slow_s = slow_s
         self._probe: dict[str, Any] | None = None
@@ -177,6 +193,12 @@ class StatusSampler:
 
     async def sample(self) -> dict[str, Any]:
         """Fast tick: endpoint probe (GETs concurrently), this host's telemetry, docker ps."""
+        moved = self._pending_url is not None
+        if moved:
+            log.info("status sampler: endpoint moved %s → %s", self.base_url, self._pending_url)
+            self.base_url, self._pending_url = self._pending_url, None
+            self._need_version = True
+            metadata.reset_live_rate_state()
         probe, hardware, containers = await asyncio.gather(
             metadata.probe_endpoint(
                 self.base_url, ENDPOINT_TIMEOUT_S, client=self._client, version=self._need_version
@@ -184,14 +206,15 @@ class StatusSampler:
             asyncio.to_thread(metadata.collect_hardware, self._telemetry),
             asyncio.to_thread(metadata.list_vllm_containers),
         )
-        prev = self._probe or {}
+        prev = {} if moved else (self._probe or {})  # the old endpoint's scrape is not this one's
         if not self._need_version:
             probe["version"] = prev.get("version")
         elif probe.get("version") is not None:
             self._need_version = False
         if not probe.get("metrics") and probe.get("healthy") and prev.get("metrics"):
-            # /metrics timed out under load: keep the last scrape; its sampled_at shows its age.
-            probe["metrics"] = prev["metrics"]
+            # /metrics timed out under load: keep the last scrape's gauges and counters
+            # (its sampled_at shows their age), but no window was measured — no live rate.
+            probe["metrics"] = {**prev["metrics"], **dict.fromkeys(metadata.LIVE_RATE_KEYS)}
         self._probe = probe
         self._hardware = hardware
         self._containers = containers
@@ -206,7 +229,12 @@ class StatusSampler:
     async def sample_cluster(self) -> None:
         """Slow tick: cluster inventory (parallel), tool-eval binary, peer streams, endpoint URL."""
         try:
-            info = await asyncio.to_thread(cluster.collect_cluster, self._hardware or None)
+            # Reuse the fast tick's telemetry and `docker ps` (once it has run) for this host.
+            info = await asyncio.to_thread(
+                cluster.collect_cluster,
+                self._hardware or None,
+                self._containers if self._probe is not None else None,
+            )
         except Exception as e:
             info = {"error": str(e), "nodes": [], "summary": {"healthy": False}}
         self._cluster = info
@@ -235,14 +263,15 @@ class StatusSampler:
                 self._streams[node_id] = stream
 
     def _follow_endpoint(self, nodes: list[dict[str, Any]]) -> None:
-        """Probe the port the local serve actually answers on (e.g. :8888), not a fixed :8000."""
+        """Probe the port the local serve actually answers on (e.g. :8888), not a fixed :8000.
+
+        Only records the move: the fast tick switches URL and resets the rate state
+        between probes, so an in-flight scrape of the old URL can't seed the new one.
+        """
         local = next((n for n in nodes if n.get("local")), None)
         url = ((local or {}).get("vllm_url") or "").rstrip("/")
         if local and local.get("endpoint_healthy") and url and url != self.base_url.rstrip("/"):
-            log.info("status sampler: endpoint moved %s → %s", self.base_url, url)
-            self.base_url = url
-            self._need_version = True
-            metadata.reset_live_rate_state()
+            self._pending_url = url
 
     async def _refresh_inspect(self) -> None:
         running = [c for c in self._containers if "Up" in str(c.get("status", ""))]

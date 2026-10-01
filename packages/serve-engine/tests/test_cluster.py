@@ -6,16 +6,15 @@ import json
 import pytest
 
 from app.services import autoconfig as ac
-from app.services import cluster, metadata, node_probe
+from app.services import cluster, node_probe
 from app.services.autoconfig import plan_placement
 
 
 def test_glm_flash_container_counts_as_a_serve():
-    assert metadata.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
-    assert metadata.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
-    assert not metadata.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
     # one container filter for local and remote (the remote runs node_probe itself)
-    assert metadata.is_serve_container is node_probe.is_serve_container
+    assert node_probe.is_serve_container("glm53-flash-nvfp4", "glm53-sm121-v11")
+    assert node_probe.is_serve_container("spark-vllm-n1", "vllm/vllm-openai:latest")
+    assert not node_probe.is_serve_container("conduit", "matrixconduit/matrix-conduit:latest")
     assert cluster._container_serve_family("glm53-flash-nvfp4") == "glm53-flash-nvfp4"
     head = {
         "tensor_parallel_size": 2,
@@ -106,7 +105,7 @@ def isolated_cluster(monkeypatch, tmp_path):
 def _install_probes(monkeypatch, *, remote_online: bool = False):
     remote_calls: list[dict] = []
 
-    def fake_local(node, base_url=None):
+    def fake_local(node, telemetry=None, containers=None):
         return _probed(node, local=True, online=True)
 
     def fake_remote(node, ping_targets=None):
@@ -298,7 +297,6 @@ def test_headless_with_explicit_rank_is_worker():
                 "status": "Up 1 minute",
                 "headless": True,
                 "node_rank": 1,
-                "cmd_blob": "vllm serve m --headless --node-rank 1",
             }
         ],
     }
@@ -318,8 +316,6 @@ def test_headless_rank_none_or_zero_not_forced_to_one():
                     "status": "Up 1 minute",
                     "headless": True,
                     "node_rank": rank,
-                    "cmd_blob": "vllm serve m --headless"
-                    + ("" if rank is None else f" --node-rank {rank}"),
                 }
             ],
         }
@@ -581,6 +577,17 @@ def test_inventory_prefers_discovered_8888_and_ships_a_lean_container(monkeypatc
     assert data["lan_ip"] == "192.168.10.4"
     assert data["pings"]["192.0.2.8"]["ok"] is True and data["pings"]["192.0.2.9"]["ok"] is False
     assert data["cpu"] == "Cortex-X925"
+
+
+    # Given the sampler's fast-tick `docker ps`, the slow inventory skips its own and
+    # enriches a copy (the fast tick's published list is never mutated).
+    calls.clear()
+    fast = [{"name": "deepseek-v4-flash-vllm-dspark-0", "status": "Up 5 minutes",
+             "image": "ghcr.io/anemll/dspark-vllm-gx10:0.1.1", "id": "abc"}]
+    data = node_probe.inventory("", "http://127.0.0.1:8000", containers=fast)
+    assert not any(cmd[:2] == ["docker", "ps"] for cmd in calls)
+    assert sum(1 for cmd in calls if cmd[:2] == ["docker", "inspect"]) == 1
+    assert data["containers"][0]["ports"] == [8888] and "ports" not in fast[0]
     node_probe.cpu_model.cache_clear()
 
 
@@ -924,7 +931,7 @@ def test_collect_cluster_probes_nodes_in_parallel_and_ships_a_lean_payload(isola
         seen_targets[node["id"]] = ping_targets
         return _probed(node, local=False, online=True, pings={}, rails=[])
 
-    monkeypatch.setattr(cluster, "_probe_local", lambda node, tel=None: _probed(node, local=True, online=True, net={"x": 1}))
+    monkeypatch.setattr(cluster, "_probe_local", lambda node, tel=None, containers=None: _probed(node, local=True, online=True, net={"x": 1}))
     monkeypatch.setattr(cluster, "_probe_remote_ssh", slow_remote)
     monkeypatch.setattr(cluster, "_ping_ok", lambda ip, timeout_s=1.0: {"ok": True})
     t0 = _time.monotonic()
@@ -1030,3 +1037,54 @@ def test_peer_stream_reports_why_it_is_down(monkeypatch):
     s.stop()
     assert "No route to host" in (s.error or "")
     assert s.reading() is None
+
+
+def test_peer_stream_drops_its_reading_when_the_stream_ends(monkeypatch):
+    """A peer that printed one line and died must not keep that line as a current reading."""
+    import sys
+    import time as _time
+
+    line = json.dumps({"available_gib": 18.6, "soc_temp_c": 50.0})
+    monkeypatch.setattr(
+        cluster, "_ssh_cmd",
+        lambda host, req: [sys.executable, "-c", f"import sys, time; print({line!r}, flush=True); time.sleep(0.3); sys.exit(255)"],
+    )
+    s = cluster.PeerStream("w", interval_s=0.2)
+    s.start()
+    try:
+        deadline = _time.monotonic() + 5
+        seen = None
+        while _time.monotonic() < deadline and not (seen and s.error):
+            seen = seen or s.reading()
+            _time.sleep(0.02)
+        assert seen and seen["available_gib"] == 18.6
+        assert "exited (255)" in (s.error or "")
+        assert s.reading() is None
+    finally:
+        s.stop()
+
+
+def test_peer_stream_stop_during_spawn_kills_the_new_process(monkeypatch):
+    """stop() landing between Popen and `self._proc = p` must not leak the ssh session."""
+    import subprocess as sp
+    import sys
+    import time as _time
+
+    monkeypatch.setattr(
+        cluster, "_ssh_cmd", lambda host, req: [sys.executable, "-c", "import time; time.sleep(60)"]
+    )
+    s = cluster.PeerStream("w", interval_s=0.2)
+    spawned: list[sp.Popen] = []
+    real_popen = sp.Popen
+
+    def popen_then_stop(*a, **k):
+        p = real_popen(*a, **k)
+        spawned.append(p)
+        s._stop.set()  # stop() ran now: self._proc is still the previous (None) process
+        return p
+
+    monkeypatch.setattr(cluster.subprocess, "Popen", popen_then_stop)
+    t0 = _time.monotonic()
+    s._run()  # the reader loop, inline
+    assert _time.monotonic() - t0 < 5
+    assert spawned and spawned[0].poll() is not None

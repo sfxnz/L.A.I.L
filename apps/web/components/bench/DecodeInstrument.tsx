@@ -6,7 +6,7 @@ import { fmtDuration, fmtMs, fmtPct, fmtTokS } from "@/lib/bench/format";
 import { interpretDecode } from "@/lib/bench/interpret";
 import type { DecodeConfig } from "@/lib/bench/levels";
 import { currentLevelIndex, rollupLevel, type HardwareSeries } from "@/lib/bench/live";
-import { c1Arm, peakArm, type DecodeResult } from "@/lib/bench/result";
+import { c1Arm, peakArm, steadyPeakArm, type DecodeResult } from "@/lib/bench/result";
 import type { StreamRunState } from "@/lib/use-stream-run";
 import { Callout, Eyebrow, Nil, SyncRing } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -117,6 +117,9 @@ export function DecodeInstrument({
 
   const interp = useMemo(() => (result ? interpretDecode(result.arms, { floor: cfg.floor, sloMs: cfg.sloMs }) : null), [result, cfg.floor, cfg.sloMs]);
   const peak = result ? peakArm(result.arms) : null;
+  // The hero is the decode-span aggregate — what the live gauge settled on — so it does not
+  // drop at completion. The wall-clock figure (incl. TTFT and the tail) is goodput, labelled.
+  const steadyPeak = result ? steadyPeakArm(result.arms) : null;
   const c1 = result ? c1Arm(result.arms) : null;
 
   const showResult = !!result && (status === "done" || status === "cancelled" || status === "error" || fromHistory);
@@ -140,6 +143,9 @@ export function DecodeInstrument({
           value: interp?.bestInteractive ? `×${interp.bestInteractive.concurrency}` : NIL,
           tone: "target",
         },
+        ...(steadyPeak && peak?.aggregate != null
+          ? [{ label: `goodput @ ×${peak.concurrency} · wall-clock, incl. TTFT`, value: `${fmtTokS(peak.aggregate)} tok/s` }]
+          : []),
         { label: "TTFT p50 @ peak", value: peak?.ttftP50 !== null && peak?.ttftP50 !== undefined ? fmtMs(peak.ttftP50) : NIL },
         { label: "knee", value: interp?.knee ? `×${interp.knee}` : "none", tone: interp?.knee ? undefined : "muted" },
         ...(peakSpec !== null ? [{ label: "spec accept @ peak", value: fmtPct(peakSpec) }] : []),
@@ -219,10 +225,16 @@ export function DecodeInstrument({
       {showResult && result && interp && (
         <ResultHero
           stage={stage}
-          value={peak?.aggregate ?? null}
+          value={steadyPeak ? steadyPeak.steady : (peak?.aggregate ?? null)}
           format={(n) => fmtTokS(n)}
           unit="tok/s"
-          at={peak ? `peak aggregate @ ×${peak.concurrency}` : "peak aggregate"}
+          at={
+            steadyPeak
+              ? `peak aggregate · decode span @ ×${steadyPeak.concurrency}`
+              : peak
+                ? `peak aggregate · wall-clock @ ×${peak.concurrency}`
+                : "peak aggregate"
+          }
           secondaries={secondaries}
           sentence={interp.sentence}
         />

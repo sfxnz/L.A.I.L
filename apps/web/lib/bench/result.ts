@@ -118,6 +118,19 @@ export function peakArm(arms: DecodeArm[]): DecodeArm | null {
   return best;
 }
 
+/**
+ * The hero's peak: the level with the highest decode-span aggregate, the metric the live
+ * gauge's settled mark shows. Runs that predate it fall back to the wall-clock aggregate
+ * (`steady` null) — the caller labels which one it is.
+ */
+export function steadyPeakArm(arms: DecodeArm[]): DecodeArm | null {
+  let best: DecodeArm | null = null;
+  for (const a of arms) {
+    if (a.ok > 0 && a.steady !== null && (best === null || a.steady > (best.steady ?? 0))) best = a;
+  }
+  return best;
+}
+
 export function c1Arm(arms: DecodeArm[]): DecodeArm | null {
   return arms.find((a) => a.concurrency === 1) ?? arms[0] ?? null;
 }

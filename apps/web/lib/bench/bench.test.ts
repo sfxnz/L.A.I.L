@@ -33,6 +33,7 @@ import {
   headlineFromResult,
   peakArm,
   resultFromEnvelope,
+  steadyPeakArm,
   sustainedArm,
   type DecodeArm,
   type DecodeResult,
@@ -182,6 +183,15 @@ describe("decode interpretation", () => {
     const it = interpretDecode(arms, { floor: 20, sloMs: 500 });
     expect(it.topLevel).toBe(8);
     expect(peakArm(arms)?.concurrency).toBe(8);
+  });
+
+  test("the hero's peak is the decode-span aggregate; runs without it have none", () => {
+    // ×8 has the higher wall-clock aggregate, ×6 the higher decode-span one: the hero
+    // follows the live gauge's metric, not the wall-clock goodput.
+    const arms = [{ ...SPARK[3], steady: 260 }, { ...SPARK[4], steady: 240 }];
+    expect(peakArm(arms)?.concurrency).toBe(8);
+    expect(steadyPeakArm(arms)?.concurrency).toBe(6);
+    expect(steadyPeakArm(arms.map((a) => ({ ...a, steady: null })))).toBeNull();
   });
 });
 

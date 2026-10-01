@@ -5,12 +5,21 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ClusterNode } from "./api";
-import { NODE_SAMPLES_KEEP, pushNodeSamples, sameLiveRun, useLabStatusStore, type LiveRun } from "./lab-status-store";
+import {
+  NODE_SAMPLES_KEEP,
+  ownsEndpoint,
+  pushNodeSamples,
+  sameLiveRun,
+  tightestNode,
+  useLabStatusStore,
+  type LiveRun,
+} from "./lab-status-store";
 
-const node = (id: string, power: number | null = 30, state = "serving"): ClusterNode => ({
+const node = (id: string, power: number | null = 30, state = "serving", local = id === "spark1"): ClusterNode => ({
   id,
   label: id,
   state,
+  local,
   power_w: power,
   gpu_util_pct: 50,
   temperature_c: 45,
@@ -26,6 +35,16 @@ describe("node sample ring buffer", () => {
     expect(s.spark1.map((x) => x.tok_s)).toEqual([40, 42]);
     // a TP worker serves the same tokens: it never carries a second copy of the rate
     expect(s.spark2[1]).toEqual({ t: 3000, tok_s: null, power: 30, util: 50, temp: 45 });
+  });
+
+  test("a remote node serving its own endpoint never carries the LOCAL endpoint's rate", () => {
+    // e.g. multi_mismatch: spark2 runs a single-node serve the serve-engine does not probe
+    const s = pushNodeSamples({}, [node("spark1", 30, "idle"), node("spark2", 30, "serving")], 1000, K, 40);
+    expect(s.spark1[0].tok_s).toBeNull();
+    expect(s.spark2[0].tok_s).toBeNull();
+    expect(ownsEndpoint(node("spark2", 30, "serving"))).toBe(false);
+    expect(ownsEndpoint(node("spark1", 30, "serving"))).toBe(true);
+    expect(ownsEndpoint(node("spark1", 30, "serving_worker"))).toBe(false);
   });
 
   test("keeps the last NODE_SAMPLES_KEEP points (30 × 2 s = 60 s), oldest first", () => {
@@ -49,6 +68,27 @@ describe("node sample ring buffer", () => {
     const prev = pushNodeSamples({}, [node("spark1")], 1, K, 1);
     expect(pushNodeSamples(prev, undefined, 2)).toBe(prev);
     expect(pushNodeSamples(prev, [], 2)).toBe(prev);
+  });
+});
+
+describe("tightestNode", () => {
+  const mem = (id: string, available_gib: number | null, extra: Partial<ClusterNode> = {}): ClusterNode => ({
+    id,
+    label: id,
+    available_gib,
+    ...extra,
+  });
+
+  test("the live node with the least MemAvailable — the rank that runs out first", () => {
+    const nodes = [mem("spark1", 14.2, { local: true }), mem("spark2", 12.9, { online: true })];
+    expect(tightestNode(nodes)?.id).toBe("spark2");
+  });
+
+  test("offline nodes and missing readings are skipped; nothing live → null", () => {
+    const nodes = [mem("spark1", 14.2, { local: true }), mem("spark2", 3.0, { online: false }), mem("spark3", null, { online: true })];
+    expect(tightestNode(nodes)?.id).toBe("spark1");
+    expect(tightestNode([mem("spark2", 3.0, { online: false })])).toBeNull();
+    expect(tightestNode(undefined)).toBeNull();
   });
 });
 

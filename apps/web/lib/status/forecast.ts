@@ -55,8 +55,15 @@ export function kvUsedTokens(capacityTokens: number | null | undefined, pct: num
   return Math.round(capacityTokens * kvFraction(pct));
 }
 
-/** "0.8%" below 10 % (a small but real pool use reads as non-zero), "42%" above. */
+/**
+ * "0.8%" below 10 %, "42%" above; any real use below 0.05 % reads "<0.1%", never "0.0%"
+ * (0.04 % of a 1.69M-token pool is ~680 tokens). The branch is chosen on the rounded
+ * value, so 9.96 reads "10%", not "10.0%".
+ */
 export function fmtKvPct(pct: number): string {
   const p = Math.max(0, Math.min(100, pct));
-  return p > 0 && p < 10 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
+  if (p === 0) return "0%";
+  if (p < 0.05) return "<0.1%";
+  const tenth = Math.round(p * 10) / 10;
+  return tenth < 10 ? `${tenth.toFixed(1)}%` : `${Math.round(p)}%`;
 }

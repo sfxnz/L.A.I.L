@@ -1,8 +1,9 @@
 "use client";
 
 import type { ClusterNode, ClusterStatus, EngineStatus, ServeMetrics } from "@/lib/api";
-import type { NodeSample } from "@/lib/lab-status-store";
+import { ownsEndpoint, type NodeSample } from "@/lib/lab-status-store";
 import { forecastLine, kvForecast } from "@/lib/status/forecast";
+import { fmtUptime } from "@/lib/status/format";
 import {
   Badge,
   EmptyState,
@@ -189,10 +190,6 @@ function series(samples: NodeSample[] | undefined, pick: (s: NodeSample) => numb
   return out;
 }
 
-function fmtC(v: number | null | undefined) {
-  return v == null ? null : `${Math.round(v)}°C`;
-}
-
 function NodeCard({
   node,
   samples,
@@ -217,18 +214,28 @@ function NodeCard({
         : `${node.qsfp_speed_mbps}M`
       : null;
   const serving = node.state === "serving" || node.state === "serving_worker";
-  // The endpoint (and its tok/s, KV pool) belongs to the serving head; a TP worker
-  // produces the same tokens, so it shows its rank instead of a second copy.
-  const head = node.state === "serving";
+  // The endpoint (and its tok/s, KV pool) belongs to the LOCAL serving head the
+  // serve-engine probes; a TP worker produces the same tokens, so it shows its rank
+  // instead of a second copy, and a remote serve of its own is not what was probed.
+  const head = ownsEndpoint(node);
   const worker = node.state === "serving_worker";
   const decode = head ? metrics?.decode_tok_per_s : null;
-  const prefill = head ? (metrics?.prefill_tok_per_s ?? metrics?.last_prefill?.tok_per_s) : null;
+  const prefill = head ? metrics?.prefill_tok_per_s : null;
+  // Between requests: the last finished request's prefill, dimmed and labelled — never live.
+  const lastPrefill = head && prefill == null ? metrics?.last_prefill : null;
   const label = stateLabel(node.state);
   const tempsTip = [
-    node.temperature_c != null ? `GPU ${fmtC(node.temperature_c)}` : null,
-    node.soc_temp_c != null ? `SoC ${fmtC(node.soc_temp_c)}` : null,
-    node.nic_temp_c != null ? `NIC ${fmtC(node.nic_temp_c)}` : null,
-    node.nvme_temp_c != null ? `NVMe ${fmtC(node.nvme_temp_c)}` : null,
+    node.temperature_c != null ? `GPU ${fmtTemp(node.temperature_c)}` : null,
+    node.soc_temp_c != null ? `SoC ${fmtTemp(node.soc_temp_c)}` : null,
+    node.nic_temp_c != null ? `NIC ${fmtTemp(node.nic_temp_c)}` : null,
+    node.nvme_temp_c != null ? `NVMe ${fmtTemp(node.nvme_temp_c)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  // Missing readings are left out, never shown as 0.
+  const usageTip = [
+    node.gpu_util_pct != null ? `GPU ${fmtPct(node.gpu_util_pct)}` : null,
+    node.cpu_util_pct != null ? `CPU ${fmtPct(node.cpu_util_pct)}${node.cpu ? ` (${node.cpu})` : ""}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -322,9 +329,21 @@ function NodeCard({
         <Readout label="Prefill" className="items-end text-right">
           <div
             className={cn("lab-num", READING)}
-            title={head ? "Computed prompt tok/s of the most recently finished requests (cache hits excluded)" : undefined}
+            title={
+              lastPrefill
+                ? `Last finished request's prefill, ${fmtUptime((Date.now() - lastPrefill.at) / 1000) || "0 s"} ago — not live`
+                : head
+                  ? "Computed prompt tok/s of the requests that finished this second (cache hits excluded)"
+                  : undefined
+            }
           >
-            {worker ? <Nil word="None" /> : <TrafficValue serving={serving} value={prefill} format={fmtRate} />}
+            {worker ? (
+              <Nil word="None" />
+            ) : lastPrefill ? (
+              <span className="text-lab-muted">last {fmtRate(lastPrefill.tok_per_s)}</span>
+            ) : (
+              <TrafficValue serving={serving} value={prefill} format={fmtRate} />
+            )}
           </div>
         </Readout>
       </div>
@@ -375,7 +394,7 @@ function NodeCard({
         </Readout>
         <Readout
           label="Usage"
-          title={node.cpu_util_pct != null ? `GPU ${fmtPct(node.gpu_util_pct ?? 0)} · CPU ${fmtPct(node.cpu_util_pct)}${node.cpu ? ` (${node.cpu})` : ""}` : undefined}
+          title={usageTip || undefined}
         >
           <div className={READING}>
             <HardwareValue value={node.gpu_util_pct} format={fmtPct} />
@@ -526,7 +545,7 @@ function LoadStrip({ cluster, metrics }: { cluster: ClusterStatus; metrics?: Ser
   const nodes = cluster.nodes || [];
   const mode = multi?.mode || "none";
   const modelShort = multi?.model_id?.split("/").pop();
-  const serving = nodes.some((n) => n.state === "serving");
+  const serving = nodes.some(ownsEndpoint);
   const liveGen = serving ? metrics?.decode_tok_per_s : null;
   const livePrefill = serving ? metrics?.prefill_tok_per_s : null;
 

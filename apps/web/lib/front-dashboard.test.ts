@@ -159,6 +159,7 @@ describe("shipped ClusterPanel render", () => {
     id: "spark1",
     label: "spark1",
     state: "serving",
+    local: true,
     hostname: "spark1",
     temperature_c: 47,
     gpu_util_pct: 83,
@@ -233,6 +234,51 @@ describe("shipped ClusterPanel render", () => {
     );
     expect(html.match(/41\.2/g)?.length).toBe(2); // head hero + load strip, not the worker
     expect(html).toContain("TP rank 1");
+  });
+
+  test("between requests the last prefill is dimmed and labelled 'last', never shown as live", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [serving],
+          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
+        },
+        metrics: { decode_tok_per_s: null, prefill_tok_per_s: null, last_prefill: { tok_per_s: 1234, at: Date.now() - 95_000 } },
+      }),
+    );
+    expect(html).toContain("last 1234");
+    expect(html).toContain("1 m 35 s ago — not live");
+    expect(html).not.toMatch(/text-lab-ok">1234</);
+  });
+
+  test("a remote node serving on its own never shows the local endpoint's rates or KV", () => {
+    const remote: ClusterNode = { ...serving, id: "spark2", label: "spark2", hostname: "spark2", local: false };
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [{ ...serving, state: "idle" }, remote],
+          summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 1 },
+        },
+        metrics: { decode_tok_per_s: 41.2, prefill_tok_per_s: 210 },
+        engine: { kv_usage_pct: 12, kv_capacity_tokens: 1_694_725 },
+      }),
+    );
+    expect(html).not.toContain("41.2");
+    expect(html).not.toContain("210");
+    expect(html).not.toContain("KV 12%");
+  });
+
+  test("usage tooltip leaves out a GPU reading it does not have — never 'GPU 0%'", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [{ ...serving, gpu_util_pct: null, cpu_util_pct: 37, cpu: "Cortex-X925" }],
+          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
+        },
+      }),
+    );
+    expect(html).toContain('title="CPU 37% (Cortex-X925)"');
+    expect(html).not.toContain("GPU 0%");
   });
 
   test("an ssh failure on a pinging host reads differently from a host that is down", () => {

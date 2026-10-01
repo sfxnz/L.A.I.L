@@ -61,8 +61,12 @@ describe("KV capacity forecast", () => {
   test("fmtKvPct: one decimal below 10 % so small real use is visible", () => {
     expect(fmtKvPct(0)).toBe("0%");
     expect(fmtKvPct(0.84)).toBe("0.8%");
-    expect(fmtKvPct(0.04)).toBe("0.0%");
+    // real but tiny use (~680 tokens of a 1.69M pool) never reads as zero
+    expect(fmtKvPct(0.04)).toBe("<0.1%");
+    expect(fmtKvPct(0.05)).toBe("0.1%");
     expect(fmtKvPct(9.94)).toBe("9.9%");
+    // the branch follows the rounded value: 9.96 is "10%", not "10.0%"
+    expect(fmtKvPct(9.96)).toBe("10%");
     expect(fmtKvPct(42.37)).toBe("42%");
     expect(fmtKvPct(100)).toBe("100%");
   });

@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveProxy } from "./routes/serve-proxy";
-import { getSettings, putSettings, openAiBase } from "./controller/settings";
+import { getSettings, putSettings } from "./controller/settings";
+import { fetchServe, labStatusOf, liveHub, liveResponse, probeBackends } from "./live";
 import { getUsageSummary } from "./controller/usage";
 import { proxyOpenAI } from "./controller/llm-proxy";
 import { streamsEngine } from "./streams/engine";
@@ -23,6 +24,9 @@ import {
   resolvePublicFile,
   resolveRunArtifact,
 } from "./lab/store";
+
+/** Bun.serve hands itself to app.fetch as the env (absent under app.request in tests). */
+type BunServerEnv = { timeout?: (req: Request, seconds: number) => void } | undefined;
 
 export function createApp() {
   const app = new Hono();
@@ -83,72 +87,18 @@ export function createApp() {
 
   app.get("/api/usage", (c) => c.json(getUsageSummary()));
 
-  // Merged lab status: controller + serve-engine + backends (all probed in parallel)
+  // The live stream every dashboard tab subscribes to (see live.ts).
+  app.get("/api/live", (c) => {
+    // Bun.serve closes a request that sends nothing for 10 s; the stream pings
+    // every 5 s, but a stalled upstream must not cut every tab at once.
+    (c.env as BunServerEnv)?.timeout?.(c.req.raw, 0);
+    return liveResponse(liveHub, c.req.raw.signal);
+  });
+
+  // One-shot status (curl, and the browser's fallback when the stream fails).
   app.get("/api/lab-status", async (c) => {
-    const settings = getSettings();
-    const backends: Record<string, { ok: boolean; url: string; error?: string }> = {};
-    const probeBackends = Object.entries(settings.backends)
-      .filter(([, v]) => v.enabled)
-      .map(async ([k, v]) => {
-        try {
-          const base = v.url.replace(/\/$/, "").replace(/\/v1$/, "");
-          const r = await fetch(`${base}/v1/models`, {
-            signal: AbortSignal.timeout(2000),
-          });
-          backends[k] = { ok: r.ok, url: v.url };
-        } catch (e) {
-          backends[k] = {
-            ok: false,
-            url: v.url,
-            error: e instanceof Error ? e.message : String(e),
-          };
-        }
-      });
-
-    let serve: unknown = null;
-    const probeServe = (async () => {
-      try {
-        const r = await fetch(`${config.serveEngineUrl}/api/status`, {
-          signal: AbortSignal.timeout(3000),
-          headers: config.token ? { "x-lail-token": config.token } : undefined,
-        });
-        if (r.ok) serve = await r.json();
-        else serve = { error: `serve-engine ${r.status}` };
-      } catch (e) {
-        serve = { error: e instanceof Error ? e.message : String(e), unreachable: true };
-      }
-    })();
-    await Promise.all([...probeBackends, probeServe]);
-
-    return c.json({
-      controller: "ok",
-      defaultBackend: settings.defaultBackend,
-      defaultModel: settings.defaultModel,
-      openAiBase: openAiBase(),
-      backends,
-      serve,
-      cluster:
-        serve && typeof serve === "object" && serve !== null && "cluster" in serve
-          ? (serve as { cluster?: unknown }).cluster
-          : null,
-      share: {
-        site_base: config.shareSiteBase || null,
-        internet_base: config.shareSiteBase || config.sharePublicBase || null,
-        internet_ready: !!(config.shareSiteBase || config.sharePublicBase),
-        mode: config.shareSiteBase
-          ? "github_pages"
-          : config.sharePublicBase
-            ? "tailscale_funnel"
-            : "tailnet_only",
-        funnel_hint: "bun run lab:funnel  # optional; prefer GitHub Pages for X",
-        site_hint: "See docs/LAB_SITE.md — bun run lab:site-deploy",
-        note: config.shareSiteBase
-          ? "Share links use static GitHub Pages (Spark private)."
-          : config.sharePublicBase
-            ? "Share links use Tailscale Funnel artifacts server."
-            : "Set LAIL_SITE_BASE + deploy site for X (Wesche-style). Until then links are Tailnet/LAN only.",
-      },
-    });
+    const [serve, backends] = await Promise.all([fetchServe(), probeBackends()]);
+    return c.json(labStatusOf(serve, backends));
   });
 
   // ── Lab gallery (Hermes task artifacts) ─────────────────────────

@@ -457,7 +457,8 @@ def test_cancel_during_the_image_pull_never_touches_the_running_serve(monkeypatc
     monkeypatch.setattr(serve, "_resolve_hf_token_for_container", lambda: "")
     monkeypatch.setattr(serve, "stop_all", lambda **k: stopped.append(True) or {"ok": True})
     monkeypatch.setattr(serve, "stop_multi_node", lambda **k: stopped.append(True) or {"ok": True})
-    monkeypatch.setattr(ac, "_cluster_topology", lambda: {"nodes": 2, "node_list": [HEAD, WORKER], "head": HEAD, "workers": [WORKER]})
+    # Nodes carry ram_gib: without it the fit gate reads this host's MemTotal (fails on a 16 GiB runner).
+    monkeypatch.setattr(ac, "_cluster_topology", _two_spark_topo)
     monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.0)
     monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": None})
 
@@ -496,7 +497,8 @@ def test_serve_cancel_removes_the_loading_container(monkeypatch):
     monkeypatch.setattr(serve, "_ensure_image_present", lambda *a, **k: None)
     monkeypatch.setattr(serve, "_resolve_hf_token_for_container", lambda: "")
     monkeypatch.setattr(serve, "stop_all", lambda **k: {"ok": True})
-    monkeypatch.setattr(ac, "_cluster_topology", lambda: {"nodes": 1, "node_list": [HEAD], "head": HEAD, "workers": []})
+    head = dict(HEAD, ram_gib=121.7)  # explicit RAM: the fit gate must not read this host's MemTotal
+    monkeypatch.setattr(ac, "_cluster_topology", lambda: {"nodes": 1, "node_list": [head], "head": head, "workers": []})
     monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 20.0)
     monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": None})
 

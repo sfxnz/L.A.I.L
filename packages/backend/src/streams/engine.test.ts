@@ -698,7 +698,9 @@ describe("bench runs", () => {
       return ev.type === "done";
     });
     while (!events.some((e) => e.type === "level")) await Bun.sleep(10);
-    while (!events.some((e) => e.type === "strand" && e.i === 1 && e.state === "decode")) await Bun.sleep(10);
+    // Level 2's strands start together but stream independently: wait for both before stopping.
+    const decoding = (i: number) => events.some((e) => e.type === "strand" && e.i === i && e.state === "decode");
+    while (!decoding(1) || !decoding(2)) await Bun.sleep(10);
     expect((await app.request(`/api/streams/runs/${run_id}/stop`, { method: "POST" })).status).toBe(200);
     const all = await seen;
     expect(byType(all, "level")).toHaveLength(1);

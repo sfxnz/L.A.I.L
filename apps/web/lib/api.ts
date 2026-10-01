@@ -35,7 +35,10 @@ export type ClusterNode = {
   role?: string;
   local?: boolean;
   online?: boolean;
-  state?: "offline" | "idle" | "loading" | "serving" | string;
+  /** offline = no ping; unreachable = pings but ssh failed; stray = old serve container, no endpoint */
+  state?: "offline" | "unreachable" | "idle" | "loading" | "stray" | "serving" | "serving_worker" | string;
+  /** 0 on the serving head and N on headless TP worker N; the endpoint rate is on serve.metrics, not here. */
+  tp_rank?: number | null;
   probe_error?: string | null;
   hostname?: string | null;
   lan_ip?: string | null;
@@ -45,10 +48,27 @@ export type ClusterNode = {
   temperature_c?: number | null;
   gpu_util_pct?: number | null;
   power_w?: number | null;
-  gen_tok_per_s?: number | null;
-  prompt_tok_per_s?: number | null;
   ram_gib?: number | null;
+  /** /proc/meminfo MemAvailable, 0.01 GiB precision */
   available_gib?: number | null;
+  swap_total_gib?: number | null;
+  swap_used_gib?: number | null;
+  /** GiB held by GPU compute processes (on GB10 UMA: the engine's slice of system RAM) */
+  engine_reserved_gib?: number | null;
+  mem_psi_full_avg10?: number | null;
+  /** ok | tight | critical — judged against running out of RAM AND swap, not a fixed GiB line */
+  mem_pressure?: "ok" | "tight" | "critical" | null;
+  cpu?: string | null;
+  cpu_util_pct?: number | null;
+  soc_temp_c?: number | null;
+  nvme_temp_c?: number | null;
+  nic_temp_c?: number | null;
+  /** server epoch ms of the telemetry (memory / temps / power) on this node */
+  sampled_at?: number | null;
+  /** server epoch ms of the slow inventory (containers, endpoint, rails) */
+  inventory_at?: number | null;
+  /** why the ~1 s remote telemetry stream is down, when it is */
+  telemetry_error?: string | null;
   endpoint_healthy?: boolean;
   model_id?: string | null;
   models?: Array<{ id?: string }>;
@@ -59,6 +79,8 @@ export type ClusterNode = {
   qsfp_carrier?: number | null;
   qsfp_speed_mbps?: number | null;
   roce_up_ifs?: string[];
+  rails?: Array<{ if: string; ip: string; prefix: number; carrier?: number | null; speed_mbps?: number | null }>;
+  ping?: { via?: string; ip?: string; ok?: boolean; rtt_ms?: number | null; error?: string | null } | null;
   vllm_url?: string | null;
   ssh_host?: string;
   /** GPU memory (C2 contract; nullable — UMA hosts may not report it). */
@@ -83,9 +105,33 @@ export type EngineStatus = {
   version?: string | null;
   prefix_cache_hit_rate?: number | null;
   preemptions_total?: number | null;
+  sleep_state?: string | null;
   uptime_s?: number | null;
   flags_fingerprint?: string | null;
   flags?: string[] | null;
+};
+
+/** Live endpoint rates over the sampler window (each null when there is no reading). */
+export type ServeMetrics = {
+  requests_running?: number | null;
+  requests_waiting?: number | null;
+  /** per-stream decode tok/s over busy time (Σ inter-token latency); 0 = running, no token moved; null = idle */
+  decode_tok_per_s?: number | null;
+  /** all streams together: Δgenerated tokens / Δwall */
+  throughput_tok_per_s?: number | null;
+  /** computed prompt tok/s of requests that finished in the window */
+  prefill_tok_per_s?: number | null;
+  ttft_s?: number | null;
+  spec_accept_rate?: number | null;
+  spec_tokens_per_step?: number | null;
+  spec_accept_rate_lifetime?: number | null;
+  rate_window_s?: number | null;
+  /** the previous busy period — show only as "last", never as live */
+  last_burst?: { decode_tok_per_s?: number | null; tokens?: number; ended_at?: number } | null;
+  /** latest non-null prefill_tok_per_s and when (epoch ms) — "last", never live */
+  last_prefill?: { tok_per_s: number; at: number } | null;
+  /** server epoch ms of the /metrics scrape */
+  sampled_at?: number | null;
 };
 
 export type ClusterStatus = {
@@ -100,6 +146,8 @@ export type ClusterStatus = {
       from: string;
       to: string;
       via?: string;
+      /** this side's RoCE interface — one link per rail */
+      iface?: string | null;
       target_ip?: string;
       ok?: boolean;
       rtt_ms?: number | null;
@@ -142,22 +190,21 @@ export type LabStatus = {
     models?: Array<{ id: string }>;
     /** vLLM /version, as sampled today. */
     version?: { version?: string | null } | null;
-    /** /metrics deltas from the serve-engine sampler (pre-C2 fallback for engine.*). */
-    metrics?: {
-      requests_running?: number | null;
-      requests_waiting?: number | null;
-      gpu_kv_cache_usage?: number | null;
-      gen_tok_per_s?: number | null;
-      prompt_tok_per_s?: number | null;
-    } | null;
+    /** The endpoint block: /metrics counters and live window rates from the serve-engine sampler. */
+    metrics?: ServeMetrics | null;
     engine?: EngineStatus | null;
     hardware?: {
       gpu_sku?: string;
       ram_gib?: number;
       available_gib?: number | null;
+      swap_total_gib?: number | null;
+      swap_used_gib?: number | null;
+      engine_reserved_gib?: number | null;
       cpu?: string;
+      sampled_at?: number | null;
     };
     containers?: Array<{ name: string; status: string; image: string }>;
+    /** worst node mem_pressure: ok | tight | critical */
     headroom?: string;
     error?: string;
     unreachable?: boolean;
@@ -172,6 +219,8 @@ export type LabStatus = {
       repo?: string;
     };
     cluster?: ClusterStatus;
+    /** server epoch ms when this snapshot was published */
+    sampled_at_ms?: number | null;
   } | null;
   cluster?: ClusterStatus | null;
 };

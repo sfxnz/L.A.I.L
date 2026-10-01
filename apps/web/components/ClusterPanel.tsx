@@ -1,6 +1,6 @@
 "use client";
 
-import type { ClusterNode, ClusterStatus, EngineStatus } from "@/lib/api";
+import type { ClusterNode, ClusterStatus, EngineStatus, ServeMetrics } from "@/lib/api";
 import type { NodeSample } from "@/lib/lab-status-store";
 import { forecastLine, kvForecast } from "@/lib/status/forecast";
 import {
@@ -46,8 +46,10 @@ function stateTone(state?: string): "ok" | "warn" | "danger" | "muted" | "accent
     case "serving_worker":
       return "ok";
     case "loading":
+    case "stray":
       return "warn";
     case "offline":
+    case "unreachable":
       return "danger";
     case "idle":
       return "muted";
@@ -69,8 +71,12 @@ function stateLabel(state?: string): string {
       return "TP worker";
     case "offline":
       return "Offline";
+    case "unreachable":
+      return "SSH failed";
     case "loading":
       return "Loading";
+    case "stray":
+      return "Stray container";
     case "idle":
       return "Idle";
     default:
@@ -159,17 +165,19 @@ function TrafficValue({
 }
 
 /** Used / total GiB for the memory bar: GPU memory when reported, else unified memory (total − available). */
-function nodeMemory(node: ClusterNode): { used: number | null; total: number | null; source: string } {
+function nodeMemory(node: ClusterNode): { used: number | null; total: number | null; source: string; uma: boolean } {
   if (node.gpu_mem_used_gib != null && node.gpu_mem_total_gib != null) {
-    return { used: node.gpu_mem_used_gib, total: node.gpu_mem_total_gib, source: "GPU memory" };
-  }
-  if (node.memory_used_mib != null && node.memory_total_mib != null) {
-    return { used: node.memory_used_mib / 1024, total: node.memory_total_mib / 1024, source: "GPU memory" };
+    return { used: node.gpu_mem_used_gib, total: node.gpu_mem_total_gib, source: "GPU memory", uma: false };
   }
   if (node.ram_gib != null && node.available_gib != null) {
-    return { used: Math.max(0, node.ram_gib - node.available_gib), total: node.ram_gib, source: "unified memory: total − available" };
+    return {
+      used: Math.max(0, node.ram_gib - node.available_gib),
+      total: node.ram_gib,
+      source: "unified memory: MemTotal − MemAvailable",
+      uma: true,
+    };
   }
-  return { used: null, total: null, source: "" };
+  return { used: null, total: null, source: "", uma: false };
 }
 
 function series(samples: NodeSample[] | undefined, pick: (s: NodeSample) => number | null): number[] {
@@ -181,14 +189,21 @@ function series(samples: NodeSample[] | undefined, pick: (s: NodeSample) => numb
   return out;
 }
 
+function fmtC(v: number | null | undefined) {
+  return v == null ? null : `${Math.round(v)}°C`;
+}
+
 function NodeCard({
   node,
   samples,
   engine,
+  metrics,
 }: {
   node: ClusterNode;
   samples?: NodeSample[];
   engine?: EngineStatus | null;
+  /** the endpoint's live rates — shown on the node that owns the endpoint only */
+  metrics?: ServeMetrics | null;
 }) {
   const modelShort = node.model_id?.split("/").pop() || null;
   const mem = nodeMemory(node);
@@ -202,7 +217,21 @@ function NodeCard({
         : `${node.qsfp_speed_mbps}M`
       : null;
   const serving = node.state === "serving" || node.state === "serving_worker";
+  // The endpoint (and its tok/s, KV pool) belongs to the serving head; a TP worker
+  // produces the same tokens, so it shows its rank instead of a second copy.
+  const head = node.state === "serving";
+  const worker = node.state === "serving_worker";
+  const decode = head ? metrics?.decode_tok_per_s : null;
+  const prefill = head ? (metrics?.prefill_tok_per_s ?? metrics?.last_prefill?.tok_per_s) : null;
   const label = stateLabel(node.state);
+  const tempsTip = [
+    node.temperature_c != null ? `GPU ${fmtC(node.temperature_c)}` : null,
+    node.soc_temp_c != null ? `SoC ${fmtC(node.soc_temp_c)}` : null,
+    node.nic_temp_c != null ? `NIC ${fmtC(node.nic_temp_c)}` : null,
+    node.nvme_temp_c != null ? `NVMe ${fmtC(node.nvme_temp_c)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const hasAddrs = !!(node.qsfp_ip || node.tailscale_ip || node.lan_ip);
 
   return (
@@ -217,13 +246,15 @@ function NodeCard({
         "transition-[border-color,box-shadow] duration-300",
         serving &&
           "border-[color:color-mix(in_srgb,var(--color-lab-ok)_45%,transparent)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-lab-ok)_10%,transparent),inset_0_0_30px_-14px_color-mix(in_srgb,var(--color-lab-ok)_75%,transparent)]",
-        node.state === "loading" &&
+        (node.state === "loading" || node.state === "stray") &&
           "border-[color:color-mix(in_srgb,var(--color-lab-warn)_40%,transparent)]",
-        node.state === "offline" &&
+        (node.state === "offline" || node.state === "unreachable") &&
           "border-[color:color-mix(in_srgb,var(--color-lab-danger)_40%,transparent)]",
         !serving &&
           node.state !== "loading" &&
+          node.state !== "stray" &&
           node.state !== "offline" &&
+          node.state !== "unreachable" &&
           "border-lab-border",
       )}
     >
@@ -253,15 +284,29 @@ function NodeCard({
 
       <div aria-hidden className="animus-rule my-3" />
 
-      {/* Rank 1: the endpoint rate on this Spark, hero weight, with its last 60 s. */}
+      {/* Rank 1: the endpoint rate on the Spark that owns it, hero weight, with its last 60 s. */}
       <div className="flex items-end justify-between gap-3">
         <Readout label="tok/s">
           <div
             className="lab-num flex items-baseline gap-1.5 font-[family-name:var(--font-display)] text-[30px] font-bold leading-none tabular-nums text-lab-text"
-            title={serving ? "Live serve decode rate (endpoint counters, 2 s)" : undefined}
+            title={
+              head
+                ? `Per-stream decode rate over busy time (endpoint, 1 s)${
+                    metrics?.throughput_tok_per_s != null ? ` · all streams ${fmtRate(metrics.throughput_tok_per_s)} tok/s` : ""
+                  }`
+                : worker
+                  ? "Headless TP worker: its tokens are the head's endpoint rate"
+                  : undefined
+            }
           >
-            <TrafficValue serving={serving} value={node.gen_tok_per_s} format={fmtRate} />
-            {serving && node.gen_tok_per_s != null && (
+            {worker ? (
+              <span className="font-mono text-[12px] font-normal text-lab-muted">
+                TP rank {node.tp_rank ?? "?"} · rate on head
+              </span>
+            ) : (
+              <TrafficValue serving={serving} value={decode} format={fmtRate} />
+            )}
+            {head && decode != null && (
               <span className="font-mono text-[10px] font-normal text-lab-muted">tok/s</span>
             )}
           </div>
@@ -275,8 +320,11 @@ function NodeCard({
           label="Decode rate over the last 60 s"
         />
         <Readout label="Prefill" className="items-end text-right">
-          <div className={cn("lab-num", READING)} title={serving ? "Live serve prefill rate" : undefined}>
-            <TrafficValue serving={serving} value={node.prompt_tok_per_s} format={fmtRate} />
+          <div
+            className={cn("lab-num", READING)}
+            title={head ? "Computed prompt tok/s of the most recently finished requests (cache hits excluded)" : undefined}
+          >
+            {worker ? <Nil word="None" /> : <TrafficValue serving={serving} value={prefill} format={fmtRate} />}
           </div>
         </Readout>
       </div>
@@ -303,16 +351,20 @@ function NodeCard({
         className="mt-3"
         usedGib={mem.used}
         totalGib={mem.total}
+        reservedGib={mem.uma ? node.engine_reserved_gib : null}
+        swapUsedGib={node.swap_used_gib}
+        swapTotalGib={node.swap_total_gib}
+        pressure={node.mem_pressure}
         source={mem.source}
-        kvUsage={serving ? engine?.kv_usage_pct : null}
+        kvUsage={head ? engine?.kv_usage_pct : null}
         kvCapacityTokens={engine?.kv_capacity_tokens}
       />
       <div className="lab-num mt-1.5 font-mono text-[10px] text-lab-muted" title="Whole 32k-token sequences that fit the KV pool">
-        {forecast && serving ? forecastLine(forecast) : <Nil word={serving ? "Awaiting" : "None"} />}
+        {forecast && head ? forecastLine(forecast) : <Nil word={head ? "Awaiting" : "None"} />}
       </div>
 
       <div className="mt-auto grid grid-cols-3 gap-x-3 gap-y-2.5 border-t border-[color:var(--animus-hairline)] pt-3">
-        <Readout label="Temperature">
+        <Readout label="Temperature" title={tempsTip || undefined}>
           <div className={READING}>
             <HardwareValue
               value={node.temperature_c}
@@ -321,7 +373,10 @@ function NodeCard({
             />
           </div>
         </Readout>
-        <Readout label="Usage">
+        <Readout
+          label="Usage"
+          title={node.cpu_util_pct != null ? `GPU ${fmtPct(node.gpu_util_pct ?? 0)} · CPU ${fmtPct(node.cpu_util_pct)}${node.cpu ? ` (${node.cpu})` : ""}` : undefined}
+        >
           <div className={READING}>
             <HardwareValue value={node.gpu_util_pct} format={fmtPct} />
           </div>
@@ -466,14 +521,14 @@ function FabricBridge({ cluster }: { cluster: ClusterStatus }) {
  * nested card. Keeping it borderless is what stops the cluster reading as a
  * box-inside-a-box.
  */
-function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
+function LoadStrip({ cluster, metrics }: { cluster: ClusterStatus; metrics?: ServeMetrics | null }) {
   const multi = cluster.summary?.multi;
   const nodes = cluster.nodes || [];
   const mode = multi?.mode || "none";
   const modelShort = multi?.model_id?.split("/").pop();
-  const live = nodes.find((n) => n.state === "serving" || n.state === "serving_worker");
-  const liveGen = live?.gen_tok_per_s;
-  const livePrefill = live?.prompt_tok_per_s;
+  const serving = nodes.some((n) => n.state === "serving");
+  const liveGen = serving ? metrics?.decode_tok_per_s : null;
+  const livePrefill = serving ? metrics?.prefill_tok_per_s : null;
 
   return (
     <div
@@ -505,7 +560,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
           {(liveGen != null || livePrefill != null) && (
             <span
               className="shrink-0 font-mono text-[10px] tabular-nums text-lab-text-dim"
-              title="Endpoint rate, shown on every in-use Spark"
+              title="Endpoint rate (once per serve): per-stream decode · prefill of requests that just finished"
             >
               {liveGen != null ? `${fmtRate(liveGen)} tok/s` : null}
               {liveGen != null && livePrefill != null ? " · " : null}
@@ -518,6 +573,7 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
           {nodes.map((n) => {
             const filled = n.state === "serving" || n.state === "serving_worker";
             const loading = n.state === "loading";
+            const down = n.state === "offline" || n.state === "unreachable";
             return (
               <div key={n.id} className="flex items-center gap-1.5">
                 <div
@@ -530,7 +586,8 @@ function LoadStrip({ cluster }: { cluster: ClusterStatus }) {
                       !loading &&
                       n.state === "idle" &&
                       "border-lab-border bg-lab-hover",
-                    n.state === "offline" &&
+                    n.state === "stray" && "border-lab-warn bg-lab-hover",
+                    down &&
                       "border-[color:color-mix(in_srgb,var(--color-lab-danger)_50%,transparent)] bg-[color:color-mix(in_srgb,var(--color-lab-danger)_20%,transparent)]",
                   )}
                   title={`${n.id}: ${n.state === "serving_worker" ? "TP worker (headless)" : n.state}${n.model_id ? ` · ${n.model_id}` : ""}`}
@@ -553,6 +610,7 @@ export function ClusterPanel({
   loading,
   samples,
   engine,
+  metrics,
 }: {
   cluster: ClusterStatus | null | undefined;
   loading?: boolean;
@@ -560,6 +618,8 @@ export function ClusterPanel({
   samples?: Record<string, NodeSample[]>;
   /** engine telemetry (KV %, capacity) — C2 contract, optional */
   engine?: EngineStatus | null;
+  /** the endpoint's live rates (serve.metrics) */
+  metrics?: ServeMetrics | null;
 }) {
   if (loading) {
     return (
@@ -626,18 +686,18 @@ export function ClusterPanel({
         </span>
       }
     >
-      <LoadStrip cluster={cluster} />
+      <LoadStrip cluster={cluster} metrics={metrics} />
 
       <div className="p-3.5 sm:p-4">
         <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-[1fr_auto_1fr]">
-          {nodes[0] ? <NodeCard node={nodes[0]} samples={samples?.[nodes[0].id]} engine={engine} /> : <div />}
+          {nodes[0] ? <NodeCard node={nodes[0]} samples={samples?.[nodes[0].id]} engine={engine} metrics={metrics} /> : <div />}
           {nodes.length >= 2 ? (
             <FabricBridge cluster={cluster} />
           ) : (
             <div className="hidden lg:block" />
           )}
           {nodes[1] ? (
-            <NodeCard node={nodes[1]} samples={samples?.[nodes[1].id]} engine={engine} />
+            <NodeCard node={nodes[1]} samples={samples?.[nodes[1].id]} engine={engine} metrics={metrics} />
           ) : nodes.length < 2 ? null : (
             <div />
           )}
@@ -646,7 +706,7 @@ export function ClusterPanel({
         {nodes.length > 2 && (
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {nodes.slice(2).map((n) => (
-              <NodeCard key={n.id} node={n} samples={samples?.[n.id]} engine={engine} />
+              <NodeCard key={n.id} node={n} samples={samples?.[n.id]} engine={engine} metrics={metrics} />
             ))}
           </div>
         )}

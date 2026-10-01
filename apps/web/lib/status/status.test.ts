@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RunRow } from "../api";
 import { toSlices, sliceColor, sliceHref } from "./dna";
-import { FORECAST_SEQ_TOKENS, fmtTokensK, forecastLine, kvForecast, kvFraction, kvUsedTokens } from "./forecast";
+import { FORECAST_SEQ_TOKENS, fmtKvPct, fmtTokensK, forecastLine, kvForecast, kvFraction, kvUsedTokens } from "./forecast";
 import { fmtUptime } from "./format";
 import { parseQuant } from "./quant";
 
@@ -45,14 +45,26 @@ describe("KV capacity forecast", () => {
     expect(fmtTokensK(800)).toBe("800");
     expect(fmtTokensK(2_100_000)).toBe("2.1M");
   });
-  test("kv usage accepts a 0–1 fraction (vLLM) or 0–100 percent (C2)", () => {
-    expect(kvFraction(0.11)).toBeCloseTo(0.11);
+  test("kv usage is a percent, always — 0.5 is 0.5 %, never 50 %", () => {
+    expect(kvFraction(0.5)).toBeCloseTo(0.005);
+    expect(kvFraction(0.11)).toBeCloseTo(0.0011);
+    expect(kvFraction(1)).toBeCloseTo(0.01);
     expect(kvFraction(11)).toBeCloseTo(0.11);
     expect(kvFraction(140)).toBe(1);
-    expect(kvUsedTokens(524_288, 0.5)).toBe(262_144);
+    expect(kvFraction(-3)).toBe(0);
+    // the live pool: 1,694,725 tokens
+    expect(kvUsedTokens(1_694_725, 0.5)).toBe(8474);
     expect(kvUsedTokens(524_288, 50)).toBe(262_144);
     expect(kvUsedTokens(null, 0.5)).toBeNull();
     expect(kvUsedTokens(524_288, null)).toBeNull();
+  });
+  test("fmtKvPct: one decimal below 10 % so small real use is visible", () => {
+    expect(fmtKvPct(0)).toBe("0%");
+    expect(fmtKvPct(0.84)).toBe("0.8%");
+    expect(fmtKvPct(0.04)).toBe("0.0%");
+    expect(fmtKvPct(9.94)).toBe("9.9%");
+    expect(fmtKvPct(42.37)).toBe("42%");
+    expect(fmtKvPct(100)).toBe("100%");
   });
 });
 

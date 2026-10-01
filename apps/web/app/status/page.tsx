@@ -267,7 +267,7 @@ export default function StatusPage() {
               </EmptyState>
             </Panel>
           ) : (
-            <ClusterPanel cluster={cluster} loading={loading} samples={samples} engine={serve?.engine} />
+            <ClusterPanel cluster={cluster} loading={loading} samples={samples} engine={serve?.engine} metrics={healthy ? serve?.metrics : null} />
           )}
         </div>
       </section>

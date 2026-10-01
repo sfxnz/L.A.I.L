@@ -26,7 +26,7 @@ describe("serve-engine proxy", () => {
     config.token = "";
     const calls = fakeEngine(() => Response.json({ ok: true }));
     const app = createApp();
-    for (const p of ["/api/status", "/api/cluster", "/api/jobs", "/api/jobs/j1/cancel", "/api/serve/recommend?model=a%2Fb", "/api/runs/tool-eval/board?limit=4", "/api/bench/perf"]) {
+    for (const p of ["/api/status", "/api/cluster", "/api/jobs", "/api/jobs/j1/cancel", "/api/serve/recommend?model=a%2Fb", "/api/runs/tool-eval/board?limit=4", "/api/bench/tool-eval-status"]) {
       expect((await app.request(p)).status).toBe(200);
     }
     expect(calls.map((c) => c.url.replace(config.serveEngineUrl, ""))).toEqual([
@@ -36,7 +36,7 @@ describe("serve-engine proxy", () => {
       "/api/jobs/j1/cancel",
       "/api/serve/recommend?model=a%2Fb",
       "/api/runs/tool-eval/board?limit=4",
-      "/api/bench/perf",
+      "/api/bench/tool-eval-status",
     ]);
   });
 

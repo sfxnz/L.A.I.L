@@ -274,6 +274,7 @@ export type StreamAggEvent = {
   waiting: number;
   done: number;
   ttft_p50_ms?: number;
+  /** Only from `TAIL_MIN_SAMPLES` first tokens up. */
   ttft_p95_ms?: number;
   /** False when some chunk arrived without `usage` (counted as 1 token): live numbers are then chunk counts. */
   tokens_exact: boolean;
@@ -491,9 +492,9 @@ export type BenchHardware = {
   /** [t_ms since run start, node id, temp °C, power W, available GiB] */
   series: Array<[number, string, number | null, number | null, number | null]>;
   nodes: BenchHardwareNode[];
-  /** ∫ Σ node power dt over the sampled window (trapezoid); null without ≥ 2 power samples. */
+  /** ∫ Σ node power dt over the measured level spans (trapezoid on the readings); null unless every node's power was re-read during the run. */
   energy_j: number | null;
-  /** energy_j ÷ Σ completion tokens of the run. */
+  /** energy_j ÷ Σ completion tokens of the run; null for the prefill bench (1-token answers). */
   energy_j_per_token: number | null;
 };
 

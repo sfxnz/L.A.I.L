@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type {
   BenchEnvelope,
-  BenchHeadline,
   StreamAggEvent,
   StreamArrival,
   StreamDeltaEvent,
@@ -19,7 +18,7 @@ import type {
   StreamThinking,
   StrandState,
 } from "@lail/shared";
-import { LIVE_RATE_WINDOW_MS, type BenchHardware } from "@lail/shared";
+import { LIVE_RATE_WINDOW_MS, TAIL_MIN_SAMPLES, type BenchHardware } from "@lail/shared";
 import { config } from "../config";
 import { getSettings, openAiBase } from "../controller/settings";
 import { assignPrompts, getPack, strandSystemPrompt } from "./packs";
@@ -119,6 +118,8 @@ const WARMUP_TOKENS = 16;
 /** Bench: before each level, wait this long for foreign requests on the server to drain. */
 const IDLE_WAIT_MS = 10_000;
 const FOREIGN_POLL_MS = 1000;
+/** Foreign-load sampling: a strand that ended this long before a scrape began still counts as ours (gauge lag). */
+const OWN_GRACE_MS = 250;
 const HARDWARE_POLL_MS = 2000;
 const LEASE_TTL_S = 90;
 const LEASE_RENEW_MS = 30_000;
@@ -208,6 +209,8 @@ type Strand = {
   reasoningChunks: number;
   /** Cumulative completion tokens: the latest per-chunk `usage.completion_tokens`, else 1 per chunk. */
   tokens: number;
+  /** Every token-bearing chunk carried cumulative usage, so `tokens` at t_last is exact. */
+  exact: boolean;
   textTokens: number;
   reasoningTokens: number;
   /** Tokens delivered with the first token-bearing chunk. */
@@ -257,6 +260,8 @@ type Run = {
   fingerprint: string | null;
   hardware: BenchHardware["series"];
   hardwareSampledAt: string | null;
+  /** Bench: each level's measured span [from, to] (ms since t0) — what energy is integrated over. */
+  levelWindows: Array<[number, number]>;
   /** Bench: holds the serve-engine bench lease (null when the serve-engine was unreachable). */
   lease: boolean;
   summary: StreamRunSummary | null;
@@ -270,7 +275,13 @@ type Run = {
 };
 
 /** One bench level's server probes: /metrics before, foreign load sampled while it runs. */
-type LevelProbe = { before: MetricSample | null; foreign: number | null; timer: ReturnType<typeof setInterval> | null };
+type LevelProbe = {
+  before: MetricSample | null;
+  foreign: number | null;
+  timer: ReturnType<typeof setInterval> | null;
+  /** When the level's measured span began (after the idle-drain wait), performance.now() ms. */
+  t_begin: number;
+};
 
 function canonBase(raw: string): string | null {
   let u: URL;
@@ -323,6 +334,11 @@ export function arrivalDelays(count: number, arrival: StreamArrival, arrivalMs: 
   return out;
 }
 
+/** Strands of ours in flight at any moment since `since` (started, and not ended before it). */
+export function ownSince(strands: Array<Pick<Strand, "t_start" | "t_end">>, since: number): number {
+  return strands.filter((s) => s.t_start !== null && (s.t_end === null || s.t_end >= since)).length;
+}
+
 function toResult(s: Strand): StrandResult {
   const usageN = s.usage?.completion_tokens;
   const fromUsage = typeof usageN === "number";
@@ -334,6 +350,7 @@ function toResult(s: Strand): StrandResult {
     t_last: s.t_last,
     t_end: s.t_end ?? s.t_last ?? s.t_start ?? 0,
     completion_tokens: fromUsage ? usageN : s.tokens || null,
+    last_tokens: s.exact && s.t_last !== null ? s.tokens : null,
     first_tokens: s.firstTokens ?? 1,
     prompt_tokens: typeof s.usage?.prompt_tokens === "number" ? s.usage.prompt_tokens : null,
     estimated: !fromUsage,
@@ -529,6 +546,7 @@ export class StreamsEngine {
         textTokens: 0,
         reasoningTokens: 0,
         firstTokens: null,
+        exact: true,
         usage: null,
         finish_reason: null,
         error: null,
@@ -555,6 +573,7 @@ export class StreamsEngine {
       fingerprint: status?.fingerprint ?? null,
       hardware: [],
       hardwareSampledAt: null,
+      levelWindows: [],
       lease,
       summary: null,
       saved_run_id: null,
@@ -650,9 +669,10 @@ export class StreamsEngine {
   /**
    * Before a level: wait (≤ IDLE_WAIT_MS) for requests that are not ours to drain, scrape
    * /metrics, then sample foreign load at 1 Hz while the level runs. Foreign = server
-   * running+waiting − our in-flight strands; ours are counted from before the request is
-   * sent until its stream closes, which brackets the server's count, so this never
-   * over-reports.
+   * running+waiting − ours. The server's count is taken at some moment during the scrape
+   * (and its gauge can trail a step), so ours = every strand in flight at any moment of
+   * [scrape start − OWN_GRACE_MS, scrape end]: a strand finishing inside that window is
+   * still ours, and foreign never over-reports.
    */
   private async beginLevel(run: Run): Promise<LevelProbe> {
     const signal = run.ctrl.signal;
@@ -664,17 +684,17 @@ export class StreamsEngine {
       before = await scrapeMetrics(run.req.base_url, signal);
       load = serverLoad(before);
     }
-    const probe: LevelProbe = { before, foreign: load, timer: null };
+    const probe: LevelProbe = { before, foreign: load, timer: null, t_begin: now() };
     if (load === null) return probe;
     let busy = false;
     probe.timer = setInterval(async () => {
       if (busy) return;
       busy = true;
       try {
+        const since = now() - OWN_GRACE_MS;
         const l = serverLoad(await scrapeMetrics(run.req.base_url, signal));
         if (l === null) return;
-        const own = run.strands.filter((s) => s.state === "prefill" || s.state === "decode").length;
-        probe.foreign = Math.max(probe.foreign ?? 0, l - own);
+        probe.foreign = Math.max(probe.foreign ?? 0, l - ownSince(run.strands, since));
       } finally {
         busy = false;
       }
@@ -684,6 +704,7 @@ export class StreamsEngine {
 
   private async endLevel(run: Run, probe: LevelProbe): Promise<LevelContext> {
     if (probe.timer) clearInterval(probe.timer);
+    if (!run.ctrl.signal.aborted) run.levelWindows.push([Math.round(probe.t_begin - run.t0), Math.round(now() - run.t0)]);
     const after = run.ctrl.signal.aborted ? null : await scrapeMetrics(run.req.base_url, run.ctrl.signal);
     return { foreign_max: probe.foreign, server: serverDelta(probe.before, after) };
   }
@@ -884,6 +905,7 @@ export class StreamsEngine {
     } else {
       n = 1;
       s.tokens += 1;
+      s.exact = false;
       run.tokensExact = false;
     }
     s.chunks++;
@@ -1027,7 +1049,8 @@ export class StreamsEngine {
       tokens_exact: run.tokensExact,
     };
     const p50 = percentile(ttfts, 50);
-    const p95 = percentile(ttfts, 95);
+    // Tail percentiles follow the same rule as the levels and the summary.
+    const p95 = ttfts.length >= TAIL_MIN_SAMPLES ? percentile(ttfts, 95) : null;
     if (p50 !== null) agg.ttft_p50_ms = r1(p50);
     if (p95 !== null) agg.ttft_p95_ms = r1(p95);
     run.aggSeries.push(agg);
@@ -1080,7 +1103,9 @@ export class StreamsEngine {
     const head = isBench ? benchHeadline(kind, arms) : undefined;
     let saved: string | null = null;
     const tokens = results.reduce((a, r) => a + (r.completion_tokens ?? 0), 0);
-    const hardware = isBench && run.hardware.length ? summarizeHardware(run.hardware, tokens) : null;
+    // Prefill answers are 1 token each: energy per *output* token would be meaningless there.
+    const hardware =
+      isBench && run.hardware.length ? summarizeHardware(run.hardware, run.levelWindows, kind === "decode" ? tokens : null) : null;
     if (isBench && !cancelled) {
       const envelope = buildEnvelope({
         kind,

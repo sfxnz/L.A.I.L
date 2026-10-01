@@ -17,6 +17,10 @@ type MockState = {
   imported: unknown[];
   /** Honour `stream_options.continuous_usage_stats` (vLLM): `usage` on every chunk. */
   continuousUsage: boolean;
+  /** The finish chunk (empty delta) and final usage count one more token: an EOS with no text. */
+  eosTail: boolean;
+  /** /metrics reads its running count when the request arrives, then answers this much later. */
+  metricsLagMs: number;
   /** Streaming completions in flight (the mock's `vllm:num_requests_running`). */
   active: number;
   /** Requests running on the "server" that are not the engine's. */
@@ -35,6 +39,8 @@ const state: MockState = {
   importMode: "ok",
   imported: [],
   continuousUsage: false,
+  eosTail: false,
+  metricsLagMs: 0,
   active: 0,
   foreign: 0,
   specDrafts: 0,
@@ -70,8 +76,9 @@ function completions(body: Record<string, unknown>, signal: AbortSignal): Respon
   const frames: string[] = [": keep-alive\n\n", frame({ role: "assistant", content: "" }, null, usage())];
   if (n > 1) frames.push(out({ reasoning_content: "thinking " }), out({ reasoning_content: "hard. " }));
   for (let k = 0; k < n; k++) frames.push(out({ content: `tok${k} ` }));
+  if (state.eosTail) outChunks++;
   frames.push(frame({}, "length", usage()));
-  const completionTokens = (n + (n > 1 ? 2 : 0)) * tokensPerChunk;
+  const completionTokens = (n + (n > 1 ? 2 : 0)) * tokensPerChunk + (state.eosTail ? tokensPerChunk : 0);
   frames.push(`data: ${JSON.stringify({ id: "cmpl-1", choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens } })}\r\n\r\n`);
   frames.push("data: [DONE]\n\n");
   // Split the first content frame across two writes to exercise the parser over HTTP.
@@ -130,11 +137,13 @@ const server = Bun.serve({
     }
     if (url.pathname === "/metrics") {
       const m = `engine="0",model_name="mock/served"`;
+      const running = state.active + state.foreign;
+      if (state.metricsLagMs) await Bun.sleep(state.metricsLagMs);
       const d = state.specDrafts;
       return new Response(
         [
           "# HELP vllm:num_requests_running running",
-          `vllm:num_requests_running{${m}} ${state.active + state.foreign}.0`,
+          `vllm:num_requests_running{${m}} ${running}.0`,
           `vllm:num_requests_waiting{${m}} 0.0`,
           `vllm:spec_decode_num_drafts_total{${m}} ${d * 10}.0`,
           `vllm:spec_decode_num_draft_tokens_total{${m}} ${d * 30}.0`,
@@ -579,6 +588,20 @@ describe("bench runs", () => {
     }
   });
 
+  test("foreign load: a strand of ours that finishes during the scrape is not counted as foreign", async () => {
+    state.importMode = "404";
+    state.metricsLagMs = 1500;
+    try {
+      // one ~2 s strand; the 1 Hz poll reads running=1 at ~1 s and answers at ~2.5 s, after it closed
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1], max_tokens: 120, samples: 1 });
+      const events = await collect(((await res.json()) as { run_id: string }).run_id);
+      expect(byType(events, "level")[0].foreign_max).toBe(0);
+    } finally {
+      state.metricsLagMs = 0;
+      state.importMode = "ok";
+    }
+  }, 15000);
+
   test("a bench is refused while the serve-engine holds the bench lease; runs without it when unreachable", async () => {
     state.leaseMode = "busy";
     try {
@@ -636,6 +659,24 @@ describe("bench runs", () => {
     } finally {
       state.continuousUsage = false;
       state.importMode = "ok";
+    }
+  });
+
+  test("continuous usage: an EOS token after the last text chunk is outside the decode span", async () => {
+    state.continuousUsage = true;
+    state.eosTail = true;
+    state.imported = [];
+    try {
+      const res = await post("/api/streams/runs", { mode: "bench-decode", pack: "prose", base_url: BASE, levels: [1], max_tokens: 4, samples: 1 });
+      await collect(((await res.json()) as { run_id: string }).run_id);
+      const r = (state.imported[0] as Record<string, any>).metrics.full_arms[0].per_request[0];
+      expect(r.completion_tokens).toBe(7); // 2 reasoning + 4 content + EOS
+      expect(r.token_counts.at(-1)).toBe(6); // tokens at t_last
+      // decode tok/s × decode span = tokens after the first chunk up to t_last: 6 − 1
+      expect(Math.round(r.tok_per_s * r.decode_s)).toBe(5);
+    } finally {
+      state.continuousUsage = false;
+      state.eosTail = false;
     }
   });
 
@@ -704,6 +745,8 @@ describe("bench runs", () => {
     expect(done.saved_run_id).toBeNull();
     expect(done.summary.headline!.prefill_tok_per_s_sustained).toBeGreaterThan(0);
     expect(done.summary.headline!.decode_tok_per_s_median_c1).toBeNull();
+    // 1-token answers: no energy per output token
+    expect(done.summary.hardware!.energy_j_per_token).toBeNull();
     state.importMode = "ok";
   });
 });
@@ -784,6 +827,7 @@ describe("live rates and fan-out", () => {
         [2000, "spark1", 52, 120, 19],
         [2000, "spark2", 46, 70, 30],
       ],
+      [[0, 2000]],
       100,
     );
     expect(fresh).toMatchObject({ energy_j: 350, energy_j_per_token: 3.5 });
@@ -796,9 +840,29 @@ describe("live rates and fan-out", () => {
         [2000, "spark1", 52, 120, 19],
         [2000, "spark2", 45, 60, 30],
       ],
+      [[0, 2000]],
       100,
     );
     expect(stale.energy_j).toBeNull();
     expect(stale.energy_j_per_token).toBeNull();
+  });
+
+  test("energy covers only the measured level windows; none per token for prefill", async () => {
+    const { summarizeHardware } = await import("./probes");
+    const series: Parameters<typeof summarizeHardware>[0] = [
+      [0, "spark1", 50, 100, 20],
+      [0, "spark2", 45, 60, 30],
+      [2000, "spark1", 52, 120, 19],
+      [2000, "spark2", 46, 70, 30],
+    ];
+    // [0.5 s, 1.5 s]: spark1 105 → 115 W, spark2 62.5 → 67.5 W → (110 + 65) × 1 s = 175 J
+    expect(summarizeHardware(series, [[500, 1500]], 100)).toMatchObject({ energy_j: 175, energy_j_per_token: 1.75 });
+    // two windows with an idle gap between them; a window past the last reading holds it flat
+    expect(summarizeHardware(series, [[0, 500], [1500, 2000]], 100).energy_j).toBe(175);
+    expect(summarizeHardware(series, [[2000, 3000]], 100).energy_j).toBe(190);
+    // prefill: energy, but no per-output-token figure
+    expect(summarizeHardware(series, [[0, 2000]], null)).toMatchObject({ energy_j: 350, energy_j_per_token: null });
+    // no completed level: nothing measured
+    expect(summarizeHardware(series, [], 100).energy_j).toBeNull();
   });
 });

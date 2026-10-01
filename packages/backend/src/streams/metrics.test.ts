@@ -26,6 +26,7 @@ function result(over: Partial<StrandResult> & { i: number }): StrandResult {
     t_last: 2100,
     t_end: 2110,
     completion_tokens: 101,
+    last_tokens: null,
     first_tokens: 1,
     prompt_tokens: 70,
     estimated: false,
@@ -68,6 +69,18 @@ describe("metric definitions", () => {
     const r = result({ i: 0, completion_tokens: 100, first_tokens: 4 });
     expect(decodeTokPerS(r)).toBe(48);
     expect(1 / tpotS(r)!).toBeCloseTo(48, 9);
+  });
+
+  test("a token after t_last (EOS / stop, empty delta) is outside the decode span", () => {
+    // 100 tokens by t_last; usage then counts the EOS that arrived with no text → 101
+    const r = result({ i: 0, completion_tokens: 101, last_tokens: 100 });
+    expect(decodeTokPerS(r)).toBe(49.5); // (100 − 1) / 2.0 s, not (101 − 1) / 2.0 s
+    expect(decodeTokPerS(r)! * tpotS(r)!).toBeCloseTo(1, 12);
+    // wall-clock: 100 tokens over max t_last − min t_start = 2.1 s
+    expect(aggregateTokPerS([r])).toBeCloseTo(100 / 2.1, 9);
+    expect(aggregateSteadyTokPerS([r])).toBe(49.5);
+    // totals still count every generated token
+    expect(summarizeWave([r]).tokens).toBe(101);
   });
 
   test("a single chunk has no decode span: rate and TPOT undefined", () => {

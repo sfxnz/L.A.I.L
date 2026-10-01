@@ -131,14 +131,44 @@ export async function readServeStatus(signal?: AbortSignal): Promise<StatusReadi
   }
 }
 
+/** Power at `t`: readings joined linearly, held flat before the first / after the last. */
+function powerAt(pw: Array<[number, number]>, t: number): number {
+  if (t <= pw[0][0]) return pw[0][1];
+  for (let k = 1; k < pw.length; k++) {
+    const [t1, p1] = pw[k];
+    if (t <= t1) {
+      const [t0, p0] = pw[k - 1];
+      return t1 === t0 ? p1 : p0 + ((p1 - p0) * (t - t0)) / (t1 - t0);
+    }
+  }
+  return pw[pw.length - 1][1];
+}
+
+/** ∫ power dt (J) over `windows` (ms since run start) — exact trapezoids on the joined readings. */
+function energyOver(pw: Array<[number, number]>, windows: Array<[number, number]>): number {
+  let j = 0;
+  for (const [a, b] of windows) {
+    if (b <= a) continue;
+    const ts = [a, ...pw.map((r) => r[0]).filter((t) => t > a && t < b), b];
+    for (let k = 1; k < ts.length; k++) j += ((powerAt(pw, ts[k - 1]) + powerAt(pw, ts[k])) / 2) * ((ts[k] - ts[k - 1]) / 1000);
+  }
+  return j;
+}
+
 /**
- * Per node over the run, plus energy: Σ over nodes of the trapezoid ∫ power dt between
- * that node's consecutive power samples; per token over `tokens`. Energy is reported only
- * when every node's power was actually re-read during the run (≥ 2 distinct readings): a
- * run shorter than the telemetry cadence sees one stale reading repeated, and integrating
- * that would report idle power as the run's.
+ * Per node over the run, plus energy: Σ over nodes of ∫ power dt over the measured
+ * `windows` only (the level spans — not the warmup or the idle-drain waits), so energy and
+ * `tokens` cover the same time; per token over `tokens` (null = not a per-token quantity,
+ * e.g. the prefill bench's 1-token answers). Energy is reported only when every node's
+ * power was actually re-read during the run (≥ 2 distinct readings): a run shorter than the
+ * telemetry cadence sees one stale reading repeated, and integrating that would report
+ * idle power as the run's.
  */
-export function summarizeHardware(series: BenchHardware["series"], tokens: number): BenchHardware {
+export function summarizeHardware(
+  series: BenchHardware["series"],
+  windows: Array<[number, number]>,
+  tokens: number | null,
+): BenchHardware {
   const byNode = new Map<string, BenchHardware["series"]>();
   for (const s of series) {
     const list = byNode.get(s[1]) ?? [];
@@ -149,7 +179,6 @@ export function summarizeHardware(series: BenchHardware["series"], tokens: numbe
   const r1 = (v: number | null) => (v === null ? null : Math.round(v * 10) / 10);
   const nodes: BenchHardwareNode[] = [];
   let energy = 0;
-  let integrated = false;
   let stale = false;
   for (const [id, rows] of byNode) {
     const temps = rows.map((r) => r[2]).filter((v): v is number => v !== null);
@@ -163,19 +192,17 @@ export function summarizeHardware(series: BenchHardware["series"], tokens: numbe
       power_mean_w: r1(mean(powers)),
       available_min_gib: avails.length ? Math.min(...avails) : null,
     });
-    const pw = rows.filter((r) => r[3] !== null);
-    if (pw.length && new Set(pw.map((r) => r[3])).size < 2) stale = true;
-    for (let k = 1; k < pw.length; k++) {
-      energy += (((pw[k - 1][3] as number) + (pw[k][3] as number)) / 2) * ((pw[k][0] - pw[k - 1][0]) / 1000);
-      integrated = true;
-    }
+    const pw = rows.filter((r) => r[3] !== null).map((r): [number, number] => [r[0], r[3] as number]);
+    if (new Set(pw.map((r) => r[1])).size < 2) stale = true;
+    else energy += energyOver(pw, windows);
   }
-  const energy_j = integrated && !stale ? Math.round(energy) : null;
+  const measured = windows.some(([a, b]) => b > a);
+  const energy_j = byNode.size && measured && !stale ? Math.round(energy) : null;
   return {
     series,
     nodes,
     energy_j,
-    energy_j_per_token: energy_j !== null && tokens > 0 ? Math.round((energy_j / tokens) * 1000) / 1000 : null,
+    energy_j_per_token: energy_j !== null && tokens !== null && tokens > 0 ? Math.round((energy_j / tokens) * 1000) / 1000 : null,
   };
 }
 

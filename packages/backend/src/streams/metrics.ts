@@ -16,7 +16,9 @@ import {
  * The bench's metric definitions — the only ones (the serve-engine decode bench is
  * retired). Per strand, with t_first/t_last the first/last token-bearing chunk:
  *   TTFT            t_first − t_start
- *   decode tok/s    (n − n_first) / (t_last − t_first)      n_first = tokens in the first chunk
+ *   decode tok/s    (n − n_first) / (t_last − t_first)      n_first = tokens in the first chunk,
+ *                                                           n = tokens at t_last (not a trailing
+ *                                                           EOS/stop token after it)
  *   TPOT            (t_last − t_first) / (n − n_first)       = 1 / decode tok/s
  * Per wave (one burst of c strands): wall-clock aggregate and decode-span aggregate below.
  * Per level (⌈samples ÷ c⌉ waves): medians over waves / pooled strands, with min–max.
@@ -36,6 +38,11 @@ export type StrandResult = {
   t_end: number;
   /** `usage.completion_tokens`, or the chunk count when the usage frame is missing. */
   completion_tokens: number | null;
+  /**
+   * Cumulative tokens at t_last, exact from per-chunk usage; null without it. Differs from
+   * completion_tokens by tokens that arrived with no text after t_last (EOS, stop strings).
+   */
+  last_tokens: number | null;
   /** Tokens delivered with the first chunk (at t_first, so outside the decode span). */
   first_tokens: number;
   prompt_tokens: number | null;
@@ -77,9 +84,12 @@ export function decodeTimeS(r: StrandResult): number | null {
   return (r.t_last - r.t_first) / 1000;
 }
 
+/** Tokens delivered by t_last: exact when known, else completion_tokens. */
+const tokensAtLast = (r: StrandResult): number | null => r.last_tokens ?? r.completion_tokens;
+
 /** Tokens decoded inside the decode span: n − n_first. */
 function decodedTokens(r: StrandResult): number | null {
-  const n = r.completion_tokens;
+  const n = tokensAtLast(r);
   if (!n || n <= 0) return null;
   const d = n - Math.max(0, r.first_tokens);
   return d > 0 ? d : null;
@@ -113,14 +123,14 @@ export function prefillTokPerS(r: StrandResult): number | null {
 }
 
 /**
- * Wave aggregate, wall-clock: Σ completion_tokens (ok strands) / (max t_last − min t_start).
+ * Wave aggregate, wall-clock: Σ tokens at t_last (ok strands) / (max t_last − min t_start).
  * Spans every strand's prefill and the slowest strand's tail, so at ×N it can read below ×1
  * when one straggler decodes alone at the end.
  */
 export function aggregateTokPerS(results: StrandResult[]): number | null {
   const ok = results.filter((r) => r.ok && r.t_last !== null);
   if (!ok.length) return null;
-  const tokens = ok.reduce((a, r) => a + (r.completion_tokens || 0), 0);
+  const tokens = ok.reduce((a, r) => a + (tokensAtLast(r) || 0), 0);
   const span = (Math.max(...ok.map((r) => r.t_last as number)) - Math.min(...ok.map((r) => r.t_start))) / 1000;
   return span > 0 && tokens > 0 ? tokens / span : null;
 }

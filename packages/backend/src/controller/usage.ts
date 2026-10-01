@@ -13,8 +13,9 @@ import { getSettings } from "./settings";
  * new engine process (process_start_time_seconds changed, or any counter went
  * backwards) starts from zero, so its whole counter is the delta.
  *
- * vLLM always exports these; SGLang needs --enable-metrics and llama-server needs
- * --metrics (llama.cpp has no request counter, so its calls stay 0).
+ * vLLM and TensorFold always export these; SGLang needs --enable-metrics and
+ * llama-server needs --metrics (L.A.I.L launches both with it; llama.cpp has no request
+ * counter, so its calls stay 0).
  */
 
 export type Totals = { prompt: number; completion: number; requests: number };
@@ -30,11 +31,16 @@ const SERIES: Record<string, keyof Totals> = {
   "sglang:num_requests_total": "requests",
   "llamacpp:prompt_tokens_total": "prompt",
   "llamacpp:tokens_predicted_total": "completion",
+  // TensorFold counts a request's tokens when it finishes; the latency histogram's count is
+  // its finished requests.
+  "tensorfold:prompt_tokens_total": "prompt",
+  "tensorfold:generation_tokens_total": "completion",
+  "tensorfold:request_latency_seconds_count": "requests",
 };
 
 export const USAGE_SAMPLE_MS = 15_000;
 
-/** `unlabeled` names the model for series without a model_name label (llama.cpp). */
+/** `unlabeled` names the model for series without a model_name label (llama.cpp, TensorFold). */
 export function parseEngineCounters(text: string, unlabeled = "unknown"): EngineCounters {
   const models = new Map<string, Totals>();
   let startTime: number | null = null;
@@ -143,7 +149,8 @@ export async function sampleUsage(): Promise<void> {
       const r = await fetch(`${base}/metrics`, { signal: AbortSignal.timeout(3000) });
       if (!r.ok) continue;
       const text = await r.text();
-      const unlabeled = text.includes("llamacpp:") ? ((await servedModelId(base)) ?? kind) : kind;
+      // llama.cpp and TensorFold series carry no model label: name them by what is served.
+      const unlabeled = /^(llamacpp|tensorfold):/m.test(text) ? ((await servedModelId(base)) ?? kind) : kind;
       const counters = parseEngineCounters(text, unlabeled);
       if (counters.models.size) recordCounters(base, counters);
     } catch {

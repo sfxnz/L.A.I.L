@@ -5,7 +5,7 @@ import { config } from "../config";
 import { RATE_WINDOW_MS, StreamsEngine, Subscriber, arrivalDelays, strandWindowRate } from "./engine";
 import { createStreamsRoutes } from "./routes";
 import { assignPrompts, getPack, listPacks, strandSystemPrompt } from "./packs";
-import { parseMetrics, serverDelta } from "./probes";
+import { parseMetrics, serverDelta, serverLoad } from "./probes";
 import { SseParser } from "./sse-parser";
 
 // ── Mock OpenAI server: reasoning + content deltas, finish_reason, trailing usage frame ──
@@ -808,7 +808,7 @@ describe("live rates and fan-out", () => {
           `vllm:num_preemptions_total{engine="0",model_name="m"} 0.0`,
         ].join("\n"),
       );
-    expect(m(0, 2)["vllm:num_requests_running"]).toBe(3); // summed over label sets
+    expect(m(0, 2).running).toBe(3); // summed over label sets
     expect(serverDelta(m(0, 0), m(100, 0))).toEqual({
       spec_acceptance: 0.667,
       spec_tokens_per_step: 3,
@@ -817,6 +817,22 @@ describe("live rates and fan-out", () => {
       preemptions: 0,
     });
     expect(serverDelta(null, m(1, 0))).toBeNull();
+  });
+
+  test("SGLang, llama.cpp and TensorFold /metrics map onto the same bench keys", () => {
+    const sgl = parseMetrics(
+      [
+        'sglang:num_running_reqs{model_name="m",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 2.0',
+        'sglang:num_queue_reqs{model_name="m",engine_type="unified",tp_rank="0",pp_rank="0",moe_ep_rank="0"} 1.0',
+        'sglang:time_to_first_token_seconds_sum{model_name="m",engine_type="unified",is_streaming="true"} 2.0',
+        'sglang:time_to_first_token_seconds_count{model_name="m",engine_type="unified",is_streaming="true"} 8.0',
+        'sglang:time_to_first_token_seconds_count{model_name="m",engine_type="unified",is_streaming="false"} 2.0',
+      ].join("\n"),
+    );
+    expect(serverLoad(sgl)).toBe(3); // foreign load is detected on SGLang too
+    expect(sgl.ttft_count).toBe(10); // summed across is_streaming
+    expect(serverLoad(parseMetrics("llamacpp:requests_processing 1\nllamacpp:requests_deferred 2\n"))).toBe(3);
+    expect(serverLoad(parseMetrics("tensorfold:requests_running 1\ntensorfold:requests_waiting 0\n"))).toBe(1);
   });
 
   test("energy is integrated only when every node's power was re-read during the run", async () => {

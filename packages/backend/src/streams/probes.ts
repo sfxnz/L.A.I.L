@@ -1,42 +1,76 @@
 /**
- * What a bench reads besides its own streams: vLLM `/metrics` (foreign load and the
- * server's per-level view), the serve-engine status snapshot (serve fingerprint, node
- * temperature / power / memory), and the serve-engine bench lease. Every probe is
- * best-effort: a server that does not expose it yields null, never a failed run.
+ * What a bench reads besides its own streams: the engine's `/metrics` (foreign load and
+ * the server's per-level view — vLLM, SGLang, llama.cpp or TensorFold names, mapped onto
+ * one set of keys), the serve-engine status snapshot (serve fingerprint, node temperature
+ * / power / memory), and the serve-engine bench lease. Every probe is best-effort: a
+ * server that does not expose it yields null, never a failed run.
  */
 import type { BenchHardware, BenchHardwareNode, ServerLevelMetrics } from "@lail/shared";
 import { config } from "../config";
 
-const COUNTERS = [
-  "vllm:num_requests_running",
-  "vllm:num_requests_waiting",
-  "vllm:spec_decode_num_accepted_tokens_total",
-  "vllm:spec_decode_num_draft_tokens_total",
-  "vllm:spec_decode_num_drafts_total",
-  "vllm:time_to_first_token_seconds_sum",
-  "vllm:time_to_first_token_seconds_count",
-  "vllm:request_prefill_kv_computed_tokens_sum",
-  "vllm:request_prefill_time_seconds_sum",
-  "vllm:num_preemptions_total",
-] as const;
+/** Engine series → bench key. Each engine exposes at most one name per key. */
+const SERIES: Record<string, keyof MetricSample> = {
+  "vllm:num_requests_running": "running",
+  "sglang:num_running_reqs": "running",
+  "llamacpp:requests_processing": "running",
+  "tensorfold:requests_running": "running",
+  "vllm:num_requests_waiting": "waiting",
+  "sglang:num_queue_reqs": "waiting",
+  "llamacpp:requests_deferred": "waiting",
+  "tensorfold:requests_waiting": "waiting",
+  "vllm:spec_decode_num_accepted_tokens_total": "spec_accepted",
+  "llamacpp:spec_decode_num_accepted_tokens_total": "spec_accepted",
+  "tensorfold:mtp_accepted_total": "spec_accepted",
+  "vllm:spec_decode_num_draft_tokens_total": "spec_drafted",
+  "llamacpp:spec_decode_num_draft_tokens_total": "spec_drafted",
+  "tensorfold:mtp_drafted_total": "spec_drafted",
+  "vllm:spec_decode_num_drafts_total": "spec_drafts",
+  "llamacpp:spec_decode_num_drafts_total": "spec_drafts",
+  "vllm:time_to_first_token_seconds_sum": "ttft_sum",
+  "sglang:time_to_first_token_seconds_sum": "ttft_sum",
+  "tensorfold:time_to_first_token_seconds_sum": "ttft_sum",
+  "vllm:time_to_first_token_seconds_count": "ttft_count",
+  "sglang:time_to_first_token_seconds_count": "ttft_count",
+  "tensorfold:time_to_first_token_seconds_count": "ttft_count",
+  // Computed (uncached) prompt tokens and the time spent on them.
+  "vllm:request_prefill_kv_computed_tokens_sum": "prefill_tokens",
+  "llamacpp:prompt_tokens_total": "prefill_tokens",
+  "vllm:request_prefill_time_seconds_sum": "prefill_seconds",
+  "llamacpp:prompt_seconds_total": "prefill_seconds",
+  "vllm:num_preemptions_total": "preemptions",
+};
 
-export type MetricSample = Partial<Record<(typeof COUNTERS)[number], number>>;
+export type MetricSample = Partial<
+  Record<
+    | "running"
+    | "waiting"
+    | "spec_accepted"
+    | "spec_drafted"
+    | "spec_drafts"
+    | "ttft_sum"
+    | "ttft_count"
+    | "prefill_tokens"
+    | "prefill_seconds"
+    | "preemptions",
+    number
+  >
+>;
 
-/** Prometheus text → the counters above, summed over label sets (one per engine / model). */
+/** Prometheus text → the bench keys, summed over label sets (one per engine / model / is_streaming). */
 export function parseMetrics(text: string): MetricSample {
-  const want = new Set<string>(COUNTERS);
-  const out: Record<string, number> = {};
+  const out: MetricSample = {};
   for (const line of text.split("\n")) {
     if (!line || line.startsWith("#")) continue;
     const brace = line.indexOf("{");
     const space = line.lastIndexOf(" ");
     if (space < 0) continue;
     const name = brace >= 0 && brace < space ? line.slice(0, brace) : line.slice(0, space);
-    if (!want.has(name)) continue;
+    const key = SERIES[name];
+    if (!key) continue;
     const v = Number(line.slice(space + 1));
-    if (Number.isFinite(v)) out[name] = (out[name] ?? 0) + v;
+    if (Number.isFinite(v)) out[key] = (out[key] ?? 0) + v;
   }
-  return out as MetricSample;
+  return out;
 }
 
 export async function scrapeMetrics(baseUrl: string, signal?: AbortSignal): Promise<MetricSample | null> {
@@ -53,8 +87,8 @@ export async function scrapeMetrics(baseUrl: string, signal?: AbortSignal): Prom
 /** Requests the server holds (running + waiting); null when it does not report them. */
 export function serverLoad(m: MetricSample | null): number | null {
   if (!m) return null;
-  const run = m["vllm:num_requests_running"];
-  const wait = m["vllm:num_requests_waiting"];
+  const run = m.running;
+  const wait = m.waiting;
   return run === undefined && wait === undefined ? null : (run ?? 0) + (wait ?? 0);
 }
 
@@ -69,20 +103,20 @@ const round = (v: number | null, digits: number) => (v === null ? null : Math.ro
 /** Server-side deltas between two scrapes bracketing a level. */
 export function serverDelta(before: MetricSample | null, after: MetricSample | null): ServerLevelMetrics | null {
   if (!before || !after) return null;
-  const accepted = delta(before, after, "vllm:spec_decode_num_accepted_tokens_total");
-  const drafted = delta(before, after, "vllm:spec_decode_num_draft_tokens_total");
-  const drafts = delta(before, after, "vllm:spec_decode_num_drafts_total");
+  const accepted = delta(before, after, "spec_accepted");
+  const drafted = delta(before, after, "spec_drafted");
+  const drafts = delta(before, after, "spec_drafts");
   const perStep = ratio(accepted, drafts);
-  const ttft = ratio(delta(before, after, "vllm:time_to_first_token_seconds_sum"), delta(before, after, "vllm:time_to_first_token_seconds_count"));
+  const ttft = ratio(delta(before, after, "ttft_sum"), delta(before, after, "ttft_count"));
   return {
     spec_acceptance: round(ratio(accepted, drafted), 3),
     spec_tokens_per_step: perStep === null ? null : round(1 + perStep, 2),
     ttft_mean_ms: ttft === null ? null : round(ttft * 1000, 1),
     prefill_tok_s: round(
-      ratio(delta(before, after, "vllm:request_prefill_kv_computed_tokens_sum"), delta(before, after, "vllm:request_prefill_time_seconds_sum")),
+      ratio(delta(before, after, "prefill_tokens"), delta(before, after, "prefill_seconds")),
       1,
     ),
-    preemptions: delta(before, after, "vllm:num_preemptions_total"),
+    preemptions: delta(before, after, "preemptions"),
   };
 }
 

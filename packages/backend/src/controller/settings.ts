@@ -12,12 +12,13 @@ function defaults(): LabSettings {
   };
 }
 
-/** Strip legacy backends (ollama, lmstudio, custom) from stored settings. */
+/** Keep the known engines (config.backends); strip legacy ones (ollama, lmstudio, custom). */
 function sanitize(raw: Partial<LabSettings> & { backends?: Record<string, unknown> }): LabSettings {
   const base = defaults();
   const backends = { ...base.backends };
+  const kinds = Object.keys(base.backends) as BackendKind[];
   if (raw.backends) {
-    for (const k of ["vllm", "llamacpp"] as BackendKind[]) {
+    for (const k of kinds) {
       const b = raw.backends[k] as LabSettings["backends"][BackendKind] | undefined;
       if (b && typeof b === "object") {
         backends[k] = {
@@ -28,10 +29,9 @@ function sanitize(raw: Partial<LabSettings> & { backends?: Record<string, unknow
       }
     }
   }
-  let defaultBackend: BackendKind =
-    raw.defaultBackend === "llamacpp" || raw.defaultBackend === "vllm"
-      ? raw.defaultBackend
-      : base.defaultBackend;
+  let defaultBackend: BackendKind = kinds.includes(raw.defaultBackend as BackendKind)
+    ? (raw.defaultBackend as BackendKind)
+    : base.defaultBackend;
   // Migrate old default ollama → vllm
   if ((raw.defaultBackend as string) === "ollama" || (raw.defaultBackend as string) === "lmstudio") {
     defaultBackend = "vllm";
@@ -78,7 +78,7 @@ export function backendBaseUrl(kind?: BackendKind): string {
 
 export function openAiBase(kind?: BackendKind): string {
   const base = backendBaseUrl(kind).replace(/\/$/, "");
-  // vLLM and llama.cpp server both expose OpenAI API under /v1
+  // Every engine (vLLM, SGLang, llama.cpp, TensorFold) serves the OpenAI API under /v1
   if (base.endsWith("/v1")) return base;
   return `${base}/v1`;
 }

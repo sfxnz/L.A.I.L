@@ -169,7 +169,7 @@ describe("sampleUsage", () => {
   });
 
   test("scrapes each enabled backend's /metrics and skips the ones that are down", async () => {
-    const { vllm, llamacpp } = getSettings().backends;
+    const { vllm, sglang, llamacpp, tensorfold } = getSettings().backends;
     const vllmMetrics = `${vllm.url.replace(/\/$/, "")}/metrics`;
     const seen: string[] = [];
     globalThis.fetch = (async (url: string) => {
@@ -178,7 +178,7 @@ describe("sampleUsage", () => {
       throw new Error("ECONNREFUSED");
     }) as unknown as typeof fetch;
     await sampleUsage();
-    expect(seen).toEqual([vllmMetrics, `${llamacpp.url.replace(/\/$/, "")}/metrics`]);
+    expect(seen).toEqual([vllmMetrics, ...[sglang, llamacpp, tensorfold].map((b) => `${b.url.replace(/\/$/, "")}/metrics`)]);
     expect(getUsageSummary().lifetimeCompletion).toBe(4829);
   });
 
@@ -193,6 +193,23 @@ describe("sampleUsage", () => {
     }) as unknown as typeof fetch;
     await sampleUsage();
     expect(getUsageSummary().topModels).toEqual([{ model: "gemma-3-4b-q8.gguf", tokens: 42, calls: 0 }]);
+  });
+
+  test("TensorFold usage: finished-request counters, attributed to the served model", async () => {
+    const { tensorfold } = getSettings().backends;
+    const tf = tensorfold.url.replace(/\/$/, "").replace(/\/v1$/, "");
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u === `${tf}/metrics`)
+        return new Response(
+          "tensorfold:requests_running 0\ntensorfold:prompt_tokens_total 800\ntensorfold:generation_tokens_total 100\n" +
+            "tensorfold:request_latency_seconds_count 2\n",
+        );
+      if (u === `${tf}/v1/models`) return Response.json({ data: [{ id: "zai-org/GLM-5.3-Flash", owned_by: "tensorfold" }] });
+      throw new Error(`ECONNREFUSED ${u}`);
+    }) as unknown as typeof fetch;
+    await sampleUsage();
+    expect(getUsageSummary().topModels).toEqual([{ model: "zai-org/GLM-5.3-Flash", tokens: 900, calls: 2 }]);
   });
 });
 

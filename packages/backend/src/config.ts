@@ -1,3 +1,4 @@
+import type { BackendKind, LabSettings } from "@lail/shared";
 import { resolve, join } from "path";
 
 const root = resolve(process.env.LAIL_ROOT || join(import.meta.dir, "../../.."));
@@ -21,7 +22,7 @@ export const config = {
     process.env.LAIL_DB_PATH ||
       join(process.env.LAIL_DATA_DIR || join(root, "data"), "lail.sqlite"),
   ),
-  defaultBackend: (process.env.LAIL_DEFAULT_BACKEND || "vllm") as "vllm" | "llamacpp",
+  defaultBackend: (process.env.LAIL_DEFAULT_BACKEND || "vllm") as BackendKind,
   defaultModel: process.env.LAIL_DEFAULT_MODEL || "auto",
   backends: {
     vllm: {
@@ -29,12 +30,23 @@ export const config = {
       enabled: true,
       label: "vLLM",
     },
+    sglang: {
+      url: process.env.LAIL_SGLANG_URL || "http://127.0.0.1:30000",
+      enabled: true,
+      label: "SGLang",
+    },
     llamacpp: {
       url: process.env.LAIL_LLAMACPP_URL || "http://127.0.0.1:8080",
       enabled: true,
       label: "llama.cpp",
     },
-  },
+    // Upstream TensorFold defaults to :8080 (llama.cpp's); L.A.I.L launches it on :8090.
+    tensorfold: {
+      url: process.env.LAIL_TENSORFOLD_URL || "http://127.0.0.1:8090",
+      enabled: true,
+      label: "TensorFold",
+    },
+  } satisfies LabSettings["backends"],
   /** Internet Funnel origin (legacy) — prefer shareSiteBase for X */
   sharePublicBase: (process.env.LAIL_SHARE_PUBLIC_BASE || "").replace(/\/$/, ""),
   /** GitHub Pages / static site origin, e.g. https://user.github.io/dgx-lab */

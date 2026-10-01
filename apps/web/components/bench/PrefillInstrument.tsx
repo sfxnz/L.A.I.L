@@ -10,6 +10,7 @@ import { sustainedArm, type PrefillResult } from "@/lib/bench/result";
 import type { StrandView, StreamRunState } from "@/lib/use-stream-run";
 import { Callout, Eyebrow, Nil, SyncRing } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import { useNow } from "./Clock";
 import type { InstrumentStatus } from "./DecodeInstrument";
 import { PrefillDetails } from "./DetailsTable";
 import { HardwareStrip } from "./HardwareStrip";
@@ -37,7 +38,6 @@ export function PrefillInstrument({
   live,
   result,
   fromHistory,
-  now,
   hardware,
   errorMessage,
   onRunAgain,
@@ -51,7 +51,6 @@ export function PrefillInstrument({
   live: StreamRunState | null;
   result: PrefillResult | null;
   fromHistory: boolean;
-  now: number;
   hardware: HardwareSeries[];
   errorMessage: string | null;
   onRunAgain: () => void;
@@ -61,6 +60,8 @@ export function PrefillInstrument({
   busy: boolean;
 }) {
   const running = status === "running" || status === "starting";
+  // The fill bars and the TTFT stopwatch animate: this instrument owns its clock.
+  const now = useNow(running);
   const sizes = live?.hello?.sizes ?? result?.sizes ?? cfg.sizes;
   const rows = live?.levels ?? [];
   // Skipped sizes report immediately, so "current" is the first size without a row.
@@ -68,8 +69,20 @@ export function PrefillInstrument({
   const cur = firstOpen < 0 ? Math.max(0, sizes.length - 1) : firstOpen;
   const strands = live?.strands ?? [];
   const starts = usePrefillStarts(strands);
-  const curStrand = strands.find((s) => s.level === cur);
+  // Each size runs `samples` requests in turn: per size, show the one in flight (else the last).
+  const shown = useMemo(() => {
+    const out: StrandView[] = [];
+    for (let i = 0; i < sizes.length; i++) {
+      const own = strands.filter((s) => s.level === i);
+      const open = own.find((s) => s.state === "waiting" || s.state === "prefill" || s.state === "decode");
+      const pick = own.find((s) => s.state === "prefill" || s.state === "decode") ?? (own.every((s) => s.state === "waiting") ? open : own.filter((s) => s.state !== "waiting").pop());
+      if (pick) out.push(pick);
+    }
+    return out;
+  }, [strands, sizes.length]);
+  const curStrand = shown.find((s) => s.level === cur);
   const curStart = curStrand ? (starts.get(curStrand.i) ?? null) : null;
+  const curRequestsLeft = strands.filter((s) => s.level === cur && s.state === "waiting" && s !== curStrand).length;
 
   const measured: MeasuredSize[] = rows.filter((r) => !r.skipped && r.ok > 0).map((r) => ({ size: r.size ?? 0, ttftMs: r.ttft_p50_ms }));
   const skipped = new Set(rows.filter((r) => r.skipped).map((r) => r.size ?? 0));
@@ -77,6 +90,7 @@ export function PrefillInstrument({
 
   const startedAt = live?.hello ? Date.parse(live.hello.started_at) : null;
   const elapsedMs = running && startedAt ? Math.max(0, now - startedAt) : (result?.durationMs ?? live?.done?.summary.duration_ms ?? null);
+  const samples = live?.hello?.samples ?? 1;
 
   const [eta, setEta] = useState<number | null>(null);
   const etaKey = live?.hello?.run_id ?? null;
@@ -93,7 +107,8 @@ export function PrefillInstrument({
       sizes,
       measured,
       skipped,
-      current: firstOpen >= 0 ? { size: sizes[cur], elapsedMs: curStart !== null ? now - curStart : 0 } : null,
+      samples,
+      current: firstOpen >= 0 ? { size: sizes[cur], elapsedMs: curStart !== null ? now - curStart : 0, requestsLeft: curRequestsLeft } : null,
     });
     setEta((shown) => reviseEta(shown, next));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -140,7 +155,10 @@ export function PrefillInstrument({
     }
   })();
 
-  const step = running && live?.hello && firstOpen >= 0 ? `${fmtSize(sizes[cur])} · Level ${cur + 1} of ${sizes.length}` : null;
+  const step =
+    running && live?.hello && firstOpen >= 0
+      ? `${fmtSize(sizes[cur])} · Level ${cur + 1} of ${sizes.length}${samples > 1 && curStrand?.wave !== undefined ? ` · request ${curStrand.wave + 1}/${samples}` : ""}`
+      : null;
   const stopwatch = running && curStart !== null && curStrand && curStrand.state === "prefill" ? now - curStart : null;
 
   return (
@@ -165,7 +183,7 @@ export function PrefillInstrument({
       )}
 
       {running && (
-        <PrefillFillBars sizes={sizes} rows={rows} strands={strands} current={cur} predicted={predicted} now={now} startedAt={curStart} />
+        <PrefillFillBars sizes={sizes} rows={rows} strands={shown} current={cur} predicted={predicted} now={now} startedAt={curStart} />
       )}
 
       {showResult && result && interp && (

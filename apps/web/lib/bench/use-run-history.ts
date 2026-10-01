@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type RunRow } from "../api";
 import type { StreamRunRow } from "../stream-run-types";
+import { previousComparable } from "./last-sync";
 import { headlineFromIndex, headlineFromResult, resultFromEnvelope, resultFromSnapshot, type BenchResult } from "./result";
 
 /**
@@ -130,16 +131,39 @@ export function useRunHistory(kind: "decode" | "prefill", limit = 12) {
   return { entries, loading, refresh };
 }
 
-/** Most recent earlier run of the same pack (and model) — the ghost behind a result. */
-export function previousOf(entries: HistoryEntry[], current: { id: string | null; savedRunId: string | null; pack: string; model: string; createdAt: string | null } | null): HistoryEntry | null {
-  if (!current) return null;
-  for (const e of entries) {
-    if (!e.result) continue;
-    if (e.id === current.id || e.id === current.savedRunId) continue;
-    if (current.createdAt && e.createdAt > current.createdAt) continue;
-    if (e.result.pack !== current.pack) continue;
-    if (current.model && e.result.model && e.result.model !== current.model) continue;
-    return e;
-  }
-  return null;
+/** How far back the ghost looks for a like-for-like run — the window Status's delta uses. */
+const PREVIOUS_LOOKBACK = 100;
+
+/**
+ * The ghost behind a decode result: the newest earlier run that is like for like
+ * (`comparable`), searched over the last PREVIOUS_LOOKBACK decode runs of the index —
+ * not the history strand's dozen, so runs of other models or packs in between do not
+ * push the baseline out of reach. Only that one envelope is loaded.
+ */
+export function usePreviousRun(current: BenchResult | null): HistoryEntry | null {
+  const [prev, setPrev] = useState<HistoryEntry | null>(null);
+  const cur = current?.kind === "decode" ? current : null;
+  // Re-search only when what defines "previous" changes, not on every live level event.
+  const key = cur
+    ? JSON.stringify({ id: cur.id, savedRunId: cur.savedRunId, model: cur.model, pack: cur.pack, maxTokens: cur.maxTokens, fingerprint: cur.fingerprint, createdAt: cur.createdAt })
+    : null;
+  useEffect(() => {
+    setPrev(null);
+    if (!key) return;
+    const c = JSON.parse(key) as Parameters<typeof previousComparable>[1];
+    let live = true;
+    api
+      .runs({ kind: "decode", limit: PREVIOUS_LOOKBACK })
+      .then(async (rows) => {
+        const row = previousComparable(rows, c);
+        if (!row) return;
+        const l = await loadEntry(row.run_id, "engine");
+        if (live) setPrev({ ...fromIndex(row), result: l.result, envelope: l.envelope });
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  return prev;
 }

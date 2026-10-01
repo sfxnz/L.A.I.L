@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { api, streamRunEventsUrl } from "./api";
 import { useLabStatusStore, type LiveRun } from "./lab-status-store";
 import {
@@ -18,8 +18,9 @@ import { STALL_MS } from "./streams/stalls";
 
 /**
  * Client side of the A2 SSE protocol: one EventSource per run, a pure reducer
- * over the event union, DOM updates batched per animation frame, and a
- * snapshot re-hydrate when the stream drops. Text per strand is a ring buffer
+ * over the event union, DOM updates batched per animation frame (a timer while
+ * the tab is hidden, where rAF does not run), and a snapshot re-hydrate when the
+ * stream drops. Text per strand is a ring buffer
  * (8k chars); reasoning is kept in its own buffer so the card can dim it.
  *
  * Every action may carry `at` — the client `performance.now()` stamp of its
@@ -31,6 +32,11 @@ import { STALL_MS } from "./streams/stalls";
 
 export const TEXT_RING_CHARS = 8_192;
 export const AGG_WINDOW_MS = 60_000;
+/** Decode steps a strand keeps (matches the engine). */
+export const STEP_KEEP = 100;
+/** Hidden tab: flush the queue on this timer (rAF is paused); also the cap before a forced flush. */
+export const HIDDEN_FLUSH_MS = 500;
+export const QUEUE_FLUSH_AT = 500;
 
 export type StrandView = {
   i: number;
@@ -39,6 +45,8 @@ export type StrandView = {
   prompt: string;
   /** bench modes: index into hello.levels / hello.sizes */
   level?: number;
+  /** bench modes: repeat (wave) of its level */
+  wave?: number;
   state: StrandState;
   text: string;
   reasoning: string;
@@ -46,13 +54,17 @@ export type StrandView = {
   chunks: number;
   /** Σ upstream chunks that were reasoning. */
   reasoning_chunks: number;
+  /** Σ tokens that were reasoning (exact with per-chunk usage). */
+  reasoning_tokens: number;
   ttft_ms?: number;
   tokens?: number;
   tok_s?: number;
   peak_tok_s?: number;
   finish_reason?: string;
   error?: string;
-  itl_ms?: number[];
+  /** Last ≤100 decode steps: gap (ms) and the tokens each carried (see StreamStrandEvent). */
+  step_ms?: number[];
+  step_tokens?: number[];
   /** Client stamps of the transitions this client observed. */
   at_prefill?: number;
   at_decode?: number;
@@ -60,8 +72,10 @@ export type StrandView = {
   at_last_delta?: number;
   /** Inter-delta gaps ≥ STALL_MS this client observed (client stamps). */
   stalls: Array<{ from: number; to: number }>;
-  /** (at, cumulative chunks) behind the live per-strand rate. */
+  /** (at, cumulative tokens) behind the live per-strand split of the aggregate. */
   samples: RateSample[];
+  /** Σ tokens seen in deltas (the samples' counter). */
+  delta_tokens: number;
 };
 
 export type AggPoint = Omit<StreamAggEvent, "type"> & {
@@ -123,8 +137,10 @@ function blankStrand(i: number): StrandView {
     reasoning: "",
     chunks: 0,
     reasoning_chunks: 0,
+    reasoning_tokens: 0,
     stalls: [],
     samples: [],
+    delta_tokens: 0,
   };
 }
 
@@ -184,6 +200,7 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
         pack: p.pack,
         prompt: p.text,
         level: p.level,
+        wave: p.wave,
       }));
       return { ...state, hello, strands, hello_at: at ?? state.hello_at };
     }
@@ -192,16 +209,19 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
       return {
         ...state,
         strands: withStrand(state.strands, action.i, (s) => {
-          const chunks = s.chunks + action.chunks;
+          const tokens = action.tokens ?? action.chunks;
+          const deltaTokens = s.delta_tokens + tokens;
           const next: StrandView = {
             ...s,
-            chunks,
+            chunks: s.chunks + action.chunks,
             reasoning_chunks: action.reasoning ? s.reasoning_chunks + action.chunks : s.reasoning_chunks,
+            reasoning_tokens: action.reasoning ? s.reasoning_tokens + tokens : s.reasoning_tokens,
+            delta_tokens: deltaTokens,
             text: action.reasoning ? s.text : appendRing(s.text, action.text),
             reasoning: action.reasoning ? appendRing(s.reasoning, action.text) : s.reasoning,
           };
           if (at !== undefined) {
-            next.samples = pushSample(s.samples, at, chunks);
+            next.samples = pushSample(s.samples, at, deltaTokens);
             if (s.at_last_delta !== undefined && at - s.at_last_delta >= STALL_MS) {
               next.stalls = [...s.stalls, { from: s.at_last_delta, to: at }];
             }
@@ -212,11 +232,19 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
       };
     }
     case "strand": {
-      const { type: _t, at, i, ...rest } = action;
+      const { type: _t, at, i, steps_append, step_ms, step_tokens, ...rest } = action;
       void _t;
       return {
         ...state,
-        strands: withStrand(state.strands, i, (s) => stampTransition({ ...s, ...rest }, rest.state, at)),
+        strands: withStrand(state.strands, i, (s) => {
+          const next: StrandView = { ...s, ...rest };
+          if (step_ms) {
+            // Live emits carry only the steps since the previous one; terminal emits all of them.
+            next.step_ms = (steps_append ? [...(s.step_ms ?? []), ...step_ms] : step_ms).slice(-STEP_KEEP);
+            next.step_tokens = (steps_append ? [...(s.step_tokens ?? []), ...(step_tokens ?? [])] : (step_tokens ?? [])).slice(-STEP_KEEP);
+          }
+          return stampTransition(next, rest.state, at);
+        }),
       };
     }
     case "agg": {
@@ -226,7 +254,7 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
       let clock = state.clock;
       if (at !== undefined) {
         clock = { t_ms: point.t_ms, at };
-        const rates = state.strands.map((s) => windowRate(s.samples, at, point.tokens_per_chunk || 1));
+        const rates = state.strands.map((s) => windowRate(s.samples, at));
         const active = state.strands.map((s) => ACTIVE.has(s.state));
         point.strand_tok_s = stackShares(rates, point.tok_s, active);
       }
@@ -258,9 +286,11 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
         pack: p.pack,
         prompt: p.text,
         level: p.level,
+        wave: p.wave,
       }));
       for (const s of snap.strands) {
-        const { text, reasoning_text, ...rest } = s;
+        const { text, reasoning_text, steps_append: _a, ...rest } = s;
+        void _a;
         strands = withStrand(strands, s.i, (cur) =>
           stampTransition(
             {
@@ -272,6 +302,8 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
               reasoning_chunks: text.length + reasoning_text.length
                 ? Math.round((s.chunks * reasoning_text.length) / (text.length + reasoning_text.length))
                 : 0,
+              reasoning_tokens: s.reasoning_tokens ?? 0,
+              delta_tokens: s.tokens ?? 0,
             },
             s.state,
             at,
@@ -300,6 +332,16 @@ export function streamRunReducer(state: StreamRunState, action: StreamRunAction)
 const EVENT_TYPES = new Set<string>(STREAM_EVENT_TYPES);
 
 /**
+ * When to reduce the queued events: at the next animation frame normally; on a timer
+ * while the tab is hidden (browsers pause rAF there, and the queue would grow for the
+ * whole run); at once when a backlog has built up.
+ */
+export function flushPlan(queued: number, hidden: boolean): "now" | "timer" | "frame" {
+  if (queued >= QUEUE_FLUSH_AT) return "now";
+  return hidden ? "timer" : "frame";
+}
+
+/**
  * What the header's instrument strip shows while this run is live: the run's
  * own aggregate (the number Streams/Bench display), not the endpoint counter
  * rate. Null once the run is done, errored, or detached.
@@ -316,6 +358,10 @@ export function liveRunOf(state: StreamRunState): LiveRun | null {
   };
 }
 
+/**
+ * One EventSource for `runId`. Read-only: stopping a run is `api.stopStreamRun`,
+ * never a side effect of detaching from it.
+ */
 export function useStreamRun(runId: string | null) {
   const [state, setState] = useState<StreamRunState>(initialStreamRunState);
 
@@ -335,19 +381,30 @@ export function useStreamRun(runId: string | null) {
 
     const queue: StreamRunAction[] = [];
     let raf = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     let terminal = false;
     const es = new EventSource(streamRunEventsUrl(runId));
 
     const flush = () => {
+      if (raf) cancelAnimationFrame(raf);
+      if (timer) clearTimeout(timer);
       raf = 0;
+      timer = null;
       const batch = queue.splice(0);
       if (batch.length) setState((s) => batch.reduce(streamRunReducer, s));
-      if (terminal) es.close(); // the server ended the run; don't let EventSource auto-reconnect
     };
     const push = (a: StreamRunAction) => {
       queue.push(a);
-      if (a.type === "done" || a.type === "error") terminal = true;
-      if (!raf) raf = requestAnimationFrame(flush);
+      if (a.type === "done" || a.type === "error") {
+        // The server ended the run: close now (no EventSource auto-reconnect), not at the next frame.
+        terminal = true;
+        es.close();
+      }
+      const plan = flushPlan(queue.length, document.hidden);
+      if (plan === "now") flush();
+      else if (plan === "timer") {
+        if (!timer) timer = setTimeout(flush, HIDDEN_FLUSH_MS);
+      } else if (!raf) raf = requestAnimationFrame(flush);
     };
     const parse = (raw: string, type?: string) => {
       try {
@@ -381,10 +438,9 @@ export function useStreamRun(runId: string | null) {
     return () => {
       es.close();
       if (raf) cancelAnimationFrame(raf);
+      if (timer) clearTimeout(timer);
     };
   }, [runId]);
 
-  const stop = useCallback(() => (runId ? api.stopStreamRun(runId) : Promise.resolve({ ok: false })), [runId]);
-
-  return { state, stop };
+  return { state };
 }

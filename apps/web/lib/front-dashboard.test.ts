@@ -13,25 +13,30 @@ import { Nil } from "../components/ui";
 import type { ClusterNode, RunRow } from "./api";
 import { lastSync, latestDecodeRuns } from "./bench/last-sync";
 import { CONCURRENCY_LEVELS, PACK_LABELS, sortConcurrencies } from "./bench/levels";
-import { decodeRunLabel, type DecodeResult } from "./bench/result";
+import type { DecodeResult } from "./bench/result";
 
 const webRoot = join(import.meta.dir, "..");
 
-const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}): RunRow => ({
+const MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4";
+const row = (run_id: string, created_at: string, kind: string, summary: Record<string, unknown> = {}, model_id = MODEL): RunRow => ({
   run_id,
   created_at,
   kind,
   intent: null,
-  model_id: "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  model_id,
   summary,
   path: `${run_id}.json`,
 });
-const HEADLINE = (c1: number, peak: number, at: number) => ({
+/** Index summary as the controller writes it: headline + comparability keys. */
+const HEADLINE = (c1: number, peak: number, at: number, over: Record<string, unknown> = {}) => ({
   decode_tok_per_s_median_c1: c1,
   aggregate_peak_tok_per_s: peak,
   aggregate_peak_concurrency: at,
   ttft_p50_s_c1: 0.21,
-  concurrencies: [1, 2, 4],
+  pack: "prose",
+  max_tokens: 512,
+  serve_fingerprint: "8488b677",
+  ...over,
 });
 
 describe("bench domain kept from the retired decode bench", () => {
@@ -45,27 +50,37 @@ describe("bench domain kept from the retired decode bench", () => {
     expect(sortConcurrencies(new Set([16, 1, 4]))).toEqual([1, 4, 16]);
   });
 
-  test("legacy run label reads summary.workload, never perf_workflow", () => {
-    expect(decodeRunLabel({ workload: "structured" })).toBe("Structured");
-    expect(decodeRunLabel({ workload: "perf_workflow" })).toBeNull();
-    expect(decodeRunLabel({ kind: "perf_workflow" })).toBeNull();
-  });
 });
 
 describe("Last synchronization (Status card)", () => {
   const rows = [
     row("old-prefill", "2026-09-06T10:00:00Z", "prefill", { prefill_tok_per_s_sustained: 2874.9 }),
     row("d1", "2026-09-06T11:00:00Z", "decode", HEADLINE(34.2, 71.8, 4)),
+    row("d1b", "2026-09-06T11:10:00Z", "decode", HEADLINE(30.0, 60.0, 4, { max_tokens: 256 })),
+    row("d1c", "2026-09-06T11:20:00Z", "decode", HEADLINE(33.0, 99.0, 4, { serve_fingerprint: "other-flags" })),
     row("tool", "2026-09-06T11:30:00Z", "tool_eval"),
+    row("other", "2026-09-06T11:40:00Z", "decode", HEADLINE(20.0, 40.0, 2), "deepseek-ai/DeepSeek-V4.1-Flash"),
     row("d2", "2026-09-06T12:00:00Z", "decode", HEADLINE(34.0, 80.5, 4)),
   ];
 
-  test("picks the newest decode run and the one before it, ignoring other kinds", () => {
-    expect(latestDecodeRuns(rows).map((r) => r.run_id)).toEqual(["d2", "d1"]);
+  test("newest decode run of the served model; previous = newest earlier comparable run", () => {
+    const { cur, prev } = latestDecodeRuns(rows, MODEL);
+    expect(cur?.run_id).toBe("d2");
+    // d1c (other serve flags) and d1b (256 tokens) are not like for like; the other model never is
+    expect(prev?.run_id).toBe("d1");
+    expect(latestDecodeRuns(rows, "deepseek-ai/DeepSeek-V4.1-Flash")).toEqual({ cur: rows[5], prev: null });
+    expect(latestDecodeRuns(rows, "nobody/serves-this")).toEqual({ cur: null, prev: null });
+    // nothing served: the newest run of any model
+    expect(latestDecodeRuns(rows, null).cur?.run_id).toBe("d2");
+  });
+
+  test("a run without comparability keys (before they were recorded) has no delta", () => {
+    const legacy = [row("a", "2026-09-01T00:00:00Z", "decode", { aggregate_peak_tok_per_s: 50 }), row("b", "2026-09-02T00:00:00Z", "decode", { aggregate_peak_tok_per_s: 60 })];
+    expect(lastSync(legacy, MODEL, { current: null, previous: null })!.delta).toBeNull();
   });
 
   test("hero, delta vs previous and both hrefs come straight from the index rows", () => {
-    const s = lastSync(rows, { current: null, previous: null });
+    const s = lastSync(rows, MODEL, { current: null, previous: null });
     expect(s).not.toBeNull();
     expect(s!.id).toBe("d2");
     expect(s!.peak).toBe(80.5);
@@ -74,14 +89,21 @@ describe("Last synchronization (Status card)", () => {
     // (80.5 − 71.8) / 71.8 = +12.1 %
     expect(s!.delta).toBeCloseTo(0.1212, 3);
     expect(s!.openHref).toBe("/bench?run=d2");
-    expect(s!.runAgainHref).toBe("/bench?tab=decode&pack=prose&levels=1%2C2%2C4&tokens=512");
+    expect(s!.comparedTo).toBe("2026-09-06T11:00:00Z");
+    expect(s!.runAgainHref).toBe("/bench?tab=decode&pack=prose&levels=1%2C2%2C4%2C8&tokens=512");
   });
 
   test("the envelope, when loaded, supplies pack, tokens and arms for the mini curve", () => {
     const arm = (concurrency: number, aggregate: number, perStream: number) => ({
+      samples: 1,
+      foreignMax: 0,
+      server: null,
       concurrency,
       aggregate,
+      steady: aggregate,
+      aggregateRange: null,
       perStream,
+      perStreamRange: null,
       ttftP50: 200,
       ttftP95: 300,
       ttftP99: 350,
@@ -100,11 +122,13 @@ describe("Last synchronization (Status card)", () => {
       createdAt: "2026-09-06T12:00:00Z",
       durationMs: 16000,
       engine: "vllm",
+      fingerprint: "8488b677",
+      hardware: null,
       source: "history",
       levels: [1, 2, 4],
       arms: [arm(1, 34, 34), arm(2, 52, 26), arm(4, 80.5, 20.1)],
     };
-    const s = lastSync(rows, { current, previous: null })!;
+    const s = lastSync(rows, MODEL, { current, previous: null })!;
     expect(s.pack).toBe("code");
     expect(s.arms).toHaveLength(3);
     expect(s.previousArms).toBeNull();
@@ -113,18 +137,20 @@ describe("Last synchronization (Status card)", () => {
   });
 
   test("no decode runs → null; a lone run has no delta", () => {
-    expect(lastSync([rows[0], rows[2]], { current: null, previous: null })).toBeNull();
-    const lone = lastSync([rows[3]], { current: null, previous: null })!;
+    expect(lastSync([rows[0], rows[4]], MODEL, { current: null, previous: null })).toBeNull();
+    const lone = lastSync([rows[6]], MODEL, { current: null, previous: null })!;
     expect(lone.delta).toBeNull();
   });
 
   test("renders the empty state with a Bench CTA, and the hero when a run exists", () => {
-    const empty = renderToStaticMarkup(createElement(LastSyncCard, { runs: [], loading: false }));
-    expect(empty).toContain("No sequences yet. Run a decode sync to draw the first slice.");
+    const empty = renderToStaticMarkup(createElement(LastSyncCard, { runs: [], loading: false, servingModel: null }));
+    expect(empty).toContain("Run a decode sync to draw the first slice.");
     expect(empty).toContain('href="/bench"');
     expect(empty).not.toContain("—");
+    const unbenched = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false, servingModel: "org/new-model" }));
+    expect(unbenched).toContain("No bench for this model yet");
 
-    const html = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false }));
+    const html = renderToStaticMarkup(createElement(LastSyncCard, { runs: rows, loading: false, servingModel: MODEL }));
     expect(html).toContain("Last synchronization");
     expect(html).toContain("80.5");
     expect(html).toContain("peak aggregate @ ×4");

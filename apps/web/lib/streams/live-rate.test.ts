@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { RATE_KEEP_MS, RATE_WINDOW_MS, pushSample, stackShares, windowRate, type RateSample } from "./live-rate";
 
 function series(points: Array<[number, number]>): RateSample[] {
-  return points.reduce<RateSample[]>((acc, [at, chunks]) => pushSample(acc, at, chunks), []);
+  return points.reduce<RateSample[]>((acc, [at, tokens]) => pushSample(acc, at, tokens), []);
 }
 
 describe("per-strand live rate window", () => {
@@ -17,13 +17,20 @@ describe("per-strand live rate window", () => {
     expect(s[0].at).toBeGreaterThanOrEqual(4000 - RATE_KEEP_MS);
   });
 
-  test("steady stream: chunk growth in the window × tokens_per_chunk", () => {
-    // one chunk every 100 ms → 10 chunks/s; MTP model at 2.7 tok/chunk → 27 tok/s
+  test("steady stream: token growth over the time it grew", () => {
+    // a coalesced delta every 100 ms carrying 4 tokens → 40 tok/s
     const pts: Array<[number, number]> = [];
-    for (let k = 0; k <= 30; k++) pts.push([k * 100, k]);
-    const s = series(pts);
-    expect(windowRate(s, 3000, 2.7)).toBeCloseTo(27, 0);
-    expect(windowRate(s, 3000, 1)).toBeCloseTo(10, 0);
+    for (let k = 0; k <= 30; k++) pts.push([k * 100, k * 4]);
+    expect(windowRate(series(pts), 3000)).toBe(40);
+  });
+
+  test("coalesced samples: growth is divided by the time since the baseline sample, not the window", () => {
+    // deltas every 400 ms carrying 20 tokens (50 tok/s). At 3000 the window starts at 1500;
+    // the baseline is the sample at 1200, so 1800 ms of growth (90 tokens) — not 1500 ms.
+    const pts: Array<[number, number]> = [];
+    for (let k = 0; k <= 7; k++) pts.push([k * 400, k * 20]);
+    const s = [...series(pts), { at: 3000, tokens: 150 }];
+    expect(windowRate(s, 3000)).toBe(50);
   });
 
   test("first second reads a rate from the earliest sample instead of zero", () => {
@@ -33,9 +40,9 @@ describe("per-strand live rate window", () => {
       [160, 2],
       [240, 3],
     ]);
-    // 3 chunks over max(250, 240) ms → 12 chunks/s
-    expect(windowRate(s, 240, 1)).toBe(12);
-    expect(windowRate([{ at: 0, chunks: 4 }], 500, 1)).toBe(0);
+    // 3 tokens over max(250, 240) ms → 12 tok/s
+    expect(windowRate(s, 240)).toBe(12);
+    expect(windowRate([{ at: 0, tokens: 4 }], 500)).toBe(0);
   });
 
   test("a strand that stopped decays to zero once the window has passed", () => {
@@ -44,8 +51,8 @@ describe("per-strand live rate window", () => {
       [500, 5],
       [1000, 10],
     ]);
-    expect(windowRate(s, 1000, 1)).toBeGreaterThan(0);
-    expect(windowRate(s, 1000 + RATE_WINDOW_MS + 1, 1)).toBe(0);
+    expect(windowRate(s, 1000)).toBeGreaterThan(0);
+    expect(windowRate(s, 1000 + RATE_WINDOW_MS + 1)).toBe(0);
   });
 
   test("stackShares scales the split so the top edge equals the engine aggregate", () => {

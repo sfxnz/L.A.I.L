@@ -59,23 +59,6 @@ async function forward(c: { req: { raw: Request; url: string; method: string; he
   }
 }
 
-const paths = [
-  "/status",
-  "/hardware",
-  "/serve/start",
-  "/serve/stop",
-  "/serve/agent-restore",
-  "/serve/recommend",
-  "/serve/recipes",
-  "/jobs",
-  "/smoke",
-  "/chat",
-  "/bench/perf",
-  "/bench/agentic",
-  "/bench/tool-eval-status",
-  "/runs",
-];
-
 // Explicit routes for Hono
 serveProxy.all("/status", (c) => forward(c, "/api/status"));
 serveProxy.all("/cluster", (c) => forward(c, "/api/cluster"));
@@ -105,4 +88,3 @@ serveProxy.all("/runs/*", (c) => {
   return forward(c, `/api${sub}`);
 });
 
-void paths;

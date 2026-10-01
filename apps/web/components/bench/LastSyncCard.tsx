@@ -12,9 +12,23 @@ import { Badge, Eyebrow, HeroNumber, Nil, Panel, Skeleton, btnClass } from "@/co
 import { cn } from "@/lib/utils";
 import { MiniCurve } from "./DecodeCharts";
 
-/** Status → "Last synchronization": the latest decode run's hero, curve, delta and two ways back into /bench. */
-export function LastSyncCard({ runs, loading, className }: { runs: RunRow[]; loading: boolean; className?: string }) {
-  const [cur, prev] = latestDecodeRuns(runs);
+/**
+ * Status → "Last synchronization": the latest decode run of the served model — its hero,
+ * curve, delta against the previous comparable run — and two ways back into /bench.
+ */
+export function LastSyncCard({
+  runs,
+  loading,
+  servingModel,
+  className,
+}: {
+  runs: RunRow[];
+  loading: boolean;
+  /** Model on the endpoint now; null when nothing is served (then: the newest run of any model). */
+  servingModel: string | null;
+  className?: string;
+}) {
+  const { cur, prev } = latestDecodeRuns(runs, servingModel);
   const [envelopes, setEnvelopes] = useState<{ id: string | null; current: BenchResult | null; previous: BenchResult | null }>({ id: null, current: null, previous: null });
   useEffect(() => {
     if (!cur) return;
@@ -27,7 +41,7 @@ export function LastSyncCard({ runs, loading, className }: { runs: RunRow[]; loa
     };
   }, [cur?.run_id, prev?.run_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const sync = lastSync(runs, envelopes.id === cur?.run_id ? envelopes : { current: null, previous: null });
+  const sync = lastSync(runs, servingModel, envelopes.id === cur?.run_id ? envelopes : { current: null, previous: null });
 
   return (
     <Panel title="Last synchronization" padded className={className} action={sync ? <Eyebrow className="lab-num">{fmtDate(sync.createdAt)}</Eyebrow> : undefined}>
@@ -38,10 +52,12 @@ export function LastSyncCard({ runs, loading, className }: { runs: RunRow[]; loa
         </div>
       ) : !sync ? (
         <div className="flex flex-col items-start gap-3 py-2">
-          <Eyebrow>No sequences yet</Eyebrow>
-          <p className="max-w-[44ch] text-[13px] leading-snug text-lab-text-dim">No sequences yet. Run a decode sync to draw the first slice.</p>
+          <Eyebrow>{servingModel ? "No bench for this model yet" : "No sequences yet"}</Eyebrow>
+          <p className="max-w-[44ch] text-[13px] leading-snug text-lab-text-dim">
+            {servingModel ? `No decode run of ${modelShort(servingModel)} on record. Run one to draw its first slice.` : "Run a decode sync to draw the first slice."}
+          </p>
           <Link href="/bench" className={btnClass("primary", "sm")}>
-            Open Bench
+            Run a bench
           </Link>
         </div>
       ) : (
@@ -57,8 +73,14 @@ export function LastSyncCard({ runs, loading, className }: { runs: RunRow[]; loa
                 </span>
               )}
               <span className="font-[family-name:var(--font-display)] text-[13px] font-semibold uppercase tracking-[0.14em] text-lab-text-dim">tok/s</span>
-              {sync.delta !== null && (
-                <Badge tone={sync.delta >= 0 ? "ok" : "warn"}>{`${fmtPct(sync.delta, true)} vs previous`}</Badge>
+              {sync.delta !== null ? (
+                <span title={`vs the previous run with the same model, pack, tokens/stream and serve flags (${sync.comparedTo ? fmtDate(sync.comparedTo) : ""})`}>
+                  <Badge tone={sync.delta >= 0 ? "ok" : "warn"}>{`${fmtPct(sync.delta, true)} vs previous`}</Badge>
+                </span>
+              ) : (
+                <span title="No earlier run with the same model, pack, tokens/stream and serve flags">
+                  <Badge tone="muted">no comparable run</Badge>
+                </span>
               )}
             </div>
             <dl className="lab-num mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-lab-text-dim">

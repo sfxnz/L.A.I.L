@@ -3,6 +3,7 @@
  * gated per-strand tok/s pill, the per-level strand roll-up, and a sampler for
  * the hardware strip. Pure, so the instrument stays a thin renderer.
  */
+import { median } from "@lail/shared";
 import type { ClusterNode } from "../api";
 import type { NodeSample } from "../lab-status-store";
 import type { StrandView } from "../use-stream-run";
@@ -72,8 +73,8 @@ export function rollupLevel(strands: StrandView[], maxTokens: number): LevelRoll
         break;
     }
   }
-  rates.sort((a, b) => a - b);
-  const medianRate = rates.length ? rates[rates.length >> 1] : null;
+  // Live strand rates are re-emitted every tick, so a stalled strand reads its decayed rate, not its last one.
+  const medianRate = median(rates);
   const cap = strands.length * Math.max(1, maxTokens);
   return {
     total: strands.length,

@@ -43,6 +43,7 @@ async def _lifespan(_app: FastAPI):
     # plus LAIL_INSECURE_BIND=1 because host ports stay on 127.0.0.1.
     assert_safe_bind(host, os.environ.get("LAIL_TOKEN") or "", allow_insecure=allow_insecure)
     db.init_db()
+    db.fail_orphaned_jobs()  # no runner survives a restart; their rows must not stay "running"
     await status_sampler.SAMPLER.start()
     try:
         yield

@@ -16,7 +16,8 @@ export type StrandCardProps = {
   packLabel: string;
   maxTokens: number;
   fillToMax: boolean;
-  tokensPerChunk: number;
+  /** False when the server sent no per-chunk usage: steps are then chunks, not tokens. */
+  tokensExact: boolean;
   /** client-observed live rate (stack share), tok/s */
   liveRate: number;
   desync: Desync;
@@ -58,7 +59,7 @@ export const StrandCard = memo(function StrandCard({
   packLabel,
   maxTokens,
   fillToMax,
-  tokensPerChunk,
+  tokensExact,
   liveRate,
   desync,
   focused,
@@ -73,9 +74,9 @@ export const StrandCard = memo(function StrandCard({
 }: StrandCardProps) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const live = s.state === "decode" && !desync.desync;
-  const itl = itlStats(s.itl_ms);
+  const itl = itlStats(s.step_ms, s.step_tokens);
   const share = s.chunks ? s.reasoning_chunks / s.chunks : 0;
-  const thinkingTokens = Math.round(s.reasoning_chunks * tokensPerChunk);
+  const thinkingTokens = s.reasoning_tokens;
   const stateWord = desync.desync ? "desync" : s.state;
   const rate = live ? liveRate : s.tok_s;
   const showThinking = s.reasoning.length > 0 && !thinkingMuted;
@@ -155,19 +156,25 @@ export const StrandCard = memo(function StrandCard({
       </Transcript>
 
       <footer className="flex shrink-0 items-center gap-2 border-t border-lab-border-subtle px-3 py-1.5">
-        <ItlSparkline itl={s.itl_ms} width={72} height={18} className="w-[72px] shrink-0" />
+        <ItlSparkline itl={s.step_ms} width={72} height={18} className="w-[72px] shrink-0" />
         <div className="lab-num flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden font-mono text-[10px] whitespace-nowrap text-lab-muted">
-          <span title="Tokens" className="text-lab-text-dim">{fmtInt(s.tokens ?? Math.round(s.chunks * tokensPerChunk))} tok</span>
+          <span title="Tokens" className="text-lab-text-dim">{fmtInt(s.tokens ?? 0)} tok</span>
           <Tick className="h-2.5" />
           <span title="Time to first token">ttft {fmtMs(s.ttft_ms)}</span>
           <Tick className="h-2.5" />
-          <span title="Inter-token latency p50 / p95">
-            itl {itl.p50 === null ? "—" : `${Math.round(itl.p50)}/${Math.round(itl.p95 ?? itl.p50)}`}
+          <span
+            title={
+              tokensExact
+                ? "Per-token latency p50 / p95 (ms): each decode step's gap ÷ the tokens it carried"
+                : "Inter-chunk latency p50 / p95 (ms): this server sends no per-chunk token counts"
+            }
+          >
+            {tokensExact ? "itl" : "chunk"} {itl.p50 === null ? "—" : `${Math.round(itl.p50)}/${Math.round(itl.p95 ?? itl.p50)}`}
           </span>
           {itl.stalls > 0 && (
             <>
               <Tick className="h-2.5" />
-              <span className="text-lab-warn" title="Inter-token gaps ≥ 2 s">{itl.stalls} stall{itl.stalls === 1 ? "" : "s"}</span>
+              <span className="text-lab-warn" title="Gaps ≥ 2 s with no output">{itl.stalls} stall{itl.stalls === 1 ? "" : "s"}</span>
             </>
           )}
           {(s.finish_reason || desync.desync) && (

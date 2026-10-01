@@ -1,30 +1,57 @@
-import type {
-  BenchArm,
-  BenchEnvelope,
-  BenchHeadline,
-  BenchPerRequest,
-  StreamLevelEvent,
-  StreamThinking,
+import {
+  TAIL_MIN_SAMPLES,
+  median,
+  percentile,
+  type BenchArm,
+  type BenchEnvelope,
+  type BenchHardware,
+  type BenchHeadline,
+  type BenchPerRequest,
+  type BenchRange,
+  type ServerLevelMetrics,
+  type StreamLevelEvent,
 } from "@lail/shared";
+
+/**
+ * The bench's metric definitions — the only ones (the serve-engine decode bench is
+ * retired). Per strand, with t_first/t_last the first/last token-bearing chunk:
+ *   TTFT            t_first − t_start
+ *   decode tok/s    (n − n_first) / (t_last − t_first)      n_first = tokens in the first chunk,
+ *                                                           n = tokens at t_last (not a trailing
+ *                                                           EOS/stop token after it)
+ *   TPOT            (t_last − t_first) / (n − n_first)       = 1 / decode tok/s
+ * Per wave (one burst of c strands): wall-clock aggregate and decode-span aggregate below.
+ * Per level (⌈samples ÷ c⌉ waves): medians over waves / pooled strands, with min–max.
+ * Percentiles: nearest rank (`@lail/shared` `percentile`); p95/p99 only from TAIL_MIN_SAMPLES.
+ */
 
 /** Timing record of one finished (or failed) strand. Times are `performance.now()` ms. */
 export type StrandResult = {
   i: number;
   ok: boolean;
   t_start: number;
-  /** First output chunk (content or reasoning). */
+  /** First token-bearing output chunk (content or reasoning). */
   t_first: number | null;
-  /** Last output chunk. */
+  /** Last token-bearing output chunk. */
   t_last: number | null;
   /** Stream closed or failed. */
   t_end: number;
   /** `usage.completion_tokens`, or the chunk count when the usage frame is missing. */
   completion_tokens: number | null;
+  /**
+   * Cumulative tokens at t_last, exact from per-chunk usage; null without it. Differs from
+   * completion_tokens by tokens that arrived with no text after t_last (EOS, stop strings).
+   */
+  last_tokens: number | null;
+  /** Tokens delivered with the first chunk (at t_first, so outside the decode span). */
+  first_tokens: number;
   prompt_tokens: number | null;
   estimated: boolean;
   finish_reason: string | null;
   error: string | null;
   token_times_ms: number[];
+  token_counts: number[];
+  wave?: number;
 };
 
 export type WaveKey = { concurrency?: number; size?: number };
@@ -41,40 +68,38 @@ export type WaveSummary = {
   tpot_s: number | null;
   prompt_tokens: number | null;
   prefill_tok_s: number | null;
+  samples: number;
+  aggregate_range: BenchRange | null;
+  per_stream_range: BenchRange | null;
 };
 
-// ── Definitions mirror serve-engine perf.py ─────────────────────────
+/** Per-level context measured around the waves (not from the strands). */
+export type LevelContext = { foreign_max: number | null; server: ServerLevelMetrics | null };
 
-/** Nearest-rank percentile over an ascending array. */
-export function percentile(sorted: number[], p: number): number | null {
-  const n = sorted.length;
-  if (!n) return null;
-  const rank = Math.ceil((p / 100) * n);
-  return sorted[Math.min(n - 1, Math.max(0, rank - 1))];
-}
+export { median, percentile };
 
-export function median(vals: number[]): number | null {
-  if (!vals.length) return null;
-  const s = [...vals].sort((a, b) => a - b);
-  const mid = s.length >> 1;
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-}
-
-/** First emitted token → last. Falls back to stream end when only one chunk arrived. */
+/** t_last − t_first in s; null when the strand never produced a second token-bearing chunk. */
 export function decodeTimeS(r: StrandResult): number | null {
-  if (r.t_first === null) return null;
-  let end = r.t_last;
-  if (end === null || end <= r.t_first) end = r.t_end;
-  const ds = (end - r.t_first) / 1000;
-  return ds > 0 ? ds : null;
+  if (r.t_first === null || r.t_last === null || r.t_last <= r.t_first) return null;
+  return (r.t_last - r.t_first) / 1000;
 }
 
-/** completion_tokens / (t_last − t_first). */
+/** Tokens delivered by t_last: exact when known, else completion_tokens. */
+const tokensAtLast = (r: StrandResult): number | null => r.last_tokens ?? r.completion_tokens;
+
+/** Tokens decoded inside the decode span: n − n_first. */
+function decodedTokens(r: StrandResult): number | null {
+  const n = tokensAtLast(r);
+  if (!n || n <= 0) return null;
+  const d = n - Math.max(0, r.first_tokens);
+  return d > 0 ? d : null;
+}
+
+/** (n − n_first) / (t_last − t_first). */
 export function decodeTokPerS(r: StrandResult): number | null {
   const ds = decodeTimeS(r);
-  const n = r.completion_tokens;
-  if (ds === null || !n || n <= 0) return null;
-  return n / ds;
+  const d = decodedTokens(r);
+  return ds === null || d === null ? null : d / ds;
 }
 
 /** t_first − t_start. */
@@ -82,15 +107,14 @@ export function ttftS(r: StrandResult): number | null {
   return r.t_first === null ? null : (r.t_first - r.t_start) / 1000;
 }
 
-/** (t_last − t_first) / (completion_tokens − 1). */
+/** (t_last − t_first) / (n − n_first) = 1 / decodeTokPerS. */
 export function tpotS(r: StrandResult): number | null {
-  const n = r.completion_tokens;
-  if (r.t_first === null || r.t_last === null || !n || n < 2) return null;
-  const span = (r.t_last - r.t_first) / 1000;
-  return span > 0 ? span / (n - 1) : null;
+  const ds = decodeTimeS(r);
+  const d = decodedTokens(r);
+  return ds === null || d === null ? null : ds / d;
 }
 
-/** prompt_tokens / TTFT. */
+/** prompt_tokens / TTFT. Meaningful for the long prompts of the prefill bench only. */
 export function prefillTokPerS(r: StrandResult): number | null {
   const ttft = ttftS(r);
   const n = r.prompt_tokens;
@@ -99,62 +123,93 @@ export function prefillTokPerS(r: StrandResult): number | null {
 }
 
 /**
- * Wave aggregate, wall-clock: Σ completion_tokens (ok strands) / (max t_last − min t_start).
- * Same definition as perf.py. The window spans every strand's prefill and the slowest
- * strand's tail, so at ×N it can read below ×1 when one straggler decodes alone at the end.
+ * Wave aggregate, wall-clock: Σ tokens at t_last (ok strands) / (max t_last − min t_start).
+ * Spans every strand's prefill and the slowest strand's tail, so at ×N it can read below ×1
+ * when one straggler decodes alone at the end.
  */
 export function aggregateTokPerS(results: StrandResult[]): number | null {
   const ok = results.filter((r) => r.ok && r.t_last !== null);
   if (!ok.length) return null;
-  const tokens = ok.reduce((a, r) => a + (r.completion_tokens || 0), 0);
+  const tokens = ok.reduce((a, r) => a + (tokensAtLast(r) || 0), 0);
   const span = (Math.max(...ok.map((r) => r.t_last as number)) - Math.min(...ok.map((r) => r.t_start))) / 1000;
   return span > 0 && tokens > 0 ? tokens / span : null;
 }
 
 /**
- * Wave aggregate, steady-state: Σ of per-strand decode rates (completion_tokens / (t_last − t_first)).
- * Each strand is measured only over its own decode window, so this is what the server
- * sustained while strands were decoding — an upper bound that excludes TTFT and straggler tails.
+ * Wave aggregate, decode span: Σ (n − n_first) / (max t_last − min t_first) over ok strands —
+ * what the server delivered while it was emitting tokens; the time-average of the live
+ * window rate. At ×1 it equals the strand's decode tok/s.
  */
 export function aggregateSteadyTokPerS(results: StrandResult[]): number | null {
-  const rates = results.filter((r) => r.ok).map(decodeTokPerS).filter((v): v is number => v !== null);
-  return rates.length ? rates.reduce((a, b) => a + b, 0) : null;
+  const ok = results.filter((r) => r.ok && r.t_first !== null && r.t_last !== null);
+  if (!ok.length) return null;
+  const tokens = ok.reduce((a, r) => a + (decodedTokens(r) ?? 0), 0);
+  const span = (Math.max(...ok.map((r) => r.t_last as number)) - Math.min(...ok.map((r) => r.t_first as number))) / 1000;
+  return span > 0 && tokens > 0 ? tokens / span : null;
 }
 
 const r2 = (v: number | null) => (v === null ? null : Math.round(v * 100) / 100);
 const r3 = (v: number | null) => (v === null ? null : Math.round(v * 1000) / 1000);
 const ms1 = (s: number | null) => (s === null ? null : Math.round(s * 10000) / 10);
+const nn = (v: number | null): v is number => v !== null;
+const range = (vals: number[]): BenchRange | null =>
+  vals.length >= 2 ? [r2(Math.min(...vals))!, r2(Math.max(...vals))!] : null;
 
+/** One wave. */
 export function summarizeWave(results: StrandResult[]): WaveSummary {
-  const ok = results.filter((r) => r.ok);
-  const ttfts = ok.map(ttftS).filter((v): v is number => v !== null).sort((a, b) => a - b);
-  const rates = ok.map(decodeTokPerS).filter((v): v is number => v !== null);
-  const tpots = ok.map(tpotS).filter((v): v is number => v !== null);
-  const prefill = ok.map(prefillTokPerS).filter((v): v is number => v !== null);
-  const prompts = ok.map((r) => r.prompt_tokens).filter((v): v is number => v !== null);
+  return summarizeLevel([results]);
+}
+
+/**
+ * A level of one or more waves. Aggregates are per wave (a wave is one burst; pooling waves
+ * would count the gaps between them), reported as the median with min–max. Per-strand
+ * numbers pool every ok strand of the level.
+ */
+export function summarizeLevel(waves: StrandResult[][]): WaveSummary {
+  const all = waves.flat();
+  const ok = all.filter((r) => r.ok);
+  const ttfts = ok.map(ttftS).filter(nn).sort((a, b) => a - b);
+  const rates = ok.map(decodeTokPerS).filter(nn);
+  const tpots = ok.map(tpotS).filter(nn);
+  const prefill = ok.map(prefillTokPerS).filter(nn);
+  const prompts = ok.map((r) => r.prompt_tokens).filter(nn);
+  const aggs = waves.map(aggregateTokPerS).filter(nn);
+  const steadies = waves.map(aggregateSteadyTokPerS).filter(nn);
+  const tail = ttfts.length >= TAIL_MIN_SAMPLES;
+  const tpot = median(tpots);
   return {
     ok: ok.length,
-    requests: results.length,
-    errors: results.filter((r) => !r.ok).map((r) => `#${r.i}: ${r.error || "failed"}`),
+    requests: all.length,
+    errors: all.filter((r) => !r.ok).map((r) => `#${r.i}: ${r.error || "failed"}`),
     tokens: ok.reduce((a, r) => a + (r.completion_tokens || 0), 0),
-    aggregate_tok_s: r2(aggregateTokPerS(results)),
-    aggregate_steady_tok_s: r2(aggregateSteadyTokPerS(results)),
+    aggregate_tok_s: r2(median(aggs)),
+    aggregate_steady_tok_s: r2(median(steadies)),
     per_stream_median_tok_s: r2(median(rates)),
-    ttft_s: { p50: r3(percentile(ttfts, 50)), p95: r3(percentile(ttfts, 95)), p99: r3(percentile(ttfts, 99)) },
-    tpot_s: tpots.length ? Math.round(median(tpots)! * 1e6) / 1e6 : null,
+    ttft_s: {
+      p50: r3(percentile(ttfts, 50)),
+      p95: tail ? r3(percentile(ttfts, 95)) : null,
+      p99: tail ? r3(percentile(ttfts, 99)) : null,
+    },
+    tpot_s: tpot === null ? null : Math.round(tpot * 1e6) / 1e6,
     prompt_tokens: prompts.length ? Math.round(median(prompts)!) : null,
     prefill_tok_s: r2(median(prefill)),
+    samples: waves.length,
+    aggregate_range: range(aggs),
+    per_stream_range: range(rates.length ? rates : prefill),
   };
 }
 
-export function toLevelEvent(index: number, key: WaveKey, ws: WaveSummary): StreamLevelEvent {
-  return {
+export function toLevelEvent(index: number, key: WaveKey, ws: WaveSummary, ctx?: LevelContext): StreamLevelEvent {
+  const ev: StreamLevelEvent = {
     type: "level",
     index,
     ...key,
     aggregate_tok_s: ws.aggregate_tok_s,
     aggregate_steady_tok_s: ws.aggregate_steady_tok_s,
     per_stream_median_tok_s: ws.per_stream_median_tok_s,
+    samples: ws.samples,
+    aggregate_range: ws.aggregate_range,
+    per_stream_range: ws.per_stream_range,
     ttft_p50_ms: ms1(ws.ttft_s.p50),
     ttft_p95_ms: ms1(ws.ttft_s.p95),
     ttft_p99_ms: ms1(ws.ttft_s.p99),
@@ -162,9 +217,16 @@ export function toLevelEvent(index: number, key: WaveKey, ws: WaveSummary): Stre
     ok: ws.ok,
     requests: ws.requests,
     errors: ws.errors,
-    prompt_tokens: ws.prompt_tokens,
-    prefill_tok_s: ws.prefill_tok_s,
   };
+  if (key.size !== undefined) {
+    ev.prompt_tokens = ws.prompt_tokens;
+    ev.prefill_tok_s = ws.prefill_tok_s;
+  }
+  if (ctx) {
+    ev.foreign_max = ctx.foreign_max;
+    ev.server = ctx.server;
+  }
+  return ev;
 }
 
 export function skippedLevelEvent(index: number, key: WaveKey, reason: string): StreamLevelEvent {
@@ -186,7 +248,7 @@ export function skippedLevelEvent(index: number, key: WaveKey, reason: string): 
   };
 }
 
-export function toArm(key: WaveKey, ws: WaveSummary | null, skipped?: string): BenchArm {
+export function toArm(key: WaveKey, ws: WaveSummary | null, skipped?: string, ctx?: LevelContext): BenchArm {
   const arm: BenchArm = {
     ...key,
     ok: ws?.ok ?? 0,
@@ -197,6 +259,11 @@ export function toArm(key: WaveKey, ws: WaveSummary | null, skipped?: string): B
     decode_tok_per_s_median: ws?.per_stream_median_tok_s ?? null,
     tpot_s: ws?.tpot_s ?? null,
     errors: ws?.errors ?? [],
+    samples: ws?.samples ?? 0,
+    aggregate_range: ws?.aggregate_range ?? null,
+    per_stream_range: ws?.per_stream_range ?? null,
+    foreign_max: ctx?.foreign_max ?? null,
+    server: ctx?.server ?? null,
   };
   if (key.size !== undefined) {
     arm.prompt_tokens = ws?.prompt_tokens ?? null;
@@ -217,11 +284,22 @@ export function toPerRequest(r: StrandResult): BenchPerRequest {
     finish_reason: r.finish_reason,
     error: r.error,
     token_times_ms: r.token_times_ms,
+    token_counts: r.token_counts,
+    ...(r.wave !== undefined ? { wave: r.wave } : {}),
     ...(r.estimated ? { estimated: true } : {}),
   };
 }
 
-export type BenchArmInput = { key: WaveKey; ws: WaveSummary | null; results: StrandResult[]; skipped?: string };
+export type BenchArmInput = { key: WaveKey; ws: WaveSummary | null; results: StrandResult[]; skipped?: string; ctx?: LevelContext };
+
+/** The decode level with the highest wall-clock aggregate. */
+export function peakArm(arms: BenchArm[]): BenchArm | null {
+  let peak: BenchArm | null = null;
+  for (const a of arms) {
+    if (a.aggregate_tok_per_s != null && (peak === null || a.aggregate_tok_per_s > (peak.aggregate_tok_per_s ?? 0))) peak = a;
+  }
+  return peak;
+}
 
 export function headline(kind: "decode" | "prefill", arms: BenchArm[]): BenchHeadline {
   if (kind === "prefill") {
@@ -236,10 +314,7 @@ export function headline(kind: "decode" | "prefill", arms: BenchArm[]): BenchHea
     };
   }
   const c1 = arms.find((a) => a.concurrency === 1) ?? arms[0];
-  let peak: BenchArm | null = null;
-  for (const a of arms) {
-    if (a.aggregate_tok_per_s !== null && (peak === null || a.aggregate_tok_per_s > (peak.aggregate_tok_per_s ?? 0))) peak = a;
-  }
+  const peak = peakArm(arms);
   return {
     decode_tok_per_s_median_c1: c1?.decode_tok_per_s_median ?? null,
     aggregate_peak_tok_per_s: peak?.aggregate_tok_per_s ?? null,
@@ -251,27 +326,25 @@ export function headline(kind: "decode" | "prefill", arms: BenchArm[]): BenchHea
 export function buildEnvelope(opts: {
   kind: "decode" | "prefill";
   model: string;
-  workload: {
-    pack: string;
-    levels?: number[];
-    sizes?: number[];
-    max_tokens: number;
-    thinking: StreamThinking;
-    temperature: number;
-    fill_to_max: boolean;
-    base_url: string;
-  };
+  workload: BenchEnvelope["workload"];
   arms: BenchArmInput[];
+  hardware?: BenchHardware | null;
 }): BenchEnvelope {
-  const arms = opts.arms.map((a) => toArm(a.key, a.ws, a.skipped));
+  const arms = opts.arms.map((a) => toArm(a.key, a.ws, a.skipped, a.ctx));
   const full_arms = opts.arms.map((a, idx) => ({ ...arms[idx], per_request: a.results.map(toPerRequest) }));
   const head = headline(opts.kind, arms);
   return {
     kind: opts.kind,
     model: opts.model,
     workload: opts.workload,
-    metrics: { arms, full_arms, headline: head },
-    summary: head,
+    metrics: { arms, full_arms, headline: head, hardware: opts.hardware ?? null },
+    summary: {
+      ...head,
+      pack: opts.workload.pack,
+      max_tokens: opts.workload.max_tokens,
+      serve_fingerprint: opts.workload.serve_fingerprint,
+      energy_j_per_token: opts.hardware?.energy_j_per_token ?? null,
+    },
     source: "controller-streams",
   };
 }

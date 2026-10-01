@@ -16,9 +16,10 @@ function Cell({ label, children, title, className }: { label: string; children: 
 
 /**
  * The instrument bar: ONE aggregate number with its method chip, then peak,
- * tokens, strand counts, TTFT p50/p95, elapsed. Live values update in place;
- * the final aggregate is the single payoff (HeroNumber count-up from the last
- * live estimate).
+ * tokens, strand counts, TTFT p50/p95, elapsed. Live and final aggregate are the
+ * same metric (window rate → its run average, the decode span), so the payoff
+ * count-up from the last live value does not drop to a different definition;
+ * wall-clock goodput (incl. TTFT) is its own cell once the run is done.
  */
 export function InstrumentBar({ state, live, className }: { state: StreamRunState; live: boolean; className?: string }) {
   const latest = state.latest;
@@ -28,8 +29,10 @@ export function InstrumentBar({ state, live, className }: { state: StreamRunStat
   const ringLabel = state.error ? "Run failed" : sum ? (sum.status === "cancelled" ? "Run cancelled" : "Run synchronized") : live ? "Synchronizing" : "Idle";
   const peak = sum?.peak_tok_s ?? latest?.peak_tok_s;
   const tokens = sum?.tokens ?? latest?.tokens;
-  const p50 = sum?.ttft_p50_ms ?? latest?.ttft_p50_ms;
-  const p95 = sum?.ttft_p95_ms ?? latest?.ttft_p95_ms;
+  // Once the run is done its summary is the definition (a null p95 = too few samples),
+  // never a fallback to the live pooled value.
+  const p50 = sum ? sum.ttft_p50_ms : latest?.ttft_p50_ms;
+  const p95 = sum ? sum.ttft_p95_ms : latest?.ttft_p95_ms;
   const elapsed = sum?.duration_ms ?? latest?.t_ms;
   const lastLive = state.agg.length ? state.agg[state.agg.length - 1].tok_s : 0;
 
@@ -63,10 +66,15 @@ export function InstrumentBar({ state, live, className }: { state: StreamRunStat
 
       <Tick className="hidden h-7 sm:block" />
 
-      <Cell label="Peak" title="Peak of the live 1 s window estimate">
+      <Cell label="Peak" title="Highest live window rate once a full window was decoding">
         {peak === undefined ? <Nil /> : <span className="text-lab-target">{fmtRate(peak)}</span>}
       </Cell>
-      <Cell label="Tokens" title="Σ completion tokens (usage where a strand finished, chunks × tok/chunk otherwise)">
+      {sum && (
+        <Cell label="Goodput" title="Wall-clock: Σ tokens ÷ (last token − first request), TTFT included">
+          {sum.aggregate_tok_s === null ? <Nil /> : fmtRate(sum.aggregate_tok_s)}
+        </Cell>
+      )}
+      <Cell label="Tokens" title="Σ completion tokens (per-chunk usage; chunk count when the server sends none)">
         {tokens === undefined ? <Nil /> : fmtInt(tokens)}
       </Cell>
       <Cell label="Strands" title="streaming · waiting · done">

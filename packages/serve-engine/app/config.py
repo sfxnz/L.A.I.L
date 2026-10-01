@@ -15,11 +15,7 @@ DB_PATH = DATA_DIR / "lab.sqlite"
 PIPELINE = HOME / "benchmarks" / "_pipeline"
 SPARK_LAB = PIPELINE / "spark_lab.sh"
 PROFILES_DIR = PIPELINE / "profiles"
-BENCH_PREFILL = PIPELINE / "lib" / "bench_prefill_decode.py"
-BENCH_CONCURRENCY = PIPELINE / "lib" / "bench_concurrency.py"
-BENCH_WORKFLOW = HOME / "benchmarks" / "qwen36-27b-unsloth-nvfp4" / "bench_workflow.py"
 VLLM_RUNTIME = HOME / "vllm-runtime"
-GOLDEN_TOOLS = HOME / "lab" / "bin" / "golden_tools.py"
 
 DEFAULT_BASE_URL = os.environ.get("LAB_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_PORT = int(os.environ.get("LAB_PORT", "8000"))

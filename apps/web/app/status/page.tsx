@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import { ClusterPanel } from "@/components/ClusterPanel";
@@ -79,24 +79,43 @@ function backendLabel(k: string) {
 export default function StatusPage() {
   const { status, loading, needToken, unreachable, error, refresh: refreshStatus, samples, liveRun } = useLabStatus();
   const [runs, setRuns] = useState<RunRow[]>([]);
+  const [decodeRuns, setDecodeRuns] = useState<RunRow[]>([]);
   const [runsLoading, setRunsLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const err = unreachable ? error : null;
 
-  // Lab status comes from the shell's shared poll; the last 30 runs (the DNA
-  // strand + Last synchronization) load on mount and when the operator asks.
+  // Lab status comes from the shell's shared poll. Runs (the DNA strand's last 30, and
+  // the decode runs Last synchronization picks from) load on mount, when a live run
+  // settles (a bench from /bench or another tab lands here without a reload), every
+  // minute while the tab is visible, and when the operator asks.
   const loadRuns = useCallback(
     () =>
-      api
-        .runs({ limit: 30 })
-        .then(setRuns)
+      Promise.all([
+        api.runs({ limit: 30 }).then(setRuns),
+        api.runs({ kind: "decode", limit: 100 }).then(setDecodeRuns),
+      ])
         .catch(() => {})
         .finally(() => setRunsLoading(false)),
     [],
   );
   useEffect(() => {
     void loadRuns();
+    const t = setInterval(() => {
+      if (!document.hidden) void loadRuns();
+    }, 60_000);
+    return () => clearInterval(t);
   }, [loadRuns]);
+  const runLive = !!liveRun;
+  const wasLive = useRef(runLive);
+  useEffect(() => {
+    // The engine imports a bench just before its `done`; give the index a moment.
+    if (wasLive.current && !runLive) {
+      const t = setTimeout(() => void loadRuns(), 1500);
+      wasLive.current = runLive;
+      return () => clearTimeout(t);
+    }
+    wasLive.current = runLive;
+  }, [runLive, loadRuns]);
 
   const refresh = useCallback(
     async (opts?: { soft?: boolean }) => {
@@ -273,7 +292,11 @@ export default function StatusPage() {
       </section>
 
       <section className="space-y-2.5">
-        <Band index="02" label="Endpoint" meta={loading ? "probing" : liveRun ? `${liveRun.source} run live` : "2s poll"} />
+        <Band
+          index="02"
+          label="Endpoint"
+          meta={loading ? "probing" : liveRun ? `${liveRun.source} run live` : typeof serve?.stale_s === "number" ? `sampled ${Math.round(serve.stale_s)} s ago` : "no sample"}
+        />
         <div className="bento lab-rise lab-rise-1">
           <div className="bento-span-8">
             <NowServing status={status} healthy={healthy} loading={loading} />
@@ -285,14 +308,10 @@ export default function StatusPage() {
       </section>
 
       <section className="space-y-2.5">
-        <Band
-          index="03"
-          label="Bench"
-          meta={healthy ? "armed" : loading ? "probing" : "locked"}
-        />
+        <Band index="03" label="Bench" />
         <div className="bento lab-rise lab-rise-2">
           <div className="bento-span-8">
-            <LastSyncCard runs={runs} loading={runsLoading} className="h-full" />
+            <LastSyncCard runs={decodeRuns} loading={runsLoading} servingModel={healthy ? (serve?.model_id ?? null) : null} className="h-full" />
           </div>
           <div className="bento-span-4">
             <DnaStrand runs={runs} loading={runsLoading} />

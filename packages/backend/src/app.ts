@@ -351,11 +351,13 @@ export function createApp() {
     const task = c.req.query("task_type") || "";
     const model = c.req.query("model") || "";
     const fp = c.req.query("fingerprint") || "";
-    let rows = fp
-      ? listLabRunsByFingerprint(fp, Math.min(50, Math.max(1, limit)))
-      : listLabRuns(Math.min(200, Math.max(1, limit)));
-    if (task) rows = rows.filter((r) => r.task_type === task);
-    if (model) rows = rows.filter((r) => (r.model_id || "").includes(model));
+    const rows = listLabRuns(
+      Math.min(fp ? 50 : 200, Math.max(1, limit)),
+      (m) =>
+        (!fp || m.task_fingerprint === fp) &&
+        (!task || m.task_type === task) &&
+        (!model || (m.model_id || "").includes(model)),
+    );
     return c.json({ runs: rows, count: rows.length });
   });
 

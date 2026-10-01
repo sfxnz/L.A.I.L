@@ -25,13 +25,12 @@ import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
 import { useJobWatch } from "@/lib/use-job-watch";
 import { cn } from "@/lib/utils";
 
-type Tab = "serve" | "perf" | "agentic" | "history";
+// Throughput / latency live on /bench, smoke and the run log on /evals.
+type Tab = "serve" | "agentic";
 
 const TAB_HINTS: Record<Tab, string> = {
   serve: "target · envelope · flags · launch",
-  perf: "throughput / latency on the live endpoint",
   agentic: "tool-calling quality suites",
-  history: "runs recorded on this box",
 };
 
 /* ---------------------------------------------------------------------------
@@ -540,9 +539,7 @@ export default function ServerPage() {
             onChange={setTab}
             options={[
               { id: "serve", label: "Serve" },
-              { id: "perf", label: "Perf" },
               { id: "agentic", label: "Agentic" },
-              { id: "history", label: "History" },
             ]}
           />
           <Tick className="hidden sm:block" />
@@ -1281,7 +1278,6 @@ export default function ServerPage() {
         </div>
       )}
 
-      {tab === "perf" && <PerfTab track={track} healthy={healthy} />}
       {tab === "agentic" && (
         <AgenticTab
           track={track}
@@ -1289,9 +1285,8 @@ export default function ServerPage() {
           toolEval={status?.serve?.tool_eval}
         />
       )}
-      {tab === "history" && <HistoryTab />}
 
-      {/* Job log always visible so Perf/Agentic jobs aren't invisible on other tabs */}
+      {/* Job log always visible so Agentic jobs aren't invisible on other tabs */}
       <div
         ref={jobPanelRef}
         id="serve-job-dock"
@@ -1403,123 +1398,6 @@ export default function ServerPage() {
         </Panel>
       </div>
     </div>
-  );
-}
-
-function PerfTab({
-  track,
-  healthy,
-}: {
-  track: (id: string) => void;
-  healthy: boolean;
-}) {
-  const [intent, setIntent] = useState("published");
-  const [runner, setRunner] = useState<"workflow" | "prefill" | "concurrency">("workflow");
-  const [err, setErr] = useState<string | null>(null);
-  const [smokeResult, setSmokeResult] = useState<string | null>(null);
-
-  return (
-    <Panel>
-      <div className="space-y-3.5 p-4">
-        <Seq
-          n="——"
-          label="Performance bench"
-          hint="serve → smoke → bench"
-          action={
-            <Badge tone={healthy ? "ok" : "muted"} dot={healthy}>
-              {healthy ? "endpoint ready" : "endpoint down"}
-            </Badge>
-          }
-        />
-        <div className="animus-rule" aria-hidden />
-        <p className="text-[11px] leading-relaxed text-lab-muted">
-          Requires a healthy endpoint (usually :8000). Logs stream into the job dock below.
-        </p>
-        {!healthy && (
-          <Callout tone="warn" title="Endpoint down">
-            Start a model on Serve first. Smoke and perf need a healthy :8000.
-          </Callout>
-        )}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Intent tag" htmlFor="perf-intent">
-            <select
-              id="perf-intent"
-              className={inputCls}
-              value={intent}
-              onChange={(e) => setIntent(e.target.value)}
-            >
-              <option value="published">published A/B</option>
-              <option value="long_context">long context</option>
-              <option value="attach">attach</option>
-            </select>
-          </Field>
-          <Field label="Runner" htmlFor="perf-runner">
-            <select
-              id="perf-runner"
-              className={inputCls}
-              value={runner}
-              onChange={(e) => setRunner(e.target.value as typeof runner)}
-            >
-              <option value="workflow">workflow (realistic multi-turn)</option>
-              <option value="prefill">prefill / decode</option>
-              <option value="concurrency">concurrency sweep</option>
-            </select>
-          </Field>
-        </div>
-        {err && (
-          <Callout tone="danger" title="Perf action failed" onDismiss={() => setErr(null)}>
-            {err}
-          </Callout>
-        )}
-        {smokeResult && (
-          <div className="space-y-1.5">
-            <div className="animus-eyebrow text-[9px] tracking-[0.2em]">Smoke response</div>
-            <pre className="max-h-56 overflow-auto rounded-[2px] border border-l-2 border-lab-border border-l-lab-line bg-lab-editor p-3 font-mono text-[11px] leading-relaxed text-lab-text-dim whitespace-pre-wrap">
-              {smokeResult}
-            </pre>
-          </div>
-        )}
-        <div className="animus-rule" aria-hidden />
-        <div className="flex flex-wrap items-center gap-2">
-          <Btn
-            variant="secondary"
-            disabled={!healthy}
-            title={!healthy ? "Start a model first" : undefined}
-            onClick={async () => {
-              setErr(null);
-              try {
-                const r = await api.smoke();
-                setSmokeResult(JSON.stringify(r, null, 2));
-              } catch (e) {
-                setErr(e instanceof Error ? e.message : String(e));
-              }
-            }}
-          >
-            Smoke
-          </Btn>
-          <Btn
-            disabled={!healthy}
-            title={!healthy ? "Start a model first" : undefined}
-            onClick={async () => {
-              setErr(null);
-              try {
-                const { job_id } = await api.benchPerf({ intent, kind: runner, runner });
-                track(job_id);
-              } catch (e) {
-                setErr(e instanceof Error ? e.message : String(e));
-              }
-            }}
-          >
-            Run {runner} perf
-          </Btn>
-          {!healthy && (
-            <span className="text-[11px] text-lab-muted">
-              Disarmed — no healthy endpoint to bench.
-            </span>
-          )}
-        </div>
-      </div>
-    </Panel>
   );
 }
 
@@ -1696,123 +1574,5 @@ function AgenticTab({
         </div>
       </Panel>
     </div>
-  );
-}
-
-function HistoryTab() {
-  const [runs, setRuns] = useState<Awaited<ReturnType<typeof api.runs>>>([]);
-  const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-
-  const load = (soft?: boolean) => {
-    if (!soft) setRefreshing(true);
-    api
-      .runs()
-      .then((r) => {
-        setRuns(r);
-        setErr(null);
-      })
-      .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
-      .finally(() => {
-        setLoading(false);
-        setRefreshing(false);
-      });
-  };
-
-  useEffect(() => {
-    load(true);
-  }, []);
-
-  return (
-    <Panel>
-      <div className="space-y-3.5 p-4">
-        <Seq
-          n="——"
-          label="Run history"
-          hint="runs recorded on this box"
-          action={
-            <>
-              <span className="font-mono text-[11px] tabular-nums text-lab-muted">
-                {loading ? "——" : runs.length}
-              </span>
-              <Btn size="sm" variant="secondary" loading={refreshing} onClick={() => load()}>
-                Refresh
-              </Btn>
-            </>
-          }
-        />
-        <div className="animus-rule" aria-hidden />
-        {err && (
-          <Callout tone="danger" title="Couldn’t load runs" onDismiss={() => setErr(null)}>
-            {err}
-          </Callout>
-        )}
-        <div className="overflow-x-auto">
-          <table className="lab-table">
-            <thead>
-              <tr>
-                <th scope="col">Run</th>
-                <th scope="col">Kind</th>
-                <th scope="col">Intent</th>
-                <th scope="col">Model</th>
-                <th scope="col">Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading && (
-                <tr>
-                  <td colSpan={5} className="!p-3">
-                    <div className="space-y-2" aria-busy="true">
-                      {[0, 1, 2].map((i) => (
-                        <Skeleton key={i} className="h-3 w-full" />
-                      ))}
-                    </div>
-                  </td>
-                </tr>
-              )}
-              {!loading &&
-                runs.map((r) => {
-                  const isTool =
-                    r.kind === "agentic_tool_eval" || String(r.kind || "").includes("tool");
-                  return (
-                    <tr key={r.run_id}>
-                      <td className="font-mono text-[11px] tabular-nums">
-                        {isTool ? (
-                          <a
-                            href={`/evals/tool/${r.run_id}`}
-                            className="text-lab-accent-bright underline-offset-2 hover:underline"
-                          >
-                            {r.run_id}
-                          </a>
-                        ) : (
-                          r.run_id
-                        )}
-                      </td>
-                      <td className="font-mono text-[11px] text-lab-muted">{r.kind}</td>
-                      <td>{r.intent || <Unset>Not set</Unset>}</td>
-                      <td className="max-w-[200px] truncate">
-                        {r.model_id?.split("/").pop() || <Unset>Unknown</Unset>}
-                      </td>
-                      <td className="font-mono text-[11px] tabular-nums text-lab-muted">
-                        {r.created_at?.slice(0, 19) || <Unset>Unknown</Unset>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              {!loading && !runs.length && (
-                <tr>
-                  <td colSpan={5} className="!p-0">
-                    <EmptyState title="No runs">
-                      Smoke or perf when the endpoint is healthy — results land here.
-                    </EmptyState>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </Panel>
   );
 }

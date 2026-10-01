@@ -1169,6 +1169,10 @@ def test_topology_multinode_without_roce_discovery_warns_instead_of_guessing(mon
 def test_recommend_dsv4_two_sparks_end_to_end(monkeypatch):
     """Full recommend: overlay + topology produce Mia's 2-node DSv4 recipe."""
     monkeypatch.setattr(ac, "_cluster_topology", _two_spark_topo)
+    # Hermetic: weights would otherwise come from the live Hub blob sum (or the local HF cache).
+    monkeypatch.setattr(ac, "estimate_weights_gib", lambda *a, **k: 155.4)
+    monkeypatch.setattr(ac, "load_local_fallback", lambda m: {"config": None, "readme": None, "notes": []})
+    monkeypatch.setattr(ac, "fetch_cookbook_text", lambda *a, **k: (None, "offline"))
     r = ac.recommend(DSV4, mode="workflow_max", fetch_remote=False)
     c = r["config"]
     assert r["topology"]["nodes"] == 2

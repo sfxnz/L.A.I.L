@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { getDb } from "../db/schema";
+import { Database } from "bun:sqlite";
+import { getDb, migrate } from "../db/schema";
 import { getSettings } from "./settings";
 import {
   counterDelta,
@@ -192,5 +193,23 @@ describe("sampleUsage", () => {
     }) as unknown as typeof fetch;
     await sampleUsage();
     expect(getUsageSummary().topModels).toEqual([{ model: "gemma-3-4b-q8.gguf", tokens: 42, calls: 0 }]);
+  });
+});
+
+describe("legacy usage_events", () => {
+  test("are folded into per-minute buckets once, when usage_minutes is first created", () => {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, model TEXT NOT NULL,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, session_id TEXT,
+      source TEXT NOT NULL DEFAULT 'proxy')`);
+    const add = db.query("INSERT INTO usage_events (ts, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?)");
+    add.run("2026-09-05T17:47:04.074Z", M, 10, 4);
+    add.run("2026-09-05T17:47:30.000Z", M, 6, 2);
+    add.run("2026-08-14T14:36:49.278Z", "ci-test-model", 9, 9);
+    migrate(db);
+    migrate(db); // a restart must not fold them again
+    expect(db.query("SELECT minute, model, prompt_tokens, completion_tokens, requests FROM usage_minutes").all()).toEqual([
+      { minute: "2026-09-05T17:47", model: M, prompt_tokens: 16, completion_tokens: 6, requests: 2 },
+    ]);
   });
 });

@@ -18,9 +18,13 @@ export function getDb(): Database {
  * Older databases also hold the retired agent/workbench tables (workspaces,
  * sessions, messages, agent_runs, patches) and usage_events (controller-side
  * metering that saw only proxied, non-streamed calls). They are left on disk
- * untouched; nothing creates, reads or writes them any more.
+ * untouched. usage_events is read once, when usage_minutes is first created, so
+ * /usage keeps the days it already showed (test-suite rows excluded).
  */
-function migrate(database: Database) {
+export function migrate(database: Database) {
+  const hasTable = (name: string) =>
+    !!database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  const firstUsageMinutes = !hasTable("usage_minutes");
   database.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -48,4 +52,13 @@ function migrate(database: Database) {
       PRIMARY KEY (backend, model)
     );
   `);
+  if (firstUsageMinutes && hasTable("usage_events")) {
+    database.exec(`
+      INSERT INTO usage_minutes (minute, model, prompt_tokens, completion_tokens, requests)
+      SELECT substr(ts, 1, 16), model, SUM(prompt_tokens), SUM(completion_tokens), COUNT(*)
+      FROM usage_events
+      WHERE model != 'ci-test-model'
+      GROUP BY substr(ts, 1, 16), model
+    `);
+  }
 }

@@ -159,13 +159,26 @@ describe("shipped ClusterPanel render", () => {
     id: "spark1",
     label: "spark1",
     state: "serving",
+    local: true,
     hostname: "spark1",
     temperature_c: 47,
     gpu_util_pct: 83,
     power_w: 32.1,
-    available_gib: 80,
-    gen_tok_per_s: 41.2,
-    prompt_tok_per_s: 210,
+    available_gib: 13.3,
+    ram_gib: 121.7,
+    engine_reserved_gib: 91.9,
+    swap_total_gib: 16,
+    swap_used_gib: 8.1,
+    mem_pressure: "ok",
+    tp_rank: 0,
+  };
+  const worker: ClusterNode = {
+    id: "spark2",
+    label: "spark2",
+    state: "serving_worker",
+    hostname: "spark2",
+    tp_rank: 1,
+    temperature_c: 42,
   };
   const idle: ClusterNode = {
     id: "spark2",
@@ -174,7 +187,7 @@ describe("shipped ClusterPanel render", () => {
     hostname: "spark2",
   };
 
-  test("serving Spark shows temperature, usage, tok/s, and prefill", () => {
+  test("serving Spark shows temperature, usage, the endpoint tok/s, prefill, memory and swap", () => {
     const html = renderToStaticMarkup(
       createElement(ClusterPanel, {
         cluster: {
@@ -186,6 +199,8 @@ describe("shipped ClusterPanel render", () => {
             nodes_serving: 1,
           },
         },
+        metrics: { decode_tok_per_s: 41.2, throughput_tok_per_s: 80.4, prefill_tok_per_s: 210 },
+        engine: { kv_usage_pct: 0.84, kv_capacity_tokens: 1_694_725 },
       }),
     );
     expect(html).toContain("Temperature");
@@ -196,8 +211,90 @@ describe("shipped ClusterPanel render", () => {
     expect(html).toContain("41.2");
     expect(html).toContain("Prefill");
     expect(html).toContain("210");
-    expect(html).toContain("Live serve decode rate");
+    expect(html).toContain("Per-stream decode rate");
+    expect(html).toContain("all streams 80.4 tok/s");
+    // 0.84 % of the pool is 0.8 %, never 84 %
+    expect(html).toContain("KV 0.8%");
+    expect(html).not.toContain("KV 84");
+    expect(html).toContain("108.4");
+    expect(html).toContain("91.9 GiB engine reservation + 16.5 GiB other used · 13.3 GiB available");
+    expect(html).toContain("swap 8.1");
     expect(html).not.toContain("—");
+  });
+
+  test("a TP worker shows its rank, not a second copy of the endpoint rate", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [serving, worker],
+          summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 2 },
+        },
+        metrics: { decode_tok_per_s: 41.2 },
+      }),
+    );
+    expect(html.match(/41\.2/g)?.length).toBe(2); // head hero + load strip, not the worker
+    expect(html).toContain("TP rank 1");
+  });
+
+  test("between requests the last prefill is dimmed and labelled 'last', never shown as live", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [serving],
+          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
+        },
+        metrics: { decode_tok_per_s: null, prefill_tok_per_s: null, last_prefill: { tok_per_s: 1234, at: Date.now() - 95_000 } },
+      }),
+    );
+    expect(html).toContain("last 1234");
+    expect(html).toContain("1 m 35 s ago — not live");
+    expect(html).not.toMatch(/text-lab-ok">1234</);
+  });
+
+  test("a remote node serving on its own never shows the local endpoint's rates or KV", () => {
+    const remote: ClusterNode = { ...serving, id: "spark2", label: "spark2", hostname: "spark2", local: false };
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [{ ...serving, state: "idle" }, remote],
+          summary: { healthy: true, nodes_online: 2, nodes_total: 2, nodes_serving: 1 },
+        },
+        metrics: { decode_tok_per_s: 41.2, prefill_tok_per_s: 210 },
+        engine: { kv_usage_pct: 12, kv_capacity_tokens: 1_694_725 },
+      }),
+    );
+    expect(html).not.toContain("41.2");
+    expect(html).not.toContain("210");
+    expect(html).not.toContain("KV 12%");
+  });
+
+  test("usage tooltip leaves out a GPU reading it does not have — never 'GPU 0%'", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [{ ...serving, gpu_util_pct: null, cpu_util_pct: 37, cpu: "Cortex-X925" }],
+          summary: { healthy: true, nodes_online: 1, nodes_total: 1, nodes_serving: 1 },
+        },
+      }),
+    );
+    expect(html).toContain('title="CPU 37% (Cortex-X925)"');
+    expect(html).not.toContain("GPU 0%");
+  });
+
+  test("an ssh failure on a pinging host reads differently from a host that is down", () => {
+    const html = renderToStaticMarkup(
+      createElement(ClusterPanel, {
+        cluster: {
+          nodes: [
+            { id: "a", label: "a", state: "unreachable" },
+            { id: "b", label: "b", state: "offline" },
+          ],
+          summary: { healthy: false, nodes_online: 0, nodes_total: 2 },
+        },
+      }),
+    );
+    expect(html).toContain("SSH failed");
+    expect(html).toContain("Offline");
   });
 
   test("idle Spark keeps tok/s and prefill as None, not zero", () => {

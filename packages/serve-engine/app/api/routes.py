@@ -33,16 +33,23 @@ async def status() -> dict[str, Any]:
 
 @router.get("/cluster")
 async def cluster_status() -> dict[str, Any]:
-    """Cluster fabric + per-node serve health (L.A.I.L cluster SoT)."""
+    """Cluster fabric + per-node serve health (L.A.I.L cluster SoT).
+
+    The sampler's cached cluster (with live telemetry); probes off the loop only
+    while the sampler has not produced one yet.
+    """
+    cached = status_sampler.SAMPLER.cluster()
+    if cached is not None:
+        return cached
     try:
-        return cluster.collect_cluster()
+        return await asyncio.to_thread(cluster.collect_cluster)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/hardware")
 async def hardware() -> dict[str, Any]:
-    return metadata.collect_hardware()
+    return status_sampler.SAMPLER.hardware() or await asyncio.to_thread(metadata.collect_hardware)
 
 
 # ─── Serve ────────────────────────────────────────────────────────────────────
@@ -123,7 +130,7 @@ async def serve_examples() -> dict[str, Any]:
 
 
 @router.get("/serve/recommend")
-async def serve_recommend(
+def serve_recommend(
     model: str = Query(..., description="HF model id or local path"),
     mode: Optional[str] = Query(
         None,
@@ -141,6 +148,8 @@ async def serve_recommend(
     """Recommend vLLM, llama.cpp, or SGLang flags from the card plus vendor recipes.
 
     Does not start a server — only returns a config the GUI (or client) can apply.
+    Plain `def`: card/HF fetches and topology run in FastAPI's threadpool, never on
+    the event loop that serves /api/status.
     """
     try:
         rec = autoconfig.recommend(
@@ -177,12 +186,12 @@ async def serve_agent_restore() -> dict[str, str]:
 
 
 @router.get("/jobs")
-async def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
+def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
     return db.list_jobs(limit)
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: str) -> dict[str, Any]:
+def get_job(job_id: str) -> dict[str, Any]:
     j = db.get_job(job_id)
     if not j:
         raise HTTPException(404, "job not found")
@@ -510,14 +519,18 @@ async def bench_agentic(body: AgenticRequest) -> dict[str, str]:
 
 @router.get("/bench/tool-eval-status")
 async def tool_eval_status() -> dict[str, Any]:
-    return agentic.tool_eval_available()
+    return await asyncio.to_thread(agentic.tool_eval_available)
 
 
 # ─── Runs / compare ───────────────────────────────────────────────────────────
 
 
+# Plain `def` routes below: sqlite + envelope JSON reads run in FastAPI's threadpool,
+# never on the event loop that serves /api/status.
+
+
 @router.get("/runs")
-async def list_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[str, Any]]:
+def list_runs(limit: int = 50, kind: Optional[str] = None) -> list[dict[str, Any]]:
     rows = db.list_runs(limit if not kind else max(limit, 100))
     if kind:
         rows = [r for r in rows if r.get("kind") == kind][:limit]
@@ -571,7 +584,7 @@ async def import_run(body: RunImport) -> dict[str, str]:
 
 
 @router.get("/runs/tool-eval/board")
-async def tool_eval_board(limit: int = 40) -> dict[str, Any]:
+def tool_eval_board(limit: int = 40) -> dict[str, Any]:
     """Normalized tool-eval scorecards for leaderboard + compare UI."""
     rows = [r for r in db.list_runs(80) if r.get("kind") == "agentic_tool_eval"][:limit]
     board: list[dict[str, Any]] = []
@@ -641,12 +654,12 @@ async def tool_eval_board(limit: int = 40) -> dict[str, Any]:
 
 
 @router.get("/runs/tool-eval/compare")
-async def tool_eval_compare(ids: str) -> dict[str, Any]:
+def tool_eval_compare(ids: str) -> dict[str, Any]:
     """Compare 2–4 tool-eval runs by id (comma-separated)."""
     run_ids = [x.strip() for x in ids.split(",") if x.strip()]
     if len(run_ids) < 2 or len(run_ids) > 4:
         raise HTTPException(400, "pass 2–4 run ids via ?ids=a,b")
-    board = (await tool_eval_board(limit=80))["runs"]
+    board = tool_eval_board(limit=80)["runs"]
     by_id = {r["run_id"]: r for r in board}
     selected = []
     for rid in run_ids:
@@ -656,7 +669,7 @@ async def tool_eval_compare(ids: str) -> dict[str, Any]:
             if not row:
                 raise HTTPException(404, f"run not found: {rid}")
             # rebuild one entry via board filter
-            full = await tool_eval_board(limit=80)
+            full = tool_eval_board(limit=80)
             by_id = {r["run_id"]: r for r in full["runs"]}
         if rid not in by_id:
             raise HTTPException(404, f"run not found: {rid}")
@@ -712,7 +725,7 @@ async def tool_eval_compare(ids: str) -> dict[str, Any]:
 
 
 @router.get("/runs/compare/{a}/{b}")
-async def compare_runs(a: str, b: str, force: bool = False) -> dict[str, Any]:
+def compare_runs(a: str, b: str, force: bool = False) -> dict[str, Any]:
     ra, rb = db.get_run(a), db.get_run(b)
     if not ra or not rb:
         raise HTTPException(404, "run not found")
@@ -732,7 +745,7 @@ async def compare_runs(a: str, b: str, force: bool = False) -> dict[str, Any]:
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
+def get_run(run_id: str) -> dict[str, Any]:
     row = db.get_run(run_id)
     if not row:
         raise HTTPException(404, "run not found")
@@ -750,7 +763,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
 
 
 @router.delete("/runs/{run_id}")
-async def delete_run(run_id: str) -> dict[str, str]:
+def delete_run(run_id: str) -> dict[str, str]:
     row = db.get_run(run_id)
     if not row:
         raise HTTPException(404, "run not found")

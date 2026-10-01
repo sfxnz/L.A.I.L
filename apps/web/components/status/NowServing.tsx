@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import type { LabStatus } from "@/lib/api";
-import { fmtTokensK, kvFraction } from "@/lib/status/forecast";
+import { fmtKvPct, fmtTokensK } from "@/lib/status/forecast";
 import { fmtUptime } from "@/lib/status/format";
 import { parseQuant } from "@/lib/status/quant";
 import { Badge, CopyButton, Eyebrow, Nil, Panel, Stat, SyncRing, Tick } from "@/components/ui";
@@ -38,8 +38,7 @@ export function NowServing({
   const engineLabel = backendKey.toLowerCase() === "vllm" ? "vLLM" : backendKey.toLowerCase() === "llamacpp" ? "llama.cpp" : backendKey;
   const tp = cluster?.summary?.multi?.tensor_parallel_hint ?? cluster?.nodes?.find((n) => n.tensor_parallel_size != null)?.tensor_parallel_size ?? null;
   const quant = parseQuant(modelId);
-  const kvUsage = engine?.kv_usage_pct ?? metrics?.gpu_kv_cache_usage ?? null;
-  const kvPct = kvUsage == null ? null : Math.round(kvFraction(kvUsage) * 100);
+  const kvPct = engine?.kv_usage_pct ?? null;
   const running = engine?.requests_running ?? metrics?.requests_running ?? null;
   const waiting = engine?.requests_waiting ?? metrics?.requests_waiting ?? null;
   const endpoint = status?.openAiBase || (serve?.base_url ? `${serve.base_url}/v1` : null);
@@ -93,7 +92,7 @@ export function NowServing({
           </Stat>
           <Stat label="KV now" title="KV cache in use">
             <span className={cn(mono, kvPct != null && kvPct >= 90 && "text-lab-warn")}>
-              {kvPct != null ? `${kvPct}%` : nil()}
+              {kvPct != null ? fmtKvPct(kvPct) : nil()}
             </span>
           </Stat>
           <Stat label="Requests" title="Running / waiting on the engine">

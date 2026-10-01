@@ -837,8 +837,11 @@ def _cluster_topology() -> dict[str, Any]:
 
     try:
         from . import cluster as _cluster
+        from . import status_sampler as _sampler
 
-        data = _cluster.collect_cluster()
+        # The sampler's slow tick already probed every node (≤ 2 ticks old); only
+        # re-probe over ssh when it has no fresh cluster (startup, scripts, tests).
+        data = _sampler.SAMPLER.cluster(max_age_s=2 * _sampler.SLOW_INTERVAL_S + 5) or _cluster.collect_cluster()
         nodes = data.get("nodes") or []
         online = [n for n in nodes if n.get("state") != "offline" and (n.get("online") or n.get("local"))]
         if not online:
@@ -1295,11 +1298,9 @@ def _resolved_node_ram_gib(value: Any = None) -> float:
     """Explicit ram_gib → live MemTotal → conservative laptop-scale. Never 121.7."""
     if isinstance(value, (int, float)) and value > 0:
         return float(value)
-    hw = _probed_local_hardware()
-    for key in ("ram_gib", "memory_capacity_gib"):
-        ram = hw.get(key)
-        if isinstance(ram, (int, float)) and ram > 0:
-            return float(ram)
+    ram = _probed_local_hardware().get("ram_gib")
+    if isinstance(ram, (int, float)) and ram > 0:
+        return float(ram)
     return _CONSERVATIVE_NODE_RAM_GIB
 
 
@@ -1312,8 +1313,6 @@ def _local_hw_fallback_node() -> dict[str, Any]:
     """Single local node from collect_hardware() when cluster topology is unavailable."""
     hw = _probed_local_hardware()
     ram = hw.get("ram_gib")
-    if not (isinstance(ram, (int, float)) and ram > 0):
-        ram = hw.get("memory_capacity_gib")
     if not (isinstance(ram, (int, float)) and ram > 0):
         ram = None
     sku = hw.get("gpu_sku")

@@ -257,7 +257,13 @@ describe("load run", () => {
       chat_template_kwargs: { enable_thinking: false },
     });
     expect(state.requests[0]).not.toHaveProperty("min_tokens");
-    const msgs = state.requests.map((r) => r.messages as Array<{ role: string; content: string }>);
+    // Burst launches both strands at once, so upstream arrival order is not strand order:
+    // key each request by its strand's system prompt instead of its position in state.requests.
+    const msgs = [0, 1].map((i) => {
+      const r = state.requests.find((q) => (q.messages as Array<{ content: string }>)[0].content === strandSystemPrompt(run_id, i));
+      expect(r).toBeDefined();
+      return r!.messages as Array<{ role: string; content: string }>;
+    });
     expect(msgs[0].map((m) => m.role)).toEqual(["system", "user"]);
     expect(msgs[0][1].content).toBe(getPack("prose")!.prompts[0].text);
     expect(msgs[0][0].content).toContain(run_id);
@@ -474,10 +480,14 @@ describe("bench runs", () => {
     const res = await post("/api/streams/runs", { mode: "load", pack: "prose", base_url: BASE, n: 1, max_tokens: 120 });
     const { run_id } = (await res.json()) as { run_id: string };
     const events = await collect(run_id);
-    const firstDone = events.findIndex((e) => e.type === "strand" && e.state === "done");
     const aggs = byType(events, "agg");
     expect(aggs.length).toBeGreaterThan(2);
-    expect(events.findIndex((e) => e.type === "agg" && e.calibrated)).toBeGreaterThan(firstDone);
+    expect(aggs[0].calibrated).toBe(false);
+    // The trailing usage frame follows every output chunk but precedes [DONE] by one frame, so an
+    // agg tick may land between it and the strand's `done`. What must hold: the first calibrated
+    // agg already counts every output chunk, i.e. calibration came from the trailing frame.
+    const doneTokens = byType(events, "strand").find((s) => s.state === "done")!.tokens!;
+    expect(aggs.find((a) => a.calibrated)!.tokens).toBe(doneTokens);
     expect(aggs[aggs.length - 1]).toMatchObject({ calibrated: true, tokens_per_chunk: 3 });
   });
 

@@ -28,10 +28,11 @@ export function StreamsMiniBoard({
   const serve = status?.serve;
   const engine = serve?.engine;
   const cluster = status?.cluster || serve?.cluster;
-  const liveNode = cluster?.nodes?.find((n) => n.state === "serving" || n.state === "serving_worker");
+  const liveNode = cluster?.nodes?.find((n) => n.state === "serving");
   const running = liveRun?.running ?? engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
   const waiting = liveRun?.waiting ?? engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
-  const rate = liveRun ? liveRun.tok_s : healthy ? liveNode?.gen_tok_per_s ?? null : null;
+  // Endpoint: per-stream decode rate over busy time (serve.metrics), never a per-node copy.
+  const rate = liveRun ? liveRun.tok_s : healthy ? serve?.metrics?.decode_tok_per_s ?? null : null;
   const history = (liveNode ? samples[liveNode.id] ?? [] : []).map((s) => s.tok_s).filter((v): v is number => v !== null);
 
   return (
@@ -53,7 +54,7 @@ export function StreamsMiniBoard({
       >
         <div className="flex flex-1 flex-col gap-3 p-4">
           <div className="flex items-end justify-between gap-3">
-            <Stat label="Aggregate" title={liveRun ? "Run aggregate (usage-calibrated)" : "Endpoint counter rate, 2 s"}>
+            <Stat label="Aggregate" title={liveRun ? "Run aggregate (usage-calibrated)" : "Endpoint per-stream decode rate (busy time, 1 s)"}>
               <div className="lab-num flex items-baseline gap-1.5 font-[family-name:var(--font-display)] text-[30px] font-bold leading-none tabular-nums text-lab-text">
                 {rate != null ? fmtRate(rate) : <Nil word={healthy ? "Awaiting" : "None"} />}
                 {rate != null && <span className="font-mono text-[10px] font-normal text-lab-muted">tok/s</span>}

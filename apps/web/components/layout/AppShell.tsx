@@ -13,7 +13,8 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { setClientToken } from "@/lib/auth-token";
-import { serveHealthy, startLabStatusPolling, useLabStatusStore } from "@/lib/lab-status-store";
+import { fmtKvPct } from "@/lib/status/forecast";
+import { serveHealthy, startLabStatusPolling, tightestNode, useLabStatusStore } from "@/lib/lab-status-store";
 import { WORKSPACE_NAV, isProseRoute } from "@/lib/ide-chrome";
 import { cn } from "@/lib/utils";
 import { Eyebrow, SyncRing, Tick, type SyncState } from "@/components/ui";
@@ -51,21 +52,27 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const servedId = serve?.model_id;
   const model =
     healthy && servedId && servedId !== "auto" && servedId !== "default" ? servedId : null;
-  const cluster = status?.cluster || serve?.cluster;
-  const liveNode = cluster?.nodes?.find(
-    (n) => n.state === "serving" || n.state === "serving_worker",
-  );
   // Header truth: while a run streams, the header shows the run's own aggregate
-  // (the number Streams/Bench show), labelled "run"; otherwise the endpoint
-  // counter rate, labelled "endpoint". Never two unexplained numbers.
-  const tokS = liveRun ? liveRun.tok_s : healthy ? liveNode?.gen_tok_per_s : null;
-  const rateSource = liveRun ? "run" : "endpoint";
+  // (the number Streams/Bench show), labelled "run"; otherwise the endpoint's
+  // per-stream decode rate (busy time, serve.metrics), labelled "endpoint". When
+  // the endpoint is idle, the previous burst is shown dimmed and labelled "last" —
+  // never as live — or "— idle" before any burst. The slot stays rendered while the
+  // endpoint is up, so the header never shifts. Never two unexplained numbers.
+  const metrics = healthy ? serve?.metrics : null;
+  const lastBurst = metrics?.last_burst?.decode_tok_per_s ?? null;
+  const liveTokS = liveRun ? liveRun.tok_s : (metrics?.decode_tok_per_s ?? null);
+  const tokS = liveTokS ?? lastBurst;
+  const rateSource = liveRun ? "run" : liveTokS != null ? "endpoint" : lastBurst != null ? "last" : "idle";
   const engine = serve?.engine;
   const running = liveRun?.running ?? engine?.requests_running ?? serve?.metrics?.requests_running ?? null;
   const waiting = liveRun?.waiting ?? engine?.requests_waiting ?? serve?.metrics?.requests_waiting ?? null;
-  const kvUsage = engine?.kv_usage_pct ?? serve?.metrics?.gpu_kv_cache_usage ?? null;
-  const kvPct = kvUsage == null ? null : Math.round(kvUsage > 1 ? kvUsage : kvUsage * 100);
-  const freeGib = serve?.hardware?.available_gib;
+  const kvPct = engine?.kv_usage_pct ?? null;
+  // Free memory of the tightest live node (under TP, the first rank to run out takes the
+  // serve down); this host's reading when there is no cluster inventory yet.
+  const clusterNodes = (status?.cluster ?? serve?.cluster)?.nodes;
+  const tightest = tightestNode(clusterNodes);
+  const freeGib = tightest?.available_gib ?? serve?.hardware?.available_gib;
+  const freeMulti = !!tightest && (clusterNodes?.filter((n) => n.local || n.online).length ?? 0) > 1;
 
   const ring: SyncState | null = needToken
     ? "token"
@@ -215,7 +222,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </>
             )}
 
-            {tokS != null && (
+            {(liveRun || healthy) && (
               <>
                 <Tick className="hidden md:block" />
                 <span
@@ -223,12 +230,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   title={
                     liveRun
                       ? `Live ${liveRun.source} run aggregate (usage-calibrated) · peak ${fmtRate(liveRun.peak)}`
-                      : "Endpoint counter rate from the serve-engine sampler (2 s)"
+                      : liveTokS != null
+                        ? `Per-stream decode rate over busy time (serve-engine, 1 s)${
+                            metrics?.throughput_tok_per_s != null ? ` · all streams ${fmtRate(metrics.throughput_tok_per_s)} tok/s` : ""
+                          }${metrics?.spec_accept_rate != null ? ` · spec accept ${Math.round(metrics.spec_accept_rate * 100)}%` : ""}`
+                        : lastBurst != null
+                          ? "Endpoint idle — decode rate of the last burst, not live"
+                          : "Endpoint idle — no burst measured yet"
                   }
                 >
                   <Eyebrow className={cn("text-[8px]", liveRun ? "text-lab-target" : undefined)}>{rateSource}</Eyebrow>
-                  <span>
-                    {fmtRate(tokS)} <span className="text-lab-muted">tok/s</span>
+                  <span className={rateSource === "last" || rateSource === "idle" ? "text-lab-muted" : undefined}>
+                    {tokS != null ? fmtRate(tokS) : "—"} <span className="text-lab-muted">tok/s</span>
                   </span>
                 </span>
               </>
@@ -250,7 +263,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <>
                 <Tick className="hidden xl:block" />
                 <Eyebrow className="hidden shrink-0 xl:inline" title="KV cache in use">
-                  KV {kvPct}%
+                  KV {fmtKvPct(kvPct)}
                 </Eyebrow>
               </>
             )}
@@ -258,8 +271,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {freeGib != null && (
               <>
                 <Tick className="hidden lg:block" />
-                <Eyebrow className="hidden shrink-0 tracking-[0.12em] lg:inline">
-                  {freeGib} GiB free
+                <Eyebrow
+                  className="hidden shrink-0 tracking-[0.12em] lg:inline"
+                  title={
+                    freeMulti
+                      ? `MemAvailable on ${tightest?.label || tightest?.id}, the tightest live node (/proc/meminfo)`
+                      : "MemAvailable on this host (/proc/meminfo)"
+                  }
+                >
+                  {freeMulti ? `${tightest?.id} ` : ""}
+                  {freeGib.toFixed(1)} GiB free
                 </Eyebrow>
               </>
             )}

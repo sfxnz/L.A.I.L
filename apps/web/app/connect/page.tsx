@@ -80,7 +80,7 @@ export default function ConnectPage() {
                 ? `${serve.hardware.available_gib} GiB`
                 : "—"
             }
-            sub={serve?.headroom ? `headroom: ${serve.headroom}` : "from free -h via serve-engine"}
+            sub={serve?.headroom ? `headroom: ${serve.headroom}` : "MemAvailable (/proc/meminfo) via serve-engine"}
             tone={
               serve?.headroom === "critical"
                 ? "danger"

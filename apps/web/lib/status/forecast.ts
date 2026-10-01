@@ -41,14 +41,29 @@ export function forecastLine(f: KvForecast): string {
   return `KV capacity ${fmtTokensK(f.capacityTokens)} tokens · fits ${f.fits} × ${fmtTokensK(f.seqTokens)}`;
 }
 
-/** KV tokens in use, from the pool's usage fraction/percent (accepts 0–1 or 0–100). */
-export function kvUsedTokens(capacityTokens: number | null | undefined, usage: number | null | undefined): number | null {
-  if (capacityTokens == null || usage == null || !Number.isFinite(capacityTokens) || !Number.isFinite(usage)) return null;
-  return Math.round(capacityTokens * kvFraction(usage));
+/**
+ * KV contract: the serve-engine sends `engine.kv_usage_pct` as a PERCENT, 0–100, always.
+ * No unit guessing — 0.84 means 0.84 %, never 84 %.
+ */
+export function kvFraction(pct: number): number {
+  return Math.max(0, Math.min(1, pct / 100));
 }
 
-/** Normalise a KV usage reading to a 0–1 fraction: vLLM reports 0–1, C2 reports percent. */
-export function kvFraction(usage: number): number {
-  const f = usage > 1 ? usage / 100 : usage;
-  return Math.max(0, Math.min(1, f));
+/** KV tokens in use, from the pool's usage percent. */
+export function kvUsedTokens(capacityTokens: number | null | undefined, pct: number | null | undefined): number | null {
+  if (capacityTokens == null || pct == null || !Number.isFinite(capacityTokens) || !Number.isFinite(pct)) return null;
+  return Math.round(capacityTokens * kvFraction(pct));
+}
+
+/**
+ * "0.8%" below 10 %, "42%" above; any real use below 0.05 % reads "<0.1%", never "0.0%"
+ * (0.04 % of a 1.69M-token pool is ~680 tokens). The branch is chosen on the rounded
+ * value, so 9.96 reads "10%", not "10.0%".
+ */
+export function fmtKvPct(pct: number): string {
+  const p = Math.max(0, Math.min(100, pct));
+  if (p === 0) return "0%";
+  if (p < 0.05) return "<0.1%";
+  const tenth = Math.round(p * 10) / 10;
+  return tenth < 10 ? `${tenth.toFixed(1)}%` : `${Math.round(p)}%`;
 }

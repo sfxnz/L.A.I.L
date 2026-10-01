@@ -63,12 +63,40 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** Append one sample per node (pure). Nodes come and go, so series are keyed by id. */
+/**
+ * The node whose endpoint serve.metrics describes: the serve-engine probes the endpoint
+ * of the host it runs on, so only the LOCAL serving node owns those rates. A TP worker
+ * serves the same tokens, and a remote node serving on its own is not what was probed.
+ */
+export function ownsEndpoint(n: ClusterNode): boolean {
+  return n.state === "serving" && !!n.local;
+}
+
+/**
+ * The live node with the least MemAvailable — under TP, any one rank running out of
+ * memory takes the serve down, so this is the number that matters. Offline nodes carry
+ * no current reading and are skipped.
+ */
+export function tightestNode(nodes: ClusterNode[] | undefined): ClusterNode | null {
+  let best: ClusterNode | null = null;
+  for (const n of nodes ?? []) {
+    if (!(n.local || n.online) || n.available_gib == null) continue;
+    if (best == null || n.available_gib < (best.available_gib as number)) best = n;
+  }
+  return best;
+}
+
+/**
+ * Append one sample per node (pure). Nodes come and go, so series are keyed by id.
+ * `tok_s` is the endpoint's decode rate (serve.metrics), recorded on the node that owns
+ * the endpoint only (`ownsEndpoint`) — TP workers serve the same tokens and must not read as 2×.
+ */
 export function pushNodeSamples(
   prev: Record<string, NodeSample[]>,
   nodes: ClusterNode[] | undefined,
   t: number,
   keep = NODE_SAMPLES_KEEP,
+  endpointTokS: number | null | undefined = null,
 ): Record<string, NodeSample[]> {
   if (!nodes?.length) return prev;
   const next: Record<string, NodeSample[]> = { ...prev };
@@ -78,7 +106,7 @@ export function pushNodeSamples(
     if (last && last.t === t) continue;
     const sample: NodeSample = {
       t,
-      tok_s: num(n.gen_tok_per_s),
+      tok_s: ownsEndpoint(n) ? num(endpointTokS) : null,
       power: num(n.power_w),
       util: num(n.gpu_util_pct),
       temp: num(n.temperature_c),
@@ -121,7 +149,7 @@ export const useLabStatusStore = create<LabStatusStore>((set, get) => ({
         unreachable: false,
         error: null,
         lastGoodAt: now,
-        samples: pushNodeSamples(s.samples, nodes, now),
+        samples: pushNodeSamples(s.samples, nodes, now, NODE_SAMPLES_KEEP, status.serve?.metrics?.decode_tok_per_s),
       }));
     } catch (e) {
       const unauthorized = isUnauthorizedError(e);

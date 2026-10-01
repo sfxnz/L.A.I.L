@@ -456,7 +456,7 @@ export const api = {
     ),
   job: (id: string) => req<Job>(`/api/jobs/${id}`),
   cancelJob: (id: string) =>
-    req<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+    req<{ job_id: string; status?: string }>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   jobs: () =>
     req<
       Array<{
@@ -470,8 +470,6 @@ export const api = {
       }>
     >("/api/jobs"),
   smoke: () => req<{ ok: boolean; content: string }>("/api/smoke", { method: "POST" }),
-  benchPerf: (body: Record<string, unknown>) =>
-    req<{ job_id: string }>("/api/bench/perf", { method: "POST", body: JSON.stringify(body) }),
   benchAgentic: (body: {
     suite?: "golden" | "tool_eval";
     preset?: "short" | "full" | "hardmode" | "coding";
@@ -501,6 +499,8 @@ export const api = {
     const s = q.toString();
     return req<RunRow[]>(`/api/runs${s ? `?${s}` : ""}`);
   },
+  runsCount: (kind?: string) =>
+    req<{ count: number }>(`/api/runs/count${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`),
   run: (runId: string) =>
     req<{
       index: RunRow;
@@ -577,69 +577,118 @@ export function streamRunEventsUrl(runId: string): string {
   return tokenQuery(`/api/streams/runs/${encodeURIComponent(runId)}/events`);
 }
 
+const TERMINAL_JOB = new Set(["completed", "failed", "cancelled", "done", "error"]);
+
+/**
+ * Follow a serve-engine job: logs + status over SSE until a terminal state.
+ *
+ * The SSE replays the log from byte 0 on every (re)connection; only bytes not yet
+ * delivered reach `onLog`. After 3 consecutive stream errors the EventSource is
+ * closed and the job row is polled with backoff (2 s → 15 s): a terminal row
+ * finishes the watch, a live row re-opens the stream, and only a 404 — never a
+ * transient failure (controller restart, 401 while a token is re-pasted) — is
+ * reported as failed.
+ */
 export function watchJob(
   jobId: string,
   onLog: (chunk: string) => void,
   onStatus: (s: { status: string; progress: number; message: string }) => void,
   onResult?: (r: unknown) => void,
 ): () => void {
-  const es = new EventSource(tokenQuery(`/api/jobs/${jobId}/logs`));
+  let es: EventSource | null = null;
   let closed = false;
   let errorTicks = 0;
+  let delivered = 0;
+  let seen = 0;
+  let poll: ReturnType<typeof setTimeout> | null = null;
+  let backoff = 2000;
+  let last = { status: "running", progress: 0, message: "" };
 
   const finish = (payload?: unknown) => {
     if (closed) return;
     closed = true;
-    try {
-      es.close();
-    } catch {
-      /* */
-    }
+    es?.close();
+    es = null;
+    if (poll) clearTimeout(poll);
+    poll = null;
     if (payload !== undefined) onResult?.(payload);
   };
 
-  es.addEventListener("log", (e) => onLog((e as MessageEvent).data));
-  es.addEventListener("status", (e) => {
-    errorTicks = 0;
-    try {
-      onStatus(JSON.parse((e as MessageEvent).data));
-    } catch {
-      /* */
-    }
-  });
-  es.addEventListener("result", (e) => {
-    try {
-      finish(JSON.parse((e as MessageEvent).data));
-    } catch {
-      finish(null);
-    }
-  });
-  es.onerror = () => {
-    errorTicks += 1;
-    // EventSource retries; after a few consecutive errors, resolve via job API
-    if (errorTicks < 3 || closed) return;
+  const status = (s: { status: string; progress: number; message: string }) => {
+    last = s;
+    onStatus(s);
+  };
+
+  const checkJob = () => {
+    poll = null;
     void api
       .job(jobId)
       .then((j) => {
-        onStatus({
-          status: j.status,
-          progress: j.progress ?? 0,
-          message: j.message || (j.status === "running" ? "reconnecting…" : j.status),
-        });
-        if (j.status !== "running" && j.status !== "queued") {
-          finish(j);
+        if (closed) return;
+        status({ status: j.status, progress: j.progress ?? 0, message: j.message || j.status });
+        if (TERMINAL_JOB.has(j.status)) finish(j);
+        else {
+          backoff = 2000;
+          open(); // the job API answers again: resume the stream (already-seen log bytes are skipped)
         }
       })
-      .catch(() => {
-        onStatus({
-          status: "failed",
-          progress: 0,
-          message: "Lost job stream — job may be orphaned after a restart",
-        });
-        finish(null);
+      .catch((e: unknown) => {
+        if (closed) return;
+        if (String((e as Error)?.message ?? e).includes("job not found")) {
+          status({ status: "failed", progress: last.progress, message: "job not found — the serve-engine no longer knows it" });
+          finish(null);
+          return;
+        }
+        onStatus({ ...last, message: "reconnecting…" });
+        poll = setTimeout(checkJob, backoff);
+        backoff = Math.min(backoff * 2, 15_000);
       });
   };
 
+  const open = () => {
+    const src = new EventSource(tokenQuery(`/api/jobs/${jobId}/logs`));
+    es = src;
+    seen = 0;
+    src.onopen = () => {
+      seen = 0;
+    };
+    src.addEventListener("log", (e) => {
+      const chunk = (e as MessageEvent).data as string;
+      const skip = Math.max(0, Math.min(chunk.length, delivered - seen));
+      seen += chunk.length;
+      if (chunk.length > skip) {
+        delivered += chunk.length - skip;
+        onLog(chunk.slice(skip));
+      }
+    });
+    src.addEventListener("status", (e) => {
+      errorTicks = 0;
+      try {
+        status(JSON.parse((e as MessageEvent).data));
+      } catch {
+        /* */
+      }
+    });
+    src.addEventListener("result", (e) => {
+      try {
+        finish(JSON.parse((e as MessageEvent).data));
+      } catch {
+        finish(null);
+      }
+    });
+    src.onerror = () => {
+      if (closed || es !== src) return;
+      errorTicks += 1;
+      // EventSource retries on its own; after a few consecutive failures stop it and ask the job API.
+      if (errorTicks < 3) return;
+      errorTicks = 0;
+      src.close();
+      es = null;
+      checkJob();
+    };
+  };
+
+  open();
   return () => finish();
 }
 

@@ -52,11 +52,16 @@ export function useJobWatch(opts?: { onSettled?: () => void }) {
   const onSettled = useRef(opts?.onSettled);
   onSettled.current = opts?.onSettled;
 
-  // Log chunks arrive faster than React should re-render; coalesce per frame.
+  // Log chunks arrive faster than React should re-render; coalesce per frame (on a
+  // timer while the tab is hidden — rAF does not run there).
   const pendingLog = useRef("");
   const logRaf = useRef(0);
+  const logTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushLogs = useCallback(() => {
+    if (logRaf.current) cancelAnimationFrame(logRaf.current);
+    if (logTimer.current) clearTimeout(logTimer.current);
     logRaf.current = 0;
+    logTimer.current = null;
     const chunk = pendingLog.current;
     pendingLog.current = "";
     if (!chunk) return;
@@ -67,7 +72,9 @@ export function useJobWatch(opts?: { onSettled?: () => void }) {
     closer.current?.();
     closer.current = null;
     if (logRaf.current) cancelAnimationFrame(logRaf.current);
+    if (logTimer.current) clearTimeout(logTimer.current);
     logRaf.current = 0;
+    logTimer.current = null;
     pendingLog.current = "";
   }, []);
 
@@ -87,7 +94,9 @@ export function useJobWatch(opts?: { onSettled?: () => void }) {
         jobId,
         (chunk) => {
           pendingLog.current += chunk;
-          if (!logRaf.current) logRaf.current = requestAnimationFrame(flushLogs);
+          if (document.hidden) {
+            if (!logTimer.current) logTimer.current = setTimeout(flushLogs, 500);
+          } else if (!logRaf.current) logRaf.current = requestAnimationFrame(flushLogs);
         },
         (s) => {
           const status = normalizeJobStatus(s.status);
@@ -100,10 +109,13 @@ export function useJobWatch(opts?: { onSettled?: () => void }) {
     [close, flushLogs],
   );
 
+  // The runner flips the row to `cancelled` at its next check; the stream reports it.
+  // Only a job that was already terminal (or orphaned) settles here.
   const cancel = useCallback(async () => {
     if (!job.id) return;
-    await api.cancelJob(job.id);
-    setJob((j) => ({ ...j, status: "cancelled", message: "cancelled" }));
+    const r = await api.cancelJob(job.id);
+    const status = normalizeJobStatus(r.status ?? "running");
+    setJob((j) => (isTerminalJobState(j.status) ? j : { ...j, status, message: isTerminalJobState(status) ? status : "cancelling…" }));
   }, [job.id]);
 
   const clear = useCallback(() => {

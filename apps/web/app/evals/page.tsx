@@ -1,21 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api, type RunRow } from "@/lib/api";
 import { serveHealthy, useLabStatus } from "@/lib/lab-status-store";
-import { useJobWatch } from "@/lib/use-job-watch";
 import {
   Badge,
   Btn,
   Callout,
   EmptyState,
   Eyebrow,
-  Field,
-  Input,
-  LogView,
   Panel,
-  ProgressBar,
   Skeleton,
   SyncRing,
   btnClass,
@@ -156,24 +151,35 @@ function scoreTone(score: number | null | undefined) {
   return "danger" as const;
 }
 
+/** Bench runs open in /bench, tool-eval runs on their scorecard; other kinds have no view. */
+function runHref(r: RunRow): string | null {
+  if (r.kind === "decode" || r.kind === "prefill") return `/bench?run=${encodeURIComponent(r.run_id)}`;
+  if (r.kind === "agentic_tool_eval") return `/evals/tool/${encodeURIComponent(r.run_id)}`;
+  return null;
+}
+
 export default function EvalsPage() {
   const { status, loading: statusLoading, refresh: refreshStatus } = useLabStatus();
   const [runs, setRuns] = useState<RunRow[]>([]);
+  const [latestTool, setLatestTool] = useState<RunRow | null>(null);
+  const [runsTotal, setRunsTotal] = useState<number | null>(null);
   const [runsLoaded, setRunsLoaded] = useState(false);
   const [smokeOut, setSmokeOut] = useState<string | null>(null);
   const [smokeOk, setSmokeOk] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
-  const [conc, setConc] = useState("1,2,4");
   const [err, setErr] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Lab status comes from the shell's shared poll; runs load on mount and
-  // re-load when a job settles or the operator asks.
+  // Lab status comes from the shell's shared poll; runs load on mount and when the
+  // operator asks. The verdict and the total are their own queries (the kind filter
+  // and the count run in SQL), never derived from the newest page of runs.
   const loadRuns = useCallback(
     () =>
-      api
-        .runs()
-        .then(setRuns)
+      Promise.all([
+        api.runs({ limit: 20 }).then(setRuns),
+        api.runs({ kind: "agentic_tool_eval", limit: 1 }).then((r) => setLatestTool(r[0] ?? null)),
+        api.runsCount().then((c) => setRunsTotal(c.count)),
+      ])
         .catch(() => {})
         .finally(() => setRunsLoaded(true)),
     [],
@@ -191,27 +197,9 @@ export default function EvalsPage() {
     }
   }, [refreshStatus, loadRuns]);
 
-  const { job, track, cancel, running: jobRunning, done: jobDone, failed: jobFailed } = useJobWatch({
-    onSettled: () => {
-      setBusy(false);
-      void loadRuns();
-    },
-  });
-  const { logs, message: jobMsg, status: jobStatus, progress: jobProgress } = job;
-
   const loading = statusLoading || !runsLoaded;
   const healthy = serveHealthy(status);
 
-  /* Purely derived from the runs already in state — no extra fetch. */
-  const latestTool = useMemo(
-    () =>
-      runs.find(
-        (r) =>
-          (r.kind === "agentic_tool_eval" || String(r.kind || "").includes("tool")) &&
-          typeof r.summary?.final_score === "number",
-      ) || null,
-    [runs],
-  );
   const latestScore =
     typeof latestTool?.summary?.final_score === "number"
       ? (latestTool.summary.final_score as number)
@@ -236,28 +224,6 @@ export default function EvalsPage() {
     }
   }
 
-  async function runPerf() {
-    setErr(null);
-    setBusy(true);
-    try {
-      const concurrencies = conc
-        .split(/[,\s]+/)
-        .map((x) => parseInt(x, 10))
-        .filter((n) => Number.isFinite(n) && n > 0);
-      // Only the in-repo workflow sweep runs here; the external prefill /
-      // single-N runners are not installed on this host and live in /bench.
-      const { job_id } = await api.benchPerf({
-        runner: "workflow",
-        concurrencies: concurrencies.length ? concurrencies : [1, 2, 4],
-        intent: "attach",
-      });
-      track(job_id);
-    } catch (e) {
-      setErr(String((e as Error).message || e));
-      setBusy(false);
-    }
-  }
-
   return (
     <div className="lab-fade-in space-y-6">
       <div className="page-header">
@@ -267,7 +233,7 @@ export default function EvalsPage() {
             Bench control
           </div>
           <h1 className="page-title">Evals</h1>
-          <p className="page-sub">Smoke, perf, and tool-eval quality vs the live serve</p>
+          <p className="page-sub">Smoke and tool-eval quality vs the live serve; throughput and latency live on Bench</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Btn variant="secondary" size="sm" onClick={() => void refresh()} loading={refreshing}>
@@ -289,7 +255,7 @@ export default function EvalsPage() {
             </Link>
           }
         >
-          Start a model before running smoke, perf, or tool-eval. Cold loads can take several
+          Start a model before running smoke, a bench, or tool-eval. Cold loads can take several
           minutes on large NVFP4 weights.
         </Callout>
       )}
@@ -397,7 +363,7 @@ export default function EvalsPage() {
                   <Skeleton className="h-3.5 w-10" />
                 ) : (
                   <span className="font-[family-name:var(--font-display)] text-[18px] font-semibold leading-none tabular-nums">
-                    {runs.length}
+                    {runsTotal ?? <Absent>unknown</Absent>}
                   </span>
                 )}
               </Cell>
@@ -437,7 +403,7 @@ export default function EvalsPage() {
               <Btn
                 onClick={() => void runSmoke()}
                 disabled={!healthy}
-                loading={busy && smokeOk == null && !jobRunning}
+                loading={busy && smokeOk == null}
                 title={!healthy ? "Start a model on Serve first" : undefined}
               >
                 Run smoke
@@ -460,79 +426,31 @@ export default function EvalsPage() {
             </div>
           </Panel>
 
-          <Panel title="Perf bench" className="flex h-full flex-col">
+          <Panel title="Throughput & latency" className="flex h-full flex-col">
             <div className="flex flex-1 flex-col gap-3.5 p-4">
               <p className="text-[13px] leading-relaxed text-lab-muted">
-                Workflow concurrency sweep on the live endpoint. Decode and prefill instruments live
-                on <Link href="/bench" className="text-lab-accent-bright underline-offset-4 hover:underline">Bench</Link>.
+                One bench: decode tok/s and TTFT across concurrency levels, and prefill throughput on long
+                prompts — warmed up, repeated, and checked for foreign load on the server.
               </p>
-              <Field
-                label="Concurrencies (comma-separated)"
-                htmlFor="eval-conc"
-                hint="Prefer concurrency + p95, not single-user tok/s only."
-              >
-                <Input
-                  id="eval-conc"
-                  value={conc}
-                  onChange={(e) => setConc(e.target.value)}
-                  placeholder="1,2,4"
-                  disabled={busy}
-                />
-              </Field>
               <div className="flex flex-wrap items-center gap-2">
-                <Btn
-                  onClick={() => void runPerf()}
-                  disabled={!healthy || busy}
-                  loading={busy && jobRunning}
-                  title={
-                    !healthy ? "Start a model on Serve first" : busy ? "Job in progress" : undefined
-                  }
-                >
-                  Start perf job
-                </Btn>
-                {jobRunning && (
-                  <Btn
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => void cancel().catch((e) => setErr(String(e)))}
-                  >
-                    Stop
-                  </Btn>
-                )}
+                <Link href="/bench?tab=decode" className={btnClass("primary", "md")}>
+                  Decode bench
+                </Link>
+                <Link href="/bench?tab=prefill" className={btnClass("secondary", "md")}>
+                  Prefill bench
+                </Link>
               </div>
             </div>
           </Panel>
         </div>
       </Section>
 
-      {(jobStatus || logs) && (
-        <Section className="lab-fade-in space-y-3" label="Job telemetry">
-          <Panel
-            title="Job log"
-            action={
-              <Badge tone={jobDone ? "ok" : jobFailed ? "danger" : "accent"} dot={jobRunning}>
-                {jobStatus || "idle"}
-              </Badge>
-            }
-          >
-            <div className="space-y-3 p-4">
-              <ProgressBar
-                value={Math.round((jobProgress || 0) * 100)}
-                indeterminate={jobRunning && !(jobProgress > 0)}
-                label={jobMsg || "Running…"}
-              />
-              <LogView text={logs} live={jobRunning} />
-            </div>
-          </Panel>
-        </Section>
-      )}
-
       {/* ── Run log ──────────────────────────────────────────────────────── */}
       <Section className="lab-rise lab-rise-3 space-y-3"
           label="Run log"
           meta={
             <Eyebrow className="lab-num tracking-[0.18em]">
-              {loading ? "loading" : `${runs.length} recorded`}
+              {loading ? "loading" : runsTotal !== null ? `${runs.length} newest of ${runsTotal}` : `${runs.length} newest`}
             </Eyebrow>
           }>
 
@@ -567,9 +485,9 @@ export default function EvalsPage() {
                   </tr>
                 )}
                 {!loading &&
-                  runs.slice(0, 20).map((r) => {
-                    const isTool =
-                      r.kind === "agentic_tool_eval" || String(r.kind || "").includes("tool");
+                  runs.map((r) => {
+                    const isTool = r.kind === "agentic_tool_eval";
+                    const href = runHref(r);
                     const s =
                       typeof r.summary?.final_score === "number"
                         ? (r.summary.final_score as number)
@@ -577,9 +495,9 @@ export default function EvalsPage() {
                     return (
                       <tr key={r.run_id}>
                         <td className="font-mono text-[12px]">
-                          {isTool ? (
+                          {href ? (
                             <Link
-                              href={`/evals/tool/${r.run_id}`}
+                              href={href}
                               className="text-lab-accent-bright underline-offset-4 hover:underline"
                             >
                               {r.run_id}
@@ -641,8 +559,8 @@ export default function EvalsPage() {
                           </Btn>
                         }
                       >
-                        Smoke or perf when the endpoint is healthy. Tool-eval results open on the
-                        board.
+                        Smoke, bench or tool-eval when the endpoint is healthy. Bench runs open on
+                        Bench, tool-eval results on the board.
                       </EmptyState>
                     </td>
                   </tr>

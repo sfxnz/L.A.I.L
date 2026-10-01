@@ -257,7 +257,13 @@ describe("load run", () => {
       chat_template_kwargs: { enable_thinking: false },
     });
     expect(state.requests[0]).not.toHaveProperty("min_tokens");
-    const msgs = state.requests.map((r) => r.messages as Array<{ role: string; content: string }>);
+    // Burst launches both strands at once, so upstream arrival order is not strand order:
+    // key each request by its strand's system prompt instead of its position in state.requests.
+    const msgs = [0, 1].map((i) => {
+      const r = state.requests.find((q) => (q.messages as Array<{ content: string }>)[0].content === strandSystemPrompt(run_id, i));
+      expect(r).toBeDefined();
+      return r!.messages as Array<{ role: string; content: string }>;
+    });
     expect(msgs[0].map((m) => m.role)).toEqual(["system", "user"]);
     expect(msgs[0][1].content).toBe(getPack("prose")!.prompts[0].text);
     expect(msgs[0][0].content).toContain(run_id);

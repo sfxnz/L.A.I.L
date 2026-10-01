@@ -3,7 +3,7 @@
 Job states: queued → running → completed | failed | cancelled.
 
 Jobs run on one of three single-worker executors, chosen by kind:
-  · lifecycle — serve / agent_restore (a multi-node load can poll for 30 min);
+  · lifecycle — serve (a multi-node load can poll for 30 min);
   · stop      — never queues behind a load or a bench, and cancels queued loads;
   · bench     — every other kind (agentic evals): one at a time, so two benches
                 never measure a GPU they share.
@@ -25,7 +25,7 @@ from ..config import DATA_DIR
 from .. import db
 from .metadata import utc_now
 
-LIFECYCLE_KINDS = frozenset({"serve", "agent_restore"})
+LIFECYCLE_KINDS = frozenset({"serve"})
 _executors: dict[str, Any] = {
     "lifecycle": ThreadPoolExecutor(max_workers=1, thread_name_prefix="job-lifecycle"),
     "stop": ThreadPoolExecutor(max_workers=1, thread_name_prefix="job-stop"),
@@ -144,7 +144,7 @@ async def start_job(kind: str, fn: Callable[..., Any], **kwargs: Any) -> str:
     sqlite at most every PROGRESS_WRITE_INTERVAL_S; a throttled update is flushed when
     the interval ends, so the last message always lands (messages always reach the log).
     A bench-class job raises BenchBusy while the external bench lease is held; a stop
-    job cancels serve / agent_restore jobs that are queued or running.
+    job cancels serve jobs that are queued or running.
     """
     cls = job_class(kind)
     job_id = new_job_id()

@@ -37,7 +37,7 @@ def test_first_scrape_has_every_rate_key_and_no_value():
     out = step(10.0)
     for key in metadata.LIVE_RATE_KEYS:
         assert key in out and out[key] is None, key
-    assert out["last_burst"] is None and out["last_prefill"] is None
+    assert out["last_burst"] is None and out["last_prefill"] is None and out["last_ttft"] is None
 
 
 def test_short_burst_is_not_diluted_by_the_window():
@@ -51,6 +51,11 @@ def test_short_burst_is_not_diluted_by_the_window():
     assert out["throughput_tok_per_s"] == 32.0  # 64 / 2 s
     assert out["ttft_s"] == 0.08
     assert out["rate_window_s"] == 2.0
+    # mid-decode no request starts: ttft_s is None, the last one is kept with its time
+    mid = step(13.0, requests_running=1.0, generation_tokens_total=4829.0 + 100, ttft_count=37.0,
+               ttft_sum=6.68 + 0.08, itl_sum=67.40 + 1.4)
+    assert mid["ttft_s"] is None
+    assert mid["last_ttft"]["s"] == 0.08 and isinstance(mid["last_ttft"]["at"], int)
 
 
 def test_busy_with_no_token_movement_is_zero_never_a_lifetime_average():
@@ -107,7 +112,7 @@ def test_counter_reset_rebaselines_and_never_shows_a_stale_rate():
                          requests_running=1.0)
     out = metadata.live_token_rates(restarted, now=14.0)
     assert out["decode_tok_per_s"] is None and out["throughput_tok_per_s"] is None
-    assert out["last_burst"] is None and out["last_prefill"] is None
+    assert out["last_burst"] is None and out["last_prefill"] is None and out["last_ttft"] is None
     after = metadata.live_token_rates({**restarted, "generation_tokens_total": 120.0, "itl_sum": 1.7}, now=16.0)
     assert after["decode_tok_per_s"] == 70.0 and after["throughput_tok_per_s"] == 35.0
 

@@ -15,7 +15,6 @@ DB_PATH = DATA_DIR / "lab.sqlite"
 PIPELINE = HOME / "benchmarks" / "_pipeline"
 SPARK_LAB = PIPELINE / "spark_lab.sh"
 PROFILES_DIR = PIPELINE / "profiles"
-VLLM_RUNTIME = HOME / "vllm-runtime"
 
 DEFAULT_BASE_URL = os.environ.get("LAB_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_PORT = int(os.environ.get("LAB_PORT", "8000"))

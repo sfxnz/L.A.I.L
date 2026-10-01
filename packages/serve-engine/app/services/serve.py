@@ -24,7 +24,6 @@ from ..config import (
     SAFE_UTIL,
     SERVE_EXAMPLES,
     SPARK_LAB,
-    VLLM_RUNTIME,
     WORKFLOW_MAX_LEN,
     WORKFLOW_UTIL,
 )
@@ -1054,29 +1053,6 @@ def serve_model(
         "docker_env": env_list,
         "vllm_args": vllm_args,
     }
-
-
-def agent_restore(log: Any = None, progress: Callable | None = None, **_: Any) -> dict[str, Any]:
-    if not SPARK_LAB.exists():
-        script = VLLM_RUNTIME / "scripts" / "vllm-use-model.sh"
-        if script.exists():
-            if log:
-                log.write(f"Using {script} 27b")
-            r = subprocess.run(["bash", str(script), "27b"], capture_output=True, text=True)
-            return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr}
-        raise FileNotFoundError("spark_lab.sh not found and no vllm-use-model.sh")
-    r = subprocess.run(
-        ["bash", str(SPARK_LAB), "agent-restore"],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if log:
-        log.write(r.stdout or "")
-        log.write(r.stderr or "")
-    if progress:
-        progress(1.0, "agent-restore done")
-    return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr}
 
 
 def ensure_hf_cache_writable(log: Any = None) -> None:

@@ -61,7 +61,7 @@ time axis and stale data is dimmed with its age, never shown as live.
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
 
 ### Model resolution
 

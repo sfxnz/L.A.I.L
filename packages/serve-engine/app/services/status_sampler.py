@@ -88,6 +88,10 @@ def _publish_cluster(
     A remote node takes its stream's line only while the node is online and the
     line is fresh (≤ STREAM_STALE_INTERVALS stream intervals old): a dead peer or a
     wedged stream never keeps its last numbers on screen as if they were current.
+    A fresh line always wins over the slow tick's one-shot reading, even when that
+    one's `sampled_at` looks newer: the two are stamped by different clocks (the
+    peer's own vs this host's receive time), and only the stream carries the 1 s
+    deltas (CPU %, rail rates) — dropping them every slow tick would blank them.
     Never mutates `info` — earlier snapshots keep the numbers they were served with.
     """
     now_ms = int(time.time() * 1000)
@@ -105,7 +109,6 @@ def _publish_cluster(
                 reading
                 and node.get("online")
                 and now_ms - at <= STREAM_STALE_INTERVALS * stream.interval_s * 1000
-                and at >= (node.get("sampled_at") or 0)
             ):
                 cluster.apply_telemetry(node, reading)
             node["telemetry_error"] = stream.error if stream else None

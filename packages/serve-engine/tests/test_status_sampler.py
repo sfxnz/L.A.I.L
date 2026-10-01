@@ -97,7 +97,7 @@ class FakeStream:
         self.stopped = True
 
     def reading(self):
-        return dict(self.line)
+        return None if self.line is None else dict(self.line)
 
 
 def _no_collectors(monkeypatch) -> None:
@@ -440,21 +440,40 @@ def test_publish_overlays_fresh_telemetry_without_mutating_the_slow_tick_cluster
             {"id": "c", "local": False, "online": True, "power_w": 6.0, "sampled_at": now - 1_000},
         ]
     }
-    fresh_b, older_c = FakeStream("b"), FakeStream("c")
-    older_c.line = {"power_w": 99.0, "sampled_at": now - 2_000}
-    older_c.error = "telemetry stream exited (255)"
+    fresh_b, broken_c = FakeStream("b"), FakeStream("c")
+    # a stream that exited has no line (PeerStream drops it), only an error
+    broken_c.line = None
+    broken_c.error = "telemetry stream exited (255)"
     out = status_sampler._publish_cluster(
-        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": now}, {"b": fresh_b, "c": older_c}
+        info, {"power_w": 11.0, "available_gib": 13.3, "sampled_at": now}, {"b": fresh_b, "c": broken_c}
     )
     a, b, c = out["nodes"]
     assert a["power_w"] == 11.0 and a["sampled_at"] == now
     assert b["power_w"] == 13.3 and b["available_gib"] == 18.5 and b["sampled_at"] == fresh_b.line["sampled_at"]
-    # an older stream line never overwrites a newer slow-tick reading; its error is surfaced
+    # no stream line: the slow-tick reading stays, and the stream's error is surfaced
     assert c["power_w"] == 6.0 and c["sampled_at"] == now - 1_000
     assert c["telemetry_error"] == "telemetry stream exited (255)"
     assert b["mem_pressure"] == "ok" and c["mem_pressure"] is None
     # the cached slow-tick dicts (and earlier snapshots built from them) are untouched
     assert info["nodes"][0]["power_w"] == 9.0 and "mem_pressure" not in info["nodes"][1]
+
+
+def test_a_fresh_stream_line_wins_over_a_newer_stamped_slow_tick_reading():
+    """The slow tick's one-shot probe is stamped by the peer's clock and has no 1 s deltas.
+
+    Seen live: every 10 s it looked newer than the stream line, and the published
+    node lost cpu_util_pct and rail_rates for one snapshot.
+    """
+    now = _now_ms()
+    node = {"id": "b", "local": False, "online": True, "power_w": 7.0, "cpu_util_pct": None,
+            "rail_rates": {}, "sampled_at": now + 300}  # peer clock a little ahead
+    stream = FakeStream("b")
+    stream.line = {"power_w": 31.0, "cpu_util_pct": 12.5,
+                   "rail_rates": {"enp1s0f1np1": {"rx_bps": 1.2e8, "tx_bps": 1.1e8}}, "sampled_at": now - 400}
+    b = status_sampler._publish_cluster({"nodes": [node]}, None, {"b": stream})["nodes"][0]
+    assert b["cpu_util_pct"] == 12.5
+    assert b["rail_rates"] == {"enp1s0f1np1": {"rx_bps": 1.2e8, "tx_bps": 1.1e8}}
+    assert b["power_w"] == 31.0 and b["sampled_at"] == now - 400
 
 
 def test_a_dead_peer_never_shows_its_last_stream_line_as_current():

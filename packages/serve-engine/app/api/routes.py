@@ -186,12 +186,6 @@ async def serve_stop() -> dict[str, str]:
     return {"job_id": job_id}
 
 
-@router.post("/serve/agent-restore")
-async def serve_agent_restore() -> dict[str, str]:
-    job_id = await jobs.start_job("agent_restore", serve.agent_restore)
-    return {"job_id": job_id}
-
-
 # ─── Jobs / logs ──────────────────────────────────────────────────────────────
 
 

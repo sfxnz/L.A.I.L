@@ -90,6 +90,17 @@ bun run dev
 
 Open http://127.0.0.1:3000 — **`/` redirects to Status**.
 
+`bun run dev` serves the web app with `next dev` (hot reload, the React development
+build: several MB of unminified JS, re-checked on every render). For the console you
+leave open all day, run the same stack with the production web build instead:
+
+```bash
+bun run start:prod   # next build (into apps/web/.next-prod), then next start
+```
+
+Same ports, same env, same controller and serve-engine; only the web server differs.
+Stop the dev stack first — both bind :3000.
+
 | Service | URL |
 |---------|-----|
 | Web (Status) | http://127.0.0.1:3000 |
@@ -132,7 +143,9 @@ Then open http://127.0.0.1:3000. Replace `$USER@<lab-host>` with your SSH login.
 
 ## Connect (Hermes)
 
-On **`/connect`**, copy the snippets for the live OpenAI-compatible endpoint.
+Status (the served-model panel) and Serve (the live endpoint panel) show the OpenAI
+base URL of the port that answers, with copy buttons for it, the model id and a
+ready env block. **`/connect`** has the rest: the Tailscale URL and curl probes.
 
 **Hermes on the same host** (loopback):
 
@@ -146,9 +159,8 @@ OPENAI_MODEL=<served-model-id>
 
 ## Serve (vLLM serve & evals)
 
-- Auto-configure + start · stop · agent-restore
-- HF auto-configure · live job logs
-- Smoke · perf · golden tools · run history envelopes
+- Auto-configure + start · stop (two clicks) · live job logs
+- Bench (decode / prefill) on `/bench`; smoke, golden tools and tool-eval-bench on `/evals`
 
 Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first**, then bench.
 

@@ -7,7 +7,7 @@ Agentic coding/chat is **not** the primary surface: after Serve, wire Hermes to 
 | Layer | Stack |
 |-------|--------|
 | UI | Next.js 16 App Router + React 19 · light console chrome · Tailwind |
-| Controller | Bun + Hono · lab-status, models, configure, proxy to serve-engine |
+| Controller | Bun + Hono · lab-status, configure, usage, lab gallery, proxy to serve-engine |
 | Serve-engine | Python FastAPI · vLLM auto-configure, smoke, benches, run history |
 | Models | **vLLM** and **llama.cpp** (no Ollama) |
 
@@ -35,7 +35,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
                              │ REST :8787
 ┌────────────────────────────▼─────────────────────────────────┐
 │  LabController (Bun + Hono)                                  │
-│  lab-status · models · configure · serve/* · bench/* proxy   │
+│  lab-status · configure · usage · serve/* · bench/* proxy    │
 └──────────────┬─────────────────────────────┬─────────────────┘
                │                             │
                ▼                             ▼
@@ -48,7 +48,7 @@ Top nav (`apps/web/lib/ide-chrome.ts`):
 
 ### Controller pattern
 
-One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). Composer agent remains in the backend for now but is **out of the primary UI**.
+One **LabController** is the public API. The Python **serve-engine** keeps the vLLM serve path (auto-configure, start, stop, agent-restore, benches). The composer agent is gone from the backend (see *Retired: Workbench*).
 
 ### Model resolution
 
@@ -154,8 +154,8 @@ Benches hit whatever is on the vLLM base URL (default `:8000`) — **serve first
 
 ## Models & Usage
 
-- **`/models`**: HF search, local list from vLLM/llama.cpp `/v1/models`, HF download jobs (not Ollama pull).
-- **`/usage`**: lifetime tokens, heatmap, mix, top models (metered from proxy + agent).
+- **`/models`** is retired (redirects to Server): weights download through Serve’s “Download weights first” option into the HF cache the engine reads.
+- **`/usage`**: lifetime tokens, heatmap, mix, top models — metered every 15 s from the engine’s own `/metrics` counters, so it covers every client, including Hermes direct to `:8000` (vLLM always; SGLang with `--enable-metrics`; llama-server with `--metrics`).
 
 ## Environment
 
@@ -218,8 +218,8 @@ python3 -m pytest packages/serve-engine/tests -q
 ```
 
 - `bun run typecheck` — web + backend TypeScript
-- `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), shell source, mentions
-- `packages/backend` tests — agent runtime, patches, context packer
+- `apps/web` tests — nav labels (`lib/ide-chrome.test.ts`), API/token handling, live status store, stream runs
+- `packages/backend` tests — usage metering, serve-engine and `/v1` proxies, lab play capability, streams
 - `packages/serve-engine` pytest — auto-config, cluster, captured corpus
 - Python runtime pins: `packages/serve-engine/requirements.txt` (`uv pip compile packages/serve-engine/pyproject.toml -o packages/serve-engine/requirements.txt`)
 

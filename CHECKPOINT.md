@@ -48,37 +48,17 @@ Same as legacy lab:
 - Auto-configure sizes util (typically ~0.85 after reserved UMA) from weights + live topology  
 - One large model at a time; trust `free -h` available more than `docker stats` on UMA  
 
-## Phase A + B Workbench (handoff)
+## Phase A + B Workbench (retired)
 
-- **Modes**: Plan (no edits) · Ask (read-only) · Agent (tools + pending patches)  
-- **Patches**: review-first; Accept / Reject / Accept all before disk write  
-- **Streaming** + mid-run **Cancel**  
-- **Risky shell**: approval banner Allow / Deny  
-- **Context (Phase B)**: client builds `EditorSnapshot` (open tabs, active path, selection, mentions); server `ContextPacker` re-reads disk, runs rg for `@search`, applies ignore + budget  
-- Composer UI: type `@` → `MentionPopup` inserts `@file path`; `ContextChips` show mentions + open tab count  
-- **Configure → Context budget (chars)** (`contextBudgetChars`, default 32000)  
-- UI: `ModeToggle`, `PatchReviewPanel`, `ShellApprovalBanner`, `MentionPopup`, `ContextChips` under `apps/web/components/workbench/`  
-- Backend: `packages/backend/src/agent/` + `agent/context/` (mentions, packer, budget, ignore, search)  
-- Phases C–E (Monaco, terminal, …) still planned — see design specs  
+Removed: the Workbench page, `components/workbench/*`, the backend agent runtime / patches / context packer, and **Configure → Context budget** (`contextBudgetChars`). Hermes against `:8000` is the agent. Existing sqlite tables from that era are left in place, unused.
 
 ## Code map
 
 ```text
 apps/web/components/layout/AppShell.tsx          # Sidebar inspo shell
-apps/web/app/workbench/page.tsx                  # IDE composer + editor + status + Phase A/B UI
-apps/web/components/workbench/ModeToggle.tsx     # Plan | Ask | Agent
-apps/web/components/workbench/MentionPopup.tsx   # @ path popup
-apps/web/components/workbench/ContextChips.tsx   # mention + open-tab chips
-apps/web/components/workbench/PatchReviewPanel.tsx
-apps/web/components/workbench/ShellApprovalBanner.tsx
-apps/web/lib/mentions.ts                         # client parseMentions
 apps/web/lib/ide-chrome.ts                       # Labels + groupTimeline (tested)
-apps/web/lib/store.ts                            # agentMode, pendingPatches
-packages/backend/src/agent/                      # Runtime, PatchStore, ToolPolicy, approvals
-packages/backend/src/agent/context/              # ContextPacker, mentions, budget, rg search
-packages/backend/src/controller/agent.ts         # Composer agent HTTP/WS (+ editorSnapshot)
-packages/backend/src/controller/patches.ts       # Accept / reject patches
-packages/backend/src/controller/settings.ts      # resolveModelId + contextBudgetChars
+packages/backend/src/controller/settings.ts      # resolveModelId
+packages/backend/src/controller/usage.ts         # Usage from engine /metrics counters
 packages/serve-engine/                           # vLLM serve/bench
 ```
 
